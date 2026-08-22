@@ -1,0 +1,13 @@
+config/*.env
+config/secrets/
+*.key
+*.pem
+data/
+*.sqlite3
+*.db
+logs/
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
