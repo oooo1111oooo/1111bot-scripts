@@ -1,0 +1,13 @@
+{
+  "symbols": [
+    { "symbol": "BTCUSDT",  "enabled": true,  "note": "" },
+    { "symbol": "ETHUSDT",  "enabled": true,  "note": "" },
+    { "symbol": "DOGEUSDT", "enabled": true,  "note": "" },
+    { "symbol": "HYPEUSDT", "enabled": true,  "note": "demo API 異常 live 正常" },
+    { "symbol": "SOLUSDT",  "enabled": true,  "note": "" },
+    { "symbol": "SUIUSDT",  "enabled": true,  "note": "" },
+    { "symbol": "XRPUSDT",  "enabled": true,  "note": "" },
+    { "symbol": "XAUUSDT",  "enabled": true,  "note": "貴金屬 須驗證交易時段" },
+    { "symbol": "ADAUSDT",  "enabled": true,  "note": "v1.4 新增 待驗證" }
+  ]
+}

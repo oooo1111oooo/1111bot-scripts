@@ -1,0 +1,6 @@
+{
+  "o2222o": { "api_key": "<FILL_ME>", "api_secret": "<FILL_ME>", "passphrase": "<FILL_ME>", "timeframe": "5m" },
+  "o3333o": { "api_key": "<FILL_ME>", "api_secret": "<FILL_ME>", "passphrase": "<FILL_ME>", "timeframe": "5m" },
+  "o4444o": { "api_key": "<FILL_ME>", "api_secret": "<FILL_ME>", "passphrase": "<FILL_ME>", "timeframe": "5m" },
+  "o5555o": { "api_key": "<FILL_ME>", "api_secret": "<FILL_ME>", "passphrase": "<FILL_ME>", "timeframe": "5m" }
+}
