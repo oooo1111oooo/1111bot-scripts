@@ -1,0 +1,17 @@
+[Unit]
+Description=1111BOT gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/srv/1111bot
+ExecStart=/srv/1111bot/.venv/bin/python -m app.gateway
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONPATH=/srv/1111bot
+Environment=TZ=Asia/Taipei
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=1111BOT daily report at 00:05 Asia/Taipei
+
+[Timer]
+OnCalendar=*-*-* 00:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=1111BOT reporter (daily)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/srv/1111bot
+ExecStart=/srv/1111bot/.venv/bin/python -m app.reporter
+Environment=PYTHONPATH=/srv/1111bot
+Environment=TZ=Asia/Taipei
