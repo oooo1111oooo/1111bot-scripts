@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B5-3 完整版：/run預覽+/confirm+逾時+完整help+未知指令+查詢指令+左下Menu選單。不真下單。"""
+"""B5-3 完整版：只留/menu(刪/help)+左下選單同步+逾時+未知指令+查詢。不真下單。"""
 import sys, hmac, base64, hashlib, json, time, asyncio
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
@@ -51,7 +51,7 @@ def get_spec(sym):
             "minsz":Decimal(d["minSz"]),"ctval":Decimal(d["ctVal"]),
             "maxlev":Decimal(d["lever"]),"last":Decimal(t["last"]),"ctvalccy":d["ctValCcy"]}
 
-HELP=(f"{E.BOT} OKXLive普K｜{ACCT}\n事件：使用說明\n━━━━━━━━━━\n"
+MENU=(f"{E.BOT} OKXLive普K｜{ACCT}\n事件：使用說明\n━━━━━━━━━━\n"
       "【交易】\n"
       "/run 建立普K策略\n"
       "　商品 方向 週期 槓桿 保證金 埋伏 TP SL TE\n"
@@ -68,7 +68,7 @@ HELP=(f"{E.BOT} OKXLive普K｜{ACCT}\n事件：使用說明\n━━━━━━�
       "━━━━━━━━━━\n"
       "⚠ B5-3 測試版：/confirm 尚未真下單")
 
-async def cmd_help(u,c): await u.message.reply_text(HELP)
+async def cmd_menu(u,c): await u.message.reply_text(MENU)
 
 async def timeout_watch(app, chat_id, stamp):
     await asyncio.sleep(61)
@@ -194,9 +194,11 @@ async def cmd_timeframe(u,c):
 async def cmd_unknown(u,c):
     await u.message.reply_text(
         f"{E.BOT} OKXLive普K｜{ACCT}\n事件：指令無法辨識\n"
-        f"你輸入：{u.message.text}\n下一步：請用 /help 查看可用指令")
+        f"你輸入：{u.message.text}\n下一步：請用 /menu 查看可用指令")
 
 async def _set_menu(app):
+    # 先刪除舊選單，再設定新的（避免舊殘留）
+    await app.bot.delete_my_commands()
     await app.bot.set_my_commands([
         BotCommand("run","建立普K策略"),
         BotCommand("confirm","60秒內確認"),
@@ -208,13 +210,14 @@ async def _set_menu(app):
         BotCommand("timeframe","查看/設定週期"),
         BotCommand("coins","幣種清單"),
         BotCommand("menu","使用說明"),
-        BotCommand("help","使用說明"),
     ])
+    print("左下 Menu 選單已更新")
 
 def main():
     print(f"啟動 o3333o 普K bot B5-3完整版（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).post_init(_set_menu).build()
-    app.add_handler(CommandHandler(["help","start","menu"],cmd_help))
+    app.add_handler(CommandHandler("menu",cmd_menu))
+    app.add_handler(CommandHandler("start",cmd_menu))
     app.add_handler(CommandHandler("run",cmd_run))
     app.add_handler(CommandHandler("confirm",cmd_confirm))
     app.add_handler(CommandHandler("status",cmd_status))
