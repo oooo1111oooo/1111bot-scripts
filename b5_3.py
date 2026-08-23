@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""B5-3 完整修正版：/run預覽+/confirm+逾時通知+完整help+未知指令回應+查詢指令。不真下單。"""
+"""B5-3 完整版：/run預覽+/confirm+逾時+完整help+未知指令+查詢指令+左下Menu選單。不真下單。"""
 import sys, hmac, base64, hashlib, json, time, asyncio
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 import httpx
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 sys.path.insert(0, "/srv/1111bot")
@@ -196,9 +196,24 @@ async def cmd_unknown(u,c):
         f"{E.BOT} OKXLive普K｜{ACCT}\n事件：指令無法辨識\n"
         f"你輸入：{u.message.text}\n下一步：請用 /help 查看可用指令")
 
+async def _set_menu(app):
+    await app.bot.set_my_commands([
+        BotCommand("run","建立普K策略"),
+        BotCommand("confirm","60秒內確認"),
+        BotCommand("status","策略/委託/持倉現況"),
+        BotCommand("summary","已完成交易與損益"),
+        BotCommand("stop","停止指定策略"),
+        BotCommand("stopall","停止全部策略"),
+        BotCommand("leverage","最低下單額查詢"),
+        BotCommand("timeframe","查看/設定週期"),
+        BotCommand("coins","幣種清單"),
+        BotCommand("menu","使用說明"),
+        BotCommand("help","使用說明"),
+    ])
+
 def main():
-    print(f"啟動 o3333o 普K bot B5-3完整修正版（token ...{TOKEN[-6:]}）")
-    app=Application.builder().token(TOKEN).build()
+    print(f"啟動 o3333o 普K bot B5-3完整版（token ...{TOKEN[-6:]}）")
+    app=Application.builder().token(TOKEN).post_init(_set_menu).build()
     app.add_handler(CommandHandler(["help","start","menu"],cmd_help))
     app.add_handler(CommandHandler("run",cmd_run))
     app.add_handler(CommandHandler("confirm",cmd_confirm))
