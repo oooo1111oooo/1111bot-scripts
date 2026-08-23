@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""B5-3修正：/run預覽+/confirm+60秒逾時主動回報+整合查詢指令。不真下單。"""
+"""B5-3 完整修正版：/run預覽+/confirm+逾時通知+完整help+未知指令回應+查詢指令。不真下單。"""
 import sys, hmac, base64, hashlib, json, time, asyncio
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 import httpx
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 sys.path.insert(0, "/srv/1111bot")
 from app.core import emoji as E
@@ -51,8 +51,26 @@ def get_spec(sym):
             "minsz":Decimal(d["minSz"]),"ctval":Decimal(d["ctVal"]),
             "maxlev":Decimal(d["lever"]),"last":Decimal(t["last"]),"ctvalccy":d["ctValCcy"]}
 
+HELP=(f"{E.BOT} OKXLive普K｜{ACCT}\n事件：使用說明\n━━━━━━━━━━\n"
+      "【交易】\n"
+      "/run 建立普K策略\n"
+      "　商品 方向 週期 槓桿 保證金 埋伏 TP SL TE\n"
+      "　例：/run ETHUSDT L 5m 1x 100 0.5 0.7 0.7 180\n"
+      "/confirm 60秒內確認 /run\n"
+      "/status 查看策略、委託、持倉現況\n"
+      "/summary 查看已完成交易與損益\n"
+      "【工具】\n"
+      "/leverage 查詢最低下單額與最大槓桿\n"
+      "　例：/leverage ETHUSDT 1x\n"
+      "/timeframe 查看／設定進場週期\n"
+      "/coins 查看幣種清單\n"
+      "/menu 顯示本說明\n"
+      "━━━━━━━━━━\n"
+      "⚠ B5-3 測試版：/confirm 尚未真下單")
+
+async def cmd_help(u,c): await u.message.reply_text(HELP)
+
 async def timeout_watch(app, chat_id, stamp):
-    """60秒後若該預覽仍在且未confirm，主動推逾時通知"""
     await asyncio.sleep(61)
     p=PENDING.get(chat_id)
     if p and p["t"]==stamp:
@@ -141,7 +159,8 @@ async def cmd_status(u,c):
         for p in pl:
             s=E.LONG if p["posSide"]=="long" else E.SHORT; upl=Decimal(p.get('upl','0'))
             L.append(f"{s} {p['instId']} 張{p['pos']} 浮{upl:+.4f}{E.pnl_emoji(upl)}")
-        L+=["━━━━━━━━━━",f"時間：{datetime.now(TZ8).strftime('%H:%M:%S')} UTC+8"]
+        L+=["━━━━━━━━━━",f"時間：{datetime.now(TZ8).strftime('%H:%M:%S')} UTC+8",
+            "（策略生命週期狀態於 B5-4 接單後顯示）"]
         await u.message.reply_text("\n".join(L))
     except Exception as e:
         await u.message.reply_text(f"{E.LOSS} 查詢失敗：{type(e).__name__}")
@@ -172,14 +191,13 @@ async def cmd_timeframe(u,c):
         f"{E.BOT} OKXLive普K｜{ACCT}\n事件：週期設定\n━━━━━━━━━━\n"
         f"目前帳戶週期：5m\n可選：3m / 5m / 10m / 15m\n（設定功能於 B5-5 開放）")
 
-async def cmd_help(u,c):
+async def cmd_unknown(u,c):
     await u.message.reply_text(
-        f"{E.BOT} OKXLive普K｜{ACCT}\n事件：使用說明（B5-3）\n━━━━━━━━━━\n"
-        "/run 商品 方向 週期 槓桿 保證金 埋伏 TP SL TE\n/confirm 60秒內確認\n"
-        "/status /leverage /coins /timeframe /menu\n━━━━━━━━━━\n⚠ confirm 尚未真下單")
+        f"{E.BOT} OKXLive普K｜{ACCT}\n事件：指令無法辨識\n"
+        f"你輸入：{u.message.text}\n下一步：請用 /help 查看可用指令")
 
 def main():
-    print(f"啟動 o3333o 普K bot B5-3修正（token ...{TOKEN[-6:]}）")
+    print(f"啟動 o3333o 普K bot B5-3完整修正版（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler(["help","start","menu"],cmd_help))
     app.add_handler(CommandHandler("run",cmd_run))
@@ -188,6 +206,7 @@ def main():
     app.add_handler(CommandHandler("leverage",cmd_leverage))
     app.add_handler(CommandHandler("coins",cmd_coins))
     app.add_handler(CommandHandler("timeframe",cmd_timeframe))
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.run_polling()
 
 if __name__=="__main__":
