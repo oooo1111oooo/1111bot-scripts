@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B5-8 普K：狀態持久化(重啟不失憶)+啟動認領+對帳。o3333o。"""
+"""B5-8b 普K：/status調整(先掛單後持倉、持倉清單精簡)。o3333o。"""
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
@@ -22,29 +22,22 @@ def load_env(p):
 ACC=load_env("/srv/1111bot/config/accounts.env"); BOTS=load_env("/srv/1111bot/config/bots.env")
 TOKEN=BOTS["BOT_o3333o_NORMAL"]; SYMS=json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 PENDING={}; STRATS={}; TASKS={}; STATS={}
-CHAT_ID=None  # 記錄主要 chat，重啟通知用
-
+CHAT_ID=None
 def skey(s,d): return f"{s}_{d}"
 def inst_id(s): return s.replace("USDT","")+"-USDT-SWAP"
 def now8(): return datetime.now(TZ8)
 def hhmmss(): return now8().strftime("%H:%M:%S")
 def today8(): return now8().strftime("%Y-%m-%d")
-
-# ===== 持久化 =====
 def save_state():
-    """把所有活著的策略寫進硬碟"""
     try:
         data={"chat":CHAT_ID,"tf":ACCOUNT_TF,"stats":STATS,"strats":[]}
         for k,S in STRATS.items():
             if S.get("alive"):
                 data["strats"].append({k2:v2 for k2,v2 in S.items()
                     if k2 in ("sym","dir","tf","lev","margin","offset","tp","sl","te","state","round","chat")})
-        # Decimal 轉字串
         def enc(o): return str(o) if isinstance(o,Decimal) else o
-        with open(STATE_FILE,"w") as f:
-            json.dump(data,f,default=enc)
+        with open(STATE_FILE,"w") as f: json.dump(data,f,default=enc)
     except Exception as e: print("save_state fail",e)
-
 def bump(k,field):
     t=today8()
     if k not in STATS or STATS[k]["date"]!=t: STATS[k]={"date":t,"placed":0,"entered":0}
@@ -53,7 +46,6 @@ def get_stat(k):
     t=today8()
     if k not in STATS or STATS[k]["date"]!=t: return (0,0)
     return (STATS[k]["placed"],STATS[k]["entered"])
-
 def ts_now():
     n=datetime.now(timezone.utc); return n.strftime("%Y-%m-%dT%H:%M:%S.")+f"{n.microsecond//1000:03d}Z"
 def sign(sec,ts,m,p,b=""):
@@ -75,7 +67,6 @@ def csize(m,lev,px,cv,lot): return ((m*lev/px)/cv/lot).to_integral_value(roundin
 async def notify(app,chat,t):
     try: await app.bot.send_message(chat,t)
     except Exception as e: print("notify fail",e)
-
 async def loop(app,chat,S):
     spec=S["spec"]; iid=spec["iid"]; d=S["dir"]; k=skey(S["sym"],d)
     try:
@@ -140,29 +131,20 @@ async def loop(app,chat,S):
         await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 循環錯誤：{type(e).__name__}: {e}")
     finally:
         S["state"]="已停止"; S["alive"]=False; STRATS.pop(k,None); TASKS.pop(k,None); save_state()
-
 def rebuild_strat(app,d):
-    """從存檔資料重建一個策略dict"""
     spec=get_spec(d["sym"])
-    S={"sym":d["sym"],"dir":d["dir"],"tf":d.get("tf",ACCOUNT_TF),"lev":int(d["lev"]),
+    return {"sym":d["sym"],"dir":d["dir"],"tf":d.get("tf",ACCOUNT_TF),"lev":int(d["lev"]),
        "margin":Decimal(str(d["margin"])),"offset":Decimal(str(d["offset"])),
        "tp":Decimal(str(d["tp"])),"sl":Decimal(str(d["sl"])),"te":int(d["te"]),
        "spec":spec,"alive":True,"state":"等下輪","chat":d.get("chat",CHAT_ID)}
-    return S
-
 async def startup_recover(app):
-    """開機認領：讀存檔重建策略，並與OKX對帳"""
     global CHAT_ID,ACCOUNT_TF,STATS
-    if not os.path.exists(STATE_FILE): 
-        print("無存檔，全新啟動"); return
-    try:
-        data=json.load(open(STATE_FILE))
-    except Exception as e:
-        print("讀存檔失敗",e); return
+    if not os.path.exists(STATE_FILE): print("無存檔"); return
+    try: data=json.load(open(STATE_FILE))
+    except Exception as e: print("讀存檔失敗",e); return
     CHAT_ID=data.get("chat"); ACCOUNT_TF=data.get("tf","5m"); STATS=data.get("stats",{})
     saved=data.get("strats",[])
     if not saved: print("存檔無策略"); return
-    print(f"認領 {len(saved)} 個策略...")
     recovered=[]
     for d in saved:
         try:
@@ -170,18 +152,13 @@ async def startup_recover(app):
             STRATS[k]=S; TASKS[k]=asyncio.create_task(loop(app,S["chat"],S))
             recovered.append(f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}")
         except Exception as e: print("重建失敗",d,e)
-    # 對帳：查OKX現況
     if CHAT_ID and recovered:
-        pend=api("GET","/api/v5/trade/orders-pending")
-        pos=api("GET","/api/v5/account/positions")
+        pend=api("GET","/api/v5/trade/orders-pending"); pos=api("GET","/api/v5/account/positions")
         n_ord=len(pend.get("data",[])) if pend.get("code")=="0" else 0
         n_pos=len([p for p in pos.get("data",[]) if float(p.get("pos","0"))!=0]) if pos.get("code")=="0" else 0
-        await notify(app,CHAT_ID,
-            f"{E.BOT} OKXLive普K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
+        await notify(app,CHAT_ID,f"{E.BOT} OKXLive普K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
             f"已接管策略（{len(recovered)}）：\n"+"\n".join("・"+x for x in recovered)+"\n"
-            f"OKX 現況：掛單{n_ord} 持倉{n_pos}\n"
-            f"循環已接管，繼續運作\n時間：{hhmmss()}")
-
+            f"OKX 現況：掛單{n_ord} 持倉{n_pos}\n循環已接管，繼續運作\n時間：{hhmmss()}")
 async def cmd_run(u,c):
     global CHAT_ID; CHAT_ID=u.effective_chat.id
     a=c.args
@@ -248,7 +225,6 @@ async def cmd_stop(u,c):
         await u.message.reply_text(f"{E.BOT} /stop\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n原狀態：{st}\n動作：{'已撤銷委託' if st=='委託中' else '已移除'}")
 async def cmd_stopall(u,c):
     alive=[k for k,s in STRATS.items() if s.get("alive")]
-    # 同時清 OKX 殘留掛單（解決孤兒）
     pend=api("GET","/api/v5/trade/orders-pending")
     okx_orders=pend.get("data",[]) if pend.get("code")=="0" else []
     held=[];done=[]
@@ -258,7 +234,6 @@ async def cmd_stopall(u,c):
         else:
             if S.get("ordId") and S["state"]=="委託中": api("POST","/api/v5/trade/cancel-order",{"instId":S["spec"]["iid"],"ordId":S["ordId"]})
             S["alive"]=False; done.append(f"{S['sym']} {S['dir']}")
-    # 清掉任何OKX殘單（孤兒）
     orphan=0
     for o in okx_orders:
         cr=api("POST","/api/v5/trade/cancel-order",{"instId":o["instId"],"ordId":o["ordId"]})
@@ -272,7 +247,8 @@ async def cmd_stopall(u,c):
     await u.message.reply_text(m+f"時間：{hhmmss()}")
 async def cmd_status(u,c):
     global CHAT_ID; CHAT_ID=u.effective_chat.id
-    bal=api("GET","/api/v5/account/balance");posr=api("GET","/api/v5/account/positions");pe=api("GET","/api/v5/trade/orders-pending")
+    posr=api("GET","/api/v5/account/positions");pe=api("GET","/api/v5/trade/orders-pending")
+    bal=api("GET","/api/v5/account/balance")
     eq=av="?"
     if bal.get("code")=="0":
         x=next((d for d in bal["data"][0].get("details",[]) if d["ccy"]=="USDT"),None)
@@ -285,10 +261,12 @@ async def cmd_status(u,c):
     for s in alive:
         k=skey(s["sym"],s["dir"]); placed,entered=get_stat(k)
         L.append(f"　{E.dir_emoji(s['dir'])} {s['sym']} {E.dir_word(s['dir'])}：{s['state']}(掛{placed}/進{entered})")
-    L+=[f"持倉數：{len(pl)}",f"掛單數：{len(pdl)}"]
+    L.append(f"掛單數：{len(pdl)}")
+    L.append(f"持倉數：{len(pl)}")
     for p in pl:
-        s=E.LONG if p["posSide"]=="long" else E.SHORT; upl=Decimal(p.get('upl','0'))
-        L.append(f"{s} {p['instId']} 張{p['pos']} 浮{upl:+.4f}{E.pnl_emoji(upl)}")
+        d="L" if p["posSide"]=="long" else "S"
+        sym=p["instId"].replace("-USDT-SWAP","USDT")
+        L.append(f"{E.dir_emoji(d)} {sym} {d}")
     L+=["━━━━━━━━━━",f"時間：{hhmmss()} UTC+8"]
     await u.message.reply_text("\n".join(L))
 async def cmd_summary(u,c):
@@ -338,7 +316,7 @@ async def cmd_menu(u,c):
         f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "　同幣可雙向、多幣可並行\n/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 當日戰報\n/timeframe 查看/設定週期\n/coins 幣種(最小張/最小保證金)\n"
-        "━━━━━━━━━━\n⚠ 真實下單，循環交易\n✅ 重啟不失憶（狀態持久化）")
+        "━━━━━━━━━━\n⚠ 真實下單，循環交易\n✅ 重啟不失憶")
 async def cmd_unknown(u,c): await u.message.reply_text(f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
 async def _post_init(app):
     await app.bot.delete_my_commands()
@@ -346,12 +324,10 @@ async def _post_init(app):
         BotCommand("stop","停指定"),BotCommand("stopall","停全部"),BotCommand("status","現況"),
         BotCommand("summary","當日戰報"),BotCommand("timeframe","週期"),BotCommand("coins","幣種"),
         BotCommand("menu","說明")])
-    print("左下 Menu 已更新")
-    await startup_recover(app)  # 開機認領
-
+    print("左下 Menu 已更新"); await startup_recover(app)
 def main():
     os.makedirs(os.path.dirname(STATE_FILE),exist_ok=True)
-    print(f"啟動 o3333o 普K B5-8 持久化版（token ...{TOKEN[-6:]}）")
+    print(f"啟動 o3333o 普K B5-8b 持久化版（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).post_init(_post_init).build()
     for cmd,fn in [(["menu","start"],cmd_menu),("run",cmd_run),("confirm",cmd_confirm),("stop",cmd_stop),
         ("stopall",cmd_stopall),("status",cmd_status),("summary",cmd_summary),
