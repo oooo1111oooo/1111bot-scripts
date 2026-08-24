@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B5-6 普K正式版：/coins含槓桿與最低保證金、移除/leverage、清除測試字眼。o3333o。"""
+"""B5-6b 普K正式版：/coins單行顯示。o3333o。"""
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
@@ -232,11 +232,11 @@ async def cmd_coins(u,c):
         try:
             sp=get_spec(sym); last=get_last(sp["iid"])
             minm=sp["minsz"]*sp["ctval"]*last/sp["maxlev"]
-            L.append(f"{sym}")
-            L.append(f"　槓桿{sp['maxlev']}x 最低{minm:.4f}U")
+            name=sym.replace("USDT","")
+            L.append(f"{name:<5} {int(sp['maxlev'])}x  最低{minm:.4f}U")
         except:
-            L.append(f"{sym}　查詢失敗")
-    L+=["━━━━━━━━━━","（最低保證金＝最大槓桿下，隨價浮動）",f"時間：{hhmmss()}"]
+            L.append(f"{sym}  查詢失敗")
+    L+=["━━━━━━━━━━","（最低＝最大槓桿下，隨價浮動）",f"時間：{hhmmss()}"]
     await u.message.reply_text("\n".join(L))
 async def cmd_timeframe(u,c):
     global ACCOUNT_TF
@@ -262,7 +262,7 @@ async def _menu(app):
         BotCommand("menu","說明")])
     print("左下 Menu 已更新")
 def main():
-    print(f"啟動 o3333o 普K B5-6 正式版（token ...{TOKEN[-6:]}）")
+    print(f"啟動 o3333o 普K B5-6b 正式版（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).post_init(_menu).build()
     for cmd,fn in [(["menu","start"],cmd_menu),("run",cmd_run),("confirm",cmd_confirm),("stop",cmd_stop),
         ("stopall",cmd_stopall),("status",cmd_status),("summary",cmd_summary),
