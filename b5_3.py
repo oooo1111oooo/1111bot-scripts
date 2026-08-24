@@ -71,22 +71,30 @@ async def loop(app,chat,S):
     spec=S["spec"]; iid=spec["iid"]; d=S["dir"]; k=skey(S["sym"],d)
     try:
         while S["alive"]:
-            S["state"]="等下輪"; save_state(); tf_sec=TF_SEC[S["tf"]]
-            oe=next_open_epoch(int(time.time()),S["tf"]); w=oe-time.time()
-            if w>0: await asyncio.sleep(w)
-            if not S["alive"]: break
+            tf_sec=TF_SEC[S["tf"]]
+            now=time.time(); cur=int(now//tf_sec)*tf_sec
+            if S.get("catchup") and cur!=S.get("last_open") and (cur+tf_sec-now)>=30:
+                oe=cur
+            else:
+                S["state"]="等下輪"; save_state()
+                oe=next_open_epoch(int(time.time()),S["tf"]); w=oe-time.time()
+                if w>0: await asyncio.sleep(w)
+                if not S["alive"]: break
+            S["last_open"]=oe; S["catchup"]=False
             op=get_last(iid)
             amb=align(op*(1-S["offset"]/100) if d=="L" else op*(1+S["offset"]/100),spec["tick"],d)
             size=csize(S["margin"],Decimal(S["lev"]),amb,spec["ctval"],spec["lot"])
             if size<spec["minsz"]:
                 await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 保證金不足，循環停止"); break
             side="buy" if d=="L" else "sell"; pos="long" if d=="L" else "short"
+            sweep_orphans(iid,pos)
             r=api("POST","/api/v5/trade/order",{"instId":iid,"tdMode":"isolated","side":side,"posSide":pos,
                 "ordType":"limit","px":str(amb),"sz":str(size),"clOrdId":"n"+uuid.uuid4().hex[:14]})
             if r.get("code")!="0":
                 await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 掛單失敗：{r.get('data',[{}])[0].get('sMsg',r.get('msg'))}")
                 await asyncio.sleep(5); continue
             oid=r["data"][0]["ordId"]; S["state"]="委託中"; S["ordId"]=oid; bump(k,"placed")
+            pt=time.time()
             nb=oe+tf_sec; filled=False; fpx=None
             while S["alive"] and time.time()<nb-3:
                 await asyncio.sleep(2)
@@ -96,17 +104,25 @@ async def loop(app,chat,S):
                     if s2=="filled": filled=True; fpx=Decimal(st["data"][0]["avgPx"]); break
                     if s2=="canceled": break
             if not S["alive"]:
-                api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid}); break
+                rc=await safe_cancel(iid,oid)
+                if rc!="canceled":
+                    await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 撤單未確認({rc})，請至 OKX 手動檢查")
+                break
             if not filled:
-                api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid}); continue
+                rc=await safe_cancel(iid,oid)
+                if rc!="canceled":
+                    await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 撤單未確認({rc})，本策略已停止以免重複掛單，請至 OKX 手動檢查")
+                    S["alive"]=False; break
+                S["catchup"]=True
+                continue
             bump(k,"entered"); S["state"]="持倉中"; S["entry_px"]=str(fpx); save_state()
             if d=="L":
                 tp=align(fpx*(1+S["tp"]/100),spec["tick"],"S"); sl=align(fpx*(1-S["sl"]/100),spec["tick"],"L")
             else:
                 tp=align(fpx*(1-S["tp"]/100),spec["tick"],"L"); sl=align(fpx*(1+S["sl"]/100),spec["tick"],"S")
             await notify(app,chat,f"{E.BOT} OKXLive普K｜{ACCT}\n事件：🔔 已進場成交\n"
-                f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n進場價格：{fpx}\n"
-                f"止盈 TP：{tp}\n止損 SL：{sl}\n持倉 TE：{S['te']}s\n狀　　態：📌 持倉中\n時間：{hhmmss()}")
+                f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n進場價格：{fpx} ({pct(S['offset'])}%)\n"
+                f"止盈 TP：{tp} ({pct(S['tp'])}%)\n止損 SL：{sl} ({pct(S['sl'])}%)\n持倉 TE：{S['te']}s\n埋伏秒數：{int(time.time()-pt)}s\n狀　　態：📌 持倉中\n時間：{hhmmss()}")
             ee=time.time(); reason=None
             while S["alive"]:
                 await asyncio.sleep(2); last=get_last(iid); held=time.time()-ee
@@ -120,17 +136,71 @@ async def loop(app,chat,S):
             if not S["alive"]:
                 await notify(app,chat,f"{E.BOT} {S['sym']} {E.dir_word(d)} 循環停止但仍有持倉，請至 OKX 確認"); break
             cs="sell" if d=="L" else "buy"
-            api("POST","/api/v5/trade/order",{"instId":iid,"tdMode":"isolated","side":cs,"posSide":pos,
+            xr=api("POST","/api/v5/trade/order",{"instId":iid,"tdMode":"isolated","side":cs,"posSide":pos,
                 "ordType":"market","sz":str(size),"clOrdId":"x"+uuid.uuid4().hex[:14]})
+            xoid=(xr.get("data") or [{}])[0].get("ordId")
             xpx=get_last(iid)
             g=(xpx-fpx)*size*spec["ctval"] if d=="L" else (fpx-xpx)*size*spec["ctval"]
-            await notify(app,chat,f"{E.BOT} OKXLive普K｜{ACCT}\n事件：{'🟢' if g>=0 else '🔴'} 已出場\n"
+            fe=await order_fee(iid,oid); fx=await order_fee(iid,xoid); fee=fe+fx
+            net=g+fee
+            nv=fpx*size*spec["ctval"]
+            gp=(g/nv*100) if nv else Decimal(0)
+            fp=(fee/nv*100) if nv else Decimal(0)
+            np_=(net/nv*100) if nv else Decimal(0)
+            await notify(app,chat,f"{E.BOT} OKXLive普K｜{ACCT}\n事件：{'🟢' if net>=0 else '🔴'} 已出場\n"
                 f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n進場價：{fpx}\n出場價：{xpx}\n"
-                f"持倉秒數：{int(time.time()-ee)}s\n毛損益：{g:+.6f} USDT {E.pnl_emoji(g)}\n時間：{hhmmss()}")
+                f"持倉秒數：{int(time.time()-ee)}s\n毛損益：{g:+.6f} USDT ({gp:+.3f}%)\n手續費：{fee:+.6f} USDT ({fp:+.3f}%)\n淨損益：{net:+.6f} USDT ({np_:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
     except Exception as e:
         await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 循環錯誤：{type(e).__name__}: {e}")
     finally:
         S["state"]="已停止"; S["alive"]=False; STRATS.pop(k,None); TASKS.pop(k,None); save_state()
+def sweep_orphans(iid, pos, keep=None):
+    try:
+        r = api("GET", "/api/v5/trade/orders-pending")
+    except Exception:
+        return 0
+    if r.get("code") != "0":
+        return 0
+    n = 0
+    for o in (r.get("data") or []):
+        if o.get("instId") != iid or o.get("posSide") != pos:
+            continue
+        if not str(o.get("clOrdId") or "").startswith("n"):
+            continue
+        if keep and o.get("ordId") == keep:
+            continue
+        api("POST", "/api/v5/trade/cancel-order", {"instId": iid, "ordId": o["ordId"]})
+        n += 1
+    return n
+
+async def safe_cancel(iid, oid, tries=5):
+    for i in range(tries):
+        api("POST", "/api/v5/trade/cancel-order", {"instId": iid, "ordId": oid})
+        await asyncio.sleep(1)
+        st = api("GET", "/api/v5/trade/order?instId=%s&ordId=%s" % (iid, oid))
+        if st.get("code") == "0" and st.get("data"):
+            s2 = st["data"][0].get("state")
+            if s2 == "canceled":
+                return "canceled"
+            if s2 == "filled":
+                return "filled"
+    return "fail"
+
+async def order_fee(iid, oid):
+    if not oid:
+        return Decimal(0)
+    for i in range(8):
+        st = api("GET", "/api/v5/trade/order?instId=%s&ordId=%s" % (iid, oid))
+        if st.get("code") == "0" and st.get("data"):
+            dd = st["data"][0]
+            if dd.get("state") == "filled":
+                return Decimal(dd.get("fee") or "0")
+        await asyncio.sleep(1)
+    return Decimal(0)
+
+def pct(v):
+    return str(Decimal(str(v)).normalize())
+
 def rebuild_strat(app,d):
     spec=get_spec(d["sym"])
     return {"sym":d["sym"],"dir":d["dir"],"tf":d.get("tf",ACCOUNT_TF),"lev":int(d["lev"]),
@@ -220,7 +290,7 @@ async def cmd_stop(u,c):
                     pi=f"倉位 {pp['pos']} 張 均價 {pp.get('avgPx','?')} 浮 {pp.get('upl','?')}"
         await u.message.reply_text(f"{E.BOT} /stop（持倉中）\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n⚠ 已進場不自動平倉\n{pi}\n請至 OKX 手動平倉")
     else:
-        if S.get("ordId") and st=="委託中": api("POST","/api/v5/trade/cancel-order",{"instId":S["spec"]["iid"],"ordId":S["ordId"]})
+        sweep_orphans(S["spec"]["iid"],"long" if S["dir"]=="L" else "short")
         S["alive"]=False; save_state()
         await u.message.reply_text(f"{E.BOT} /stop\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n原狀態：{st}\n動作：{'已撤銷委託' if st=='委託中' else '已移除'}")
 async def cmd_stopall(u,c):
@@ -232,7 +302,7 @@ async def cmd_stopall(u,c):
         S=STRATS[k]
         if S["state"]=="持倉中": S["alive"]=False; held.append(f"{S['sym']} {S['dir']}")
         else:
-            if S.get("ordId") and S["state"]=="委託中": api("POST","/api/v5/trade/cancel-order",{"instId":S["spec"]["iid"],"ordId":S["ordId"]})
+            sweep_orphans(S["spec"]["iid"],"long" if S["dir"]=="L" else "short")
             S["alive"]=False; done.append(f"{S['sym']} {S['dir']}")
     orphan=0
     for o in okx_orders:
@@ -258,9 +328,15 @@ async def cmd_status(u,c):
     alive=[s for s in STRATS.values() if s.get("alive")]
     L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：現況（即時查 OKX）","━━━━━━━━━━",
        f"USDT權益：{eq}",f"可用餘額：{av}",f"帳戶週期：{ACCOUNT_TF}",f"運行中策略：{len(alive)} 個"]
+    okx_pos={(p["instId"],p["posSide"]) for p in pl}
+    okx_ord={(o["instId"],o.get("posSide")) for o in pdl}
     for s in alive:
         k=skey(s["sym"],s["dir"]); placed,entered=get_stat(k)
-        L.append(f"　{E.dir_emoji(s['dir'])} {s['sym']} {E.dir_word(s['dir'])}：{s['state']}(掛{placed}/進{entered})")
+        key=(s["spec"]["iid"],"long" if s["dir"]=="L" else "short")
+        if key in okx_pos: live="持倉中"
+        elif key in okx_ord: live="委託中"
+        else: live="等下輪"
+        L.append(f"　{E.dir_emoji(s['dir'])} {s['sym']} {E.dir_word(s['dir'])}：{live}(掛{placed}/進{entered})")
     L.append(f"掛單數：{len(pdl)}")
     L.append(f"持倉數：{len(pl)}")
     for p in pl:
@@ -270,9 +346,24 @@ async def cmd_status(u,c):
     L+=["━━━━━━━━━━",f"時間：{hhmmss()} UTC+8"]
     await u.message.reply_text("\n".join(L))
 async def cmd_summary(u,c):
-    r=api("GET","/api/v5/account/positions-history?instType=SWAP&limit=100")
     s8=now8().replace(hour=0,minute=0,second=0,microsecond=0); sms=int(s8.timestamp()*1000)
-    td=[p for p in r.get("data",[]) if int(p.get("uTime") or 0)>=sms] if r.get("code")=="0" else []
+    td=[]; after=""; pages=0
+    while pages<20:
+        q="/api/v5/account/positions-history?instType=SWAP&limit=100"
+        if after: q+="&after="+after
+        r=api("GET",q)
+        if r.get("code")!="0": break
+        batch=r.get("data") or []
+        if not batch: break
+        pages+=1
+        stop=False
+        for pp in batch:
+            ut=int(pp.get("uTime") or 0)
+            if ut>=sms: td.append(pp)
+            else: stop=True
+        if stop or len(batch)<100: break
+        after=batch[-1].get("posId") or ""
+        if not after: break
     n=len(td)
     L=[f"{E.BOT} OKXLive普K｜{ACCT}",f"事件：當日戰報 {s8.strftime('%m-%d')}","━━━━━━━━━━"]
     if n>0:
@@ -281,8 +372,15 @@ async def cmd_summary(u,c):
         tn=sum((Decimal(p.get('realizedPnl') or '0') for p in td),Decimal(0))
         win=sum(1 for p in td if Decimal(p.get('realizedPnl') or '0')>0)
         loss=sum(1 for p in td if Decimal(p.get('realizedPnl') or '0')<0); even=n-win-loss
+        nv=Decimal(0)
+        for pp in td:
+            try: nv+=Decimal(pp.get("openAvgPx") or "0")*Decimal(pp.get("closeTotalPos") or "0")
+            except Exception: pass
+        gp=(tp/nv*100) if nv else Decimal(0)
+        fpc=(tf/nv*100) if nv else Decimal(0)
+        npc=(tn/nv*100) if nv else Decimal(0)
         L+=[f"平倉筆數：{n}",f"獲利/虧損/打平：{win}/{loss}/{even}",f"勝率：{win/n*100:.1f}%",
-            f"毛損益：{tp:+.6f}",f"手續費：{tf:+.6f}",f"淨損益：{tn:+.6f} {E.pnl_emoji(tn)}"]
+            f"毛損益：{tp:+.6f} ({gp:+.3f}%)",f"手續費：{tf:+.6f} ({fpc:+.3f}%)",f"淨損益：{tn:+.6f} ({npc:+.3f}%) {E.pnl_emoji(tn)}"]
     else: L.append("今日尚無已平倉交易")
     t=today8(); ts={k:v for k,v in STATS.items() if v.get("date")==t}
     if ts:
