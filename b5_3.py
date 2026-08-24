@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B5-6e 普K正式版：/coins一般文字對齊(不用code block)。o3333o。"""
+"""B5-7 普K：委託次數統計(掛單/進場)、跨日歸零、/summary增列。o3333o。"""
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
@@ -21,6 +21,18 @@ def load_env(p):
 ACC=load_env("/srv/1111bot/config/accounts.env"); BOTS=load_env("/srv/1111bot/config/bots.env")
 TOKEN=BOTS["BOT_o3333o_NORMAL"]; SYMS=json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 PENDING={}; STRATS={}; TASKS={}
+STATS={}  # key "SYM_DIR" -> {"date":"YYYY-MM-DD","placed":n,"entered":n}
+def today8(): return datetime.now(TZ8).strftime("%Y-%m-%d")
+def bump(k,field):
+    """累加統計，跨日自動歸零"""
+    t=today8()
+    if k not in STATS or STATS[k]["date"]!=t:
+        STATS[k]={"date":t,"placed":0,"entered":0}
+    STATS[k][field]+=1
+def get_stat(k):
+    t=today8()
+    if k not in STATS or STATS[k]["date"]!=t: return (0,0)
+    return (STATS[k]["placed"],STATS[k]["entered"])
 def skey(s,d): return f"{s}_{d}"
 def inst_id(s): return s.replace("USDT","")+"-USDT-SWAP"
 def now8(): return datetime.now(TZ8)
@@ -70,6 +82,7 @@ async def loop(app,chat,S):
                 await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 掛單失敗：{r.get('data',[{}])[0].get('sMsg',r.get('msg'))}")
                 await asyncio.sleep(5); continue
             oid=r["data"][0]["ordId"]; S["state"]="委託中"; S["ordId"]=oid
+            bump(k,"placed")  # 掛單次數 +1
             nb=oe+tf_sec; filled=False; fpx=None
             while S["alive"] and time.time()<nb-3:
                 await asyncio.sleep(2)
@@ -81,8 +94,9 @@ async def loop(app,chat,S):
             if not S["alive"]:
                 api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid}); break
             if not filled:
-                api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid}); S["round"]+=1; continue
-            S["round"]=0; S["state"]="持倉中"; S["entry_px"]=fpx
+                api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid}); continue
+            bump(k,"entered")  # 進場次數 +1
+            S["state"]="持倉中"; S["entry_px"]=fpx
             if d=="L":
                 tp=align(fpx*(1+S["tp"]/100),spec["tick"],"S"); sl=align(fpx*(1-S["sl"]/100),spec["tick"],"L")
             else:
@@ -150,7 +164,7 @@ async def cmd_confirm(u,c):
     if not p: await u.message.reply_text(f"{E.BOT} 沒有待確認的 /run"); return
     if time.time()-p["t"]>60: del PENDING[u.effective_chat.id]; await u.message.reply_text(f"{E.BOT} 確認逾時"); return
     del PENDING[u.effective_chat.id]; k=skey(p["sym"],p["dir"])
-    S={**p,"alive":True,"state":"等下輪","round":0,"chat":u.effective_chat.id}
+    S={**p,"alive":True,"state":"等下輪","chat":u.effective_chat.id}
     STRATS[k]=S; TASKS[k]=asyncio.create_task(loop(c.application,u.effective_chat.id,S))
     cnt=sum(1 for s in STRATS.values() if s.get("alive"))
     await u.message.reply_text(f"{E.BOT} ✅ 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
@@ -203,8 +217,8 @@ async def cmd_status(u,c):
     L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：現況（即時查 OKX）","━━━━━━━━━━",
        f"USDT權益：{eq}",f"可用餘額：{av}",f"帳戶週期：{ACCOUNT_TF}",f"運行中策略：{len(alive)} 個"]
     for s in alive:
-        st=f"等下輪({s['round']})" if s["state"]=="等下輪" else s["state"]
-        L.append(f"　{E.dir_emoji(s['dir'])} {s['sym']} {E.dir_word(s['dir'])}：{st}")
+        k=skey(s["sym"],s["dir"]); placed,entered=get_stat(k)
+        L.append(f"　{E.dir_emoji(s['dir'])} {s['sym']} {E.dir_word(s['dir'])}：{s['state']}(掛{placed}/進{entered})")
     L+=[f"持倉數：{len(pl)}",f"掛單數：{len(pdl)}"]
     for p in pl:
         s=E.LONG if p["posSide"]=="long" else E.SHORT; upl=Decimal(p.get('upl','0'))
@@ -213,18 +227,30 @@ async def cmd_status(u,c):
     await u.message.reply_text("\n".join(L))
 async def cmd_summary(u,c):
     r=api("GET","/api/v5/account/positions-history?instType=SWAP&limit=100")
-    if r.get("code")!="0": await u.message.reply_text(f"{E.LOSS} 查詢失敗"); return
     s8=now8().replace(hour=0,minute=0,second=0,microsecond=0); sms=int(s8.timestamp()*1000)
-    td=[p for p in r["data"] if int(p.get("uTime") or 0)>=sms]; n=len(td)
-    if n==0: await u.message.reply_text(f"{E.BOT} OKXLive普K｜{ACCT}\n事件：當日戰報 {s8.strftime('%m-%d')}\n今日尚無已平倉交易"); return
-    tp=sum((Decimal(p.get('pnl') or '0') for p in td),Decimal(0))
-    tf=sum((Decimal(p.get('fee') or '0')+Decimal(p.get('fundingFee') or '0') for p in td),Decimal(0))
-    tn=sum((Decimal(p.get('realizedPnl') or '0') for p in td),Decimal(0))
-    win=sum(1 for p in td if Decimal(p.get('realizedPnl') or '0')>0)
-    loss=sum(1 for p in td if Decimal(p.get('realizedPnl') or '0')<0); even=n-win-loss
-    await u.message.reply_text(f"{E.BOT} OKXLive普K｜{ACCT}\n事件：當日戰報 {s8.strftime('%m-%d')}\n━━━━━━━━━━\n"
-        f"成交筆數：{n}\n獲利：{win} 筆\n虧損：{loss} 筆\n打平：{even} 筆\n勝率：{win/n*100:.1f}%\n"
-        f"毛損益：{tp:+.6f}\n手續費：{tf:+.6f}\n淨損益：{tn:+.6f} {E.pnl_emoji(tn)}\n━━━━━━━━━━\n時間：{hhmmss()}")
+    td=[p for p in r.get("data",[]) if int(p.get("uTime") or 0)>=sms] if r.get("code")=="0" else []
+    n=len(td)
+    L=[f"{E.BOT} OKXLive普K｜{ACCT}",f"事件：當日戰報 {s8.strftime('%m-%d')}","━━━━━━━━━━"]
+    # 損益統計（來自OKX平倉紀錄）
+    if n>0:
+        tp=sum((Decimal(p.get('pnl') or '0') for p in td),Decimal(0))
+        tf=sum((Decimal(p.get('fee') or '0')+Decimal(p.get('fundingFee') or '0') for p in td),Decimal(0))
+        tn=sum((Decimal(p.get('realizedPnl') or '0') for p in td),Decimal(0))
+        win=sum(1 for p in td if Decimal(p.get('realizedPnl') or '0')>0)
+        loss=sum(1 for p in td if Decimal(p.get('realizedPnl') or '0')<0); even=n-win-loss
+        L+=[f"平倉筆數：{n}",f"獲利/虧損/打平：{win}/{loss}/{even}",f"勝率：{win/n*100:.1f}%",
+            f"毛損益：{tp:+.6f}",f"手續費：{tf:+.6f}",f"淨損益：{tn:+.6f} {E.pnl_emoji(tn)}"]
+    else:
+        L.append("今日尚無已平倉交易")
+    # 掛單/進場次數統計（來自本地累計）
+    t=today8(); today_stats={k:v for k,v in STATS.items() if v["date"]==t}
+    if today_stats:
+        L.append("━━ 各策略今日次數 ━━")
+        for k,v in today_stats.items():
+            sym,dr=k.rsplit("_",1)
+            L.append(f"{E.dir_emoji(dr)} {sym} {E.dir_word(dr)}：掛{v['placed']} 進{v['entered']}")
+    L+=["━━━━━━━━━━",f"時間：{hhmmss()}"]
+    await u.message.reply_text("\n".join(L))
 async def cmd_coins(u,c):
     on=[s["symbol"] for s in SYMS if s["enabled"]]
     L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：幣種清單（即時）","━━━━━━━━━━"]
@@ -261,7 +287,7 @@ async def _menu(app):
         BotCommand("menu","說明")])
     print("左下 Menu 已更新")
 def main():
-    print(f"啟動 o3333o 普K B5-6e 正式版（token ...{TOKEN[-6:]}）")
+    print(f"啟動 o3333o 普K B5-7（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).post_init(_menu).build()
     for cmd,fn in [(["menu","start"],cmd_menu),("run",cmd_run),("confirm",cmd_confirm),("stop",cmd_stop),
         ("stopall",cmd_stopall),("status",cmd_status),("summary",cmd_summary),
