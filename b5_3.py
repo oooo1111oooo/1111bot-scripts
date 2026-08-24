@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B5-5 普K：/TF可變、/run去掉TF參數、減噪(不通知掛單/撤單)、等下輪(N)輪次、/summary當日戰報。"""
+"""B5-6 普K正式版：/coins含槓桿與最低保證金、移除/leverage、清除測試字眼。o3333o。"""
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
@@ -10,7 +10,7 @@ sys.path.insert(0,"/srv/1111bot")
 from app.core import emoji as E
 from app.strategy.normal import next_open_epoch, TF_SEC
 BASE="https://www.okx.com"; ACCT="o3333o"; TZ8=timezone(timedelta(hours=8))
-ACCOUNT_TF="5m"   # 帳戶預設週期，可用 /timeframe 變更
+ACCOUNT_TF="5m"
 def load_env(p):
     d={}
     for line in open(p):
@@ -69,7 +69,7 @@ async def loop(app,chat,S):
             if r.get("code")!="0":
                 await notify(app,chat,f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 掛單失敗：{r.get('data',[{}])[0].get('sMsg',r.get('msg'))}")
                 await asyncio.sleep(5); continue
-            oid=r["data"][0]["ordId"]; S["state"]="委託中"; S["ordId"]=oid  # 不通知(減噪)
+            oid=r["data"][0]["ordId"]; S["state"]="委託中"; S["ordId"]=oid
             nb=oe+tf_sec; filled=False; fpx=None
             while S["alive"] and time.time()<nb-3:
                 await asyncio.sleep(2)
@@ -81,9 +81,7 @@ async def loop(app,chat,S):
             if not S["alive"]:
                 api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid}); break
             if not filled:
-                api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid})
-                S["round"]+=1  # 輪空+1，不通知(減噪)
-                continue
+                api("POST","/api/v5/trade/cancel-order",{"instId":iid,"ordId":oid}); S["round"]+=1; continue
             S["round"]=0; S["state"]="持倉中"; S["entry_px"]=fpx
             if d=="L":
                 tp=align(fpx*(1+S["tp"]/100),spec["tick"],"S"); sl=align(fpx*(1-S["sl"]/100),spec["tick"],"L")
@@ -120,7 +118,7 @@ async def loop(app,chat,S):
 async def cmd_run(u,c):
     a=c.args
     fmt=f"用法：/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n（週期依 /timeframe，目前 {ACCOUNT_TF}）"
-    if len(a)!=8: await u.message.reply_text(f"{E.BOT} 參數數量錯誤（需8個，週期已移除）\n{fmt}"); return
+    if len(a)!=8: await u.message.reply_text(f"{E.BOT} 參數數量錯誤（需8個）\n{fmt}"); return
     try:
         sym=a[0].upper();dr=a[1].upper();lev=int(a[2].replace("x",""));margin=Decimal(a[3])
         offset=Decimal(a[4]);tp=Decimal(a[5]);sl=Decimal(a[6]);te=int(a[7])
@@ -227,17 +225,19 @@ async def cmd_summary(u,c):
     await u.message.reply_text(f"{E.BOT} OKXLive普K｜{ACCT}\n事件：當日戰報 {s8.strftime('%m-%d')}\n━━━━━━━━━━\n"
         f"成交筆數：{n}\n獲利：{win} 筆\n虧損：{loss} 筆\n打平：{even} 筆\n勝率：{win/n*100:.1f}%\n"
         f"毛損益：{tp:+.6f}\n手續費：{tf:+.6f}\n淨損益：{tn:+.6f} {E.pnl_emoji(tn)}\n━━━━━━━━━━\n時間：{hhmmss()}")
-async def cmd_leverage(u,c):
-    if not c.args: await u.message.reply_text(f"{E.BOT} 用法：/leverage 商品 [槓桿]"); return
-    sym=c.args[0].upper(); lev=Decimal(c.args[1].replace("x","")) if len(c.args)>1 else Decimal(1)
-    try:
-        sp=get_spec(sym); last=get_last(sp["iid"]); m=sp["minsz"]*sp["ctval"]*last/lev
-        await u.message.reply_text(f"{E.BOT} 最低下單金額\n商品：{sym}\n槓桿：{lev}x\n標記價：{last}\n"
-            f"最小張：{sp['minsz']}\n面值：{sp['ctval']}{sp['ctvalccy']}\n最低金額：{m:.4f} USDT\n最大槓桿：{sp['maxlev']}x")
-    except: await u.message.reply_text(f"{E.LOSS} 查詢失敗")
 async def cmd_coins(u,c):
     on=[s["symbol"] for s in SYMS if s["enabled"]]
-    await u.message.reply_text(f"{E.BOT} 幣種清單\n啟用（{len(on)}）：\n"+"\n".join("　"+s for s in on))
+    L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：幣種清單（即時）","━━━━━━━━━━"]
+    for sym in on:
+        try:
+            sp=get_spec(sym); last=get_last(sp["iid"])
+            minm=sp["minsz"]*sp["ctval"]*last/sp["maxlev"]
+            L.append(f"{sym}")
+            L.append(f"　槓桿{sp['maxlev']}x 最低{minm:.4f}U")
+        except:
+            L.append(f"{sym}　查詢失敗")
+    L+=["━━━━━━━━━━","（最低保證金＝最大槓桿下，隨價浮動）",f"時間：{hhmmss()}"]
+    await u.message.reply_text("\n".join(L))
 async def cmd_timeframe(u,c):
     global ACCOUNT_TF
     if not c.args:
@@ -251,21 +251,21 @@ async def cmd_menu(u,c):
         "/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n"
         f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "　同幣可雙向、多幣可並行\n/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部\n"
-        "/status 所有策略現況\n/summary 當日戰報\n/leverage 最低額\n/timeframe 查看/設定週期\n/coins 幣種\n"
+        "/status 所有策略現況\n/summary 當日戰報\n/timeframe 查看/設定週期\n/coins 幣種(含槓桿/最低額)\n"
         "━━━━━━━━━━\n⚠ 真實下單，循環交易")
 async def cmd_unknown(u,c): await u.message.reply_text(f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
 async def _menu(app):
     await app.bot.delete_my_commands()
     await app.bot.set_my_commands([BotCommand("run","建立策略"),BotCommand("confirm","確認啟動"),
         BotCommand("stop","停指定"),BotCommand("stopall","停全部"),BotCommand("status","現況"),
-        BotCommand("summary","當日戰報"),BotCommand("leverage","最低額"),BotCommand("timeframe","週期"),
-        BotCommand("coins","幣種"),BotCommand("menu","說明")])
+        BotCommand("summary","當日戰報"),BotCommand("timeframe","週期"),BotCommand("coins","幣種"),
+        BotCommand("menu","說明")])
     print("左下 Menu 已更新")
 def main():
-    print(f"啟動 o3333o 普K B5-5（token ...{TOKEN[-6:]}）")
+    print(f"啟動 o3333o 普K B5-6 正式版（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).post_init(_menu).build()
     for cmd,fn in [(["menu","start"],cmd_menu),("run",cmd_run),("confirm",cmd_confirm),("stop",cmd_stop),
-        ("stopall",cmd_stopall),("status",cmd_status),("summary",cmd_summary),("leverage",cmd_leverage),
+        ("stopall",cmd_stopall),("status",cmd_status),("summary",cmd_summary),
         ("timeframe",cmd_timeframe),("coins",cmd_coins)]:
         app.add_handler(CommandHandler(cmd,fn))
     app.add_handler(MessageHandler(filters.COMMAND,cmd_unknown))
