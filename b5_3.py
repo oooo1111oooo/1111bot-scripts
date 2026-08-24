@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B5-6d 普K正式版：/coins加USDT、刪說明、對齊。o3333o。"""
+"""B5-6e 普K正式版：/coins一般文字對齊(不用code block)。o3333o。"""
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
@@ -227,17 +227,16 @@ async def cmd_summary(u,c):
         f"毛損益：{tp:+.6f}\n手續費：{tf:+.6f}\n淨損益：{tn:+.6f} {E.pnl_emoji(tn)}\n━━━━━━━━━━\n時間：{hhmmss()}")
 async def cmd_coins(u,c):
     on=[s["symbol"] for s in SYMS if s["enabled"]]
-    L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：幣種清單（即時）","━━━━━━━━━━",
-       f"{'幣種':<9}{'最小張':<7}最小保證金"]
+    L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：幣種清單（即時）","━━━━━━━━━━"]
     for sym in on:
         try:
             sp=get_spec(sym); last=get_last(sp["iid"])
             mm=sp["minsz"]*sp["ctval"]*last
-            L.append(f"{sym:<9}{str(sp['minsz']):<7}{mm:.4f}U")
+            L.append(f"{sym}｜最小{sp['minsz']}張｜{mm:.4f}U")
         except:
-            L.append(f"{sym}  查詢失敗")
+            L.append(f"{sym}｜查詢失敗")
     L+=["━━━━━━━━━━",f"時間：{hhmmss()}"]
-    await u.message.reply_text("<pre>"+"\n".join(L)+"</pre>",parse_mode="HTML")
+    await u.message.reply_text("\n".join(L))
 async def cmd_timeframe(u,c):
     global ACCOUNT_TF
     if not c.args:
@@ -262,7 +261,7 @@ async def _menu(app):
         BotCommand("menu","說明")])
     print("左下 Menu 已更新")
 def main():
-    print(f"啟動 o3333o 普K B5-6d 正式版（token ...{TOKEN[-6:]}）")
+    print(f"啟動 o3333o 普K B5-6e 正式版（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).post_init(_menu).build()
     for cmd,fn in [(["menu","start"],cmd_menu),("run",cmd_run),("confirm",cmd_confirm),("stop",cmd_stop),
         ("stopall",cmd_stopall),("status",cmd_status),("summary",cmd_summary),
