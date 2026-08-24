@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B5-6b 普K正式版：/coins單行顯示。o3333o。"""
+"""B5-6c 普K正式版：/coins三欄(幣種/最小張/最小保證金)。o3333o。"""
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
@@ -227,16 +227,16 @@ async def cmd_summary(u,c):
         f"毛損益：{tp:+.6f}\n手續費：{tf:+.6f}\n淨損益：{tn:+.6f} {E.pnl_emoji(tn)}\n━━━━━━━━━━\n時間：{hhmmss()}")
 async def cmd_coins(u,c):
     on=[s["symbol"] for s in SYMS if s["enabled"]]
-    L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：幣種清單（即時）","━━━━━━━━━━"]
+    L=[f"{E.BOT} OKXLive普K｜{ACCT}","事件：幣種清單（即時）","幣種  最小張  最小保證金(1x)","━━━━━━━━━━"]
     for sym in on:
         try:
             sp=get_spec(sym); last=get_last(sp["iid"])
-            minm=sp["minsz"]*sp["ctval"]*last/sp["maxlev"]
+            minmargin=sp["minsz"]*sp["ctval"]*last
             name=sym.replace("USDT","")
-            L.append(f"{name:<5} {int(sp['maxlev'])}x  最低{minm:.4f}U")
+            L.append(f"{name:<5}{sp['minsz']:<7}{minmargin:.4f}U")
         except:
             L.append(f"{sym}  查詢失敗")
-    L+=["━━━━━━━━━━","（最低＝最大槓桿下，隨價浮動）",f"時間：{hhmmss()}"]
+    L+=["━━━━━━━━━━","（最小保證金＝最小張×面值×現價，1x）",f"時間：{hhmmss()}"]
     await u.message.reply_text("\n".join(L))
 async def cmd_timeframe(u,c):
     global ACCOUNT_TF
@@ -251,7 +251,7 @@ async def cmd_menu(u,c):
         "/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n"
         f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "　同幣可雙向、多幣可並行\n/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部\n"
-        "/status 所有策略現況\n/summary 當日戰報\n/timeframe 查看/設定週期\n/coins 幣種(含槓桿/最低額)\n"
+        "/status 所有策略現況\n/summary 當日戰報\n/timeframe 查看/設定週期\n/coins 幣種(最小張/最小保證金)\n"
         "━━━━━━━━━━\n⚠ 真實下單，循環交易")
 async def cmd_unknown(u,c): await u.message.reply_text(f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
 async def _menu(app):
@@ -262,7 +262,7 @@ async def _menu(app):
         BotCommand("menu","說明")])
     print("左下 Menu 已更新")
 def main():
-    print(f"啟動 o3333o 普K B5-6b 正式版（token ...{TOKEN[-6:]}）")
+    print(f"啟動 o3333o 普K B5-6c 正式版（token ...{TOKEN[-6:]}）")
     app=Application.builder().token(TOKEN).post_init(_menu).build()
     for cmd,fn in [(["menu","start"],cmd_menu),("run",cmd_run),("confirm",cmd_confirm),("stop",cmd_stop),
         ("stopall",cmd_stopall),("status",cmd_status),("summary",cmd_summary),
