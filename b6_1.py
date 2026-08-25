@@ -504,6 +504,13 @@ async def startup_recover(app):
             f"\nOKX 現況：掛單{n_ord} 持倉{n_pos}\n循環已接管，繼續運作\n時間：{hhmmss()}")
 
 # ---------- TG 指令 ----------
+def strat_params(sym, dr):
+    S = STRATS.get(skey(sym, dr))
+    if not S or not S.get("alive"):
+        return f"{dr}（已停止）"
+    return (f"{dr} {S['lev']}x {pct(S['margin'])} {pct(S['offset'])} "
+            f"{pct(S['tp'])} {pct(S['sl'])} {S['te']}")
+
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
@@ -628,7 +635,8 @@ async def cmd_status(u, c):
         k = skey(s["sym"], s["dir"]); placed, entered = get_stat(k)
         key = (s["spec"]["iid"], "long" if s["dir"] == "L" else "short")
         live = "持倉中" if key in okxp else ("委託中" if key in okxo else "等下輪")
-        L.append(f"　{E.dir_emoji(s['dir'])} {s['sym']} {E.dir_word(s['dir'])}：{live}(掛{placed}/進{entered})")
+        L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(掛{placed}/進{entered})")
+        L.append(f"　　策略　　：{strat_params(s['sym'], s['dir'])}")
     L.append(f"掛單數：{len(pdl)}")
     L.append(f"持倉數：{len(pl)}")
     for p in pl:
@@ -678,13 +686,6 @@ def sum_lines(rs, placed, entered):
     L.append("手續費：%+.6f (%+.3f%%)" % (tf, fp))
     L.append("淨損益：%+.6f (%+.3f%%) %s" % (tn, npc, E.pnl_emoji(tn)))
     return L
-
-def strat_params(sym, dr):
-    S = STRATS.get(skey(sym, dr))
-    if not S or not S.get("alive"):
-        return f"{dr}（已停止）"
-    return (f"{dr} {S['lev']}x {pct(S['margin'])} {pct(S['offset'])} "
-            f"{pct(S['tp'])} {pct(S['sl'])} {S['te']}")
 
 async def cmd_summary(u, c):
     t = today8(); recs = load_trades(t)
