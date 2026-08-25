@@ -300,25 +300,15 @@ async def overlap_warn(app, chat, sym, d, mykind):
 # ---------- 出場處理（普K：正常出場與重啟接管都走這裡） ----------
 async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, k):
     cs = "sell" if d == "L" else "buy"
-    own = size
     # 平倉張數一律以 OKX 實際持倉為準（避免重複掛單造成倉位加倍時只平掉一半）
-    # 例外：均K 同幣同向也在跑時，OKX 倉位是合併的，只能平自己那份
     p_now = await okx_pos(iid, pos)
     if p_now:
         try:
             real = abs(Decimal(str(p_now.get("availPos") or p_now.get("pos") or "0")))
             if real > 0:
-                if other_alive(S["sym"], d, "n") and own and Decimal(str(own)) < real:
-                    size = Decimal(str(own))
-                    print("overlap: 普K 只平自有部位", S.get("sym"), d, size, "of", real)
-                    await notify(app, S["chat"],
-                        f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 倉位重疊\n"
-                        f"OKX 合併 {real} 張，普K 只平自有 {size} 張\n"
-                        f"（損益數字由 OKX 合併計算，僅供參考）")
-                else:
-                    if real != size:
-                        print("size mismatch", S.get("sym"), d, "local", size, "okx", real)
-                    size = real
+                if real != size:
+                    print("size mismatch", S.get("sym"), d, "local", size, "okx", real)
+                size = real
         except Exception:
             pass
     else:
@@ -354,7 +344,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
     fp = (fee / nv * 100) if nv else Decimal(0)
     npv = (net / nv * 100) if nv else Decimal(0)
     hs = int(time.time() - ee)
-    log_trade({"kind": "n", "date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
+    log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
                "ambush_s": round(ee - pt) if pt else 0, "hold_s": hs,
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
                "src": src, "ts": hhmmss(),
@@ -390,7 +380,7 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
         if not reason and held >= S["te"]: reason = "Time_Exit"
         if not reason and chk % 8 == 0:
             p_chk = await okx_pos(iid, pos)
-            if p_chk and not other_alive(S["sym"], d, "n"):
+            if p_chk:
                 try:
                     rs = abs(Decimal(str(p_chk.get("pos") or "0")))
                     if rs > 0 and rs != size:
@@ -456,7 +446,6 @@ async def loop(app, chat, S):
                 await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 保證金不足，循環停止")
                 break
 
-            await overlap_warn(app, chat, S["sym"], d, "n")
             await sweep(iid, pos)                 # 掛新單前先清乾淨
             r = await api("POST", "/api/v5/trade/order",
                           {"instId": iid, "tdMode": "isolated", "side": "buy" if d == "L" else "sell",
@@ -890,14 +879,13 @@ async def cmd_run(u, c):
     if size < spec["minsz"]:
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
-    warn = "\n⚠ 均K 同幣同向運行中，倉位將被 OKX 合併，損益會混算" if other_alive(sym, dr, "n") else ""
     PENDING[u.effective_chat.id] = {"kind": "n", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
         "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl, "te": te, "spec": spec}
     await reply(u, f"{E.BOT} OKX普K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{ACCOUNT_TF}\n"
         f"開盤估價：{op}\n埋伏距離：{offset}%\n埋伏價格：{amb}\n"
         f"止盈 TP：{tp}%\n止損 SL：{sl}%\n持倉 TE：{te}s\n保 證 金：{margin} USDT\n下單張數：{size}\n"
-        f"━━━━━━━━━━\n⚠ 確認後真實循環交易{warn}\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
+        f"━━━━━━━━━━\n⚠ 確認後真實循環交易\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def cmd_runh(u, c):
