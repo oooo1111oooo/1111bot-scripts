@@ -12,7 +12,7 @@ import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 import httpx
-from telegram import BotCommand
+from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 sys.path.insert(0, "/srv/1111bot")
 from app.core import emoji as E
@@ -760,14 +760,25 @@ async def job_summary(ctx):
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
-    await app.bot.delete_my_commands()
-    await app.bot.set_my_commands([
-        BotCommand("run", "建立策略"), BotCommand("confirm", "確認啟動"),
-        BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
-        BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
-        BotCommand("timeframe", "週期"), BotCommand("coins", "幣種"),
-        BotCommand("menu", "說明")])
-    print("左下 Menu 已更新")
+    CMDS = [BotCommand("run", "建立策略"), BotCommand("confirm", "確認啟動"),
+            BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
+            BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
+            BotCommand("timeframe", "週期"), BotCommand("coins", "幣種"),
+            BotCommand("menu", "說明")]
+    # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
+    # 只刪 Default 會被舊清單蓋住，導致左下 Menu 卡在舊版）
+    scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
+    try:
+        saved = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
+        ch = saved.get("chat")
+        if ch: scopes.append(BotCommandScopeChat(ch))
+    except Exception:
+        pass
+    for sc in scopes:
+        try: await app.bot.delete_my_commands(scope=sc)
+        except Exception as e: print("delete cmds fail", type(sc).__name__, e)
+    await app.bot.set_my_commands(CMDS)
+    print(f"左下 Menu 已更新（已清除 {len(scopes)} 個 scope 的舊指令）")
     try:
         jq = app.job_queue
         if jq:
