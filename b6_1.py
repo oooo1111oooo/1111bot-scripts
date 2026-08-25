@@ -291,7 +291,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
                "tf": S["tf"], "te": str(S["te"]) + "s",
                "in_px": str(fpx), "out_px": str(xpx)})
     await notify(app, S["chat"],
-        f"{E.BOT} OKXLive普K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
+        f"{E.BOT} OKX普K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
         f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
         f"進場價：{fpx}\n出場價：{xpx}\n持倉秒數：{hs}s\n"
         f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
@@ -442,7 +442,7 @@ async def loop(app, chat, S):
             S["pos_tp"] = str(tp); S["pos_sl"] = str(sl); S["pos_ee"] = ee; S["pos_pt"] = pt
             save_state()
             await notify(app, chat,
-                f"{E.BOT} OKXLive普K｜{ACCT}\n事件：🔔 已進場成交\n"
+                f"{E.BOT} OKX普K｜{ACCT}\n事件：🔔 已進場成交\n"
                 f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                 f"進場價格：{fpx} ({pct(S['offset'])}%)\n"
                 f"止盈 TP：{tp} ({pct(S['tp'])}%)\n止損 SL：{sl} ({pct(S['sl'])}%)\n"
@@ -499,7 +499,7 @@ async def startup_recover(app):
     print(f"已接管策略 {len(rec)}｜OKX 掛單{n_ord} 持倉{n_pos}")
     if CHAT_ID and rec:
         await notify(app, CHAT_ID,
-            f"{E.BOT} OKXLive普K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
+            f"{E.BOT} OKX普K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
             f"已接管策略（{len(rec)}）：\n" + "\n".join("・" + x for x in rec) +
             f"\nOKX 現況：掛單{n_ord} 持倉{n_pos}\n循環已接管，繼續運作\n時間：{hhmmss()}")
 
@@ -530,7 +530,7 @@ async def cmd_run(u, c):
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
     PENDING[u.effective_chat.id] = {"t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
         "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl, "te": te, "spec": spec}
-    await reply(u, f"{E.BOT} OKXLive普K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
+    await reply(u, f"{E.BOT} OKX普K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{ACCOUNT_TF}\n"
         f"開盤估價：{op}\n埋伏距離：{offset}%\n埋伏價格：{amb}\n"
         f"止盈 TP：{tp}%\n止損 SL：{sl}%\n持倉 TE：{te}s\n保 證 金：{margin} USDT\n下單張數：{size}\n"
@@ -621,7 +621,7 @@ async def cmd_status(u, c):
     alive = [s for s in STRATS.values() if s.get("alive")]
     okxp = {(p["instId"], p["posSide"]) for p in pl}
     okxo = {(o["instId"], o.get("posSide")) for o in pdl}
-    L = [f"{E.BOT} OKXLive普K｜{ACCT}", "事件：現況（即時查 OKX）", "━━━━━━━━━━",
+    L = [f"{E.BOT} OKX普K｜{ACCT}", "事件：現況（即時查 OKX）", "━━━━━━━━━━",
          f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
          f"運行中策略：{len(alive)} 個"]
     for s in alive:
@@ -689,7 +689,7 @@ def strat_params(sym, dr):
 async def cmd_summary(u, c):
     t = today8(); recs = load_trades(t)
     ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t)}
-    L = [f"{E.BOT} OKXLive普K｜{ACCT}", f"📊📊📊 Summary {t}"]
+    L = [f"{E.BOT} OKX普K｜{ACCT}", f"📊📊📊 Summary {t}"]
     for dr in ("L", "S"):
         rows = [r for r in recs if r["dir"] == dr]
         pa = sum(v["placed"] for k, v in ts.items() if k.endswith("_" + dr))
@@ -705,15 +705,14 @@ async def cmd_summary(u, c):
             rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
             st_ = ts.get(skey(sy, dr)) or {"placed": 0, "entered": 0}
             D.append("━" * 10)
-            D.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)}")
-            D.append(f"策略參數：{strat_params(sy, dr)}")
+            D.append(f"策略：{E.dir_emoji(dr)} {strat_params(sy, dr)}")
             D += sum_lines(rows, st_["placed"], st_["entered"])
         D += ["━" * 10, f"時間：{hhmmss()}"]
         await reply(u, "\n".join(D))
 
 async def cmd_coins(u, c):
     on = [s["symbol"] for s in SYMS if s["enabled"]]
-    L = [f"{E.BOT} OKXLive普K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
+    L = [f"{E.BOT} OKX普K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
     for sym in on:
         try:
             sp = await get_spec(sym); last = await get_last(sp["iid"])
@@ -734,7 +733,7 @@ async def cmd_timeframe(u, c):
     await reply(u, f"{E.BOT} ✅ 帳戶週期已設為 {tf}\n（僅影響之後新建立的策略）")
 
 async def cmd_menu(u, c):
-    await reply(u, f"{E.BOT} OKXLive普K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
+    await reply(u, f"{E.BOT} OKX普K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
         "/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n"
         f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
