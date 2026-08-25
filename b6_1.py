@@ -55,7 +55,7 @@ def pct(v): return str(Decimal(str(v)).normalize())
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","te","chat",
                "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open")
 
-def save_state():
+def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
     try:
         data = {"chat": CHAT_ID, "tf": ACCOUNT_TF, "stats": STATS, "strats": []}
         for k, S in STRATS.items():
@@ -65,9 +65,9 @@ def save_state():
             return
         def enc(o): return str(o) if isinstance(o, Decimal) else o
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, default=enc); f.flush(); os.fsync(f.fileno())
-        os.replace(tmp, STATE_FILE)
+        with _open(tmp, "w") as f:
+            _dump(data, f, default=enc); f.flush(); _fsync(f.fileno())
+        _replace(tmp, STATE_FILE)
     except Exception as e:
         print("save_state fail", e)
 
@@ -760,7 +760,7 @@ async def job_summary(ctx):
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
-    CMDS = [BotCommand("run", "建立策略"), BotCommand("confirm", "確認啟動"),
+    CMDS = [BotCommand("run", "建立策略"),
             BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
             BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
             BotCommand("timeframe", "週期"), BotCommand("coins", "幣種"),
