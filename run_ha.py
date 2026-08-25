@@ -173,8 +173,9 @@ async def get_klines(iid, bar, limit=HA_HIST):
     out.reverse()
     return out
 
-async def ha_series(iid, tf, limit=HA_HIST):
-    """回傳 HA 序列（舊->新）。10m 由 5m 合成並對齊 10 分鐘邊界。"""
+async def klines_and_ha(iid, tf, limit=HA_HIST):
+    """回傳 (原始K線, HA序列)，兩者索引一一對應，皆為舊->新。
+    10m 由 5m 合成並對齊 10 分鐘邊界。"""
     if tf == "10m":
         kl = await get_klines(iid, "5m", limit * 2 + 10)
         while kl and int(kl[0]["ts"]) % 600000 != 0:
@@ -183,8 +184,40 @@ async def ha_series(iid, tf, limit=HA_HIST):
         kl = merge_5m_to_10m(kl)
     else:
         kl = await get_klines(iid, tf, limit)
-    if not kl: return []
-    return calc_ha(kl)
+    if not kl: return [], []
+    return kl, calc_ha(kl)
+
+async def ha_series(iid, tf, limit=HA_HIST):
+    """只要 HA 序列時用這個。"""
+    kl, ha = await klines_and_ha(iid, tf, limit)
+    return ha
+
+def calc_atr(kl, period=14):
+    """在【原始 K 線】上算 ATR14（Wilder 平滑）與 ATR ratio(%)。
+    技術指標一律用正統 K 線，不使用 HA 平滑值。
+    TR = max(h-l, |h-prev_c|, |l-prev_c|)
+    前 period 根取 TR 簡單平均為種子，之後 ATR = (前ATR*(n-1) + TR)/n
+    回傳與 kl 等長的 [(atr, atr_ratio), ...]，資料不足處為 (None, None)。"""
+    n = len(kl)
+    out = [(None, None)] * n
+    if n == 0: return out
+    trs = []
+    for i, k in enumerate(kl):
+        if i == 0:
+            tr = k["h"] - k["l"]
+        else:
+            pc = kl[i-1]["c"]
+            tr = max(k["h"] - k["l"], abs(k["h"] - pc), abs(k["l"] - pc))
+        trs.append(tr)
+    if n < period: return out
+    prev = sum(trs[:period], Decimal(0)) / Decimal(period)
+    c0 = kl[period-1]["c"]
+    out[period-1] = (prev, (prev / c0 * 100) if c0 else None)
+    for i in range(period, n):
+        prev = (prev * Decimal(period - 1) + trs[i]) / Decimal(period)
+        ci = kl[i]["c"]
+        out[i] = (prev, (prev / ci * 100) if ci else None)
+    return out
 
 # ---------- Telegram（旁路） ----------
 _BG = set()
@@ -746,33 +779,63 @@ async def cmd_summary(u, c):
         D += ["━" * 10, f"時間：{hhmmss()}"]
         await reply(u, "\n".join(D))
 
+async def _reply_long(u, head, lines, tail):
+    """把長清單拆成多則訊息送出（Telegram 單則上限 4096 字元）。"""
+    LIM = 3500
+    buf = list(head); msgs = []
+    for ln in lines:
+        if sum(len(x) + 1 for x in buf) + len(ln) + 1 > LIM and len(buf) > len(head):
+            msgs.append("\n".join(buf)); buf = list(head)
+        buf.append(ln)
+    buf += tail
+    msgs.append("\n".join(buf))
+    for i, m in enumerate(msgs):
+        if len(msgs) > 1:
+            m = m.replace("事件：燈號檢視", f"事件：燈號檢視（{i+1}/{len(msgs)}）", 1)
+        await reply(u, m)
+
+def _fmt_atr(v, tick):
+    """ATR 依商品 tick 決定小數位，避免大幣印一堆 0 或小幣被截斷。"""
+    if v is None: return "-"
+    exp = -tick.as_tuple().exponent
+    q = Decimal(1).scaleb(-max(2, min(8, exp + 1)))
+    return str(v.quantize(q))
+
 async def cmd_ha(u, c):
-    """查看目前燈號序列與振幅，用來決定參數。用法：/ha ETHUSDT [根數]"""
+    """燈號(HA) + ATR14/ATR ratio(原始K線)。用法：/ha ETHUSDT [根數 3~300]"""
     if not c.args:
-        await reply(u, f"{E.BOT} 用法：/ha ETHUSDT 30\n（顯示最近 N 根 HA 燈號與振幅，週期依 /timeframe，目前 {ACCOUNT_TF}）"); return
+        await reply(u, f"{E.BOT} 用法：/ha ETHUSDT 30\n"
+                       f"根數範圍 3~300（預設 20）\n"
+                       f"欄位：漲跌燈號(HA)｜ATR14｜ATR ratio\n"
+                       f"※ ATR 以原始 K 線計算，非 HA\n"
+                       f"週期依 /timeframe，目前 {ACCOUNT_TF}"); return
     sym = c.args[0].upper()
     n = 20
     if len(c.args) >= 2:
-        try: n = max(3, min(60, int(c.args[1])))
+        try: n = max(3, min(300, int(c.args[1])))
         except Exception: pass
     try: spec = await get_spec(sym)
     except Exception: await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
-    ha = await ha_series(spec["iid"], ACCOUNT_TF)
+    kl, ha = await klines_and_ha(spec["iid"], ACCOUNT_TF, limit=min(300, max(HA_HIST, n + 20)))
     if not ha: await reply(u, f"{E.BOT} {sym} K 線取得失敗"); return
-    seg = ha[-n:]
-    L = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：燈號檢視 {sym} {ACCOUNT_TF}", "━━━━━━━━━━",
-         "序列（舊→新）：", "".join("🟩" if x["color"] == "G" else "🟥" for x in seg),
-         "".join(x["color"] for x in seg), "━━━━━━━━━━", "最近 10 根明細："]
-    for x in seg[-10:]:
-        tt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%H:%M")
-        L.append(f"{tt} {'🟩' if x['color']=='G' else '🟥'} 振幅 {x['amp']:.4f}%")
-    L.append("━" * 10)
-    for w in (2, 3, 4, 5):
-        if len(seg) >= w:
-            s = sum((x["amp"] for x in seg[-w:]), Decimal(0))
-            L.append(f"近{w}根振幅累加：{s:.4f}%")
-    L += ["━━━━━━━━━━", f"時間：{hhmmss()}"]
-    await reply(u, "\n".join(L))
+    atrs = calc_atr(kl, 14)
+    st = max(0, len(ha) - n)
+    head = [f"{E.BOT} OKX均K｜{ACCT}",
+            f"事件：燈號檢視 {sym} {ACCOUNT_TF}",
+            f"共 {len(ha) - st} 根（舊→新）｜ATR14 / ATR ratio",
+            "※ ATR 取原始 K 線，燈號取 HA",
+            "━" * 10]
+    lines = []
+    for i in range(st, len(ha)):
+        x = ha[i]
+        tt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+        lg = "🟩" if x["color"] == "G" else "🟥"
+        av, rv = atrs[i]
+        avs = _fmt_atr(av, spec["tick"])
+        rvs = f"{rv:.4f}%" if rv is not None else "-"
+        lines.append(f"{tt} {lg} {avs} | {rvs}")
+    tail = ["━" * 10, f"時間：{hhmmss()}"]
+    await _reply_long(u, head, lines, tail)
 
 async def cmd_coins(u, c):
     on = [s["symbol"] for s in SYMS if s["enabled"]]
@@ -801,9 +864,9 @@ async def cmd_menu(u, c):
         "/run 商品 方向 槓桿 保證金 PRE POST EXIT 振幅\n"
         f"例：/run ETHUSDT L 1x 3 2 3 2 0.3\n"
         f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
-        "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部\n"
+        "/stop 商品 方向\n/stopall 停全部\n"
         "/status 策略現況\n/summary 當日戰報\n"
-        "/ha 商品 根數  查看燈號序列與振幅\n"
+        "/ha 商品 根數  燈號+ATR14+ATRratio（3~300根）\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "進場：PRE根反轉前色 + POST根反轉後色 + 振幅達標\n"
@@ -832,10 +895,10 @@ async def job_summary(ctx):
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
-    CMDS = [BotCommand("run", "建立均K策略"), BotCommand("confirm", "確認啟動"),
+    CMDS = [BotCommand("run", "建立均K策略"),
             BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
             BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
-            BotCommand("ha", "燈號檢視"), BotCommand("timeframe", "週期"),
+            BotCommand("ha", "燈號+ATR 3~300根"), BotCommand("timeframe", "週期"),
             BotCommand("coins", "幣種"), BotCommand("menu", "說明")]
     scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
     try:
