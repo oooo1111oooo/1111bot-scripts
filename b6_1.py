@@ -53,7 +53,7 @@ def pct(v): return str(Decimal(str(v)).normalize())
 
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","te","chat",
-               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","last_open")
+               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open")
 
 def save_state():
     try:
@@ -252,7 +252,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
             pass
     else:
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 平倉時 OKX 已無持倉，略過")
-        for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee"):
+        for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
             S.pop(a, None)
         save_state()
         return True
@@ -287,7 +287,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
                "ambush_s": round(ee - pt) if pt else 0, "hold_s": hs,
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
                "src": src, "ts": hhmmss(),
-               "in_ts": time.strftime("%H:%M:%S", time.localtime(ee)),
+               "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
                "tf": S["tf"], "te": str(S["te"]) + "s",
                "in_px": str(fpx), "out_px": str(xpx)})
     await notify(app, S["chat"],
@@ -296,7 +296,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
         f"進場價：{fpx}\n出場價：{xpx}\n持倉秒數：{hs}s\n"
         f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
         f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
-    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee"):
+    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
         S.pop(a, None)
     save_state()
     return True
@@ -329,7 +329,7 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
                     pass
             if not p_chk:
                 await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉），本輪結束")
-                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee"):
+                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
                     S.pop(a, None)
                 save_state(); return
         if reason:
@@ -352,12 +352,13 @@ async def loop(app, chat, S):
                 fpx = Decimal(S.get("pos_px") or p.get("avgPx") or "0")
                 tp = Decimal(S["pos_tp"]); sl = Decimal(S["pos_sl"])
                 ee = float(S.get("pos_ee") or time.time())
+                pt0 = float(S["pos_pt"]) if S.get("pos_pt") else None
                 size = abs(Decimal(p.get("pos") or "0"))
                 S["state"] = "持倉中"; save_state()
                 await notify(app, chat, f"{E.BOT} {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} 已接管既有持倉，恢復 TP/SL/TE 監控")
-                await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, None, k)
+                await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt0, k)
             else:
-                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee"):
+                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
                     S.pop(a, None)
                 save_state()
 
@@ -438,7 +439,7 @@ async def loop(app, chat, S):
             ee = time.time()
             S["state"] = "持倉中"
             S["pos_open"] = True; S["pos_px"] = str(fpx)
-            S["pos_tp"] = str(tp); S["pos_sl"] = str(sl); S["pos_ee"] = ee
+            S["pos_tp"] = str(tp); S["pos_sl"] = str(sl); S["pos_ee"] = ee; S["pos_pt"] = pt
             save_state()
             await notify(app, chat,
                 f"{E.BOT} OKXLive普K｜{ACCT}\n事件：🔔 已進場成交\n"
@@ -465,7 +466,7 @@ async def rebuild_strat(d):
          "offset": Decimal(str(d["offset"])), "tp": Decimal(str(d["tp"])),
          "sl": Decimal(str(d["sl"])), "te": int(d["te"]), "spec": spec,
          "alive": True, "state": "等下輪", "chat": d.get("chat", CHAT_ID)}
-    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "last_open"):
+    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "last_open"):
         if a in d: S[a] = d[a]
     return S
 
