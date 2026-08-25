@@ -401,7 +401,7 @@ async def loop(app, chat, S):
             dup = await sweep(iid, pos, keep=oid)
             if dup:
                 print("dup orders cleared", S["sym"], d, dup)
-                await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} 已清除重複掛單 {dup} 筆")
+                await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} 已清除殘留掛單 {dup} 筆")
 
             # 輪詢成交，直到收線前 CANCEL_LEAD 秒
             deadline = oe + tf_sec - CANCEL_LEAD
@@ -679,6 +679,13 @@ def sum_lines(rs, placed, entered):
     L.append("淨損益：%+.6f (%+.3f%%) %s" % (tn, npc, E.pnl_emoji(tn)))
     return L
 
+def strat_params(sym, dr):
+    S = STRATS.get(skey(sym, dr))
+    if not S or not S.get("alive"):
+        return f"{dr}（已停止）"
+    return (f"{dr} {S['lev']}x {pct(S['margin'])} {pct(S['offset'])} "
+            f"{pct(S['tp'])} {pct(S['sl'])} {S['te']}")
+
 async def cmd_summary(u, c):
     t = today8(); recs = load_trades(t)
     ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t)}
@@ -693,12 +700,13 @@ async def cmd_summary(u, c):
     L += ["━" * 10, f"時間：{hhmmss()}"]
     await reply(u, "\n".join(L))
     for sy in sorted({r["sym"] for r in recs}):
-        D = [f"{E.BOT} OKXLive普K｜{ACCT}", f"附表：{sy} {t}"]
+        D = [f"\U0001f49a\U0001f499\U0001fa75\U0001f49c {sy} {t}"]
         for dr in ("L", "S"):
             rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
             st_ = ts.get(skey(sy, dr)) or {"placed": 0, "entered": 0}
             D.append("━" * 10)
             D.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)}")
+            D.append(f"策略參數：{strat_params(sy, dr)}")
             D += sum_lines(rows, st_["placed"], st_["entered"])
         D += ["━" * 10, f"時間：{hhmmss()}"]
         await reply(u, "\n".join(D))
