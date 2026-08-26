@@ -16,15 +16,24 @@ from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPriva
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 sys.path.insert(0, "/srv/1111bot")
 from app.core import emoji as E
-from app.strategy.normal import next_open_epoch, TF_SEC
+from app.strategy.normal import next_open_epoch as _noe_unused, TF_SEC as _TFS_unused
+
+# 普K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
+TF_SEC = {"3m": 180, "4m": 240, "5m": 300, "6m": 360, "10m": 600,
+          "12m": 720, "15m": 900, "20m": 1200, "30m": 1800, "60m": 3600}
+
+def next_open_epoch(now_epoch, tf):
+    sec = TF_SEC[tf]
+    return ((now_epoch // sec) + 1) * sec
 
 BASE = "https://www.okx.com"
 ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
-CANCEL_LEAD = 3      # 收線前幾秒撤單
-MIN_ROOM = 30        # 距收線不足幾秒就放棄本輪
+CANCEL_LEAD = 1      # TF 結束前幾秒撤未成交單
+CLOSE_LEAD = 2       # TF 結束前幾秒強制平倉（TE）
+MIN_ROOM = 30        # 距 TF 結束不足幾秒就放棄本輪
 
 def load_env(p):
     d = {}
@@ -53,7 +62,7 @@ def today8(): return now8().strftime("%Y-%m-%d")
 def pct(v): return str(Decimal(str(v)).normalize())
 
 # ---------- 狀態持久化（原子寫入） ----------
-SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","te","chat",
+SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","chat",
                "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open","catchup")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
@@ -291,7 +300,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
                "src": src, "ts": hhmmss(),
                "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
-               "tf": S["tf"], "te": str(S["te"]) + "s",
+               "tf": S["tf"], "te": S["tf"] + "-end",
                "in_px": str(fpx), "out_px": str(xpx)})
     await notify(app, S["chat"],
         f"{E.BOT} OKX普K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
@@ -305,12 +314,12 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
     return True
 
 # ---------- 持倉監控 ----------
-async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
+async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end):
+    """tf_end：本 TF 的結束時刻（epoch）。到 tf_end-CLOSE_LEAD 秒一律平倉。"""
     chk = 0
     while S["alive"]:
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         chk += 1
-        held = time.time() - ee
         last = await get_last(iid)
         reason = None
         if d == "L":
@@ -319,8 +328,8 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
         else:
             if last <= tp: reason = "Take_Profit"
             elif last >= sl: reason = "Stop_Loss"
-        if not reason and held >= S["te"]: reason = "Time_Exit"
-        if not reason and chk % 8 == 0:
+        if not reason and time.time() >= tf_end - CLOSE_LEAD: reason = "Time_Exit"
+        if not reason and chk % 16 == 0:
             p_chk = await okx_pos(iid, pos)
             if p_chk:
                 try:
@@ -358,8 +367,10 @@ async def loop(app, chat, S):
                 pt0 = float(S["pos_pt"]) if S.get("pos_pt") else None
                 size = abs(Decimal(p.get("pos") or "0"))
                 S["state"] = "持倉中"; save_state()
+                tfs = TF_SEC[S["tf"]]
+                tf_end0 = (int(time.time()) // tfs + 1) * tfs
                 await notify(app, chat, f"{E.BOT} {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} 已接管既有持倉，恢復 TP/SL/TE 監控")
-                await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt0, k)
+                await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt0, k, tf_end0)
             else:
                 for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
                     S.pop(a, None)
@@ -409,7 +420,8 @@ async def loop(app, chat, S):
                 await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} 已清除殘留掛單 {dup} 筆")
 
             # 輪詢成交，直到收線前 CANCEL_LEAD 秒
-            deadline = oe + tf_sec - CANCEL_LEAD
+            tf_end = oe + tf_sec
+            deadline = tf_end - CANCEL_LEAD
             filled = False; fpx = None
             while S["alive"] and time.time() < deadline:
                 await asyncio.sleep(2)
@@ -453,10 +465,10 @@ async def loop(app, chat, S):
                 f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                 f"進場價格：{fpx} ({pct(S['offset'])}%)\n"
                 f"止盈 TP：{tp} ({pct(S['tp'])}%)\n止損 SL：{sl} ({pct(S['sl'])}%)\n"
-                f"持倉 TE：{S['te']}s\n埋伏秒數：{int(ee - pt)}s\n"
+                f"持倉 TE：{S['tf']} 結束前 {CLOSE_LEAD}s\n埋伏秒數：{int(ee - pt)}s\n"
                 f"狀　　態：📌 持倉中\n時間：{hhmmss()}")
-            await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k)
-            S["catchup"] = False      # 出場後必須等下一根 K 線開盤
+            await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end)
+            S["catchup"] = False      # 出場後必須等下一個 TF 開始
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -476,7 +488,7 @@ async def rebuild_strat(d):
     S = {"sym": d["sym"], "dir": d["dir"], "tf": d.get("tf", ACCOUNT_TF),
          "lev": int(d["lev"]), "margin": Decimal(str(d["margin"])),
          "offset": Decimal(str(d["offset"])), "tp": Decimal(str(d["tp"])),
-         "sl": Decimal(str(d["sl"])), "te": int(d["te"]), "spec": spec,
+         "sl": Decimal(str(d["sl"])), "spec": spec,
          "alive": True, "state": "等下輪", "chat": d.get("chat", CHAT_ID)}
     for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "last_open", "catchup"):
         if a in d: S[a] = d[a]
@@ -521,21 +533,20 @@ def strat_params(sym, dr):
     if not S or not S.get("alive"):
         return f"{dr}（已停止）"
     return (f"{dr} {S['lev']}x {pct(S['margin'])} {pct(S['offset'])} "
-            f"{pct(S['tp'])} {pct(S['sl'])} {S['te']}")
+            f"{pct(S['tp'])} {pct(S['sl'])}")
 
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = f"用法：/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n（週期依 /timeframe，目前 {ACCOUNT_TF}）"
-    if len(a) != 8: await reply(u, f"{E.BOT} 參數數量錯誤（需8個）\n{fmt}"); return
+    fmt = f"用法：/run 商品 方向 槓桿 保證金 埋伏 TP SL\n例：/run ETHUSDT L 1x 3 0.5 0.5 0.5\n（TE 已固定為 TF 結束，週期依 /timeframe，目前 {ACCOUNT_TF}）"
+    if len(a) != 7: await reply(u, f"{E.BOT} 參數數量錯誤（需7個）\n{fmt}"); return
     try:
         sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
         margin = Decimal(a[3]); offset = Decimal(a[4]); tp = Decimal(a[5])
-        sl = Decimal(a[6]); te = int(a[7])
+        sl = Decimal(a[6])
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     if dr not in ("L", "S"): await reply(u, f"{E.BOT} 方向須 L 或 S"); return
-    if not 1 <= te <= 900: await reply(u, f"{E.BOT} TE 須 1~900 秒"); return
     k = skey(sym, dr)
     if k in STRATS and STRATS[k].get("alive"):
         await reply(u, f"{E.BOT} {sym} {E.dir_word(dr)} 已在運行"); return
@@ -548,11 +559,11 @@ async def cmd_run(u, c):
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
     PENDING[u.effective_chat.id] = {"kind": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
-        "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl, "te": te, "spec": spec}
+        "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl, "spec": spec}
     await reply(u, f"{E.BOT} OKX普K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{ACCOUNT_TF}\n"
         f"開盤估價：{op}\n埋伏距離：{offset}%\n埋伏價格：{amb}\n"
-        f"止盈 TP：{tp}%\n止損 SL：{sl}%\n持倉 TE：{te}s\n保 證 金：{margin} USDT\n下單張數：{size}\n"
+        f"止盈 TP：{tp}%\n止損 SL：{sl}%\n持倉 TE：{ACCOUNT_TF} 結束前 {CLOSE_LEAD}s\n保 證 金：{margin} USDT\n下單張數：{size}\n"
         f"━━━━━━━━━━\n⚠ 確認後真實循環交易\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
@@ -748,19 +759,22 @@ async def cmd_coins(u, c):
 async def cmd_timeframe(u, c):
     global ACCOUNT_TF
     if not c.args:
-        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選 3m/5m/10m/15m\n變更：/timeframe 10m"); return
+        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選：" + "/".join(TF_SEC.keys()) + "\n變更：/timeframe 10m"); return
     tf = c.args[0]
-    if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須 3m/5m/10m/15m"); return
+    if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須為：" + "/".join(TF_SEC.keys())); return
     ACCOUNT_TF = tf; save_state()
     await reply(u, f"{E.BOT} ✅ 帳戶週期已設為 {tf}\n（僅影響之後新建立的策略）")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX普K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
-        "/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n"
-        f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
+        "/run 商品 方向 槓桿 保證金 埋伏 TP SL\n"
+        f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 當日戰報\n/timeframe 查看/設定週期\n/coins 幣種\n"
-        "━━━━━━━━━━\n⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
+        "━━━━━━━━━━\n"
+        f"一個 TF 一輪：TF 開始埋伏，未成交於結束前 {CANCEL_LEAD}s 撤單\n"
+        f"已進場未觸發 TP/SL 者，於 TF 結束前 {CLOSE_LEAD}s 平倉（TE）\n"
+        "⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
