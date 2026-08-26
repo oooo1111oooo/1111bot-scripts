@@ -1,0 +1,18 @@
+[Unit]
+Description=1111bot o3333o normal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/srv/1111bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/srv/1111bot/config/acct_o3333o.env
+ExecStart=/srv/1111bot/.venv/bin/python /srv/1111bot/run_bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
