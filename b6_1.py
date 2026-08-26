@@ -41,6 +41,7 @@ SYMS = json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 
 PENDING = {}; STRATS = {}; TASKS = {}; STATS = {}
 CHAT_ID = None
+SHUTTING_DOWN = False
 HTTP = None
 SPEC_CACHE = {}
 
@@ -56,13 +57,15 @@ SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","te","chat",
                "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
+    # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
+    # 若照常寫入就會把存檔覆蓋成空的，導致重啟後策略全滅。
+    if SHUTTING_DOWN:
+        return
     try:
         data = {"chat": CHAT_ID, "tf": ACCOUNT_TF, "stats": STATS, "strats": []}
         for k, S in STRATS.items():
             if S.get("alive"):
                 data["strats"].append({a: S[a] for a in SAVE_FIELDS if a in S})
-        if STRATS and not data["strats"]:
-            return
         def enc(o): return str(o) if isinstance(o, Decimal) else o
         tmp = STATE_FILE + ".tmp"
         with _open(tmp, "w") as f:
@@ -455,8 +458,12 @@ async def loop(app, chat, S):
         print("loop error", S.get("sym"), S.get("dir"), type(e).__name__, e)
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 循環錯誤：{type(e).__name__}: {e}")
     finally:
-        S["state"] = "已停止"; S["alive"] = False
-        STRATS.pop(k, None); TASKS.pop(k, None); save_state()
+        if SHUTTING_DOWN:
+            # 服務關閉：保留 STRATS 與存檔原狀，讓重啟後能完整認領
+            S["state"] = "已停止"
+        else:
+            S["state"] = "已停止"; S["alive"] = False
+            STRATS.pop(k, None); TASKS.pop(k, None); save_state()
 
 # ---------- 啟動接管 ----------
 async def rebuild_strat(d):
@@ -798,10 +805,16 @@ async def _post_init(app):
         print("schedule fail", e)
     await startup_recover(app)
 
+async def _post_stop(app):
+    global SHUTTING_DOWN
+    save_state()          # 關閉前最後一次完整存檔（此時 STRATS 仍完整）
+    SHUTTING_DOWN = True
+    print("關閉中：已保存狀態，停止後續寫檔")
+
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     print(f"啟動 o3333o 普K B6-1 核心重寫版（token ...{TOKEN[-6:]}）")
-    app = (Application.builder().token(TOKEN).post_init(_post_init)
+    app = (Application.builder().token(TOKEN).post_init(_post_init).post_stop(_post_stop)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .pool_timeout(30.0).get_updates_read_timeout(40.0)
            .get_updates_connect_timeout(30.0).build())
