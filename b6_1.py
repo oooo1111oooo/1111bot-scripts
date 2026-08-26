@@ -650,8 +650,7 @@ def sum_lines(rs, placed, entered):
     L = []
     m = len(rs)
     hit = (entered / placed * 100) if placed else 0
-    L.append("委託次數：%d" % placed)
-    L.append("進場數：%d | 命中率：%.2f%%" % (entered, hit))
+    L.append("次數：%d | %d | %.2f%%" % (placed, entered, hit))
     if m:
         L.append("平均埋伏秒數：%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs) / m))
     else:
@@ -662,19 +661,16 @@ def sum_lines(rs, placed, entered):
             sub = [r for r in rs if Decimal(str(r.get("net") or "0")) > 0]
         else:
             sub = [r for r in rs if Decimal(str(r.get("net") or "0")) < 0]
-        L.append("━" * 10)
-        L.append("%s數：%d" % (lab, len(sub)))
         ps = []; ss = []
         for cn in cats:
             gg = [r for r in sub if r.get("reason") == cn]
-            ps.append("%s:%d" % (NAME[cn], len(gg)))
+            ps.append("%s：%d" % (NAME[cn], len(gg)))
             if gg:
                 ss.append("%s:%d秒" % (NAME[cn], sum(int(r.get("hold_s") or 0) for r in gg) / len(gg)))
             else:
                 ss.append("%s:-" % NAME[cn])
-        L.append("　" + " | ".join(ps))
+        L.append("%s數：%d | %s" % (lab, len(sub), " | ".join(ps)))
         L.append("　平均秒數 " + " | ".join(ss))
-    L.append("━" * 10)
     tg = sum((Decimal(str(r.get("gross") or "0")) for r in rs), Decimal(0))
     tf = sum((Decimal(str(r.get("fee") or "0")) for r in rs), Decimal(0))
     tn = sum((Decimal(str(r.get("net") or "0")) for r in rs), Decimal(0))
@@ -695,20 +691,18 @@ async def cmd_summary(u, c):
         rows = [r for r in recs if r["dir"] == dr]
         pa = sum(v["placed"] for k, v in ts.items() if k.endswith("_" + dr))
         en = sum(v["entered"] for k, v in ts.items() if k.endswith("_" + dr))
-        L.append("━" * 10)
         L.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)}")
         L += sum_lines(rows, pa, en)
-    L += ["━" * 10, f"時間：{hhmmss()}"]
+    L.append(f"時間：{hhmmss()}")
     await reply(u, "\n".join(L))
     for sy in sorted({r["sym"] for r in recs}):
         D = [f"\U0001f49a\U0001f499\U0001fa75\U0001f49c {sy} {t}"]
         for dr in ("L", "S"):
             rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
             st_ = ts.get(skey(sy, dr)) or {"placed": 0, "entered": 0}
-            D.append("━" * 10)
             D.append(f"策略：{E.dir_emoji(dr)} {strat_params(sy, dr)}")
             D += sum_lines(rows, st_["placed"], st_["entered"])
-        D += ["━" * 10, f"時間：{hhmmss()}"]
+        D.append(f"時間：{hhmmss()}")
         await reply(u, "\n".join(D))
 
 async def cmd_coins(u, c):
