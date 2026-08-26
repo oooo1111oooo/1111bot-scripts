@@ -54,7 +54,7 @@ def pct(v): return str(Decimal(str(v)).normalize())
 
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","te","chat",
-               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open")
+               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open","catchup")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
     # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
@@ -370,15 +370,17 @@ async def loop(app, chat, S):
             now = time.time()
             cur = int(now // tf_sec) * tf_sec
             room = cur + tf_sec - now
-            if cur != S.get("last_open") and room >= MIN_ROOM:
-                oe = cur                          # 本根尚未掛過且還有時間 -> 立刻掛
+            # 僅在「上一輪未成交、剛撤完單」的情況下才允許盤中補掛；
+            # 新建策略與出場後一律等下一根 K 線開盤，嚴守一根 K 線一輪。
+            if S.get("catchup") and cur != S.get("last_open") and room >= MIN_ROOM:
+                oe = cur
             else:
                 S["state"] = "等下輪"; save_state()
                 oe = next_open_epoch(int(time.time()), S["tf"])
                 w = oe - time.time()
                 if w > 0: await asyncio.sleep(w)
                 if not S["alive"]: break
-            S["last_open"] = oe; save_state()
+            S["last_open"] = oe; S["catchup"] = False; save_state()
 
             # 開盤取價 -> 埋伏價 -> 張數
             op = await get_last(iid)
@@ -429,7 +431,9 @@ async def loop(app, chat, S):
                     await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 撤單未確認，本策略停止以免重複掛單")
                     S["alive"] = False; break
             if not S["alive"]: break
-            if not filled: continue
+            if not filled:
+                S["catchup"] = True
+                continue
 
             # 成交 -> 算 TP/SL -> 監控
             bump(k, "entered")
@@ -452,6 +456,7 @@ async def loop(app, chat, S):
                 f"持倉 TE：{S['te']}s\n埋伏秒數：{int(ee - pt)}s\n"
                 f"狀　　態：📌 持倉中\n時間：{hhmmss()}")
             await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k)
+            S["catchup"] = False      # 出場後必須等下一根 K 線開盤
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -473,7 +478,7 @@ async def rebuild_strat(d):
          "offset": Decimal(str(d["offset"])), "tp": Decimal(str(d["tp"])),
          "sl": Decimal(str(d["sl"])), "te": int(d["te"]), "spec": spec,
          "alive": True, "state": "等下輪", "chat": d.get("chat", CHAT_ID)}
-    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "last_open"):
+    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "last_open", "catchup"):
         if a in d: S[a] = d[a]
     return S
 
