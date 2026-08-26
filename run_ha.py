@@ -46,6 +46,7 @@ SYMS = json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 PENDING = {}; STRATS = {}; TASKS = {}; STATS = {}
 CHAT_ID = None
 HTTP = None
+SHUTTING_DOWN = False
 SPEC_CACHE = {}
 
 def skey(s, d): return f"{s}_{d}"
@@ -60,13 +61,13 @@ SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post","exitn","amp","chat"
                "pos_open","pos_px","pos_ee","pos_sz","last_bar")
 
 def save_state():
+    if SHUTTING_DOWN:
+        return
     try:
         data = {"chat": CHAT_ID, "tf": ACCOUNT_TF, "stats": STATS, "strats": []}
         for k, S in STRATS.items():
             if S.get("alive"):
                 data["strats"].append({a: S[a] for a in SAVE_FIELDS if a in S})
-        if STRATS and not data["strats"]:
-            return
         def enc(o): return str(o) if isinstance(o, Decimal) else o
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -490,13 +491,16 @@ async def hloop(app, chat, S):
         print("hloop error", S.get("sym"), S.get("dir"), type(e).__name__, e)
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 循環錯誤：{type(e).__name__}: {e}")
     finally:
-        S["state"] = "已停止"; S["alive"] = False
-        STRATS.pop(k, None); TASKS.pop(k, None); save_state()
-        try:
-            if await okx_pos(iid, pos):
-                await notify(app, chat, f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 已停止但仍有持倉，請至 OKX 處理")
-        except Exception:
-            pass
+        if SHUTTING_DOWN:
+            S["state"] = "已停止"
+        else:
+            S["state"] = "已停止"; S["alive"] = False
+            STRATS.pop(k, None); TASKS.pop(k, None); save_state()
+            try:
+                if await okx_pos(iid, pos):
+                    await notify(app, chat, f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 已停止但仍有持倉，請至 OKX 處理")
+            except Exception:
+                pass
 
 # ---------- 心跳看門狗 ----------
 async def hb_watch(app):
@@ -615,7 +619,7 @@ async def cmd_run(u, c):
     ps = "long" if dr == "L" else "short"
     exist = await okx_pos(spec["iid"], ps)
     warn = f"\n⚠ OKX 上 {sym} {E.dir_word(dr)} 已有 {exist['pos']} 張持倉\n　（可能是普K 或手動單，倉位會被合併）" if exist else ""
-    PENDING[u.effective_chat.id] = {"t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
+    PENDING[u.effective_chat.id] = {"kind": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
         "lev": lev, "margin": margin, "pre": pre, "post": post, "exitn": exitn, "amp": amp, "spec": spec}
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{ACCOUNT_TF}\n"
@@ -633,15 +637,23 @@ async def _to(app, chat, stamp):
     await asyncio.sleep(61)
     p = PENDING.get(chat)
     if p and p["t"] == stamp:
+        kd = p.get("kind", "run")
         del PENDING[chat]
-        await notify(app, chat, f"{E.BOT} 參數逾時已取消，請重新 /run")
+        await notify(app, chat, f"{E.BOT} /{kd} 逾時未確認，已取消")
 
 async def cmd_confirm(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     p = PENDING.get(u.effective_chat.id)
-    if not p: await reply(u, f"{E.BOT} 沒有待確認的 /run"); return
+    if not p: await reply(u, f"{E.BOT} 沒有待確認的指令"); return
     if time.time() - p["t"] > 60:
         del PENDING[u.effective_chat.id]; await reply(u, f"{E.BOT} 確認逾時"); return
+    kind = p.get("kind", "run")
+    if kind == "stop":
+        del PENDING[u.effective_chat.id]
+        await do_stop(u, p["key"]); return
+    if kind == "stopall":
+        del PENDING[u.effective_chat.id]
+        await do_stopall(u); return
     del PENDING[u.effective_chat.id]
     k = skey(p["sym"], p["dir"])
     S = {**p, "alive": True, "state": "等訊號", "chat": u.effective_chat.id,
@@ -664,19 +676,34 @@ async def cmd_stop(u, c):
          else [k for k in alive if STRATS[k]["sym"] == sym]
     if not tg: await reply(u, f"{E.BOT} 找不到運行中的 {sym}"); return
     if len(tg) > 1: await reply(u, f"{E.BOT} {sym} 有多方向，請指定 /stop {sym} L 或 S"); return
-    S = STRATS[tg[0]]; d = S["dir"]; iid = S["spec"]["iid"]
+    S = STRATS[tg[0]]
+    PENDING[u.effective_chat.id] = {"kind": "stop", "t": time.time(), "key": tg[0]}
+    await reply(u, f"{E.BOT} 將停止 {E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}\n"
+                   f"60秒內 /confirm 確認")
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stop(u, key):
+    S = STRATS.get(key)
+    if not S or not S.get("alive"):
+        await reply(u, f"{E.BOT} 策略已不存在"); return
+    d = S["dir"]; iid = S["spec"]["iid"]
     ps = "long" if d == "L" else "short"
     p = await okx_pos(iid, ps)
     S["alive"] = False
+    n = await sweep_h(iid, ps)
     save_state()
-    if p:
-        await reply(u, f"{E.BOT} /stop（持倉中）\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                       f"⚠ 已進場不自動平倉\n倉位 {p['pos']} 張 均價 {p.get('avgPx','?')} 浮 {p.get('upl','?')}\n"
-                       f"請至 OKX 手動平倉")
-    else:
-        await reply(u, f"{E.BOT} /stop\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n已停止")
+    tail = f"\n⚠ 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
+    await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜殘單 {n}{tail}")
 
 async def cmd_stopall(u, c):
+    alive = [k for k, s in STRATS.items() if s.get("alive")]
+    if not alive:
+        await reply(u, f"{E.BOT} 目前無運行中策略"); return
+    PENDING[u.effective_chat.id] = {"kind": "stopall", "t": time.time()}
+    await reply(u, f"{E.BOT} ⚠ 將停止全部 {len(alive)} 個均K 策略\n60秒內 /confirm 確認")
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stopall(u):
     alive = [k for k, s in STRATS.items() if s.get("alive")]
     held = []; done = []
     for k in list(alive):
@@ -687,13 +714,10 @@ async def cmd_stopall(u, c):
         (held if p else done).append(f"{S['sym']} {S['dir']}")
     orphan = await sweep_h()
     save_state()
-    m = f"{E.BOT} /stopall（均K）\n━━━━━━━━━━\n"
-    if done: m += f"已停止策略（{len(done)}）：\n" + "\n".join("・" + x for x in done) + "\n"
-    if orphan: m += f"另清除均K 殘留掛單：{orphan} 筆\n"
-    if held: m += f"⚠ 持倉需手動平倉（{len(held)}）：\n" + "\n".join("・" + x for x in held) + "\n"
-    if not done and not orphan and not held: m += "目前無策略、無殘單\n"
-    m += "（普K 不受影響）\n"
-    await reply(u, m + f"時間：{hhmmss()}")
+    m = f"{E.BOT} 已停止 {len(done)} 個均K 策略｜清殘單 {orphan}"
+    if held: m += f"\n⚠ 持倉需手動平倉：" + "、".join(held)
+    m += "\n（普K 不受影響）"
+    await reply(u, m)
 
 async def cmd_status(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
@@ -895,11 +919,15 @@ async def job_summary(ctx):
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
-    CMDS = [BotCommand("run", "建立均K策略"),
-            BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
-            BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
-            BotCommand("ha", "燈號+ATR 3~300根"), BotCommand("timeframe", "週期"),
-            BotCommand("coins", "幣種"), BotCommand("menu", "說明")]
+    CMDS = [BotCommand("status", "現況"),
+            BotCommand("summary", "當日戰報"),
+            BotCommand("coins", "幣種"),
+            BotCommand("stopall", "停全部"),
+            BotCommand("stop", "停指定"),
+            BotCommand("ha", "燈號+ATR 3~300根"),
+            BotCommand("run", "建立均K策略"),
+            BotCommand("timeframe", "週期"),
+            BotCommand("menu", "說明")]
     scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
     try:
         saved = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
@@ -925,10 +953,16 @@ async def _post_init(app):
     _BG.add(hb); hb.add_done_callback(_BG.discard)
     print("心跳看門狗已啟動")
 
+async def _post_stop(app):
+    global SHUTTING_DOWN
+    save_state()
+    SHUTTING_DOWN = True
+    print("關閉中：已保存狀態，停止後續寫檔")
+
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     print(f"啟動 {ACCT} 均K B6-2（token ...{TOKEN[-6:]}）")
-    app = (Application.builder().token(TOKEN).post_init(_post_init)
+    app = (Application.builder().token(TOKEN).post_init(_post_init).post_stop(_post_stop)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .pool_timeout(30.0).get_updates_read_timeout(40.0)
            .get_updates_connect_timeout(30.0).build())
