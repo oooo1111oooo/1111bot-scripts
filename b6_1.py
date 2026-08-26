@@ -781,10 +781,13 @@ async def job_summary(ctx):
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
-    CMDS = [BotCommand("run", "建立策略"),
-            BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
-            BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
-            BotCommand("timeframe", "週期"), BotCommand("coins", "幣種"),
+    CMDS = [BotCommand("status", "現況"),
+            BotCommand("summary", "當日戰報"),
+            BotCommand("coins", "幣種"),
+            BotCommand("stopall", "停全部"),
+            BotCommand("stop", "停指定"),
+            BotCommand("run", "建立策略"),
+            BotCommand("timeframe", "週期"),
             BotCommand("menu", "說明")]
     # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
     # 只刪 Default 會被舊清單蓋住，導致左下 Menu 卡在舊版）
