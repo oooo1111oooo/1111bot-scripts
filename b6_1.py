@@ -535,7 +535,7 @@ async def cmd_run(u, c):
     if size < spec["minsz"]:
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
-    PENDING[u.effective_chat.id] = {"t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
+    PENDING[u.effective_chat.id] = {"kind": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
         "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl, "te": te, "spec": spec}
     await reply(u, f"{E.BOT} OKX普K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{ACCOUNT_TF}\n"
@@ -548,15 +548,23 @@ async def _to(app, chat, stamp):
     await asyncio.sleep(61)
     p = PENDING.get(chat)
     if p and p["t"] == stamp:
+        k = p.get("kind", "run")
         del PENDING[chat]
-        await notify(app, chat, f"{E.BOT} 參數逾時已取消，請重新 /run")
+        await notify(app, chat, f"{E.BOT} /{k} 逾時未確認，已取消")
 
 async def cmd_confirm(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     p = PENDING.get(u.effective_chat.id)
-    if not p: await reply(u, f"{E.BOT} 沒有待確認的 /run"); return
+    if not p: await reply(u, f"{E.BOT} 沒有待確認的指令"); return
     if time.time() - p["t"] > 60:
         del PENDING[u.effective_chat.id]; await reply(u, f"{E.BOT} 確認逾時"); return
+    kind = p.get("kind", "run")
+    if kind == "stop":
+        del PENDING[u.effective_chat.id]
+        await do_stop(u, p["key"]); return
+    if kind == "stopall":
+        del PENDING[u.effective_chat.id]
+        await do_stopall(u); return
     del PENDING[u.effective_chat.id]
     k = skey(p["sym"], p["dir"])
     S = {**p, "alive": True, "state": "等下輪", "chat": u.effective_chat.id}
@@ -577,20 +585,34 @@ async def cmd_stop(u, c):
     tg = [skey(sym, a[1].upper())] if len(a) >= 2 and skey(sym, a[1].upper()) in alive else [k for k in alive if STRATS[k]["sym"] == sym]
     if not tg: await reply(u, f"{E.BOT} 找不到運行中的 {sym}"); return
     if len(tg) > 1: await reply(u, f"{E.BOT} {sym} 有多方向，請指定 /stop {sym} L 或 S"); return
-    S = STRATS[tg[0]]; d = S["dir"]; iid = S["spec"]["iid"]
+    S = STRATS[tg[0]]
+    PENDING[u.effective_chat.id] = {"kind": "stop", "t": time.time(), "key": tg[0]}
+    await reply(u, f"{E.BOT} 將停止 {E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}\n"
+                   f"60秒內 /confirm 確認")
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stop(u, key):
+    S = STRATS.get(key)
+    if not S or not S.get("alive"):
+        await reply(u, f"{E.BOT} 策略已不存在"); return
+    d = S["dir"]; iid = S["spec"]["iid"]
     ps = "long" if d == "L" else "short"
     p = await okx_pos(iid, ps)
     S["alive"] = False
     n = await sweep(iid, ps)
     save_state()
-    if p:
-        await reply(u, f"{E.BOT} /stop（持倉中）\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                       f"⚠ 已進場不自動平倉\n倉位 {p['pos']} 張 均價 {p.get('avgPx','?')} 浮 {p.get('upl','?')}\n"
-                       f"已撤掛單 {n} 筆\n請至 OKX 手動平倉")
-    else:
-        await reply(u, f"{E.BOT} /stop\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n已停止，撤掉掛單 {n} 筆")
+    tail = f"\n⚠ 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
+    await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜撤單 {n}{tail}")
 
 async def cmd_stopall(u, c):
+    alive = [k for k, s in STRATS.items() if s.get("alive")]
+    if not alive:
+        await reply(u, f"{E.BOT} 目前無運行中策略"); return
+    PENDING[u.effective_chat.id] = {"kind": "stopall", "t": time.time()}
+    await reply(u, f"{E.BOT} ⚠ 將停止全部 {len(alive)} 個策略\n60秒內 /confirm 確認")
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stopall(u):
     alive = [k for k, s in STRATS.items() if s.get("alive")]
     held = []; done = []
     for k in list(alive):
@@ -605,12 +627,9 @@ async def cmd_stopall(u, c):
         cr = await api("POST", "/api/v5/trade/cancel-order", {"instId": o["instId"], "ordId": o["ordId"]})
         if cr.get("code") == "0": orphan += 1
     save_state()
-    m = f"{E.BOT} /stopall\n━━━━━━━━━━\n"
-    if done: m += f"已停止策略（{len(done)}）：\n" + "\n".join("・" + x for x in done) + "\n"
-    if orphan: m += f"另清除殘留掛單：{orphan} 筆\n"
-    if held: m += f"⚠ 持倉需手動平倉（{len(held)}）：\n" + "\n".join("・" + x for x in held) + "\n"
-    if not done and not orphan and not held: m += "目前無策略、無殘單\n"
-    await reply(u, m + f"時間：{hhmmss()}")
+    m = f"{E.BOT} 已停止 {len(done)} 個策略｜清殘單 {orphan}"
+    if held: m += f"\n⚠ 持倉需手動平倉：" + "、".join(held)
+    await reply(u, m)
 
 async def cmd_status(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
