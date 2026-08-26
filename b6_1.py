@@ -655,7 +655,7 @@ async def cmd_status(u, c):
         key = (s["spec"]["iid"], "long" if s["dir"] == "L" else "short")
         live = "持倉中" if key in okxp else ("委託中" if key in okxo else "等下輪")
         L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(掛{placed}/進{entered})")
-        L.append(f"　　策略　　：{strat_params(s['sym'], s['dir'])}")
+        L.append(f"策略:{strat_params(s['sym'], s['dir'])}")
     L.append(f"掛單數：{len(pdl)}")
     L.append(f"持倉數：{len(pl)}")
     for p in pl:
