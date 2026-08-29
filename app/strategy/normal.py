@@ -1,6 +1,6 @@
-"""普K 訊號判定（B4-3 驗證）。
+"""原K 訊號判定（B4-3 驗證）。
 開盤取價→OFFSET埋伏(L向下/S向上)→TP/SL/TE出場。TP/SL 以埋伏成交價計算。
-註：普K 主程式 run_bot.py 自帶 10 種 TF_SEC，本檔的 TF_SEC 僅供均K 使用。"""
+註：原K 主程式 run_bot.py 自帶 10 種 TF_SEC，本檔的 TF_SEC 僅供均K 使用。"""
 from decimal import Decimal
 from app.core.precision import align_price, calc_size
 
