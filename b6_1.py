@@ -488,6 +488,13 @@ async def loop(app, chat, S):
             # 服務關閉：保留 STRATS 與存檔原狀，讓重啟後能完整認領
             S["state"] = "已停止"
         else:
+            # 策略結束前先清掉自己掛在 OKX 上的單，否則會變成沒人認領的孤兒單
+            try:
+                left = await sweep(iid, pos)
+                if left:
+                    await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 策略結束，已清除自身殘留掛單 {left} 筆")
+            except Exception as e:
+                print("finally sweep fail", S.get("sym"), d, e)
             S["state"] = "已停止"; S["alive"] = False
             STRATS.pop(k, None); TASKS.pop(k, None); save_state()
 
@@ -515,7 +522,7 @@ async def startup_recover(app):
     saved = data.get("strats", [])
     if not saved:
         print("存檔無策略"); return
-    rec = []
+    rec = []; failed = []
     for d in saved:
         try:
             S = await rebuild_strat(d)
@@ -525,11 +532,19 @@ async def startup_recover(app):
             rec.append(f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}")
         except Exception as e:
             print("重建失敗", d, e)
+            failed.append(f"{d.get('sym')} {d.get('dir')}：{type(e).__name__}")
     pend = await api("GET", "/api/v5/trade/orders-pending")
     posr = await api("GET", "/api/v5/account/positions")
     n_ord = len(pend.get("data", [])) if pend.get("code") == "0" else 0
     n_pos = len([p for p in posr.get("data", []) if float(p.get("pos", "0")) != 0]) if posr.get("code") == "0" else 0
     print(f"已接管策略 {len(rec)}｜OKX 掛單{n_ord} 持倉{n_pos}")
+    if failed:
+        print("重建失敗清單:", failed)
+        if CHAT_ID:
+            await notify(app, CHAT_ID, f"{E.BOT} {E.LOSS} 重啟時有 {len(failed)} 個策略重建失敗：\n" +
+                         "\n".join("・" + x for x in failed) + "\n⚠ 這些策略已消失，請確認 OKX 是否有殘留掛單")
+    if CHAT_ID and rec and n_ord > len(rec):
+        await notify(app, CHAT_ID, f"{E.BOT} {E.LOSS} OKX 掛單 {n_ord} 筆 > 策略 {len(rec)} 個，可能有孤兒單，請查 /status")
     if CHAT_ID and rec:
         await notify(app, CHAT_ID,
             f"{E.BOT} OKX普K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
