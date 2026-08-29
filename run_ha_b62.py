@@ -4,10 +4,10 @@
   1. 每根 K 線收線後 +5 秒抓 K 線，算 HA，判燈號。
   2. 進場：PRE根反轉前色 + POST根反轉後色 + POST振幅累加達門檻 -> taker 市價進場。
   3. 出場：EXIT根反向色 + 振幅累加達門檻 -> taker 市價平倉。無 TP/SL/TE。
-  4. clOrdId 前綴：進場 h / 出場 y（普K 用 n / x，互不干擾）。
+  4. clOrdId 前綴：進場 h / 出場 y（原K 用 n / x，互不干擾）。
   5. 心跳：超過 3 根 K 線未推進燈號判定即 TG 告警。
   6. OKX 為唯一真相來源；重啟接管既有持倉；Telegram 為旁路，發送失敗不影響交易。
-注意：本檔完全獨立於 run_bot.py（普K），使用自己的 bot token 與 state 檔。
+注意：本檔完全獨立於 run_bot.py（原K），使用自己的 bot token 與 state 檔。
 """
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
@@ -257,7 +257,7 @@ async def okx_pos(iid, ps):
     return None
 
 async def okx_orders(iid=None, ps=None, prefix="h"):
-    """只認均K 自己的前綴，絕不碰普K 的 n / x 單。"""
+    """只認均K 自己的前綴，絕不碰原K 的 n / x 單。"""
     r = await api("GET", "/api/v5/trade/orders-pending")
     if r.get("code") != "0": return []
     out = []
@@ -566,7 +566,7 @@ async def startup_recover(app):
     posr = await api("GET", "/api/v5/account/positions")
     if posr.get("code") == "0":
         n_pos = len([p for p in posr.get("data", []) if float(p.get("pos", "0")) != 0])
-    print(f"已接管均K 策略 {len(rec)}｜OKX 帳戶持倉{n_pos}（含普K）")
+    print(f"已接管均K 策略 {len(rec)}｜OKX 帳戶持倉{n_pos}（含原K）")
     if CHAT_ID and rec:
         await notify(app, CHAT_ID,
             f"{E.BOT} OKX均K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
@@ -618,7 +618,7 @@ async def cmd_run(u, c):
         prev = f"燈號預覽失敗：{type(e).__name__}"
     ps = "long" if dr == "L" else "short"
     exist = await okx_pos(spec["iid"], ps)
-    warn = f"\n⚠ OKX 上 {sym} {E.dir_word(dr)} 已有 {exist['pos']} 張持倉\n　（可能是普K 或手動單，倉位會被合併）" if exist else ""
+    warn = f"\n⚠ OKX 上 {sym} {E.dir_word(dr)} 已有 {exist['pos']} 張持倉\n　（可能是原K 或手動單，倉位會被合併）" if exist else ""
     PENDING[u.effective_chat.id] = {"kind": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
         "lev": lev, "margin": margin, "pre": pre, "post": post, "exitn": exitn, "amp": amp, "spec": spec}
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
@@ -716,7 +716,7 @@ async def do_stopall(u):
     save_state()
     m = f"{E.BOT} 已停止 {len(done)} 個均K 策略｜清殘單 {orphan}"
     if held: m += f"\n⚠ 持倉需手動平倉：" + "、".join(held)
-    m += "\n（普K 不受影響）"
+    m += "\n（原K 不受影響）"
     await reply(u, m)
 
 async def cmd_status(u, c):
@@ -741,7 +741,7 @@ async def cmd_status(u, c):
         age = f"{int(time.time()-hb)}s" if hb else "-"
         L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(進{entered}/{placed}) 心跳{age}")
         L.append(f"　　策略　　：{strat_params(s['sym'], s['dir'])}")
-    L += ["━━━━━━━━━━", f"OKX 帳戶總持倉：{len(pl)}（含普K）"]
+    L += ["━━━━━━━━━━", f"OKX 帳戶總持倉：{len(pl)}（含原K）"]
     for p in pl:
         d = "L" if p["posSide"] == "long" else "S"
         L.append(f"{E.dir_emoji(d)} {p['instId'].replace('-USDT-SWAP','USDT')} {d} {p['pos']}張")
@@ -898,7 +898,7 @@ async def cmd_menu(u, c):
         "進出場皆 taker 市價\n"
         "⚠ 無 TP/SL/TE，僅靠反向訊號出場\n"
         "✅ 重啟接管持倉\n"
-        "✅ 與普K 完全獨立，不互相撤單")
+        "✅ 與原K 完全獨立，不互相撤單")
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
