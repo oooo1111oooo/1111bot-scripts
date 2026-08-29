@@ -7,7 +7,7 @@ from openpyxl.styles import Font, Alignment
 
 BASE = os.environ.get("REPORT_BASE", "/srv/1111bot")
 ACCT = os.environ.get("REPORT_ACCT", "o3333o")
-KIND = os.environ.get("REPORT_KIND", "普K")
+KIND = os.environ.get("REPORT_KIND", "原K")
 FONT = "PingFang TC"
 SIZE = 12
 
