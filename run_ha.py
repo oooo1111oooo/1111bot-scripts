@@ -428,8 +428,9 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     fp = (fee / nv * 100) if nv else Decimal(0)
     npv = (net / nv * 100) if nv else Decimal(0)
     hs = int(time.time() - ee)
+    tfs = tf_sec(S["tf"])
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
-               "hold_s": hs, "bars": round(hs / tf_sec(S["tf"]), 1),
+               "hold_s": hs, "bars": round(hs / tfs, 1),
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
                "src": src, "ts": hhmmss(),
                "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
@@ -440,7 +441,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
         f"{E.BOT} OKX均K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
         f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
         f"進場價：{fpx}\n出場價：{xpx}\n"
-        f"持倉秒數：{hs}s（約 {hs / tf_sec(S["tf"]):.1f} 根）\n"
+        f"持倉秒數：{hs}s（約 {hs / tfs:.1f} 根）\n"
         f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
         f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
     for a in ("pos_open", "pos_px", "pos_ee", "pos_sz"):
