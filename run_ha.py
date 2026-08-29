@@ -7,6 +7,8 @@
   4. clOrdId 前綴：進場 h / 出場 y（普K 用 n / x，互不干擾）。
   5. 心跳：超過 3 根 K 線未推進燈號判定即 TG 告警。
   6. OKX 為唯一真相來源；重啟接管既有持倉；Telegram 為旁路，發送失敗不影響交易。
+  7. 週期 5m/10m/15m/30m/60m/120m/240m/480m/720m/1440m；非原生者由底層 bar 合成。
+     邊界以 UTC+8 對齊（與 OKX App 的 12H/1D 日界一致）。
 注意：本檔完全獨立於 run_bot.py（普K），使用自己的 bot token 與 state 檔。
 """
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
@@ -17,8 +19,7 @@ from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPriva
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 sys.path.insert(0, "/srv/1111bot")
 from app.core import emoji as E
-from app.strategy.normal import next_open_epoch, TF_SEC
-from app.strategy.ha import calc_ha, merge_5m_to_10m
+from app.strategy.ha import calc_ha
 from app.strategy.heikin import judge_entry, judge_exit
 
 BASE = "https://www.okx.com"
@@ -29,6 +30,33 @@ STATE_FILE = "/srv/1111bot/data/strategies_ha_o3333o.json"
 HA_LAG = 5           # 收線後幾秒才抓 K 線（等 OKX 資料落定）
 HA_HIST = 120        # 抓幾根歷史 K 線做 HA 遞迴
 HB_BARS = 3          # 心跳超過幾根 K 線未推進就告警
+
+# 均K 專屬週期表（不共用原K 的 normal.TF_SEC，兩邊互不影響）
+# tf -> (秒數, OKX bar, 合成倍數)  合成倍數 >1 表示該週期非交易所原生，需自行合成
+HA_TF = {
+    "5m":    (300,    "5m", 1),
+    "10m":   (600,    "5m", 2),
+    "15m":   (900,   "15m", 1),
+    "30m":   (1800,  "30m", 1),
+    "60m":   (3600,   "1H", 1),
+    "120m":  (7200,   "2H", 1),
+    "240m":  (14400,  "4H", 1),
+    "480m":  (28800,  "4H", 2),
+    "720m":  (43200, "12H", 1),
+    "1440m": (86400,  "1D", 1),
+}
+TF_LIST = ["5m", "10m", "15m", "30m", "60m", "120m", "240m", "480m", "720m", "1440m"]
+# OKX 的 12H/1D K 線以 UTC+8 為日界；短週期能整除 8 小時，套用位移不影響結果
+ALIGN_OFF = 8 * 3600
+
+def tf_sec(tf):
+    return HA_TF[tf][0]
+
+def next_open_epoch(now_epoch, tf):
+    """下一根 K 線的開盤 epoch（秒），以 UTC+8 對齊。"""
+    sec = tf_sec(tf)
+    n = int(now_epoch) + ALIGN_OFF
+    return ((n // sec) + 1) * sec - ALIGN_OFF
 
 def load_env(p):
     d = {}
@@ -59,13 +87,17 @@ def pct(v): return str(Decimal(str(v)).normalize())
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post","exitn","amp","chat",
                "pos_open","pos_px","pos_ee","pos_sz","last_bar")
 
-def save_state():
+SHUTTING_DOWN = False
+
+def save_state(force=False):
+    """force=True：寫入當下真實狀態（使用者主動停止時用，避免幽靈策略殘留存檔）。
+    force=False：保留原保護，避免競態把仍在跑的策略誤清空。"""
     try:
         data = {"chat": CHAT_ID, "tf": ACCOUNT_TF, "stats": STATS, "strats": []}
         for k, S in STRATS.items():
             if S.get("alive"):
                 data["strats"].append({a: S[a] for a in SAVE_FIELDS if a in S})
-        if STRATS and not data["strats"]:
+        if not force and STRATS and not data["strats"]:
             return
         def enc(o): return str(o) if isinstance(o, Decimal) else o
         tmp = STATE_FILE + ".tmp"
@@ -173,17 +205,28 @@ async def get_klines(iid, bar, limit=HA_HIST):
     out.reverse()
     return out
 
+def merge_n(kl, n):
+    """把 n 根合成 1 根（舊->新）。用於非原生週期：10m=2x5m、480m=2x4H。"""
+    out = []
+    for i in range(0, len(kl) - n + 1, n):
+        g = kl[i:i+n]
+        out.append({"ts": g[0]["ts"], "o": g[0]["o"],
+                    "h": max(x["h"] for x in g), "l": min(x["l"] for x in g),
+                    "c": g[-1]["c"]})
+    return out
+
 async def klines_and_ha(iid, tf, limit=HA_HIST):
     """回傳 (原始K線, HA序列)，兩者索引一一對應，皆為舊->新。
-    10m 由 5m 合成並對齊 10 分鐘邊界。"""
-    if tf == "10m":
-        kl = await get_klines(iid, "5m", limit * 2 + 10)
-        while kl and int(kl[0]["ts"]) % 600000 != 0:
-            kl.pop(0)
-        if len(kl) % 2: kl = kl[:-1]
-        kl = merge_5m_to_10m(kl)
+    非原生週期先抓底層 bar 再對齊邊界合成。"""
+    sec, bar, mul = HA_TF[tf]
+    if mul == 1:
+        kl = await get_klines(iid, bar, limit)
     else:
-        kl = await get_klines(iid, tf, limit)
+        kl = await get_klines(iid, bar, min(300, limit * mul + mul * 2))
+        pms = sec * 1000
+        while kl and int(kl[0]["ts"]) % pms != 0:
+            kl.pop(0)
+        kl = merge_n(kl, mul)
     if not kl: return [], []
     return kl, calc_ha(kl)
 
@@ -386,7 +429,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     npv = (net / nv * 100) if nv else Decimal(0)
     hs = int(time.time() - ee)
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
-               "hold_s": hs, "bars": round(hs / TF_SEC[S["tf"]], 1),
+               "hold_s": hs, "bars": round(hs / tf_sec(S["tf"]), 1),
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
                "src": src, "ts": hhmmss(),
                "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
@@ -397,7 +440,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
         f"{E.BOT} OKX均K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
         f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
         f"進場價：{fpx}\n出場價：{xpx}\n"
-        f"持倉秒數：{hs}s（約 {hs / TF_SEC[S['tf']]:.1f} 根）\n"
+        f"持倉秒數：{hs}s（約 {hs / tf_sec(S["tf"]):.1f} 根）\n"
         f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
         f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
     for a in ("pos_open", "pos_px", "pos_ee", "pos_sz"):
@@ -435,20 +478,25 @@ async def hloop(app, chat, S):
             if tk: size, fpx, ee = tk
 
         while S["alive"]:
-            tf_sec = TF_SEC[S["tf"]]
+            tf_sec_v = tf_sec(S["tf"])
             oe = next_open_epoch(int(time.time()), S["tf"])
             S["state"] = "持倉中" if S.get("pos_open") else "等訊號"
             save_state()
-            w = oe + HA_LAG - time.time()
-            if w > 0: await asyncio.sleep(w)
+            # 分段睡眠：每 5 秒檢查一次 alive，/stop 後最多 5 秒收工
+            # （長週期若一次睡到底，停止指令要等一整根 K 線才生效）
+            while S["alive"]:
+                w = oe + HA_LAG - time.time()
+                if w <= 0: break
+                await asyncio.sleep(min(5.0, w))
             if not S["alive"]: break
 
-            want = (oe - tf_sec) * 1000
+            want = (oe - tf_sec_v) * 1000
+            tries = 6 if tf_sec_v <= 900 else 15
             ha = []
-            for _ in range(6):
+            for _ in range(tries):
                 ha = await ha_series(iid, S["tf"])
                 if ha and int(ha[-1]["ts"]) >= want: break
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
             S["hb"] = time.time(); S["hb_warned"] = False
             if len(ha) < need:
                 print("歷史K不足", S["sym"], len(ha), "<", need)
@@ -491,7 +539,10 @@ async def hloop(app, chat, S):
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 循環錯誤：{type(e).__name__}: {e}")
     finally:
         S["state"] = "已停止"; S["alive"] = False
-        STRATS.pop(k, None); TASKS.pop(k, None); save_state()
+        # 關機（systemd restart/stop）時保留存檔讓重啟接管；
+        # 其餘情況把真實狀態寫回，避免幽靈策略殘留。
+        if not SHUTTING_DOWN:
+            STRATS.pop(k, None); TASKS.pop(k, None); save_state(True)
         try:
             if await okx_pos(iid, pos):
                 await notify(app, chat, f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 已停止但仍有持倉，請至 OKX 處理")
@@ -507,7 +558,7 @@ async def hb_watch(app):
                 if not S.get("alive"): continue
                 hb = S.get("hb")
                 if not hb: continue
-                lim = TF_SEC[S["tf"]] * HB_BARS
+                lim = tf_sec(S["tf"]) * HB_BARS
                 gap = time.time() - hb
                 if gap > lim and not S.get("hb_warned"):
                     S["hb_warned"] = True
@@ -668,7 +719,9 @@ async def cmd_stop(u, c):
     ps = "long" if d == "L" else "short"
     p = await okx_pos(iid, ps)
     S["alive"] = False
-    save_state()
+    # 立刻移出並寫回存檔，不等迴圈醒來——否則重啟會把停掉的策略撈回來（幽靈策略）
+    STRATS.pop(tg[0], None); TASKS.pop(tg[0], None)
+    save_state(True)
     if p:
         await reply(u, f"{E.BOT} /stop（持倉中）\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                        f"⚠ 已進場不自動平倉\n倉位 {p['pos']} 張 均價 {p.get('avgPx','?')} 浮 {p.get('upl','?')}\n"
@@ -684,9 +737,10 @@ async def cmd_stopall(u, c):
         ps = "long" if d == "L" else "short"
         p = await okx_pos(iid, ps)
         S["alive"] = False
+        STRATS.pop(k, None); TASKS.pop(k, None)
         (held if p else done).append(f"{S['sym']} {S['dir']}")
     orphan = await sweep_h()
-    save_state()
+    save_state(True)
     m = f"{E.BOT} /stopall（均K）\n━━━━━━━━━━\n"
     if done: m += f"已停止策略（{len(done)}）：\n" + "\n".join("・" + x for x in done) + "\n"
     if orphan: m += f"另清除均K 殘留掛單：{orphan} 筆\n"
@@ -852,10 +906,20 @@ async def cmd_coins(u, c):
 
 async def cmd_timeframe(u, c):
     global ACCOUNT_TF
+    opts = " / ".join(TF_LIST)
     if not c.args:
-        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選 3m/5m/10m/15m\n變更：/timeframe 10m"); return
+        L = [f"{E.BOT} 目前週期：{ACCOUNT_TF}", "━" * 10, "可選週期："]
+        for t in TF_LIST:
+            sec, bar, mul = HA_TF[t]
+            src = f"OKX {bar}" if mul == 1 else f"{mul}x OKX {bar} 合成"
+            L.append(f"・{t}（{src}）")
+        L += ["━" * 10, "變更：/timeframe 60m",
+              "※ 僅影響之後新建立的策略",
+              "※ 720m/1440m 以 UTC+8 為日界，與 OKX App 一致"]
+        await reply(u, "\n".join(L)); return
     tf = c.args[0]
-    if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須 3m/5m/10m/15m"); return
+    if tf not in HA_TF:
+        await reply(u, f"{E.BOT} 週期須為：{opts}"); return
     ACCOUNT_TF = tf; save_state()
     await reply(u, f"{E.BOT} ✅ 週期已設為 {tf}\n（僅影響之後新建立的策略）")
 
@@ -867,7 +931,7 @@ async def cmd_menu(u, c):
         "/stop 商品 方向\n/stopall 停全部\n"
         "/status 策略現況\n/summary 當日戰報\n"
         "/ha 商品 根數  燈號+ATR14+ATR14ratio（3~300根）\n"
-        "/timeframe 查看/設定週期\n/coins 幣種\n"
+        f"/timeframe 週期 {TF_LIST[0]}~{TF_LIST[-1]} 共{len(TF_LIST)}種\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "進場：PRE根反轉前色 + POST根反轉後色 + 振幅達標\n"
         "出場：EXIT根反向色 + 振幅達標\n"
@@ -892,6 +956,11 @@ async def job_summary(ctx):
     except Exception as e: print("auto summary fail", e)
 
 # ---------- 啟動 ----------
+async def _post_stop(app):
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
+    print("收到停止訊號，保留策略存檔供重啟接管")
+
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
@@ -928,7 +997,7 @@ async def _post_init(app):
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     print(f"啟動 {ACCT} 均K B6-2（token ...{TOKEN[-6:]}）")
-    app = (Application.builder().token(TOKEN).post_init(_post_init)
+    app = (Application.builder().token(TOKEN).post_init(_post_init).post_stop(_post_stop)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .pool_timeout(30.0).get_updates_read_timeout(40.0)
            .get_updates_connect_timeout(30.0).build())
