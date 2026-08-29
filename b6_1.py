@@ -496,7 +496,16 @@ async def loop(app, chat, S):
             except Exception as e:
                 print("finally sweep fail", S.get("sym"), d, e)
             S["state"] = "已停止"; S["alive"] = False
-            STRATS.pop(k, None); TASKS.pop(k, None); save_state()
+            # 身分檢查：若 STRATS[k] 已被新策略取代，絕不能誤刪，
+            # 否則新策略會從清單消失卻仍在背景掛單（幽靈策略）。
+            if STRATS.get(k) is S:
+                STRATS.pop(k, None)
+            try:
+                if TASKS.get(k) is asyncio.current_task():
+                    TASKS.pop(k, None)
+            except Exception:
+                pass
+            save_state()
 
 # ---------- 啟動接管 ----------
 async def rebuild_strat(d):
@@ -614,6 +623,14 @@ async def cmd_confirm(u, c):
         await do_stopall(u); return
     del PENDING[u.effective_chat.id]
     k = skey(p["sym"], p["dir"])
+    # 先確保同 key 沒有殘存的舊 task 還在跑（幽靈策略防護）
+    old_t = TASKS.get(k)
+    if old_t and not old_t.done():
+        old_s = STRATS.get(k)
+        if old_s: old_s["alive"] = False
+        old_t.cancel()
+        try: await asyncio.wait_for(asyncio.shield(old_t), timeout=5)
+        except Exception: pass
     S = {**p, "alive": True, "state": "等下輪", "chat": u.effective_chat.id}
     STRATS[k] = S
     TASKS[k] = asyncio.create_task(loop(c.application, u.effective_chat.id, S))
