@@ -474,7 +474,10 @@ async def loop(app, chat, S):
                 f"止盈:{tp}({pct(S['tp'])}%)\n止損:{sl}({pct(S['sl'])}%)\n"
                 f"狀　　態：📌 持倉中\n時間：{hhmmss()}")
             await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end)
-            S["catchup"] = False      # 出場後必須等下一個 TF 開始
+            # 出場後允許補掛：出場流程（查 OKX 真實損益）可能耗時數秒而跨進新 TF，
+            # 若新 TF 尚未掛過且剩餘 >= ENTRY_CUTOFF 就立刻掛，避免整輪被跳過。
+            # 若仍在同一個 TF（cur == last_open），迴圈頂端會照常睡到下一個 TF 開始。
+            S["catchup"] = True
     except asyncio.CancelledError:
         raise
     except Exception as e:
