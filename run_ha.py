@@ -1004,7 +1004,7 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
     from openpyxl.utils import get_column_letter
     wb = Workbook()
     ws = wb.active; ws.title = "明細"
-    heads = ["幣種", "日期", "時間", "燈號", "ATR14", "ATR14 ratio(%)"]
+    heads = ["幣種", "週期", "日期", "時間", "燈號", "ATR14", "ATR14 ratio(%)"]
     ws.append(heads)
     hf = Font(bold=True, color="FFFFFF")
     hfill = PatternFill("solid", fgColor="404040")
@@ -1018,16 +1018,17 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
         dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8)
         av, rv = atrs[i]
         up = x["color"] == "G"
-        ws.append([sym, dt.strftime("%Y/%m/%d"), dt.strftime("%H:%M"),
+        ws.append([sym, tf, dt.strftime("%Y/%m/%d"), dt.strftime("%H:%M"),
                    "\U0001F7E9" if up else "\U0001F7E5",
                    float(av) if av is not None else None,
                    float(rv) if rv is not None else None])
         r = ws.max_row
-        ws.cell(row=r, column=4).alignment = Alignment(horizontal="center")
-        ws.cell(row=r, column=5).number_format = afmt
-        ws.cell(row=r, column=6).number_format = "0.0000"
+        ws.cell(row=r, column=2).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=5).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=6).number_format = afmt
+        ws.cell(row=r, column=7).number_format = "0.0000"
     ws.freeze_panes = "A2"
-    for i, w in enumerate([12, 12, 8, 8, 16, 16], start=1):
+    for i, w in enumerate([12, 8, 12, 8, 8, 16, 16], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     va = [float(a) for a, _ in atrs if a is not None]
