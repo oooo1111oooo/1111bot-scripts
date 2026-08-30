@@ -11,7 +11,7 @@ KIND = os.environ.get("REPORT_KIND", "原K")
 FONT = "PingFang TC"
 SIZE = 12
 
-HEAD = ["交易日期","進場時間","出場時間","進場參數","出場參數","幣種","方向","出場原因",
+HEAD = ["交易日期","進場時間","出場時間","進場參數","保證金","幣種","方向","出場原因",
         "埋伏秒數","持倉秒數","進場價","出場價","毛損益","毛損益率(%)","手續費","淨損益"]
 NUM8 = '#,##0.00000000_ ;[Red]\\-#,##0.00000000\\ '
 NUM6 = '#,##0.000000_ ;[Red]\\-#,##0.000000\\ '
@@ -49,7 +49,7 @@ def build(day, recs, out):
         gross = dnum(rec.get("gross")); fee = dnum(rec.get("fee"))
         net = dnum(rec.get("net")); nv = dnum(rec.get("nv"))
         rate = (gross / nv) if nv else 0.0
-        vals = [d0, rec.get("in_ts",""), rec.get("ts",""), rec.get("tf",""), rec.get("te",""),
+        vals = [d0, rec.get("in_ts",""), rec.get("ts",""), rec.get("tf",""), dnum(rec.get("margin")),
                 rec.get("sym",""), rec.get("dir",""), REASON.get(rec.get("reason"), rec.get("reason","")),
                 dnum(rec.get("ambush_s")), dnum(rec.get("hold_s")),
                 dnum(rec.get("in_px")), dnum(rec.get("out_px")),
