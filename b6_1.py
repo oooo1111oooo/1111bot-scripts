@@ -305,7 +305,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
                "src": src, "ts": hhmmss(),
                "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
-               "tf": S["tf"], "te": S["tf"] + "-end",
+               "tf": S["tf"], "margin": str(S["margin"]),
                "in_px": str(fpx), "out_px": str(xpx)})
     await notify(app, S["chat"],
         f"{E.BOT} OKX原K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
