@@ -67,7 +67,7 @@ def pct(v):
 
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","chat",
-               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open","catchup")
+               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","pos_oid","last_open","catchup")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
     # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
@@ -241,7 +241,104 @@ async def sweep(iid, pos, keep=None):
         n += 1
     return n
 
-async def close_record(iid, ps, after_ms, tries=10):
+async def order_detail(iid, oid, tries=10):
+    """查訂單成交明細（成交後即時可得）。回傳 {avgPx, fee, sz} 或 None。"""
+    if not oid:
+        return None
+    for _ in range(tries):
+        st = await api("GET", f"/api/v5/trade/order?instId={iid}&ordId={oid}")
+        if st.get("code") == "0" and st.get("data"):
+            dd = st["data"][0]
+            if dd.get("state") == "filled" and dd.get("avgPx"):
+                return {"avgPx": Decimal(dd["avgPx"]),
+                        "fee": Decimal(dd.get("fee") or "0"),
+                        "sz": Decimal(dd.get("accFillSz") or dd.get("sz") or "0")}
+        await asyncio.sleep(1)
+    return None
+
+def _from_ph(ph, size, ctval, fpx):
+    """由 positions-history 取值（OKX 官方口徑）。"""
+    g = Decimal(ph.get("pnl") or "0")
+    fee = Decimal(ph.get("fee") or "0") + Decimal(ph.get("fundingFee") or "0")
+    net = Decimal(ph.get("realizedPnl") or "0")
+    xpx = Decimal(ph.get("closeAvgPx") or "0")
+    opx = Decimal(ph.get("openAvgPx") or "0") or fpx
+    csz = Decimal(ph.get("closeTotalPos") or "0") or size
+    nv = opx * csz * ctval
+    return g, fee, net, nv, xpx
+
+def _from_orders(od_in, od_out, d, size, ctval):
+    """由進出場訂單成交明細取值（OKX 實收手續費與成交均價）。"""
+    opx = od_in["avgPx"]; xpx = od_out["avgPx"]
+    fee = od_in["fee"] + od_out["fee"]
+    g = (xpx - opx) * size * ctval if d == "L" else (opx - xpx) * size * ctval
+    return g, fee, g + fee, opx * size * ctval, xpx
+
+async def reconcile_pending(app, days=3):
+    """背景補帳：掃描近幾日紀錄檔，把 PENDING 的財務數字向 OKX 補齊。"""
+    filled = 0
+    for back in range(days):
+        t = (now8() - timedelta(days=back)).strftime("%Y-%m-%d")
+        fp = trade_file(t)
+        try:
+            arr = json.load(open(fp))
+        except Exception:
+            continue
+        changed = False
+        for rec in arr:
+            if rec.get("src") != "PENDING":
+                continue
+            iid = rec.get("iid"); pos = rec.get("pos")
+            if not iid or not pos:
+                continue
+            fpx = Decimal(rec.get("in_px") or "0")
+            size = Decimal("0")
+            g = fee = net = nv = xpx = None; src = None
+            ph = await close_record(iid, pos, int(rec.get("t0") or 0), tries=1)
+            if ph:
+                g, fee, net, nv, xpx = _from_ph(ph, size, Decimal("1"), fpx)
+                src = "OKX"
+            else:
+                od_out = await order_detail(iid, rec.get("xoid"), tries=1)
+                od_in = await order_detail(iid, rec.get("eoid"), tries=1)
+                if od_out and od_in:
+                    sz = od_out.get("sz") or Decimal("0")
+                    try:
+                        sp = await get_spec(rec["sym"])
+                        ctv = sp["ctval"]
+                    except Exception:
+                        ctv = Decimal("1")
+                    g, fee, net, nv, xpx = _from_orders(od_in, od_out, rec["dir"], sz, ctv)
+                    src = "訂單"
+            if src:
+                rec["gross"] = str(g); rec["fee"] = str(fee)
+                rec["net"] = str(net); rec["nv"] = str(nv)
+                rec["out_px"] = str(xpx); rec["src"] = src
+                rec["filled_at"] = hhmmss()
+                changed = True; filled += 1
+            await asyncio.sleep(0.2)
+        if changed:
+            try:
+                tmp = fp + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(arr, f, default=str); f.flush(); os.fsync(f.fileno())
+                os.replace(tmp, fp)
+            except Exception as e:
+                print("reconcile write fail", e)
+    return filled
+
+async def reconcile_watch(app):
+    """每 5 分鐘嘗試補帳一次；補到就通知。"""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            n = await reconcile_pending(app)
+            if n and CHAT_ID:
+                await notify(app, CHAT_ID, f"{E.BOT} ✅ 補帳完成：已向 OKX 回填 {n} 筆待補紀錄")
+        except Exception as e:
+            print("reconcile_watch fail", e)
+
+async def close_record(iid, ps, after_ms, tries=3):
     """出場後取 OKX 真實平倉紀錄。"""
     for i in range(tries):
         r = await api("GET", f"/api/v5/account/positions-history?instType=SWAP&instId={iid}&limit=10")
@@ -268,7 +365,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
             pass
     else:
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 平倉時 OKX 已無持倉，略過")
-        for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
+        for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_oid"):
             S.pop(a, None)
         save_state()
         return True
@@ -281,32 +378,50 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
         em = (xr.get("data") or [{}])[0].get("sMsg") or xr.get("msg")
         await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 平倉失敗：{em}\n⚠ 倉位可能仍在，請至 OKX 確認")
         return False
-    ph = await close_record(iid, pos, t0)
-    src = "OKX"
+    # 財務數字一律以 OKX 為準，絕不估算。
+    #   1. positions-history（官方口徑，含資金費）
+    #   2. 訂單成交明細（OKX 實收手續費與成交均價）
+    #   3. 兩者皆取不到 -> 寫入 null 並標記 pending，由背景補帳任務事後回填
+    xoid = (xr.get("data") or [{}])[0].get("ordId")
+    eoid = S.get("pos_oid")
+    g = fee = net = nv = xpx = None
+    src = "PENDING"
+    ph = await close_record(iid, pos, t0, tries=3)
     if ph:
-        g = Decimal(ph.get("pnl") or "0")
-        fee = Decimal(ph.get("fee") or "0") + Decimal(ph.get("fundingFee") or "0")
-        net = Decimal(ph.get("realizedPnl") or "0")
-        xpx = Decimal(ph.get("closeAvgPx") or "0") or await get_last(iid)
-        nv = Decimal(ph.get("openAvgPx") or fpx) * Decimal(ph.get("closeTotalPos") or size) * spec["ctval"]
+        g, fee, net, nv, xpx = _from_ph(ph, size, spec["ctval"], fpx)
+        src = "OKX"
     else:
-        src = "估算"
-        xpx = await get_last(iid)
-        g = (xpx - fpx) * size * spec["ctval"] if d == "L" else (fpx - xpx) * size * spec["ctval"]
-        fee = Decimal(0); net = g
-        nv = fpx * size * spec["ctval"]
+        od_out = await order_detail(iid, xoid, tries=8)
+        od_in = await order_detail(iid, eoid, tries=2) if eoid else None
+        if od_out and od_in:
+            g, fee, net, nv, xpx = _from_orders(od_in, od_out, d, size, spec["ctval"])
+            src = "訂單"
+    hs = int(time.time() - ee)
+    amb_s = f"{round(ee - pt)}s" if pt else "-"
+    rec = {"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
+           "ambush_s": round(ee - pt) if pt else 0, "hold_s": hs,
+           "gross": None if g is None else str(g),
+           "fee": None if fee is None else str(fee),
+           "net": None if net is None else str(net),
+           "nv": None if nv is None else str(nv),
+           "src": src, "ts": hhmmss(),
+           "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
+           "tf": S["tf"], "margin": str(S["margin"]),
+           "in_px": str(fpx), "out_px": None if xpx is None else str(xpx),
+           "iid": iid, "pos": pos, "t0": t0, "eoid": eoid, "xoid": xoid}
+    log_trade(rec)
+    if src == "PENDING":
+        await notify(app, S["chat"],
+            f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 已平倉，但 OKX 損益尚未回報\n"
+            f"出場原因：{reason}｜持倉 {hs}s\n"
+            f"已標記待補帳，背景任務會自動回填（可用 /audit 追蹤）\n時間：{hhmmss()}")
+        for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_oid"):
+            S.pop(a, None)
+        save_state()
+        return True
     gp = (g / nv * 100) if nv else Decimal(0)
     fp = (fee / nv * 100) if nv else Decimal(0)
     npv = (net / nv * 100) if nv else Decimal(0)
-    hs = int(time.time() - ee)
-    amb_s = f"{round(ee - pt)}s" if pt else "-"
-    log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
-               "ambush_s": round(ee - pt) if pt else 0, "hold_s": hs,
-               "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
-               "src": src, "ts": hhmmss(),
-               "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
-               "tf": S["tf"], "margin": str(S["margin"]),
-               "in_px": str(fpx), "out_px": str(xpx)})
     await notify(app, S["chat"],
         f"{E.BOT} OKX原K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
         f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
@@ -314,8 +429,10 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
         f"止盈:{tp}({pct(S['tp'])}%)\n止損:{sl}({pct(S['sl'])}%)\n"
         f"出場:{xpx}({gp:+.3f}%) | {hhmmss()} | {hs}s\n"
         f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
-        f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
-    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
+        f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n"
+        + ("" if src == "OKX" else f"⚠ 來源：{src}\n")
+        + f"時間：{hhmmss()}")
+    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_oid"):
         S.pop(a, None)
     save_state()
     return True
@@ -348,7 +465,7 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_en
                     pass
             if not p_chk:
                 await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉），本輪結束")
-                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
+                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_oid"):
                     S.pop(a, None)
                 save_state(); return
         if reason:
@@ -379,7 +496,7 @@ async def loop(app, chat, S):
                 await notify(app, chat, f"{E.BOT} {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} 已接管既有持倉，恢復 TP/SL/TE 監控")
                 await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt0, k, tf_end0)
             else:
-                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
+                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_oid"):
                     S.pop(a, None)
                 save_state()
 
@@ -466,6 +583,7 @@ async def loop(app, chat, S):
             S["state"] = "持倉中"
             S["pos_open"] = True; S["pos_px"] = str(fpx)
             S["pos_tp"] = str(tp); S["pos_sl"] = str(sl); S["pos_ee"] = ee; S["pos_pt"] = pt
+            S["pos_oid"] = oid
             save_state()
             await notify(app, chat,
                 f"{E.BOT} OKX原K｜{ACCT}\n事件：🔔 已進場成交\n"
@@ -515,7 +633,7 @@ async def rebuild_strat(d):
          "offset": Decimal(str(d["offset"])), "tp": Decimal(str(d["tp"])),
          "sl": Decimal(str(d["sl"])), "spec": spec,
          "alive": True, "state": "等下輪", "chat": d.get("chat", CHAT_ID)}
-    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "last_open", "catchup"):
+    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_oid", "last_open", "catchup"):
         if a in d: S[a] = d[a]
     return S
 
@@ -808,12 +926,19 @@ async def cmd_status(u, c):
     await reply(u, "\n".join(L))
 
 # ---------- /summary ----------
-def sum_lines(rs, placed, entered):
+def sum_lines(rs_all, placed, entered):
     L = []
+    pend = [r for r in rs_all if r.get("src") == "PENDING" or r.get("net") is None]
+    rs = [r for r in rs_all if r not in pend]
     m = len(rs)
     hit = (entered / placed * 100) if placed else 0
-    amb = ("%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs) / m)) if m else "-"
+    amb = ("%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs_all) / len(rs_all))) if rs_all else "-"
     L.append("次數:%d | %d(%s) | %.2f%%" % (placed, entered, amb, hit))
+    if pend:
+        L.append("%s 待補帳:%d 筆（未計入損益）" % (E.LOSS, len(pend)))
+    if not m:
+        L.append("尚無已確認損益")
+        return L
     NAME = {"Take_Profit": "TP", "Stop_Loss": "SL", "Time_Exit": "TE"}
     for lab, cats in (("獲利", ("Take_Profit", "Time_Exit")), ("虧損", ("Stop_Loss", "Time_Exit"))):
         if lab == "獲利":
@@ -1082,6 +1207,76 @@ async def cmd_amp(u, c):
                    f"最大 {max(seg):.4f}% | 最小 {min(seg):.4f}%\n"
                    f"時間：{hhmmss()}")
 
+async def cmd_audit(u, c):
+    """對帳：本地紀錄 vs OKX positions-history。用法：/audit [YYYYMMDD]"""
+    day = c.args[0] if c.args else now8().strftime("%Y%m%d")
+    t = day[:4] + "-" + day[4:6] + "-" + day[6:8]
+    recs = load_trades(t)
+    if not recs:
+        await reply(u, f"{E.BOT} {t} 無本地交易紀錄"); return
+    await reply(u, f"{E.BOT} 對帳中：{t}，本地 {len(recs)} 筆…")
+    s8 = now8().replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        s8 = s8.replace(year=int(day[:4]), month=int(day[4:6]), day=int(day[6:8]))
+    except Exception:
+        pass
+    sms = int(s8.timestamp() * 1000)
+    ph = []; after = ""; pages = 0
+    while pages < 20:
+        q = "/api/v5/account/positions-history?instType=SWAP&limit=100"
+        if after:
+            q += "&after=" + after
+        r = await api("GET", q)
+        if r.get("code") != "0":
+            break
+        batch = r.get("data") or []
+        if not batch:
+            break
+        pages += 1
+        stop = False
+        for p in batch:
+            ut = int(p.get("uTime") or 0)
+            if ut >= sms and ut < sms + 86400000:
+                ph.append(p)
+            elif ut < sms:
+                stop = True
+        if stop or len(batch) < 100:
+            break
+        after = batch[-1].get("posId") or ""
+        if not after:
+            break
+    ln = sum(Decimal(str(x.get("net") or "0")) for x in recs)
+    lf = sum(Decimal(str(x.get("fee") or "0")) for x in recs)
+    on = sum(Decimal(p.get("realizedPnl") or "0") for p in ph)
+    of = sum(Decimal(p.get("fee") or "0") + Decimal(p.get("fundingFee") or "0") for p in ph)
+    from collections import Counter
+    srcs = Counter(x.get("src") for x in recs)
+    L = [f"{E.BOT} OKX原K｜{ACCT}", f"📋 對帳 {t}", "━" * 10,
+         f"本地筆數：{len(recs)}｜OKX：{len(ph)}",
+         "來源分佈：" + "、".join(f"{k}×{v}" for k, v in srcs.items()),
+         "━" * 10,
+         f"本地淨損益：{ln:+.6f}",
+         f"OKX 淨損益：{on:+.6f}",
+         f"差異：{ln - on:+.6f}",
+         "━" * 10,
+         f"本地手續費：{lf:+.6f}",
+         f"OKX 手續費：{of:+.6f}",
+         f"差異：{lf - of:+.6f}",
+         "━" * 10]
+    if len(recs) != len(ph):
+        L.append(f"{E.LOSS} 筆數不符，OKX 可能尚未完全落帳")
+    elif abs(ln - on) < Decimal("0.000001") and abs(lf - of) < Decimal("0.000001"):
+        L.append("✅ 完全一致")
+    else:
+        L.append(f"{E.LOSS} 有差異，請人工核對")
+    zero = [x for x in recs if Decimal(str(x.get("fee") or "0")) == 0]
+    if zero:
+        L.append(f"⚠ 手續費為 0 的紀錄：{len(zero)} 筆")
+        for x in zero[:5]:
+            L.append(f"　{x['ts']} {x['sym']} {x['dir']} src={x.get('src')}")
+    L.append(f"時間：{hhmmss()}")
+    await reply(u, "\n".join(L))
+
 async def cmd_coins(u, c):
     on = [s["symbol"] for s in SYMS if s["enabled"]]
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
@@ -1111,6 +1306,7 @@ async def cmd_menu(u, c):
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 當日戰報\n"
         "/amp 商品 根數  振幅報表 Excel 寄信（3~2000根）\n"
+        "/audit [YYYYMMDD]  與 OKX 對帳\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         f"一個 TF 一輪：TF 開始埋伏\n"
@@ -1141,6 +1337,7 @@ async def _post_init(app):
             BotCommand("summary", "當日戰報"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
+            BotCommand("audit", "對帳 OKX"),
             BotCommand("stopall", "停全部"),
             BotCommand("stop", "停指定"),
             BotCommand("run", "建立策略"),
@@ -1169,6 +1366,9 @@ async def _post_init(app):
     except Exception as e:
         print("schedule fail", e)
     await startup_recover(app)
+    _rc = asyncio.create_task(reconcile_watch(app))
+    _BG.add(_rc); _rc.add_done_callback(_BG.discard)
+    print("補帳背景任務已啟動（每 5 分鐘）")
 
 async def _post_stop(app):
     global SHUTTING_DOWN
@@ -1185,7 +1385,7 @@ def main():
            .get_updates_connect_timeout(30.0).build())
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
-                    ("summary", cmd_summary), ("amp", cmd_amp),
+                    ("summary", cmd_summary), ("amp", cmd_amp), ("audit", cmd_audit),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
