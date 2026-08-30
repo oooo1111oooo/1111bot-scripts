@@ -30,6 +30,9 @@ STATE_FILE = "/srv/1111bot/data/strategies_ha_o3333o.json"
 HA_LAG = 5           # 收線後幾秒才抓 K 線（等 OKX 資料落定）
 HA_HIST = 120        # 抓幾根歷史 K 線做 HA 遞迴
 HB_BARS = 3          # 心跳超過幾根 K 線未推進就告警
+HA_MAX  = 2000       # /ha 單次最多抓幾根
+HA_MAX  = 2000       # /ha 單次最多抓幾根
+HA_INLINE = 30       # /ha 根數 <= 此值直接顯示在 TG，超過則產 Excel 寄信
 
 # 均K 專屬週期表（不共用原K 的 normal.TF_SEC，兩邊互不影響）
 # tf -> (秒數, OKX bar, 合成倍數)  合成倍數 >1 表示該週期非交易所原生，需自行合成
@@ -205,6 +208,67 @@ async def get_klines(iid, bar, limit=HA_HIST):
     out.reverse()
     return out
 
+async def get_klines_paged(iid, bar, want):
+    """翻頁抓已收線 K 線（舊->新）。
+    /market/candles 只保留最近約 1440 根，翻不動時自動改用 /market/history-candles。"""
+    out = {}
+    after = None
+    ep = "candles"
+    for _ in range(40):                      # 上限保護，避免無限翻頁
+        q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit=300"
+        if after is not None:
+            q += f"&after={after}"
+        r = await pub(q)
+        data = (r.get("data") or []) if r.get("code") == "0" else []
+        if not data:
+            if ep == "candles":
+                ep = "history-candles"; continue
+            break
+        oldest = None
+        for cd in data:
+            try:
+                ts = int(cd[0])
+                oldest = ts if oldest is None else min(oldest, ts)
+                if len(cd) >= 9 and str(cd[8]) != "1":
+                    continue
+                if ts in out:
+                    continue
+                out[ts] = {"ts": ts, "o": Decimal(cd[1]), "h": Decimal(cd[2]),
+                           "l": Decimal(cd[3]), "c": Decimal(cd[4])}
+            except Exception:
+                continue
+        if len(out) >= want:
+            break
+        if oldest is None or (after is not None and oldest >= after):
+            if ep == "candles":
+                ep = "history-candles"; after = oldest or after; continue
+            break
+        after = oldest
+        await asyncio.sleep(0.15)
+    kl = [out[t] for t in sorted(out)]
+    return kl[-want:] if len(kl) > want else kl
+
+async def klines_paged_for_tf(iid, tf, want):
+    """依週期抓 want 根（非原生週期先抓底層 bar 再合成）。"""
+    sec, bar, mul = HA_TF[tf]
+    if mul == 1:
+        return await get_klines_paged(iid, bar, want)
+    kl = await get_klines_paged(iid, bar, want * mul + mul * 2)
+    kl = align_head(kl, sec * 1000, mul)
+    kl = merge_n(kl, mul)
+    return kl[-want:] if len(kl) > want else kl
+
+def align_head(kl, period_ms, n):
+    """丟掉開頭沒對齊合成邊界的零星根。最多丟 n-1 根；丟完仍對不上就是資料異常，
+    直接回空並記錄，避免無聲把整串資料清光。"""
+    dropped = 0
+    while kl and int(kl[0]["ts"]) % period_ms != 0 and dropped < n:
+        kl.pop(0); dropped += 1
+    if kl and int(kl[0]["ts"]) % period_ms != 0:
+        print("align_head: 時間戳無法對齊合成邊界", kl[0]["ts"], period_ms)
+        return []
+    return kl
+
 def merge_n(kl, n):
     """把 n 根合成 1 根（舊->新）。用於非原生週期：10m=2x5m、480m=2x4H。"""
     out = []
@@ -215,6 +279,58 @@ def merge_n(kl, n):
                     "c": g[-1]["c"]})
     return out
 
+async def get_klines_paged(iid, bar, want):
+    """往回翻頁抓已收線 K 線，回傳舊->新。
+    candles 只保留最近約 1440 根，翻不動時自動改用 history-candles 續抓。"""
+    got = {}
+    after = None
+    ep = "candles"
+    for _ in range(40):
+        if len(got) >= want: break
+        q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit=300"
+        if after: q += f"&after={after}"
+        r = await pub(q)
+        if r.get("code") != "0":
+            if ep == "candles":
+                ep = "history-candles"; continue
+            break
+        data = r.get("data") or []
+        if not data:
+            if ep == "candles":
+                ep = "history-candles"; continue
+            break
+        new = 0
+        for c in data:
+            try:
+                if len(c) >= 9 and str(c[8]) != "1": continue
+                t = int(c[0])
+                if t in got: continue
+                got[t] = {"ts": t, "o": Decimal(c[1]), "h": Decimal(c[2]),
+                          "l": Decimal(c[3]), "c": Decimal(c[4])}
+                new += 1
+            except Exception:
+                continue
+        after = data[-1][0]          # 該頁最舊的 ts，用來繼續往回翻
+        if new == 0:
+            if ep == "candles":
+                ep = "history-candles"; continue
+            break
+        await asyncio.sleep(0.12)
+    out = [got[t] for t in sorted(got)]
+    return out[-want:] if len(out) > want else out
+
+async def klines_paged_for_tf(iid, tf, want):
+    """依週期翻頁抓 K 線；非原生週期先抓底層 bar 再對齊合成。"""
+    sec, bar, mul = HA_TF[tf]
+    if mul == 1:
+        return await get_klines_paged(iid, bar, want)
+    kl = await get_klines_paged(iid, bar, want * mul + mul * 4)
+    pms = sec * 1000
+    while kl and int(kl[0]["ts"]) % pms != 0:
+        kl.pop(0)
+    kl = merge_n(kl, mul)
+    return kl[-want:] if len(kl) > want else kl
+
 async def klines_and_ha(iid, tf, limit=HA_HIST):
     """回傳 (原始K線, HA序列)，兩者索引一一對應，皆為舊->新。
     非原生週期先抓底層 bar 再對齊邊界合成。"""
@@ -223,9 +339,7 @@ async def klines_and_ha(iid, tf, limit=HA_HIST):
         kl = await get_klines(iid, bar, limit)
     else:
         kl = await get_klines(iid, bar, min(300, limit * mul + mul * 2))
-        pms = sec * 1000
-        while kl and int(kl[0]["ts"]) % pms != 0:
-            kl.pop(0)
+        kl = align_head(kl, sec * 1000, mul)
         kl = merge_n(kl, mul)
     if not kl: return [], []
     return kl, calc_ha(kl)
@@ -876,21 +990,6 @@ async def cmd_summary(u, c):
         D += ["━" * 10, f"時間：{hhmmss()}"]
         await reply(u, "\n".join(D))
 
-async def _reply_long(u, head, lines, tail):
-    """把長清單拆成多則訊息送出（Telegram 單則上限 4096 字元）。"""
-    LIM = 3500
-    buf = list(head); msgs = []
-    for ln in lines:
-        if sum(len(x) + 1 for x in buf) + len(ln) + 1 > LIM and len(buf) > len(head):
-            msgs.append("\n".join(buf)); buf = list(head)
-        buf.append(ln)
-    buf += tail
-    msgs.append("\n".join(buf))
-    for i, m in enumerate(msgs):
-        if len(msgs) > 1:
-            m = m.replace("事件：燈號檢視", f"事件：燈號檢視（{i+1}/{len(msgs)}）", 1)
-        await reply(u, m)
-
 def _fmt_atr(v, tick):
     """ATR 依商品 tick 決定小數位，避免大幣印一堆 0 或小幣被截斷。"""
     if v is None: return "-"
@@ -898,41 +997,167 @@ def _fmt_atr(v, tick):
     q = Decimal(1).scaleb(-max(2, min(8, exp + 1)))
     return str(v.quantize(q))
 
-async def cmd_ha(u, c):
-    """燈號(HA) + ATR14/ATR14 ratio(原始K線)。用法：/ha ETHUSDT [根數 3~300]"""
-    if not c.args:
-        await reply(u, f"{E.BOT} 用法：/ha ETHUSDT 30\n"
-                       f"根數範圍 3~300（預設 20）\n"
-                       f"欄位：漲跌燈號(HA)｜ATR14｜ATR14 ratio\n"
-                       f"※ ATR 以原始 K 線計算，非 HA\n"
-                       f"週期依 /timeframe，目前 {ACCOUNT_TF}"); return
-    sym = c.args[0].upper()
-    n = 20
-    if len(c.args) >= 2:
-        try: n = max(3, min(300, int(c.args[1])))
-        except Exception: pass
-    try: spec = await get_spec(sym)
-    except Exception: await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
-    kl, ha = await klines_and_ha(spec["iid"], ACCOUNT_TF, limit=min(300, max(HA_HIST, n + 20)))
-    if not ha: await reply(u, f"{E.BOT} {sym} K 線取得失敗"); return
-    atrs = calc_atr(kl, 14)
-    st = max(0, len(ha) - n)
-    head = [f"{E.BOT} OKX均K｜{ACCT}",
-            f"事件：燈號檢視 {sym} {ACCOUNT_TF}",
-            f"共 {len(ha) - st} 根（舊→新）｜ATR14 / ATR14 ratio",
-            "※ ATR 取原始 K 線，燈號取 HA",
-            "━" * 10]
-    lines = []
-    for i in range(st, len(ha)):
-        x = ha[i]
-        tt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
-        lg = "🟩" if x["color"] == "G" else "🟥"
+def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
+    """明細＋統計兩張表。欄位：幣種 / 日期 / 時間 / 燈號 / ATR14 / ATR14 ratio"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    ws = wb.active; ws.title = "明細"
+    heads = ["幣種", "日期", "時間", "燈號", "ATR14", "ATR14 ratio(%)"]
+    ws.append(heads)
+    hf = Font(bold=True, color="FFFFFF")
+    hfill = PatternFill("solid", fgColor="404040")
+    for i in range(1, len(heads) + 1):
+        cc = ws.cell(row=1, column=i); cc.font = hf; cc.fill = hfill
+        cc.alignment = Alignment(horizontal="center")
+    gfill = PatternFill("solid", fgColor="C6EFCE")
+    rfill = PatternFill("solid", fgColor="FFC7CE")
+    exp = -tick.as_tuple().exponent
+    ndp = max(2, min(8, exp + 1))
+    afmt = "0." + "0" * ndp
+    for i, x in enumerate(ha):
+        dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8)
         av, rv = atrs[i]
-        avs = _fmt_atr(av, spec["tick"])
-        rvs = f"{rv:.4f}%" if rv is not None else "-"
-        lines.append(f"{tt} {lg} {avs} | {rvs}")
-    tail = ["━" * 10, f"時間：{hhmmss()}"]
-    await _reply_long(u, head, lines, tail)
+        up = x["color"] == "G"
+        ws.append([sym, dt.strftime("%Y/%m/%d"), dt.strftime("%H:%M"),
+                   "漲" if up else "跌",
+                   float(av) if av is not None else None,
+                   float(rv) if rv is not None else None])
+        r = ws.max_row
+        ws.cell(row=r, column=4).fill = gfill if up else rfill
+        ws.cell(row=r, column=4).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=5).number_format = afmt
+        ws.cell(row=r, column=6).number_format = "0.0000"
+    ws.freeze_panes = "A2"
+    for i, w in enumerate([12, 12, 8, 8, 16, 16], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    va = [float(a) for a, _ in atrs if a is not None]
+    vr = [float(r) for _, r in atrs if r is not None]
+    ng = sum(1 for x in ha if x["color"] == "G")
+    def stat(v):
+        if not v: return ("-", "-", "-", "-")
+        sv = sorted(v); m = len(sv)
+        med = sv[m // 2] if m % 2 else (sv[m // 2 - 1] + sv[m // 2]) / 2
+        return (sum(v) / m, med, max(v), min(v))
+    aA, aM, aX, aN = stat(va)
+    rA, rM, rX, rN = stat(vr)
+    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
+    w2 = wb.create_sheet("統計")
+    rows = [["項目", "數值"],
+            ["幣種", sym], ["週期", tf], ["根數", len(ha)],
+            ["期間起", t0], ["期間迄", t1],
+            ["漲(綠)根數", ng], ["跌(紅)根數", len(ha) - ng],
+            ["漲佔比(%)", round(ng / len(ha) * 100, 2) if ha else 0],
+            ["ATR14 平均", aA], ["ATR14 中位", aM], ["ATR14 最大", aX], ["ATR14 最小", aN],
+            ["ATR14 ratio 平均(%)", rA], ["ATR14 ratio 中位(%)", rM],
+            ["ATR14 ratio 最大(%)", rX], ["ATR14 ratio 最小(%)", rN],
+            ["燈號來源", "Heikin-Ashi"], ["ATR 來源", "原始 K 線（Wilder 平滑）"],
+            ["產生時間", now8().strftime("%Y/%m/%d %H:%M:%S")]]
+    for r in rows: w2.append(r)
+    for i in range(1, 3):
+        cc = w2.cell(row=1, column=i); cc.font = hf; cc.fill = hfill
+    w2.column_dimensions["A"].width = 24
+    w2.column_dimensions["B"].width = 24
+    wb.save(path)
+
+def send_ha_mail(path, name, sym, tf, m, aA, rA):
+    """寄出均K 燈號+ATR 報表。回傳 (ok, 訊息)。"""
+    import smtplib
+    from email.message import EmailMessage
+    env = {}
+    try:
+        for line in open("/srv/1111bot/.env"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception as e:
+        return False, "讀 .env 失敗：%s" % e
+    user = env.get("GMAIL_USER")
+    pwd = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "")
+    to = env.get("REPORT_TO") or user
+    if not user or not pwd:
+        return False, "未設定 GMAIL_USER / GMAIL_APP_PASSWORD"
+    msg = EmailMessage()
+    msg["Subject"] = "OKX %s 均K燈號+ATR %s %s（%d 根）" % (ACCT, sym, tf, m)
+    msg["From"] = user; msg["To"] = to
+    msg.set_content(
+        "商品 %s\n週期 %s\n根數 %d\n"
+        "ATR14 平均 %s\nATR14 ratio 平均 %s%%\n"
+        "欄位：幣種 / 日期 / 時間 / 燈號 / ATR14 / ATR14 ratio\n"
+        "燈號取 Heikin-Ashi，ATR 取原始 K 線\n" % (sym, tf, m, aA, rA))
+    msg.add_attachment(open(path, "rb").read(),
+                       maintype="application",
+                       subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       filename=name)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as sv:
+        sv.login(user, pwd); sv.send_message(msg)
+    return True, to
+
+async def cmd_ha(u, c):
+    """均K 燈號+ATR 報表（Excel 寄信）。用法：/ha ETHUSDT [根數 3~2000]"""
+    if not c.args:
+        await reply(u, f"{E.BOT} 用法：/ha ETHUSDT 900\n"
+                       f"根數 3~{HA_MAX}（預設 300）\n"
+                       f"產生 Excel（明細＋統計）寄到信箱\n"
+                       f"欄位：幣種/日期/時間/燈號/ATR14/ATR14 ratio\n"
+                       f"※ 燈號取 HA，ATR 取原始 K 線\n"
+                       f"目前週期：{ACCOUNT_TF}")
+        return
+    sym = c.args[0].upper()
+    n = 300
+    if len(c.args) >= 2:
+        try: n = max(3, min(HA_MAX, int(c.args[1])))
+        except Exception: pass
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
+    await reply(u, f"{E.BOT} 產生 {sym} {ACCOUNT_TF} 燈號+ATR 報表中（{n} 根），請稍候…")
+    try:
+        kl = await klines_paged_for_tf(spec["iid"], ACCOUNT_TF, n + 20)   # +20 給 ATR14 暖身
+    except Exception as e:
+        await reply(u, f"{E.LOSS} K 線取得失敗：{type(e).__name__}: {e}"); return
+    if not kl:
+        await reply(u, f"{E.BOT} {sym} K 線取得失敗"); return
+    ha_all = calc_ha(kl)
+    atr_all = calc_atr(kl, 14)
+    st = max(0, len(ha_all) - n)
+    ha = ha_all[st:]; atrs = atr_all[st:]
+    m = len(ha)
+    if m < 3:
+        await reply(u, f"{E.BOT} {sym} {ACCOUNT_TF} 可用 K 線僅 {m} 根，不足以產表"); return
+    day = now8().strftime("%Y%m%d")
+    name = f"OKX_{ACCT}_均K_{sym}_{ACCOUNT_TF}_{m}根_{day}.xlsx"
+    path = f"/srv/1111bot/data/{name}"
+    try:
+        build_ha_xlsx(sym, ACCOUNT_TF, ha, atrs, spec["tick"], path)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 產生 Excel 失敗：{type(e).__name__}: {e}"); return
+    va = [a for a, _ in atrs if a is not None]
+    vr = [r for _, r in atrs if r is not None]
+    aA = (sum(va) / len(va)) if va else Decimal(0)
+    rA = (sum(vr) / len(vr)) if vr else Decimal(0)
+    aAs = _fmt_atr(aA, spec["tick"]); rAs = f"{rA:.4f}"
+    try:
+        ok, info = send_ha_mail(path, name, sym, ACCOUNT_TF, m, aAs, rAs)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
+    if not ok:
+        await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
+    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    ng = sum(1 for x in ha if x["color"] == "G")
+    await reply(u, f"{E.BOT} ✅ 均K 報表已寄出\n"
+                   f"{sym} {ACCOUNT_TF}｜{m} 根\n"
+                   f"期間：{t0} ~ {t1}\n"
+                   f"燈號：🟩{ng} / 🟥{m - ng}\n"
+                   f"ATR14 平均 {aAs}\n"
+                   f"ATR14 ratio 平均 {rAs}%\n"
+                   f"時間：{hhmmss()}")
 
 async def cmd_coins(u, c):
     on = [s["symbol"] for s in SYMS if s["enabled"]]
@@ -973,7 +1198,7 @@ async def cmd_menu(u, c):
         f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/stop 商品 方向\n/stopall 停全部\n"
         "/status 策略現況\n/summary 當日戰報\n"
-        "/ha 商品 根數  燈號+ATR14+ATR14ratio（3~300根）\n"
+        f"/ha 商品 根數  燈號+ATR14（≤{HA_INLINE}顯示 / >{HA_INLINE}寄Excel，上限{HA_MAX}）\n"
         f"/timeframe 週期 {TF_LIST[0]}~{TF_LIST[-1]} 共{len(TF_LIST)}種\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "進場：PRE根反轉前色 + POST根反轉後色 + 振幅達標\n"
@@ -1010,7 +1235,7 @@ async def _post_init(app):
     CMDS = [BotCommand("run", "建立均K策略"),
             BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
             BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
-            BotCommand("ha", "燈號+ATR14 3~300根"), BotCommand("timeframe", "週期"),
+            BotCommand("ha", "燈號+ATR14 3~2000根"), BotCommand("timeframe", "週期"),
             BotCommand("coins", "幣種"), BotCommand("menu", "說明")]
     scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
     try:
