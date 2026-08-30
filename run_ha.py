@@ -361,11 +361,22 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
                 return False
         await asyncio.sleep(1)
     if fpx is None:
-        p = await okx_pos(iid, pos)
+        # 查單沒回 filled 不代表沒成交；多查幾次持倉再判定，
+        # 否則會出現「OKX 已有倉、程式卻以為空手」而下一根重複進場。
+        p = None
+        for _ in range(3):
+            p = await okx_pos(iid, pos)
+            if p: break
+            await asyncio.sleep(2)
         if not p:
-            await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 進場未確認成交，跳過本輪")
+            await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 進場未確認成交，跳過本輪\n⚠ 若 OKX 實際有倉請手動處理")
             return False
         fpx = Decimal(p.get("avgPx") or await get_last(iid))
+        try:
+            rsz = abs(Decimal(str(p.get("pos") or "0")))
+            if rsz > 0: size = rsz
+        except Exception:
+            pass
     bump(k, "entered")
     ee = time.time()
     S["state"] = "持倉中"; S["pos_open"] = True
@@ -540,10 +551,28 @@ async def hloop(app, chat, S):
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 循環錯誤：{type(e).__name__}: {e}")
     finally:
         S["state"] = "已停止"; S["alive"] = False
+        # 結束前先清掉自己的殘留掛單（h/y 前綴），不碰原K 的 n/x
+        try:
+            nrm = await sweep_h(iid, pos)
+            if nrm:
+                await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} 結束前清除殘留掛單 {nrm} 筆")
+        except Exception as e:
+            print("finally sweep fail", e)
         # 關機（systemd restart/stop）時保留存檔讓重啟接管；
         # 其餘情況把真實狀態寫回，避免幽靈策略殘留。
         if not SHUTTING_DOWN:
-            STRATS.pop(k, None); TASKS.pop(k, None); save_state(True)
+            # 只刪「還是自己」的那一筆：若期間已被 /stop 後重新 /run，
+            # 同 key 底下是新策略與新 task，無條件 pop 會把新的刪掉、
+            # 留下沒人管卻仍在跑的幽靈 task。
+            if STRATS.get(k) is S:
+                STRATS.pop(k, None)
+            try:
+                me = asyncio.current_task()
+            except Exception:
+                me = None
+            if TASKS.get(k) is None or TASKS.get(k) is me:
+                TASKS.pop(k, None)
+            save_state(True)
         try:
             if await okx_pos(iid, pos):
                 await notify(app, chat, f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 已停止但仍有持倉，請至 OKX 處理")
@@ -605,6 +634,8 @@ async def startup_recover(app):
         try:
             S = await rebuild_strat(d)
             k = skey(S["sym"], S["dir"])
+            if k in STRATS:
+                print("存檔有重複策略，略過", k); continue
             STRATS[k] = S
             TASKS[k] = asyncio.create_task(hloop(app, S["chat"], S))
             rec.append(f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}")
@@ -696,11 +727,22 @@ async def cmd_confirm(u, c):
         del PENDING[u.effective_chat.id]; await reply(u, f"{E.BOT} 確認逾時"); return
     del PENDING[u.effective_chat.id]
     k = skey(p["sym"], p["dir"])
-    S = {**p, "alive": True, "state": "等訊號", "chat": u.effective_chat.id,
-         "hb": time.time(), "hb_warned": False}
-    STRATS[k] = S
+    # 同 key 若還有舊策略/舊 task，先停掉並等它收工，避免兩個 task 同時對同一倉位下單
+    old_S = STRATS.get(k)
+    if old_S is not None:
+        old_S["alive"] = False
+    old_T = TASKS.get(k)
+    if old_T is not None and not old_T.done():
+        old_T.cancel()
+        try:
+            await asyncio.wait([old_T], timeout=8)
+        except Exception as e:
+            print("cancel old task fail", e)
+        await reply(u, f"{E.BOT} 已先停止 {p['sym']} {E.dir_word(p['dir'])} 的舊策略")
+    STRATS[k] = S = {**p, "alive": True, "state": "等訊號", "chat": u.effective_chat.id,
+                     "hb": time.time(), "hb_warned": False}
     TASKS[k] = asyncio.create_task(hloop(c.application, u.effective_chat.id, S))
-    save_state()
+    save_state(True)
     cnt = sum(1 for s in STRATS.values() if s.get("alive"))
     await reply(u, f"{E.BOT} ✅ 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
 
