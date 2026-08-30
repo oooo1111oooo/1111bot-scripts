@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
-"""B6-2 普K + 均K｜o3333o — 單一進程雙策略
-普K規格（不變）：
+"""B6-1 原K｜o3333o — 核心重寫版
+規格：
   1. 每根 K 線開盤即掛限價埋伏單；未成交於收線前 3 秒撤單。
-  2. 遲到一律立刻補掛，除非距離收線不足 30 秒才跳過。
+  2. 遲到一律立刻補掛，除非距離收線不足 30 秒（避免與下一根碰撞）才跳過。
   3. 一根 K 線只掛一次。進場後依 TP/SL/TE 出場，出場後等下一根開盤。
-均K規格（新增）：
-  1. 每根 K 線收線後 +5 秒抓 K 線，算 HA，判燈號。
-  2. 進場：PRE根反轉前色 + POST根反轉後色 + POST振幅累加達門檻 -> taker 市價進場。
-  3. 出場：EXIT根反向色 + 振幅累加達門檻 -> taker 市價平倉。無 TP/SL/TE。
-  4. clOrdId 前綴：普K 進場 n / 出場 x；均K 進場 h / 出場 y。互不干擾。
-  5. 同幣同向若與普K 倉位重疊，照常下單但 TG 告警（損益會被 OKX 合併計算）。
-  6. 心跳：超過 3 根 K 線未推進即 TG 告警。
-共同：
-  * OKX 為唯一真相來源：撤單、持倉、損益一律回查 OKX 確認。
-  * 重啟時接管 OKX 上的既有持倉與掛單，不留孤兒。
-  * Telegram 為旁路：發送失敗絕不影響交易流程。
+  4. OKX 為唯一真相來源：撤單、持倉、損益一律回查 OKX 確認。
+  5. 重啟時接管 OKX 上的既有持倉與掛單，不留孤兒。
+  6. Telegram 為旁路：發送失敗絕不影響交易流程。
 """
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
@@ -24,20 +16,23 @@ from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPriva
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 sys.path.insert(0, "/srv/1111bot")
 from app.core import emoji as E
-from app.strategy.normal import next_open_epoch, TF_SEC
-from app.strategy.ha import calc_ha, merge_5m_to_10m
-from app.strategy.heikin import judge_entry, judge_exit
+from app.strategy.normal import next_open_epoch as _noe_unused, TF_SEC as _TFS_unused
+
+# 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
+TF_SEC = {"3m": 180, "4m": 240, "5m": 300, "6m": 360, "10m": 600,
+          "12m": 720, "15m": 900, "20m": 1200, "30m": 1800, "60m": 3600}
+
+def next_open_epoch(now_epoch, tf):
+    sec = TF_SEC[tf]
+    return ((now_epoch // sec) + 1) * sec
 
 BASE = "https://www.okx.com"
 ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
-CANCEL_LEAD = 3      # 收線前幾秒撤單
-MIN_ROOM = 30        # 距收線不足幾秒就放棄本輪
-HA_LAG = 5           # 均K：收線後幾秒才抓 K 線（等 OKX 資料落定）
-HA_HIST = 120        # 均K：抓幾根歷史 K 線做 HA 遞迴（越多越準）
-HB_BARS = 3          # 均K：心跳超過幾根 K 線未推進就告警
+ENTRY_CUTOFF = 60    # TF 剩餘不足幾秒就放棄進場（撤掉未成交單、也不補掛）
+CLOSE_LEAD = 2       # TF 結束前幾秒強制平倉（TE）
 
 def load_env(p):
     d = {}
@@ -54,35 +49,41 @@ SYMS = json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 
 PENDING = {}; STRATS = {}; TASKS = {}; STATS = {}
 CHAT_ID = None
+SHUTTING_DOWN = False
 HTTP = None
 SPEC_CACHE = {}
 
-def skey(s, d, kind="n"): return f"{s}_{d}" if kind == "n" else f"{kind}:{s}_{d}"
+def skey(s, d): return f"{s}_{d}"
 def inst_id(s): return s.replace("USDT", "") + "-USDT-SWAP"
 def now8(): return datetime.now(TZ8)
 def hhmmss(): return now8().strftime("%H:%M:%S")
 def today8(): return now8().strftime("%Y-%m-%d")
-def pct(v): return str(Decimal(str(v)).normalize())
+def pct(v):
+    """去尾零但不用科學記號：10 -> "10"（非 "1E+1"），0.50 -> "0.5"。"""
+    d = Decimal(str(v)).normalize()
+    if d == d.to_integral_value():
+        d = d.quantize(Decimal(1))
+    return str(d)
 
 # ---------- 狀態持久化（原子寫入） ----------
-SAVE_FIELDS = ("kind","sym","dir","tf","lev","margin","offset","tp","sl","te","chat",
-               "pre","post","exitn","amp",
-               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","pos_sz",
-               "last_open","last_bar")
+SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","chat",
+               "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open","catchup")
 
-def save_state():
+def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
+    # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
+    # 若照常寫入就會把存檔覆蓋成空的，導致重啟後策略全滅。
+    if SHUTTING_DOWN:
+        return
     try:
         data = {"chat": CHAT_ID, "tf": ACCOUNT_TF, "stats": STATS, "strats": []}
         for k, S in STRATS.items():
             if S.get("alive"):
                 data["strats"].append({a: S[a] for a in SAVE_FIELDS if a in S})
-        if STRATS and not data["strats"]:
-            return
         def enc(o): return str(o) if isinstance(o, Decimal) else o
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, default=enc); f.flush(); os.fsync(f.fileno())
-        os.replace(tmp, STATE_FILE)
+        with _open(tmp, "w") as f:
+            _dump(data, f, default=enc); f.flush(); _fsync(f.fileno())
+        _replace(tmp, STATE_FILE)
     except Exception as e:
         print("save_state fail", e)
 
@@ -99,17 +100,16 @@ def get_stat(k):
     return (STATS[k]["placed"], STATS[k]["entered"])
 
 # ---------- 交易紀錄 ----------
-def trade_file(t, kind="n"):
-    base = STATE_FILE.replace("strategies_", "trades_" if kind == "n" else "trades_h_")
-    return base.replace(".json", "_" + str(t).replace("-", "") + ".json")
+def trade_file(t):
+    return STATE_FILE.replace("strategies_", "trades_").replace(".json", "_" + str(t).replace("-", "") + ".json")
 
-def load_trades(t, kind="n"):
-    try: return json.load(open(trade_file(t, kind)))
+def load_trades(t):
+    try: return json.load(open(trade_file(t)))
     except Exception: return []
 
 def log_trade(rec):
     try:
-        fp = trade_file(rec.get("date"), rec.get("kind", "n"))
+        fp = trade_file(rec.get("date"))
         try: arr = json.load(open(fp))
         except Exception: arr = []
         arr.append(rec)
@@ -172,35 +172,6 @@ def align(px, tick, d):
 def csize(m, lev, px, cv, lot):
     return ((m * lev / px) / cv / lot).to_integral_value(rounding=ROUND_DOWN) * lot
 
-# ---------- K 線 / HA（均K 專用） ----------
-async def get_klines(iid, bar, limit=120):
-    """只取已收線（confirm=1）的 K 線，回傳舊->新。"""
-    r = await pub(f"/api/v5/market/candles?instId={iid}&bar={bar}&limit={min(300, limit)}")
-    if r.get("code") != "0": return []
-    out = []
-    for c in (r.get("data") or []):
-        try:
-            if len(c) >= 9 and str(c[8]) != "1": continue   # 未收線，丟掉
-            out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
-                        "l": Decimal(c[3]), "c": Decimal(c[4])})
-        except Exception:
-            continue
-    out.reverse()
-    return out
-
-async def ha_series(iid, tf, limit=HA_HIST):
-    """回傳 HA 序列（舊->新）。10m 由 5m 合成並對齊 10 分鐘邊界。"""
-    if tf == "10m":
-        kl = await get_klines(iid, "5m", limit * 2 + 10)
-        while kl and int(kl[0]["ts"]) % 600000 != 0:
-            kl.pop(0)
-        if len(kl) % 2: kl = kl[:-1]
-        kl = merge_5m_to_10m(kl)
-    else:
-        kl = await get_klines(iid, tf, limit)
-    if not kl: return []
-    return calc_ha(kl)
-
 # ---------- Telegram（旁路：永不阻塞交易） ----------
 _BG = set()
 
@@ -262,7 +233,7 @@ async def cancel_verified(iid, oid, tries=4):
     return "fail"
 
 async def sweep(iid, pos, keep=None):
-    """清掉本 bot 在該幣種該方向的所有殘留掛單（只認 n 前綴，不動均K）。"""
+    """清掉本 bot 在該幣種該方向的所有殘留掛單。"""
     n = 0
     for o in await okx_orders(iid, pos):
         if keep and o.get("ordId") == keep: continue
@@ -281,23 +252,7 @@ async def close_record(iid, ps, after_ms, tries=10):
         await asyncio.sleep(1)
     return None
 
-# ---------- 倉位重疊偵測（普K / 均K 同幣同向） ----------
-def other_alive(sym, d, mykind):
-    other = "h" if mykind == "n" else "n"
-    S = STRATS.get(skey(sym, d, other))
-    return bool(S and S.get("alive"))
-
-async def overlap_warn(app, chat, sym, d, mykind):
-    """同幣同向雙策略並存時告警：OKX 會合併倉位，損益將混算。"""
-    if not other_alive(sym, d, mykind): return False
-    name = "均K" if mykind == "n" else "普K"
-    await notify(app, chat,
-        f"{E.BOT} ⚠ 倉位重疊警告\n{E.dir_emoji(d)} {sym} {E.dir_word(d)}\n"
-        f"{name} 同幣同向也在運行中。\nOKX 會把兩邊合併成同一個倉位，\n"
-        f"平倉損益將混算，日報數字會失真。\n時間：{hhmmss()}")
-    return True
-
-# ---------- 出場處理（普K：正常出場與重啟接管都走這裡） ----------
+# ---------- 出場處理（共用：正常出場與重啟接管都走這裡） ----------
 async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, k):
     cs = "sell" if d == "L" else "buy"
     # 平倉張數一律以 OKX 實際持倉為準（避免重複掛單造成倉位加倍時只平掉一半）
@@ -344,17 +299,20 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
     fp = (fee / nv * 100) if nv else Decimal(0)
     npv = (net / nv * 100) if nv else Decimal(0)
     hs = int(time.time() - ee)
+    amb_s = f"{round(ee - pt)}s" if pt else "-"
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
                "ambush_s": round(ee - pt) if pt else 0, "hold_s": hs,
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
                "src": src, "ts": hhmmss(),
                "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
-               "tf": S["tf"], "te": str(S["te"]) + "s",
+               "tf": S["tf"], "margin": str(S["margin"]),
                "in_px": str(fpx), "out_px": str(xpx)})
     await notify(app, S["chat"],
-        f"{E.BOT} OKX普K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
+        f"{E.BOT} OKX原K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
         f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
-        f"進場價：{fpx}\n出場價：{xpx}\n持倉秒數：{hs}s\n"
+        f"進場:{fpx}({pct(S['offset'])}%) | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')} | {amb_s}\n"
+        f"止盈:{tp}({pct(S['tp'])}%)\n止損:{sl}({pct(S['sl'])}%)\n"
+        f"出場:{xpx}({gp:+.3f}%) | {hhmmss()} | {hs}s\n"
         f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
         f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
     for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
@@ -362,13 +320,13 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
     save_state()
     return True
 
-# ---------- 持倉監控（普K） ----------
-async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
+# ---------- 持倉監控 ----------
+async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end):
+    """tf_end：本 TF 的結束時刻（epoch）。到 tf_end-CLOSE_LEAD 秒一律平倉。"""
     chk = 0
     while S["alive"]:
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         chk += 1
-        held = time.time() - ee
         last = await get_last(iid)
         reason = None
         if d == "L":
@@ -377,8 +335,8 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
         else:
             if last <= tp: reason = "Take_Profit"
             elif last >= sl: reason = "Stop_Loss"
-        if not reason and held >= S["te"]: reason = "Time_Exit"
-        if not reason and chk % 8 == 0:
+        if not reason and time.time() >= tf_end - CLOSE_LEAD: reason = "Time_Exit"
+        if not reason and chk % 16 == 0:
             p_chk = await okx_pos(iid, pos)
             if p_chk:
                 try:
@@ -400,7 +358,7 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
     if await okx_pos(iid, pos):
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 策略停止但仍有持倉，請至 OKX 處理")
 
-# ---------- 普K 主迴圈：一根 K 線一輪 ----------
+# ---------- 主迴圈：一根 K 線一輪 ----------
 async def loop(app, chat, S):
     spec = S["spec"]; iid = spec["iid"]; d = S["dir"]
     pos = "long" if d == "L" else "short"
@@ -416,8 +374,10 @@ async def loop(app, chat, S):
                 pt0 = float(S["pos_pt"]) if S.get("pos_pt") else None
                 size = abs(Decimal(p.get("pos") or "0"))
                 S["state"] = "持倉中"; save_state()
+                tfs = TF_SEC[S["tf"]]
+                tf_end0 = (int(time.time()) // tfs + 1) * tfs
                 await notify(app, chat, f"{E.BOT} {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} 已接管既有持倉，恢復 TP/SL/TE 監控")
-                await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt0, k)
+                await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt0, k, tf_end0)
             else:
                 for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
                     S.pop(a, None)
@@ -428,15 +388,17 @@ async def loop(app, chat, S):
             now = time.time()
             cur = int(now // tf_sec) * tf_sec
             room = cur + tf_sec - now
-            if cur != S.get("last_open") and room >= MIN_ROOM:
-                oe = cur                          # 本根尚未掛過且還有時間 -> 立刻掛
+            # 僅在「上一輪未成交、剛撤完單」的情況下才允許盤中補掛；
+            # 新建策略與出場後一律等下一根 K 線開盤，嚴守一根 K 線一輪。
+            if S.get("catchup") and cur != S.get("last_open") and room >= ENTRY_CUTOFF:
+                oe = cur
             else:
                 S["state"] = "等下輪"; save_state()
                 oe = next_open_epoch(int(time.time()), S["tf"])
                 w = oe - time.time()
                 if w > 0: await asyncio.sleep(w)
                 if not S["alive"]: break
-            S["last_open"] = oe; save_state()
+            S["last_open"] = oe; S["catchup"] = False; save_state()
 
             # 開盤取價 -> 埋伏價 -> 張數
             op = await get_last(iid)
@@ -464,8 +426,9 @@ async def loop(app, chat, S):
                 print("dup orders cleared", S["sym"], d, dup)
                 await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} 已清除殘留掛單 {dup} 筆")
 
-            # 輪詢成交，直到收線前 CANCEL_LEAD 秒
-            deadline = oe + tf_sec - CANCEL_LEAD
+            # 輪詢成交，直到 TF 剩餘不足 ENTRY_CUTOFF 秒
+            tf_end = oe + tf_sec
+            deadline = tf_end - ENTRY_CUTOFF   # 剩 60 秒就不再等成交
             filled = False; fpx = None
             while S["alive"] and time.time() < deadline:
                 await asyncio.sleep(2)
@@ -487,7 +450,9 @@ async def loop(app, chat, S):
                     await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 撤單未確認，本策略停止以免重複掛單")
                     S["alive"] = False; break
             if not S["alive"]: break
-            if not filled: continue
+            if not filled:
+                S["catchup"] = True
+                continue
 
             # 成交 -> 算 TP/SL -> 監控
             bump(k, "entered")
@@ -503,299 +468,54 @@ async def loop(app, chat, S):
             S["pos_tp"] = str(tp); S["pos_sl"] = str(sl); S["pos_ee"] = ee; S["pos_pt"] = pt
             save_state()
             await notify(app, chat,
-                f"{E.BOT} OKX普K｜{ACCT}\n事件：🔔 已進場成交\n"
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：🔔 已進場成交\n"
                 f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                f"進場價格：{fpx} ({pct(S['offset'])}%)\n"
-                f"止盈 TP：{tp} ({pct(S['tp'])}%)\n止損 SL：{sl} ({pct(S['sl'])}%)\n"
-                f"持倉 TE：{S['te']}s\n埋伏秒數：{int(ee - pt)}s\n"
+                f"進場:{fpx}({pct(S['offset'])}%) | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')} | {int(ee - pt)}s\n"
+                f"止盈:{tp}({pct(S['tp'])}%)\n止損:{sl}({pct(S['sl'])}%)\n"
                 f"狀　　態：📌 持倉中\n時間：{hhmmss()}")
-            await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k)
+            await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end)
+            # 出場後允許補掛：出場流程（查 OKX 真實損益）可能耗時數秒而跨進新 TF，
+            # 若新 TF 尚未掛過且剩餘 >= ENTRY_CUTOFF 就立刻掛，避免整輪被跳過。
+            # 若仍在同一個 TF（cur == last_open），迴圈頂端會照常睡到下一個 TF 開始。
+            S["catchup"] = True
     except asyncio.CancelledError:
         raise
     except Exception as e:
         print("loop error", S.get("sym"), S.get("dir"), type(e).__name__, e)
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 循環錯誤：{type(e).__name__}: {e}")
     finally:
-        S["state"] = "已停止"; S["alive"] = False
-        STRATS.pop(k, None); TASKS.pop(k, None); save_state()
-
-# ==================== 均K（Heikin-Ashi）====================
-
-async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
-    """均K 出場：taker 市價平倉 + 取 OKX 真實損益。"""
-    cs = "sell" if d == "L" else "buy"
-    p_now = await okx_pos(iid, pos)
-    if not p_now:
-        await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 均K 平倉時 OKX 已無持倉，略過")
-        for a in ("pos_open", "pos_px", "pos_ee"):
-            S.pop(a, None)
-        save_state()
-        return True
-    own = S.get("pos_sz") or size
-    try:
-        real = abs(Decimal(str(p_now.get("availPos") or p_now.get("pos") or "0")))
-        if real > 0:
-            if other_alive(S["sym"], d, "h") and own and Decimal(str(own)) < real:
-                size = Decimal(str(own))
-                print("overlap: 均K 只平自有部位", S.get("sym"), d, size, "of", real)
-                await notify(app, S["chat"],
-                    f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 倉位重疊\n"
-                    f"OKX 合併 {real} 張，均K 只平自有 {size} 張\n"
-                    f"（損益數字由 OKX 合併計算，僅供參考）")
-            else:
-                if real != size:
-                    print("h size mismatch", S.get("sym"), d, "local", size, "okx", real)
-                size = real
-    except Exception:
-        pass
-    t0 = int(time.time() * 1000)
-    xr = await api("POST", "/api/v5/trade/order",
-                   {"instId": iid, "tdMode": "isolated", "side": cs, "posSide": pos,
-                    "ordType": "market", "sz": str(size),
-                    "clOrdId": "y" + uuid.uuid4().hex[:14]})
-    if xr.get("code") != "0":
-        em = (xr.get("data") or [{}])[0].get("sMsg") or xr.get("msg")
-        await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 均K 平倉失敗：{em}\n⚠ 倉位可能仍在，請至 OKX 確認")
-        return False
-    ph = await close_record(iid, pos, t0)
-    src = "OKX"
-    if ph:
-        g = Decimal(ph.get("pnl") or "0")
-        fee = Decimal(ph.get("fee") or "0") + Decimal(ph.get("fundingFee") or "0")
-        net = Decimal(ph.get("realizedPnl") or "0")
-        xpx = Decimal(ph.get("closeAvgPx") or "0") or await get_last(iid)
-        nv = Decimal(ph.get("openAvgPx") or fpx) * Decimal(ph.get("closeTotalPos") or size) * spec["ctval"]
-    else:
-        src = "估算"
-        xpx = await get_last(iid)
-        g = (xpx - fpx) * size * spec["ctval"] if d == "L" else (fpx - xpx) * size * spec["ctval"]
-        fee = Decimal(0); net = g
-        nv = fpx * size * spec["ctval"]
-    gp = (g / nv * 100) if nv else Decimal(0)
-    fp = (fee / nv * 100) if nv else Decimal(0)
-    npv = (net / nv * 100) if nv else Decimal(0)
-    hs = int(time.time() - ee)
-    log_trade({"kind": "h", "date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
-               "hold_s": hs, "bars": round(hs / TF_SEC[S["tf"]], 1),
-               "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
-               "src": src, "ts": hhmmss(),
-               "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
-               "tf": S["tf"],
-               "pre": str(S["pre"]), "post": str(S["post"]),
-               "exitn": str(S["exitn"]), "amp": str(S["amp"]),
-               "in_px": str(fpx), "out_px": str(xpx)})
-    await notify(app, S["chat"],
-        f"{E.BOT} OKX均K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
-        f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
-        f"進場價：{fpx}\n出場價：{xpx}\n"
-        f"持倉秒數：{hs}s（約 {hs / TF_SEC[S['tf']]:.1f} 根）\n"
-        f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
-        f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz"):
-        S.pop(a, None)
-    save_state()
-    return True
-
-
-async def h_open(app, S, spec, iid, d, pos, info, k):
-    """均K 進場：taker 市價。"""
-    last = await get_last(iid)
-    size = csize(S["margin"], Decimal(S["lev"]), last, spec["ctval"], spec["lot"])
-    if size < spec["minsz"]:
-        await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 均K 保證金不足，循環停止")
-        S["alive"] = False
-        return False
-    await overlap_warn(app, S["chat"], S["sym"], d, "h")
-    r = await api("POST", "/api/v5/trade/order",
-                  {"instId": iid, "tdMode": "isolated", "side": "buy" if d == "L" else "sell",
-                   "posSide": pos, "ordType": "market", "sz": str(size),
-                   "clOrdId": "h" + uuid.uuid4().hex[:14]})
-    bump(k, "placed")
-    if r.get("code") != "0":
-        em = (r.get("data") or [{}])[0].get("sMsg") or r.get("msg")
-        await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 均K 進場失敗：{em}")
-        return False
-    oid = r["data"][0]["ordId"]
-    fpx = None
-    for _ in range(8):
-        st = await api("GET", f"/api/v5/trade/order?instId={iid}&ordId={oid}")
-        if st.get("code") == "0" and st.get("data"):
-            dd = st["data"][0]
-            if dd.get("state") == "filled" and dd.get("avgPx"):
-                fpx = Decimal(dd["avgPx"]); break
-            if dd.get("state") == "canceled":
-                await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 均K 市價單被取消")
-                return False
-        await asyncio.sleep(1)
-    if fpx is None:
-        p = await okx_pos(iid, pos)
-        if not p:
-            await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 均K 進場未確認成交，跳過本輪")
-            return False
-        fpx = Decimal(p.get("avgPx") or await get_last(iid))
-    bump(k, "entered")
-    ee = time.time()
-    S["state"] = "持倉中"; S["pos_open"] = True
-    S["pos_px"] = str(fpx); S["pos_ee"] = ee; S["pos_sz"] = str(size)
-    save_state()
-    seq = "".join(x["color"] for x in info["seg"]) if info else "-"
-    await notify(app, S["chat"],
-        f"{E.BOT} OKX均K｜{ACCT}\n事件：🔔 訊號進場（taker）\n"
-        f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['lev']}x\n"
-        f"週　　期：{S['tf']}\n進場價格：{fpx}\n下單張數：{size}\n"
-        f"燈號序列：{seq}（PRE{S['pre']}+POST{S['post']}）\n"
-        f"振幅累加：{info['amp_sum']:.4f}% ≥ {pct(S['amp'])}%\n"
-        f"出場條件：EXIT{S['exitn']} 根反向 + 振幅 ≥ {pct(S['amp'])}%\n"
-        f"⚠ 無 TP/SL/TE，僅靠反向訊號出場\n"
-        f"狀　　態：📌 持倉中\n時間：{hhmmss()}")
-    return True
-
-
-async def h_takeover(app, S, spec, iid, d, pos):
-    """重啟接管既有均K 持倉。回傳 (size, fpx, ee) 或 None。"""
-    p = await okx_pos(iid, pos)
-    if not p:
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz"):
-            S.pop(a, None)
-        save_state()
-        return None
-    fpx = Decimal(S.get("pos_px") or p.get("avgPx") or "0")
-    ee = float(S.get("pos_ee") or time.time())
-    size = Decimal(str(S["pos_sz"])) if S.get("pos_sz") else abs(Decimal(p.get("pos") or "0"))
-    S["state"] = "持倉中"; save_state()
-    await notify(app, S["chat"],
-        f"{E.BOT} {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} 均K 已接管既有持倉\n"
-        f"進場價 {fpx}｜{size} 張\n繼續等待反向訊號出場")
-    return (size, fpx, ee)
-
-
-async def hloop(app, chat, S):
-    """均K 主迴圈：每根 K 收線後判燈號。"""
-    spec = S["spec"]; iid = spec["iid"]; d = S["dir"]
-    pos = "long" if d == "L" else "short"
-    k = skey(S["sym"], d, "h")
-    need = max(int(S["pre"]) + int(S["post"]), int(S["exitn"]))
-    size = fpx = None; ee = None
-    try:
-        if S.get("pos_open"):
-            tk = await h_takeover(app, S, spec, iid, d, pos)
-            if tk: size, fpx, ee = tk
-
-        while S["alive"]:
-            tf_sec = TF_SEC[S["tf"]]
-            oe = next_open_epoch(int(time.time()), S["tf"])
-            S["state"] = "持倉中" if S.get("pos_open") else "等訊號"
+        if SHUTTING_DOWN:
+            # 服務關閉：保留 STRATS 與存檔原狀，讓重啟後能完整認領
+            S["state"] = "已停止"
+        else:
+            # 策略結束前先清掉自己掛在 OKX 上的單，否則會變成沒人認領的孤兒單
+            try:
+                left = await sweep(iid, pos)
+                if left:
+                    await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 策略結束，已清除自身殘留掛單 {left} 筆")
+            except Exception as e:
+                print("finally sweep fail", S.get("sym"), d, e)
+            S["state"] = "已停止"; S["alive"] = False
+            # 身分檢查：若 STRATS[k] 已被新策略取代，絕不能誤刪，
+            # 否則新策略會從清單消失卻仍在背景掛單（幽靈策略）。
+            if STRATS.get(k) is S:
+                STRATS.pop(k, None)
+            try:
+                if TASKS.get(k) is asyncio.current_task():
+                    TASKS.pop(k, None)
+            except Exception:
+                pass
             save_state()
-            w = oe + HA_LAG - time.time()
-            if w > 0: await asyncio.sleep(w)
-            if not S["alive"]: break
-
-            want = (oe - tf_sec) * 1000
-            ha = []
-            for _ in range(6):
-                ha = await ha_series(iid, S["tf"])
-                if ha and int(ha[-1]["ts"]) >= want: break
-                await asyncio.sleep(2)
-            S["hb"] = time.time(); S["hb_warned"] = False
-            if len(ha) < need:
-                print("h: 歷史K不足", S["sym"], len(ha), "<", need)
-                continue
-            bar_ts = int(ha[-1]["ts"])
-            if bar_ts == S.get("last_bar"):
-                continue                      # 這根已判過，不重複
-            S["last_bar"] = bar_ts; save_state()
-            idx = len(ha) - 1
-
-            if S.get("pos_open"):
-                # --- 持倉中：判出場 ---
-                p = await okx_pos(iid, pos)
-                if not p:
-                    await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} 均K OKX 已無持倉（可能手動平倉），重回等訊號")
-                    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz"):
-                        S.pop(a, None)
-                    size = fpx = ee = None
-                    save_state(); continue
-                if S.get("pos_sz"):
-                    size = Decimal(str(S["pos_sz"]))
-                elif not other_alive(S["sym"], d, "h"):
-                    try:
-                        size = abs(Decimal(p.get("pos") or "0"))
-                    except Exception:
-                        pass
-                if fpx is None: fpx = Decimal(S.get("pos_px") or p.get("avgPx") or "0")
-                if ee is None: ee = float(S.get("pos_ee") or time.time())
-                r = judge_exit(ha, d, int(S["exitn"]), S["amp"], idx)
-                if r and r["hit"]:
-                    await h_exit(app, S, spec, iid, d, pos, size, fpx, ee, "Signal_Exit", k)
-                    size = fpx = ee = None
-            else:
-                # --- 空手：判進場 ---
-                r = judge_entry(ha, d, int(S["pre"]), int(S["post"]), S["amp"], idx)
-                if r and r["hit"]:
-                    ok = await h_open(app, S, spec, iid, d, pos, r, k)
-                    if ok:
-                        fpx = Decimal(S["pos_px"]); ee = float(S["pos_ee"])
-                        size = Decimal(str(S["pos_sz"]))
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        print("hloop error", S.get("sym"), S.get("dir"), type(e).__name__, e)
-        await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 均K 循環錯誤：{type(e).__name__}: {e}")
-    finally:
-        S["state"] = "已停止"; S["alive"] = False
-        STRATS.pop(k, None); TASKS.pop(k, None); save_state()
-        try:
-            if await okx_pos(iid, pos):
-                await notify(app, chat, f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 均K 停止但仍有持倉，請至 OKX 處理")
-        except Exception:
-            pass
-
-# ---------- 均K 心跳看門狗 ----------
-async def hb_watch(app):
-    while True:
-        await asyncio.sleep(60)
-        try:
-            for k, S in list(STRATS.items()):
-                if S.get("kind") != "h" or not S.get("alive"): continue
-                hb = S.get("hb")
-                if not hb: continue
-                lim = TF_SEC[S["tf"]] * HB_BARS
-                gap = time.time() - hb
-                if gap > lim and not S.get("hb_warned"):
-                    S["hb_warned"] = True
-                    await notify(app, S.get("chat") or CHAT_ID,
-                        f"{E.BOT} {E.LOSS} 均K 心跳異常\n"
-                        f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}\n"
-                        f"已 {int(gap)}s（>{HB_BARS} 根 {S['tf']}）未推進燈號判定。\n"
-                        f"⚠ 均K 無停損，出場依賴程式運作，請確認服務狀態\n時間：{hhmmss()}")
-                elif gap <= lim and S.get("hb_warned"):
-                    S["hb_warned"] = False
-                    await notify(app, S.get("chat") or CHAT_ID,
-                        f"{E.BOT} ✅ 均K 心跳恢復｜{S['sym']} {E.dir_word(S['dir'])}")
-        except Exception as e:
-            print("hb_watch fail", e)
 
 # ---------- 啟動接管 ----------
 async def rebuild_strat(d):
     spec = await get_spec(d["sym"])
-    S = {"kind": "n", "sym": d["sym"], "dir": d["dir"], "tf": d.get("tf", ACCOUNT_TF),
+    S = {"sym": d["sym"], "dir": d["dir"], "tf": d.get("tf", ACCOUNT_TF),
          "lev": int(d["lev"]), "margin": Decimal(str(d["margin"])),
          "offset": Decimal(str(d["offset"])), "tp": Decimal(str(d["tp"])),
-         "sl": Decimal(str(d["sl"])), "te": int(d["te"]), "spec": spec,
+         "sl": Decimal(str(d["sl"])), "spec": spec,
          "alive": True, "state": "等下輪", "chat": d.get("chat", CHAT_ID)}
-    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "last_open"):
-        if a in d: S[a] = d[a]
-    return S
-
-async def h_rebuild(d):
-    spec = await get_spec(d["sym"])
-    S = {"kind": "h", "sym": d["sym"], "dir": d["dir"], "tf": d.get("tf", ACCOUNT_TF),
-         "lev": int(d["lev"]), "margin": Decimal(str(d["margin"])),
-         "pre": int(d["pre"]), "post": int(d["post"]), "exitn": int(d["exitn"]),
-         "amp": Decimal(str(d["amp"])), "spec": spec,
-         "alive": True, "state": "等訊號", "chat": d.get("chat", CHAT_ID),
-         "hb": time.time(), "hb_warned": False}
-    for a in ("pos_open", "pos_px", "pos_ee", "last_bar"):
+    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "last_open", "catchup"):
         if a in d: S[a] = d[a]
     return S
 
@@ -811,63 +531,134 @@ async def startup_recover(app):
     saved = data.get("strats", [])
     if not saved:
         print("存檔無策略"); return
-    rec = []; hrec = []
+    rec = []; failed = []
     for d in saved:
         try:
-            if d.get("kind") == "h":
-                S = await h_rebuild(d)
-                k = skey(S["sym"], S["dir"], "h")
-                STRATS[k] = S
-                TASKS[k] = asyncio.create_task(hloop(app, S["chat"], S))
-                hrec.append(f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}")
-            else:
-                S = await rebuild_strat(d)
-                k = skey(S["sym"], S["dir"])
-                STRATS[k] = S
-                TASKS[k] = asyncio.create_task(loop(app, S["chat"], S))
-                rec.append(f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}")
+            S = await rebuild_strat(d)
+            k = skey(S["sym"], S["dir"])
+            STRATS[k] = S
+            TASKS[k] = asyncio.create_task(loop(app, S["chat"], S))
+            rec.append(f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}")
         except Exception as e:
             print("重建失敗", d, e)
+            failed.append(f"{d.get('sym')} {d.get('dir')}：{type(e).__name__}")
     pend = await api("GET", "/api/v5/trade/orders-pending")
     posr = await api("GET", "/api/v5/account/positions")
     n_ord = len(pend.get("data", [])) if pend.get("code") == "0" else 0
     n_pos = len([p for p in posr.get("data", []) if float(p.get("pos", "0")) != 0]) if posr.get("code") == "0" else 0
-    print(f"已接管 普K {len(rec)} / 均K {len(hrec)}｜OKX 掛單{n_ord} 持倉{n_pos}")
-    if CHAT_ID and (rec or hrec):
-        m = f"{E.BOT} OKX｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
-        if rec: m += f"普K 策略（{len(rec)}）：\n" + "\n".join("・" + x for x in rec) + "\n"
-        if hrec: m += f"均K 策略（{len(hrec)}）：\n" + "\n".join("・" + x for x in hrec) + "\n"
-        m += f"OKX 現況：掛單{n_ord} 持倉{n_pos}\n循環已接管，繼續運作\n時間：{hhmmss()}"
-        await notify(app, CHAT_ID, m)
+    print(f"已接管策略 {len(rec)}｜OKX 掛單{n_ord} 持倉{n_pos}")
+    if failed:
+        print("重建失敗清單:", failed)
+        if CHAT_ID:
+            await notify(app, CHAT_ID, f"{E.BOT} {E.LOSS} 重啟時有 {len(failed)} 個策略重建失敗：\n" +
+                         "\n".join("・" + x for x in failed) + "\n⚠ 這些策略已消失，請確認 OKX 是否有殘留掛單")
+    if CHAT_ID and rec and n_ord > len(rec):
+        await notify(app, CHAT_ID, f"{E.BOT} {E.LOSS} OKX 掛單 {n_ord} 筆 > 策略 {len(rec)} 個，可能有孤兒單，請查 /status")
+    if CHAT_ID and rec:
+        await notify(app, CHAT_ID,
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
+            f"已接管策略（{len(rec)}）：\n" + "\n".join("・" + x for x in rec) +
+            f"\nOKX 現況：掛單{n_ord} 持倉{n_pos}\n循環已接管，繼續運作\n時間：{hhmmss()}")
 
 # ---------- TG 指令 ----------
+# ---------- K 線 / 振幅（/amp 用） ----------
+NATIVE_BARS = {"3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1H"}
+
+async def get_klines(iid, bar, limit=300):
+    """只取已收線（confirm=1）的 K 線，回傳舊->新。"""
+    r = await pub(f"/api/v5/market/candles?instId={iid}&bar={bar}&limit={min(300, limit)}")
+    if r.get("code") != "0":
+        return []
+    out = []
+    for c in (r.get("data") or []):
+        try:
+            if len(c) >= 9 and str(c[8]) != "1":
+                continue
+            out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
+                        "l": Decimal(c[3]), "c": Decimal(c[4])})
+        except Exception:
+            continue
+    out.reverse()
+    return out
+
+def _merge2(kl5):
+    """兩根 5m 合成一根 10m，強制對齊 10 分鐘邊界。"""
+    out = []
+    i = 0
+    n = len(kl5)
+    while i < n:
+        a = kl5[i]
+        ts_a = int(a["ts"])
+        if ts_a % 600000 != 0:
+            i += 1; continue
+        if i + 1 >= n:
+            break
+        b = kl5[i + 1]
+        if int(b["ts"]) - ts_a != 300000:
+            i += 1; continue
+        out.append({"ts": ts_a, "o": a["o"], "h": max(a["h"], b["h"]),
+                    "l": min(a["l"], b["l"]), "c": b["c"]})
+        i += 2
+    return out
+
+async def klines_for_tf(iid, tf, want=300):
+    """依 TF 取原始 K 線。10m 由兩根 5m 合成；其餘須為 OKX 原生週期。"""
+    if tf == "10m":
+        return _merge2(await get_klines(iid, "5m", 300))
+    bar = NATIVE_BARS.get(tf)
+    if not bar:
+        return None
+    return await get_klines(iid, bar, want)
+
+def calc_amp(kl):
+    """每根回傳 (振幅%, 漲跌幅%)。
+    振幅% = (高-低) / 前一根收盤 * 100（恆正）
+    漲跌幅% = (收盤-前一根收盤) / 前一根收盤 * 100（帶正負）
+    第一根無前收，以本根開盤價替代。"""
+    out = []
+    for i, k in enumerate(kl):
+        base = kl[i-1]["c"] if i > 0 else k["o"]
+        if not base:
+            out.append((Decimal(0), Decimal(0))); continue
+        amp = (k["h"] - k["l"]) / base * 100
+        chg = (k["c"] - base) / base * 100
+        out.append((amp, chg))
+    return out
+
+async def _reply_long(u, head, lines, tail):
+    """長清單拆多則送出（Telegram 單則上限 4096 字元）。"""
+    LIM = 3500
+    buf = list(head); msgs = []
+    for ln in lines:
+        if sum(len(x) + 1 for x in buf) + len(ln) + 1 > LIM and len(buf) > len(head):
+            msgs.append("\n".join(buf)); buf = list(head)
+        buf.append(ln)
+    buf += tail
+    msgs.append("\n".join(buf))
+    for i, m in enumerate(msgs):
+        if len(msgs) > 1:
+            m = m.replace("事件：振幅檢視", "事件：振幅檢視（%d/%d）" % (i+1, len(msgs)), 1)
+        await reply(u, m)
+
 def strat_params(sym, dr):
     S = STRATS.get(skey(sym, dr))
     if not S or not S.get("alive"):
         return f"{dr}（已停止）"
     return (f"{dr} {S['lev']}x {pct(S['margin'])} {pct(S['offset'])} "
-            f"{pct(S['tp'])} {pct(S['sl'])} {S['te']}")
-
-def h_params(sym, dr):
-    S = STRATS.get(skey(sym, dr, "h"))
-    if not S or not S.get("alive"):
-        return f"{dr}（已停止）"
-    return (f"{dr} {S['lev']}x {pct(S['margin'])} "
-            f"P{S['pre']}/{S['post']}/E{S['exitn']} amp{pct(S['amp'])}")
+            f"{pct(S['tp'])} {pct(S['sl'])}")
 
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = f"用法：/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n（週期依 /timeframe，目前 {ACCOUNT_TF}）"
-    if len(a) != 8: await reply(u, f"{E.BOT} 參數數量錯誤（需8個）\n{fmt}"); return
+    fmt = f"用法：/run 商品 方向 槓桿 保證金 埋伏 TP SL\n例：/run ETHUSDT L 1x 3 0.5 0.5 0.5\n（TE 已固定為 TF 結束，週期依 /timeframe，目前 {ACCOUNT_TF}）"
+    if len(a) != 7: await reply(u, f"{E.BOT} 參數數量錯誤（需7個）\n{fmt}"); return
     try:
         sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
         margin = Decimal(a[3]); offset = Decimal(a[4]); tp = Decimal(a[5])
-        sl = Decimal(a[6]); te = int(a[7])
+        sl = Decimal(a[6])
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     if dr not in ("L", "S"): await reply(u, f"{E.BOT} 方向須 L 或 S"); return
-    if not 1 <= te <= 900: await reply(u, f"{E.BOT} TE 須 1~900 秒"); return
     k = skey(sym, dr)
     if k in STRATS and STRATS[k].get("alive"):
         await reply(u, f"{E.BOT} {sym} {E.dir_word(dr)} 已在運行"); return
@@ -879,155 +670,109 @@ async def cmd_run(u, c):
     if size < spec["minsz"]:
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
-    PENDING[u.effective_chat.id] = {"kind": "n", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
-        "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl, "te": te, "spec": spec}
-    await reply(u, f"{E.BOT} OKX普K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
+    PENDING[u.effective_chat.id] = {"kind": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
+        "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl, "spec": spec}
+    await reply(u, f"{E.BOT} OKX原K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{ACCOUNT_TF}\n"
         f"開盤估價：{op}\n埋伏距離：{offset}%\n埋伏價格：{amb}\n"
-        f"止盈 TP：{tp}%\n止損 SL：{sl}%\n持倉 TE：{te}s\n保 證 金：{margin} USDT\n下單張數：{size}\n"
+        f"止盈 TP：{tp}%\n止損 SL：{sl}%\n保 證 金：{margin} USDT\n下單張數：{size}\n"
         f"━━━━━━━━━━\n⚠ 確認後真實循環交易\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
-    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
-
-async def cmd_runh(u, c):
-    global CHAT_ID; CHAT_ID = u.effective_chat.id
-    a = c.args
-    fmt = (f"用法：/runh 商品 方向 槓桿 保證金 PRE POST EXIT 振幅\n"
-           f"例：/runh BTCUSDT L 1x 3 2 3 2 0.3\n"
-           f"（PRE=反轉前色根數 POST=反轉後色根數 EXIT=反向出場根數 振幅=%）\n"
-           f"（週期依 /timeframe，目前 {ACCOUNT_TF}）")
-    if len(a) != 8: await reply(u, f"{E.BOT} 參數數量錯誤（需8個）\n{fmt}"); return
-    try:
-        sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
-        margin = Decimal(a[3]); pre = int(a[4]); post = int(a[5])
-        exitn = int(a[6]); amp = Decimal(a[7])
-    except Exception:
-        await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
-    if dr not in ("L", "S"): await reply(u, f"{E.BOT} 方向須 L 或 S"); return
-    if not 1 <= pre <= 20: await reply(u, f"{E.BOT} PRE 須 1~20"); return
-    if not 1 <= post <= 20: await reply(u, f"{E.BOT} POST 須 1~20"); return
-    if not 1 <= exitn <= 20: await reply(u, f"{E.BOT} EXIT 須 1~20"); return
-    if amp < 0: await reply(u, f"{E.BOT} 振幅不可為負"); return
-    k = skey(sym, dr, "h")
-    if k in STRATS and STRATS[k].get("alive"):
-        await reply(u, f"{E.BOT} 均K {sym} {E.dir_word(dr)} 已在運行"); return
-    try: spec = await get_spec(sym)
-    except Exception: await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
-    op = await get_last(spec["iid"])
-    size = csize(margin, Decimal(lev), op, spec["ctval"], spec["lot"])
-    if size < spec["minsz"]:
-        need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
-        await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
-    # 現況燈號預覽
-    try:
-        ha = await ha_series(spec["iid"], ACCOUNT_TF)
-        seq = "".join(x["color"] for x in ha[-(pre + post):]) if len(ha) >= pre + post else "-"
-        amps = sum((x["amp"] for x in ha[-post:]), Decimal(0)) if len(ha) >= post else Decimal(0)
-        prev = f"目前燈號：{seq}\n近{post}根振幅：{amps:.4f}%"
-    except Exception as e:
-        prev = f"燈號預覽失敗：{type(e).__name__}"
-    warn = "\n⚠ 普K 同幣同向運行中，倉位將被 OKX 合併，損益會混算" if other_alive(sym, dr, "h") else ""
-    PENDING[u.effective_chat.id] = {"kind": "h", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
-        "lev": lev, "margin": margin, "pre": pre, "post": post, "exitn": exitn, "amp": amp, "spec": spec}
-    await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
-        f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{ACCOUNT_TF}\n"
-        f"目前價格：{op}\n保 證 金：{margin} USDT\n預估張數：{size}\n"
-        f"━━━━━━━━━━\n"
-        f"進場：{pre} 根反轉前色 + {post} 根反轉後色\n"
-        f"　　　且後 {post} 根振幅累加 ≥ {amp}%\n"
-        f"出場：{exitn} 根反向色 + 振幅累加 ≥ {amp}%\n"
-        f"進出場皆 taker 市價\n{prev}\n"
-        f"━━━━━━━━━━\n⚠ 無 TP/SL/TE，僅靠反向訊號出場{warn}\n"
-        f"下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def _to(app, chat, stamp):
     await asyncio.sleep(61)
     p = PENDING.get(chat)
     if p and p["t"] == stamp:
+        k = p.get("kind", "run")
         del PENDING[chat]
-        await notify(app, chat, f"{E.BOT} 參數逾時已取消，請重新 /run 或 /runh")
+        await notify(app, chat, f"{E.BOT} /{k} 逾時未確認，已取消")
 
 async def cmd_confirm(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     p = PENDING.get(u.effective_chat.id)
-    if not p: await reply(u, f"{E.BOT} 沒有待確認的 /run 或 /runh"); return
+    if not p: await reply(u, f"{E.BOT} 沒有待確認的指令"); return
     if time.time() - p["t"] > 60:
         del PENDING[u.effective_chat.id]; await reply(u, f"{E.BOT} 確認逾時"); return
+    kind = p.get("kind", "run")
+    if kind == "stop":
+        del PENDING[u.effective_chat.id]
+        await do_stop(u, p["key"]); return
+    if kind == "stopall":
+        del PENDING[u.effective_chat.id]
+        await do_stopall(u); return
     del PENDING[u.effective_chat.id]
-    kind = p.get("kind", "n")
-    k = skey(p["sym"], p["dir"], kind)
-    if kind == "h":
-        S = {**p, "alive": True, "state": "等訊號", "chat": u.effective_chat.id,
-             "hb": time.time(), "hb_warned": False}
-        STRATS[k] = S
-        TASKS[k] = asyncio.create_task(hloop(c.application, u.effective_chat.id, S))
-    else:
-        S = {**p, "alive": True, "state": "等下輪", "chat": u.effective_chat.id}
-        STRATS[k] = S
-        TASKS[k] = asyncio.create_task(loop(c.application, u.effective_chat.id, S))
+    k = skey(p["sym"], p["dir"])
+    # 先確保同 key 沒有殘存的舊 task 還在跑（幽靈策略防護）
+    old_t = TASKS.get(k)
+    if old_t and not old_t.done():
+        old_s = STRATS.get(k)
+        if old_s: old_s["alive"] = False
+        old_t.cancel()
+        try: await asyncio.wait_for(asyncio.shield(old_t), timeout=5)
+        except Exception: pass
+    S = {**p, "alive": True, "state": "等下輪", "chat": u.effective_chat.id}
+    STRATS[k] = S
+    TASKS[k] = asyncio.create_task(loop(c.application, u.effective_chat.id, S))
     save_state()
-    nn = sum(1 for s in STRATS.values() if s.get("alive") and s.get("kind", "n") == "n")
-    nh = sum(1 for s in STRATS.values() if s.get("alive") and s.get("kind") == "h")
-    label = "均K" if kind == "h" else "普K"
-    await reply(u, f"{E.BOT} ✅ 已確認，{label} {p['sym']} {E.dir_word(p['dir'])} 啟動\n"
-                   f"運行中：普K {nn} 個 / 均K {nh} 個")
+    cnt = sum(1 for s in STRATS.values() if s.get("alive"))
+    await reply(u, f"{E.BOT} ✅ 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
 
-async def _stop_common(u, c, kind):
+async def cmd_stop(u, c):
     a = c.args
-    label = "均K" if kind == "h" else "普K"
-    alive = [k for k, s in STRATS.items() if s.get("alive") and s.get("kind", "n") == kind]
-    if not alive: await reply(u, f"{E.BOT} 目前無運行中的{label}策略"); return
-    cmd = "/stoph" if kind == "h" else "/stop"
+    alive = [k for k, s in STRATS.items() if s.get("alive")]
+    if not alive: await reply(u, f"{E.BOT} 目前無運行中策略"); return
     if not a:
-        lst = "\n".join(f"・{cmd} {STRATS[k]['sym']} {STRATS[k]['dir']}" for k in alive)
+        lst = "\n".join(f"・/stop {STRATS[k]['sym']} {STRATS[k]['dir']}" for k in alive)
         await reply(u, f"{E.BOT} 請指定：\n{lst}\n或 /stopall"); return
     sym = a[0].upper()
-    tg = [skey(sym, a[1].upper(), kind)] if len(a) >= 2 and skey(sym, a[1].upper(), kind) in alive \
-         else [k for k in alive if STRATS[k]["sym"] == sym]
-    if not tg: await reply(u, f"{E.BOT} 找不到運行中的{label} {sym}"); return
-    if len(tg) > 1: await reply(u, f"{E.BOT} {sym} 有多方向，請指定 {cmd} {sym} L 或 S"); return
-    S = STRATS[tg[0]]; d = S["dir"]; iid = S["spec"]["iid"]
+    tg = [skey(sym, a[1].upper())] if len(a) >= 2 and skey(sym, a[1].upper()) in alive else [k for k in alive if STRATS[k]["sym"] == sym]
+    if not tg: await reply(u, f"{E.BOT} 找不到運行中的 {sym}"); return
+    if len(tg) > 1: await reply(u, f"{E.BOT} {sym} 有多方向，請指定 /stop {sym} L 或 S"); return
+    S = STRATS[tg[0]]
+    PENDING[u.effective_chat.id] = {"kind": "stop", "t": time.time(), "key": tg[0]}
+    await reply(u, f"{E.BOT} 將停止 {E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}\n"
+                   f"60秒內 /confirm 確認")
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stop(u, key):
+    S = STRATS.get(key)
+    if not S or not S.get("alive"):
+        await reply(u, f"{E.BOT} 策略已不存在"); return
+    d = S["dir"]; iid = S["spec"]["iid"]
     ps = "long" if d == "L" else "short"
     p = await okx_pos(iid, ps)
     S["alive"] = False
-    n = await sweep(iid, ps) if kind == "n" else 0
+    n = await sweep(iid, ps)
     save_state()
-    if p:
-        await reply(u, f"{E.BOT} {cmd}（持倉中）\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                       f"⚠ 已進場不自動平倉\n倉位 {p['pos']} 張 均價 {p.get('avgPx','?')} 浮 {p.get('upl','?')}\n"
-                       + (f"已撤掛單 {n} 筆\n" if kind == "n" else "")
-                       + "請至 OKX 手動平倉")
-    else:
-        await reply(u, f"{E.BOT} {cmd}\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                       + (f"已停止，撤掉掛單 {n} 筆" if kind == "n" else "已停止"))
-
-async def cmd_stop(u, c): await _stop_common(u, c, "n")
-async def cmd_stoph(u, c): await _stop_common(u, c, "h")
+    tail = f"\n⚠ 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
+    await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜撤單 {n}{tail}")
 
 async def cmd_stopall(u, c):
+    alive = [k for k, s in STRATS.items() if s.get("alive")]
+    if not alive:
+        await reply(u, f"{E.BOT} 目前無運行中策略"); return
+    PENDING[u.effective_chat.id] = {"kind": "stopall", "t": time.time()}
+    await reply(u, f"{E.BOT} ⚠ 將停止全部 {len(alive)} 個策略\n60秒內 /confirm 確認")
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stopall(u):
     alive = [k for k, s in STRATS.items() if s.get("alive")]
     held = []; done = []
     for k in list(alive):
         S = STRATS[k]; d = S["dir"]; iid = S["spec"]["iid"]
-        kd = S.get("kind", "n")
-        tag = "均K" if kd == "h" else "普K"
         ps = "long" if d == "L" else "short"
         p = await okx_pos(iid, ps)
         S["alive"] = False
-        if kd == "n": await sweep(iid, ps)
-        (held if p else done).append(f"{tag} {S['sym']} {S['dir']}")
+        await sweep(iid, ps)
+        (held if p else done).append(f"{S['sym']} {S['dir']}")
     orphan = 0
-    for pre in ("n", "h"):
-        for o in await okx_orders(prefix=pre):
-            cr = await api("POST", "/api/v5/trade/cancel-order", {"instId": o["instId"], "ordId": o["ordId"]})
-            if cr.get("code") == "0": orphan += 1
+    for o in await okx_orders(prefix="n"):
+        cr = await api("POST", "/api/v5/trade/cancel-order", {"instId": o["instId"], "ordId": o["ordId"]})
+        if cr.get("code") == "0": orphan += 1
     save_state()
-    m = f"{E.BOT} /stopall\n━━━━━━━━━━\n"
-    if done: m += f"已停止策略（{len(done)}）：\n" + "\n".join("・" + x for x in done) + "\n"
-    if orphan: m += f"另清除殘留掛單：{orphan} 筆\n"
-    if held: m += f"⚠ 持倉需手動平倉（{len(held)}）：\n" + "\n".join("・" + x for x in held) + "\n"
-    if not done and not orphan and not held: m += "目前無策略、無殘單\n"
-    await reply(u, m + f"時間：{hhmmss()}")
+    m = f"{E.BOT} 已停止 {len(done)} 個策略｜清殘單 {orphan}"
+    if held: m += f"\n⚠ 持倉需手動平倉：" + "、".join(held)
+    await reply(u, m)
 
 async def cmd_status(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
@@ -1042,30 +787,20 @@ async def cmd_status(u, c):
             av = f"{Decimal(x.get('availEq') or x.get('availBal') or '0'):.4f}"
     pl = [p for p in posr.get("data", []) if float(p.get("pos", "0")) != 0] if posr.get("code") == "0" else []
     pdl = pe.get("data", []) if pe.get("code") == "0" else []
-    aliveN = [s for s in STRATS.values() if s.get("alive") and s.get("kind", "n") == "n"]
-    aliveH = [s for s in STRATS.values() if s.get("alive") and s.get("kind") == "h"]
+    alive = [s for s in STRATS.values() if s.get("alive")]
     okxp = {(p["instId"], p["posSide"]) for p in pl}
     okxo = {(o["instId"], o.get("posSide")) for o in pdl}
-    L = [f"{E.BOT} OKX｜{ACCT}", "事件：現況（即時查 OKX）", "━━━━━━━━━━",
+    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：現況（即時查 OKX）", "━━━━━━━━━━",
          f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
-         "━━━━━━━━━━", f"普K 策略：{len(aliveN)} 個"]
-    for s in aliveN:
+         f"運行中策略：{len(alive)} 個"]
+    for s in alive:
         k = skey(s["sym"], s["dir"]); placed, entered = get_stat(k)
         key = (s["spec"]["iid"], "long" if s["dir"] == "L" else "short")
         live = "持倉中" if key in okxp else ("委託中" if key in okxo else "等下輪")
         L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(掛{placed}/進{entered})")
-        L.append(f"　　策略　　：{strat_params(s['sym'], s['dir'])}")
-    L += ["━━━━━━━━━━", f"均K 策略：{len(aliveH)} 個"]
-    for s in aliveH:
-        k = skey(s["sym"], s["dir"], "h"); placed, entered = get_stat(k)
-        live = "持倉中" if s.get("pos_open") else "等訊號"
-        hb = s.get("hb")
-        age = f"{int(time.time()-hb)}s" if hb else "-"
-        L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(進{entered}) 心跳{age}")
-        L.append(f"　　策略　　：{h_params(s['sym'], s['dir'])}")
-        if other_alive(s["sym"], s["dir"], "h"):
-            L.append("　　⚠ 與普K 同幣同向，損益會混算")
-    L += ["━━━━━━━━━━", f"掛單數：{len(pdl)}", f"持倉數：{len(pl)}"]
+        L.append(f"策略:{strat_params(s['sym'], s['dir'])}")
+    L.append(f"掛單數：{len(pdl)}")
+    L.append(f"持倉數：{len(pl)}")
     for p in pl:
         d = "L" if p["posSide"] == "long" else "S"
         L.append(f"{E.dir_emoji(d)} {p['instId'].replace('-USDT-SWAP','USDT')} {d}")
@@ -1077,35 +812,23 @@ def sum_lines(rs, placed, entered):
     L = []
     m = len(rs)
     hit = (entered / placed * 100) if placed else 0
-    L.append("委託次數：%d" % placed)
-    L.append("進場數：%d | 命中率：%.2f%%" % (entered, hit))
-    if m:
-        L.append("平均埋伏秒數：%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs) / m))
-    else:
-        L.append("平均埋伏秒數：-")
+    amb = ("%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs) / m)) if m else "-"
+    L.append("次數:%d | %d(%s) | %.2f%%" % (placed, entered, amb, hit))
     NAME = {"Take_Profit": "TP", "Stop_Loss": "SL", "Time_Exit": "TE"}
     for lab, cats in (("獲利", ("Take_Profit", "Time_Exit")), ("虧損", ("Stop_Loss", "Time_Exit"))):
         if lab == "獲利":
             sub = [r for r in rs if Decimal(str(r.get("net") or "0")) > 0]
         else:
             sub = [r for r in rs if Decimal(str(r.get("net") or "0")) < 0]
-        L.append("━" * 10)
-        L.append("%s數：%d" % (lab, len(sub)))
-        ps = []; ss = []
+        ps = []
         for cn in cats:
             gg = [r for r in sub if r.get("reason") == cn]
-            ps.append("%s:%d" % (NAME[cn], len(gg)))
             if gg:
-                ss.append("%s:%d秒" % (NAME[cn], sum(int(r.get("hold_s") or 0) for r in gg) / len(gg)))
+                sec = "%d秒" % (sum(int(r.get("hold_s") or 0) for r in gg) / len(gg))
             else:
-                ss.append("%s:-" % NAME[cn])
-        L.append("　" + " | ".join(ps))
-        L.append("　平均秒數 " + " | ".join(ss))
-    L.append("━" * 10)
-    return L + _pnl_lines(rs)
-
-def _pnl_lines(rs):
-    L = []
+                sec = "0秒"
+            ps.append("%s:%d(%s)" % (NAME[cn], len(gg), sec))
+        L.append("%s數:%d | %s" % (lab, len(sub), " | ".join(ps)))
     tg = sum((Decimal(str(r.get("gross") or "0")) for r in rs), Decimal(0))
     tf = sum((Decimal(str(r.get("fee") or "0")) for r in rs), Decimal(0))
     tn = sum((Decimal(str(r.get("net") or "0")) for r in rs), Decimal(0))
@@ -1113,110 +836,254 @@ def _pnl_lines(rs):
     gp = (tg / nv * 100) if nv else Decimal(0)
     fp = (tf / nv * 100) if nv else Decimal(0)
     npc = (tn / nv * 100) if nv else Decimal(0)
-    L.append("毛損益：%+.6f (%+.3f%%)" % (tg, gp))
-    L.append("手續費：%+.6f (%+.3f%%)" % (tf, fp))
-    L.append("淨損益：%+.6f (%+.3f%%) %s" % (tn, npc, E.pnl_emoji(tn)))
+    L.append("毛損益:%+.6f (%+.3f%%)" % (tg, gp))
+    L.append("手續費:%+.6f (%+.3f%%)" % (tf, fp))
+    L.append("淨損益:%+.6f (%+.3f%%) %s" % (tn, npc, E.pnl_emoji(tn)))
     return L
 
-def h_sum_lines(rs, entered):
-    """均K 戰報：只有訊號出場，統計改看持倉根數與勝率。"""
-    L = []
-    m = len(rs)
-    win = [r for r in rs if Decimal(str(r.get("net") or "0")) > 0]
-    los = [r for r in rs if Decimal(str(r.get("net") or "0")) < 0]
-    wr = (len(win) / m * 100) if m else 0
-    L.append("進場數：%d | 已出場：%d" % (entered, m))
-    L.append("勝率：%.2f%%（勝 %d / 敗 %d）" % (wr, len(win), len(los)))
-    if m:
-        L.append("平均持倉：%d秒（約 %.1f 根）" % (
-            sum(int(r.get("hold_s") or 0) for r in rs) / m,
-            sum(float(r.get("bars") or 0) for r in rs) / m))
-    else:
-        L.append("平均持倉：-")
-    if win:
-        L.append("　平均獲利：%+.6f" % (sum(Decimal(str(r.get("net") or "0")) for r in win) / len(win)))
-    if los:
-        L.append("　平均虧損：%+.6f" % (sum(Decimal(str(r.get("net") or "0")) for r in los) / len(los)))
-    L.append("━" * 10)
-    return L + _pnl_lines(rs)
-
 async def cmd_summary(u, c):
-    t = today8(); recs = load_trades(t, "n")
-    ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t) and ":" not in k}
-    L = [f"{E.BOT} OKX普K｜{ACCT}", f"📊📊📊 Summary {t}"]
+    t = today8(); recs = load_trades(t)
+    ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t)}
+    L = [f"{E.BOT} OKX原K｜{ACCT}", f"📊📊📊 Summary {t}"]
     for dr in ("L", "S"):
         rows = [r for r in recs if r["dir"] == dr]
         pa = sum(v["placed"] for k, v in ts.items() if k.endswith("_" + dr))
         en = sum(v["entered"] for k, v in ts.items() if k.endswith("_" + dr))
-        L.append("━" * 10)
         L.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)}")
         L += sum_lines(rows, pa, en)
-    L += ["━" * 10, f"時間：{hhmmss()}"]
+    L.append(f"時間:{hhmmss()}")
     await reply(u, "\n".join(L))
     for sy in sorted({r["sym"] for r in recs}):
         D = [f"\U0001f49a\U0001f499\U0001fa75\U0001f49c {sy} {t}"]
         for dr in ("L", "S"):
             rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
             st_ = ts.get(skey(sy, dr)) or {"placed": 0, "entered": 0}
-            D.append("━" * 10)
-            D.append(f"策略：{E.dir_emoji(dr)} {strat_params(sy, dr)}")
+            D.append(f"策略:{E.dir_emoji(dr)} {strat_params(sy, dr)}")
             D += sum_lines(rows, st_["placed"], st_["entered"])
-        D += ["━" * 10, f"時間：{hhmmss()}"]
+        D.append(f"時間:{hhmmss()}")
         await reply(u, "\n".join(D))
 
-async def cmd_summaryh(u, c):
-    t = today8(); recs = load_trades(t, "h")
-    ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t) and k.startswith("h:")}
-    L = [f"{E.BOT} OKX均K｜{ACCT}", f"📊📊📊 Summary {t}"]
-    for dr in ("L", "S"):
-        rows = [r for r in recs if r["dir"] == dr]
-        en = sum(v["entered"] for k, v in ts.items() if k.endswith("_" + dr))
-        L.append("━" * 10)
-        L.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)}")
-        L += h_sum_lines(rows, en)
-    L += ["━" * 10, f"時間：{hhmmss()}"]
-    await reply(u, "\n".join(L))
-    for sy in sorted({r["sym"] for r in recs}):
-        D = [f"\U0001f49a\U0001f499\U0001fa75\U0001f49c 均K {sy} {t}"]
-        for dr in ("L", "S"):
-            rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
-            st_ = ts.get(skey(sy, dr, "h")) or {"placed": 0, "entered": 0}
-            D.append("━" * 10)
-            D.append(f"策略：{E.dir_emoji(dr)} {h_params(sy, dr)}")
-            D += h_sum_lines(rows, st_["entered"])
-        D += ["━" * 10, f"時間：{hhmmss()}"]
-        await reply(u, "\n".join(D))
+# ---------- /amp 振幅報表（Excel + Email） ----------
+AMP_MAX = 2000       # 單次最多抓幾根
+AMP_BINS = [Decimal(str(x)) for x in
+            ("0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9","1.0","1.2","1.5")]
 
-async def cmd_ha(u, c):
-    """查看目前燈號序列，用來對參數。用法：/ha BTCUSDT [根數]"""
+async def get_klines_paged(iid, bar, want):
+    """分頁往前抓 K 線（OKX 單次上限 300），回傳舊->新、只含已收線。"""
+    out = []
+    after = ""
+    ep = "candles"          # 近期用 candles，翻不動時自動切 history-candles
+    for _ in range(40):
+        q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit=300"
+        if after:
+            q += f"&after={after}"
+        r = await pub(q)
+        if r.get("code") != "0":
+            break
+        batch = r.get("data") or []
+        if not batch:
+            if ep == "candles" and after:
+                ep = "history-candles"      # candles 只保留近 ~1440 根，改用歷史端點續抓
+                continue
+            break
+        got = []
+        for c in batch:
+            try:
+                if len(c) >= 9 and str(c[8]) != "1":
+                    continue
+                got.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
+                            "l": Decimal(c[3]), "c": Decimal(c[4])})
+            except Exception:
+                continue
+        if not got:
+            break
+        out.extend(got)                      # OKX 回傳為新->舊
+        after = str(min(int(x["ts"]) for x in got))
+        if len(out) >= want + 10:
+            break
+        await asyncio.sleep(0.15)
+    out.sort(key=lambda x: x["ts"])          # 轉成舊->新
+    seen = set(); uniq = []
+    for k in out:
+        if k["ts"] in seen:
+            continue
+        seen.add(k["ts"]); uniq.append(k)
+    return uniq[-want:] if want else uniq
+
+async def klines_paged_for_tf(iid, tf, want):
+    """依 TF 分頁取 K 線。10m 由兩根 5m 合成。"""
+    if tf == "10m":
+        return _merge2(await get_klines_paged(iid, "5m", want * 2 + 4))
+    bar = NATIVE_BARS.get(tf)
+    if not bar:
+        return None
+    return await get_klines_paged(iid, bar, want)
+
+def build_amp_xlsx(sym, tf, kl, amps, path):
+    """產生兩個工作表：明細 + 統計。日期與時間分欄，便於樞紐分析。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    FONT = "PingFang TC"; SIZE = 12
+    wb = Workbook()
+
+    ws = wb.active; ws.title = "明細"
+    heads = ["幣種", "日期", "時間", "漲跌", "開", "高", "低", "收", "振幅%", "漲跌幅%"]
+    widths = {"A": 3.3, "B": 12, "C": 11, "D": 8.5, "E": 6, "F": 13, "G": 13, "H": 13, "I": 13, "J": 11, "K": 11}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    for i, h in enumerate(heads):
+        c = ws.cell(row=2, column=2 + i, value=h)
+        c.font = Font(name=FONT, size=SIZE, bold=True)
+        c.alignment = Alignment(horizontal="center")
+    r = 3
+    for k, (amp, chg) in zip(kl, amps):
+        dt = datetime.fromtimestamp(int(k["ts"]) / 1000, TZ8)
+        vals = [sym, dt.date(), dt.strftime("%H:%M:%S"),
+                "\U0001f7e9" if k["c"] >= k["o"] else "\U0001f7e5",
+                float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]),
+                float(amp) / 100, float(chg) / 100]
+        for i, v in enumerate(vals):
+            cc = ws.cell(row=r, column=2 + i, value=v)
+            cc.font = Font(name=FONT, size=SIZE)
+        ws.cell(row=r, column=3).number_format = "m/d/yy"
+        ws.cell(row=r, column=4).number_format = "@"
+        ws.cell(row=r, column=5).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=10).number_format = "0.0000%"
+        ws.cell(row=r, column=11).number_format = '0.0000%;[Red]-0.0000%'
+        r += 1
+    ws.freeze_panes = "A3"
+
+    st = wb.create_sheet("統計")
+    for col, w in {"A": 3.3, "B": 18, "C": 20, "D": 12}.items():
+        st.column_dimensions[col].width = w
+    seg = [a for a, _ in amps]
+    chgs = [c for _, c in amps]
+    ss = sorted(seg); m = len(ss)
+    med = ss[m // 2] if m % 2 else (ss[m // 2 - 1] + ss[m // 2]) / 2
+    avg = sum(seg, Decimal(0)) / m
+    d0 = datetime.fromtimestamp(int(kl[0]["ts"]) / 1000, TZ8)
+    d1 = datetime.fromtimestamp(int(kl[-1]["ts"]) / 1000, TZ8)
+    up = sum(1 for c in chgs if c > 0); dn = sum(1 for c in chgs if c < 0)
+    rows = [("商品", sym, None), ("週期", tf, None), ("根數", m, None),
+            ("期間起", d0.strftime("%Y-%m-%d %H:%M"), None),
+            ("期間迄", d1.strftime("%Y-%m-%d %H:%M"), None),
+            ("漲/跌根數", "%d / %d" % (up, dn), None), ("", "", None),
+            ("平均振幅", float(avg) / 100, "pct"),
+            ("中位振幅", float(med) / 100, "pct"),
+            ("最大振幅", float(max(seg)) / 100, "pct"),
+            ("最小振幅", float(min(seg)) / 100, "pct"), ("", "", None),
+            ("最大漲幅", float(max(chgs)) / 100, "pct"),
+            ("最大跌幅", float(min(chgs)) / 100, "pct"), ("", "", None)]
+    rr = 2
+    for a, b, kind in rows:
+        st.cell(row=rr, column=2, value=a).font = Font(name=FONT, size=SIZE)
+        cb = st.cell(row=rr, column=3, value=b); cb.font = Font(name=FONT, size=SIZE)
+        if kind == "pct":
+            cb.number_format = '0.0000%;[Red]-0.0000%'
+        rr += 1
+    for i, h in enumerate(["振幅達標門檻", "根數", "佔比"]):
+        st.cell(row=rr, column=2 + i, value=h).font = Font(name=FONT, size=SIZE, bold=True)
+    rr += 1
+    for b in AMP_BINS:
+        n = sum(1 for a in seg if a >= b)
+        st.cell(row=rr, column=2, value="\u2265 " + str(b) + "%").font = Font(name=FONT, size=SIZE)
+        st.cell(row=rr, column=3, value=n).font = Font(name=FONT, size=SIZE)
+        cd = st.cell(row=rr, column=4, value=n / m)
+        cd.font = Font(name=FONT, size=SIZE); cd.number_format = "0.00%"
+        rr += 1
+    wb.save(path)
+
+def send_amp_mail(path, name, sym, tf, m, avg, med):
+    """寄出振幅報表。回傳 (ok, 訊息)。"""
+    import smtplib
+    from email.message import EmailMessage
+    env = {}
+    try:
+        for line in open("/srv/1111bot/.env"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception as e:
+        return False, "讀 .env 失敗：%s" % e
+    user = env.get("GMAIL_USER")
+    pwd = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "")
+    to = env.get("REPORT_TO") or user
+    if not user or not pwd:
+        return False, "未設定 GMAIL_USER / GMAIL_APP_PASSWORD"
+    msg = EmailMessage()
+    msg["Subject"] = "OKX %s 振幅報表 %s %s（%d 根）" % (ACCT, sym, tf, m)
+    msg["From"] = user; msg["To"] = to
+    msg.set_content("商品 %s\\n週期 %s\\n根數 %d\\n平均振幅 %.4f%%\\n中位振幅 %.4f%%\\n" % (sym, tf, m, avg, med))
+    msg.add_attachment(open(path, "rb").read(),
+                       maintype="application",
+                       subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       filename=name)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as sv:
+        sv.login(user, pwd); sv.send_message(msg)
+    return True, to
+
+async def cmd_amp(u, c):
+    """原K 振幅報表（Excel 寄信）。用法：/amp SOLUSDT [根數 3~2000]"""
+    supported = "3m/5m/10m/15m/30m/60m"
     if not c.args:
-        await reply(u, f"{E.BOT} 用法：/ha BTCUSDT 20\n（顯示最近 N 根 HA 燈號與振幅，週期依 /timeframe）"); return
+        await reply(u, f"{E.BOT} 用法：/amp SOLUSDT 900\n"
+                       f"根數 3~{AMP_MAX}（預設 300）\n"
+                       f"產生 Excel（明細＋統計）寄到信箱\n"
+                       f"支援週期：{supported}\n"
+                       f"目前週期：{ACCOUNT_TF}")
+        return
     sym = c.args[0].upper()
-    n = 20
+    n = 300
     if len(c.args) >= 2:
-        try: n = max(3, min(60, int(c.args[1])))
+        try: n = max(3, min(AMP_MAX, int(c.args[1])))
         except Exception: pass
-    try: spec = await get_spec(sym)
-    except Exception: await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
-    ha = await ha_series(spec["iid"], ACCOUNT_TF)
-    if not ha: await reply(u, f"{E.BOT} {sym} K 線取得失敗"); return
-    seg = ha[-n:]
-    L = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：燈號檢視 {sym} {ACCOUNT_TF}", "━━━━━━━━━━",
-         "序列（舊→新）：", "".join("🟩" if x["color"] == "G" else "🟥" for x in seg),
-         "".join(x["color"] for x in seg), "━━━━━━━━━━", "最近 10 根明細："]
-    for x in seg[-10:]:
-        tt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%H:%M")
-        L.append(f"{tt} {'🟩' if x['color']=='G' else '🟥'} 振幅 {x['amp']:.4f}%")
-    for w in (2, 3, 4, 5):
-        if len(seg) >= w:
-            s = sum((x["amp"] for x in seg[-w:]), Decimal(0))
-            L.append(f"近{w}根振幅累加：{s:.4f}%")
-    L += ["━━━━━━━━━━", f"時間：{hhmmss()}"]
-    await reply(u, "\n".join(L))
+    if ACCOUNT_TF != "10m" and ACCOUNT_TF not in NATIVE_BARS:
+        await reply(u, f"{E.BOT} 目前週期 {ACCOUNT_TF} 無原生 K 線\n"
+                       f"可查週期：{supported}\n請先 /timeframe 切換")
+        return
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
+    await reply(u, f"{E.BOT} 產生 {sym} {ACCOUNT_TF} 振幅報表中（{n} 根），請稍候…")
+    try:
+        kl = await klines_paged_for_tf(spec["iid"], ACCOUNT_TF, n)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} K 線取得失敗：{type(e).__name__}"); return
+    if not kl:
+        await reply(u, f"{E.BOT} {sym} K 線取得失敗"); return
+    amps = calc_amp(kl)
+    m = len(kl)
+    seg = [a for a, _ in amps]
+    ss = sorted(seg)
+    med = ss[m // 2] if m % 2 else (ss[m // 2 - 1] + ss[m // 2]) / 2
+    avg = sum(seg, Decimal(0)) / m
+    day = now8().strftime("%Y%m%d")
+    name = f"OKX_{ACCT}_振幅_{sym}_{ACCOUNT_TF}_{m}根_{day}.xlsx"
+    path = f"/srv/1111bot/data/{name}"
+    try:
+        build_amp_xlsx(sym, ACCOUNT_TF, kl, amps, path)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 產生 Excel 失敗：{type(e).__name__}: {e}"); return
+    try:
+        ok, info = send_amp_mail(path, name, sym, ACCOUNT_TF, m, float(avg), float(med))
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
+    if not ok:
+        await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
+    t0 = datetime.fromtimestamp(int(kl[0]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(kl[-1]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    await reply(u, f"{E.BOT} ✅ 振幅報表已寄出\n"
+                   f"{sym} {ACCOUNT_TF}｜{m} 根\n"
+                   f"期間：{t0} ~ {t1}\n"
+                   f"平均 {avg:.4f}% | 中位 {med:.4f}%\n"
+                   f"最大 {max(seg):.4f}% | 最小 {min(seg):.4f}%\n"
+                   f"時間：{hhmmss()}")
 
 async def cmd_coins(u, c):
     on = [s["symbol"] for s in SYMS if s["enabled"]]
-    L = [f"{E.BOT} OKX｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
+    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
     for sym in on:
         try:
             sp = await get_spec(sym); last = await get_last(sp["iid"])
@@ -1230,33 +1097,25 @@ async def cmd_coins(u, c):
 async def cmd_timeframe(u, c):
     global ACCOUNT_TF
     if not c.args:
-        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選 3m/5m/10m/15m\n變更：/timeframe 10m"); return
+        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選：" + "/".join(TF_SEC.keys()) + "\n變更：/timeframe 10m"); return
     tf = c.args[0]
-    if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須 3m/5m/10m/15m"); return
+    if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須為：" + "/".join(TF_SEC.keys())); return
     ACCOUNT_TF = tf; save_state()
     await reply(u, f"{E.BOT} ✅ 帳戶週期已設為 {tf}\n（僅影響之後新建立的策略）")
 
 async def cmd_menu(u, c):
-    await reply(u, f"{E.BOT} OKX 普K+均K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
-        "【普K｜限價埋伏 TP/SL/TE】\n"
-        "/run 商品 方向 槓桿 保證金 埋伏 TP SL TE\n"
-        "例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 180\n"
-        "/stop 商品 方向\n"
-        "/summary 普K 當日戰報\n"
+    await reply(u, f"{E.BOT} OKX原K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
+        "/run 商品 方向 槓桿 保證金 埋伏 TP SL\n"
+        f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
+        "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
+        "/status 所有策略現況\n/summary 當日戰報\n"
+        "/amp 商品 根數  振幅報表 Excel 寄信（3~2000根）\n"
+        "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
-        "【均K｜燈號訊號 taker 進出】\n"
-        "/runh 商品 方向 槓桿 保證金 PRE POST EXIT 振幅\n"
-        "例：/runh BTCUSDT L 1x 3 2 3 2 0.3\n"
-        "/stoph 商品 方向\n"
-        "/summaryh 均K 當日戰報\n"
-        "/ha 商品 根數  查看燈號序列與振幅\n"
-        "⚠ 均K 無 TP/SL/TE，僅靠反向訊號出場\n"
-        "━━━━━━━━━━\n"
-        "【共用】\n"
-        "/confirm 確認啟動（/run 與 /runh 共用）\n"
-        "/stopall 停全部+清殘單\n/status 所有策略現況\n"
-        f"/timeframe 查看/設定週期（目前 {ACCOUNT_TF}）\n/coins 幣種\n"
-        "━━━━━━━━━━\n⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
+        f"一個 TF 一輪：TF 開始埋伏\n"
+        f"未成交且剩餘不足 {ENTRY_CUTOFF}s → 撤單放棄本輪\n"
+        f"已進場未觸發 TP/SL → TF 結束前 {CLOSE_LEAD}s 平倉（TE）\n"
+        "⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
@@ -1272,22 +1131,19 @@ async def job_summary(ctx):
     if not CHAT_ID: return
     try: await cmd_summary(_U(ctx.application, CHAT_ID), ctx)
     except Exception as e: print("auto summary fail", e)
-    try:
-        if any(s.get("kind") == "h" for s in STRATS.values()) or load_trades(today8(), "h"):
-            await cmd_summaryh(_U(ctx.application, CHAT_ID), ctx)
-    except Exception as e: print("auto summaryh fail", e)
 
 # ---------- 啟動 ----------
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
-    CMDS = [BotCommand("run", "普K建立策略"), BotCommand("runh", "均K建立策略"),
-            BotCommand("confirm", "確認啟動"),
-            BotCommand("stop", "停普K"), BotCommand("stoph", "停均K"),
+    CMDS = [BotCommand("status", "現況"),
+            BotCommand("summary", "當日戰報"),
+            BotCommand("coins", "幣種"),
+            BotCommand("amp", "振幅報表 Excel"),
             BotCommand("stopall", "停全部"),
-            BotCommand("status", "現況"), BotCommand("summary", "普K戰報"),
-            BotCommand("summaryh", "均K戰報"), BotCommand("ha", "燈號檢視"),
-            BotCommand("timeframe", "週期"), BotCommand("coins", "幣種"),
+            BotCommand("stop", "停指定"),
+            BotCommand("run", "建立策略"),
+            BotCommand("timeframe", "週期"),
             BotCommand("menu", "說明")]
     # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
     # 只刪 Default 會被舊清單蓋住，導致左下 Menu 卡在舊版）
@@ -1308,25 +1164,27 @@ async def _post_init(app):
         if jq:
             t2359 = datetime.strptime("23:59", "%H:%M").time().replace(tzinfo=TZ8)
             jq.run_daily(job_summary, time=t2359, name="daily_summary")
-            print("已排程：每日 23:59 自動 /summary + /summaryh")
+            print("已排程：每日 23:59 自動 /summary")
     except Exception as e:
         print("schedule fail", e)
     await startup_recover(app)
-    hb = asyncio.create_task(hb_watch(app))
-    _BG.add(hb); hb.add_done_callback(_BG.discard)
-    print("均K 心跳看門狗已啟動")
+
+async def _post_stop(app):
+    global SHUTTING_DOWN
+    save_state()          # 關閉前最後一次完整存檔（此時 STRATS 仍完整）
+    SHUTTING_DOWN = True
+    print("關閉中：已保存狀態，停止後續寫檔")
 
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    print(f"啟動 o3333o 普K+均K B6-2（token ...{TOKEN[-6:]}）")
-    app = (Application.builder().token(TOKEN).post_init(_post_init)
+    print(f"啟動 o3333o 原K B6-1 核心重寫版（token ...{TOKEN[-6:]}）")
+    app = (Application.builder().token(TOKEN).post_init(_post_init).post_stop(_post_stop)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .pool_timeout(30.0).get_updates_read_timeout(40.0)
            .get_updates_connect_timeout(30.0).build())
-    for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("runh", cmd_runh),
-                    ("confirm", cmd_confirm), ("stop", cmd_stop), ("stoph", cmd_stoph),
-                    ("stopall", cmd_stopall), ("status", cmd_status),
-                    ("summary", cmd_summary), ("summaryh", cmd_summaryh), ("ha", cmd_ha),
+    for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
+                    ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
+                    ("summary", cmd_summary), ("amp", cmd_amp),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
