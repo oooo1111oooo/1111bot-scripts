@@ -11,7 +11,7 @@
      邊界以 UTC+8 對齊（與 OKX App 的 12H/1D 日界一致）。
 注意：本檔完全獨立於 run_bot.py（普K），使用自己的 bot token 與 state 檔。
 """
-import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
+import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os, sqlite3
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 import httpx
@@ -31,7 +31,17 @@ HA_LAG = 5           # 收線後幾秒才抓 K 線（等 OKX 資料落定）
 HA_HIST = 120        # 抓幾根歷史 K 線做 HA 遞迴
 HB_BARS = 3          # 心跳超過幾根 K 線未推進就告警
 HA_MAX  = 2000       # /ha 單次最多抓幾根
+DB_FILE = "/srv/1111bot/data/ha_market.db"
+DB_KEEP = 30         # 每個 (幣種,週期) 在 DB 保留幾根（連續均K 很少超過30）
+DB_WARM = HA_HIST    # 開機補歷史抓幾根（僅供算 ATR14 暖身與連續段，仍只存 DB_KEEP 根）
+DB_TICK = 15         # 收集器每幾秒巡一次
+DB_GAP  = 0.15       # 每次 API 之間間隔秒數（避免打到 OKX 限流）
 HA_MAX  = 2000       # /ha 單次最多抓幾根
+DB_FILE = "/srv/1111bot/data/ha_market.db"
+DB_KEEP = 30         # 每個 (幣種,週期) 在 DB 保留幾根（連續均K 很少超過30）
+DB_WARM = HA_HIST    # 開機補歷史抓幾根（僅供算 ATR14 暖身與連續段，仍只存 DB_KEEP 根）
+DB_TICK = 15         # 收集器每幾秒巡一次
+DB_GAP  = 0.15       # 每次 API 之間間隔秒數（避免打到 OKX 限流）
 HA_INLINE = 30       # /ha 根數 <= 此值直接顯示在 TG，超過則產 Excel 寄信
 
 # 均K 專屬週期表（不共用原K 的 normal.TF_SEC，兩邊互不影響）
@@ -375,6 +385,196 @@ def calc_atr(kl, period=14):
         ci = kl[i]["c"]
         out[i] = (prev, (prev / ci * 100) if ci else None)
     return out
+
+# ==================== 行情資料庫（決策時只讀 DB，不打 API）====================
+# 設計目的：均K 是趨勢型策略，需要多根歷史才能判斷。若等到訊號當下才抓 K 線，
+# 會多花數百毫秒甚至更久。收集器在每根 K 線收線後就把結果算好寫入 SQLite，
+# 下單時只做一次本機讀取。
+DB = None
+COLLECT_LAST = {}    # (sym, tf) -> 最近已寫入的 bar ts
+COLLECT_ERR = {}     # (sym, tf) -> 最近一次錯誤訊息
+
+DDL = """
+CREATE TABLE IF NOT EXISTS ha_bars (
+  sym TEXT NOT NULL,
+  tf  TEXT NOT NULL,
+  ts  INTEGER NOT NULL,
+  dt  TEXT,
+  color TEXT,
+  dir INTEGER,
+  ha_o REAL, ha_h REAL, ha_l REAL, ha_c REAL,
+  body_pct REAL,
+  range_pct REAL,
+  chg_pct REAL,
+  o REAL, h REAL, l REAL, c REAL,
+  atr14 REAL,
+  atr14_ratio REAL,
+  streak INTEGER,
+  streak_body REAL,
+  streak_range REAL,
+  updated INTEGER,
+  PRIMARY KEY (sym, tf, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_ha_bars_lookup ON ha_bars (sym, tf, ts DESC);
+CREATE TABLE IF NOT EXISTS ha_meta (
+  sym TEXT NOT NULL,
+  tf  TEXT NOT NULL,
+  last_ts INTEGER,
+  last_run INTEGER,
+  bars INTEGER,
+  err TEXT,
+  PRIMARY KEY (sym, tf)
+);
+"""
+
+def db_open():
+    global DB
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    DB = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
+    DB.row_factory = sqlite3.Row
+    DB.execute("PRAGMA journal_mode=WAL")      # 讀寫不互鎖
+    DB.execute("PRAGMA synchronous=NORMAL")
+    DB.executescript(DDL)
+    DB.commit()
+    n = DB.execute("SELECT COUNT(*) FROM ha_bars").fetchone()[0]
+    print(f"行情DB 就緒：{DB_FILE}（現有 {n} 筆）")
+
+def _f(v):
+    try: return float(v)
+    except Exception: return None
+
+def build_rows(sym, tf, kl, ha, atrs):
+    """把 K 線 / HA / ATR 併成一列列可寫入 DB 的紀錄，並算好連續段累計。"""
+    rows = []
+    streak = 0; sbody = 0.0; srange = 0.0; prev_color = None
+    now = int(time.time())
+    for i, x in enumerate(ha):
+        k = kl[i]
+        ho, hh, hl, hc = x["ho"], x["hh"], x["hl"], x["hc"]
+        body = float((hc - ho) / ho * 100) if ho else 0.0
+        rng = float((hh - hl) / k["c"] * 100) if k["c"] else 0.0
+        if i == 0:
+            chg = 0.0
+        else:
+            pc = ha[i-1]["hc"]
+            chg = float((hc - pc) / pc * 100) if pc else 0.0
+        if x["color"] == prev_color:
+            streak += 1; sbody += body; srange += rng
+        else:
+            streak = 1; sbody = body; srange = rng
+        prev_color = x["color"]
+        a, r = atrs[i]
+        dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%Y-%m-%d %H:%M")
+        rows.append((sym, tf, int(x["ts"]), dt, x["color"],
+                     1 if x["color"] == "G" else -1,
+                     _f(ho), _f(hh), _f(hl), _f(hc),
+                     body, rng, chg,
+                     _f(k["o"]), _f(k["h"]), _f(k["l"]), _f(k["c"]),
+                     _f(a) if a is not None else None,
+                     _f(r) if r is not None else None,
+                     streak, sbody, srange, now))
+    return rows
+
+def db_write(sym, tf, rows, err=None):
+    if DB is None or not rows: return
+    rows = rows[-DB_KEEP:]          # 前面幾根只是 ATR14/連續段的暖身，不必落地
+    DB.executemany(
+        "INSERT OR REPLACE INTO ha_bars VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    DB.execute("DELETE FROM ha_bars WHERE sym=? AND tf=? AND ts NOT IN "
+               "(SELECT ts FROM ha_bars WHERE sym=? AND tf=? ORDER BY ts DESC LIMIT ?)",
+               (sym, tf, sym, tf, DB_KEEP))
+    n = DB.execute("SELECT COUNT(*) FROM ha_bars WHERE sym=? AND tf=?", (sym, tf)).fetchone()[0]
+    DB.execute("INSERT OR REPLACE INTO ha_meta VALUES (?,?,?,?,?,?)",
+               (sym, tf, rows[-1][2], int(time.time()), n, err))
+    DB.commit()
+
+def db_latest(sym, tf, n=1):
+    """取最近 n 根（回傳舊->新的 dict 清單）。決策時就是呼叫這個，不打 API。"""
+    if DB is None: return []
+    cur = DB.execute("SELECT * FROM ha_bars WHERE sym=? AND tf=? ORDER BY ts DESC LIMIT ?",
+                     (sym, tf, n))
+    return [dict(r) for r in cur.fetchall()][::-1]
+
+def db_meta(sym=None, tf=None):
+    if DB is None: return []
+    q = "SELECT * FROM ha_meta"; a = []
+    if sym: q += " WHERE sym=?"; a.append(sym)
+    if sym and tf: q += " AND tf=?"; a.append(tf)
+    cur = DB.execute(q + " ORDER BY sym, tf", a)
+    return [dict(r) for r in cur.fetchall()]
+
+def db_fresh(sym, tf, tol=2):
+    """DB 是否新鮮：最近一根是否就是剛收線那根（容許落後 tol 根）。"""
+    m = db_meta(sym, tf)
+    if not m or not m[0].get("last_ts"): return False
+    sec = tf_sec(tf)
+    want = next_open_epoch(int(time.time()), tf) - 2 * sec
+    return int(m[0]["last_ts"]) >= (want - tol * sec) * 1000
+
+async def collect_one(sym, tf, warm=False):
+    """抓一個 (幣種,週期) 並寫入 DB。回傳寫入根數，失敗回 0。"""
+    try:
+        spec = await get_spec(sym)
+    except Exception as e:
+        COLLECT_ERR[(sym, tf)] = f"spec:{type(e).__name__}"; return 0
+    try:
+        kl, ha = await klines_and_ha(spec["iid"], tf, DB_WARM if warm else HA_HIST)
+        if not ha:
+            COLLECT_ERR[(sym, tf)] = "無K線"; return 0
+        atrs = calc_atr(kl, 14)
+        rows = build_rows(sym, tf, kl, ha, atrs)
+        db_write(sym, tf, rows)
+        COLLECT_LAST[(sym, tf)] = rows[-1][2]
+        COLLECT_ERR.pop((sym, tf), None)
+        return len(rows)
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        COLLECT_ERR[(sym, tf)] = msg
+        try: db_write(sym, tf, [], err=msg)
+        except Exception: pass
+        print("collect fail", sym, tf, msg)
+        return 0
+
+def db_symbols():
+    return [s["symbol"] for s in SYMS if s.get("enabled")]
+
+async def collector(app):
+    """背景收集器：每根 K 線收線後把該週期所有幣種算好寫入 DB。"""
+    await asyncio.sleep(3)
+    syms = db_symbols()
+    print(f"行情收集器啟動：{len(syms)} 幣種 x {len(TF_LIST)} 週期")
+    # 開機先補歷史
+    ok = 0
+    for tf in TF_LIST:
+        for sym in syms:
+            if await collect_one(sym, tf, warm=True): ok += 1
+            await asyncio.sleep(DB_GAP)
+    print(f"行情DB 初始化完成：{ok}/{len(syms)*len(TF_LIST)} 組")
+    if CHAT_ID:
+        await notify(app, CHAT_ID,
+            f"{E.BOT} OKX均K｜{ACCT}\n事件：📚 行情DB 初始化完成\n"
+            f"{len(syms)} 幣種 x {len(TF_LIST)} 週期 = {ok} 組就緒\n"
+            f"每根收線後自動更新，下單時只讀本機不打 API\n時間：{hhmmss()}")
+    while True:
+        try:
+            await asyncio.sleep(DB_TICK)
+            now = time.time()
+            for tf in TF_LIST:
+                sec = tf_sec(tf)
+                closed = next_open_epoch(int(now), tf) - 2 * sec   # 最後一根已收線的開盤 epoch
+                if now < closed + sec + HA_LAG:                    # 還沒到可抓的時間
+                    continue
+                want = closed * 1000
+                todo = [s for s in db_symbols() if COLLECT_LAST.get((s, tf), 0) < want]
+                if not todo: continue
+                for sym in todo:
+                    await collect_one(sym, tf)
+                    await asyncio.sleep(DB_GAP)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("collector loop error", type(e).__name__, e)
+            await asyncio.sleep(5)
 
 # ---------- Telegram（旁路） ----------
 _BG = set()
@@ -1166,6 +1366,57 @@ async def cmd_ha(u, c):
                    f"ATR14 ratio 平均 {rAs}%\n"
                    f"時間：{hhmmss()}")
 
+async def cmd_db(u, c):
+    """行情DB 狀態。用法：/db 或 /db ETHUSDT 或 /db ETHUSDT 5m"""
+    if DB is None:
+        await reply(u, f"{E.BOT} 行情DB 尚未就緒"); return
+    sym = c.args[0].upper() if c.args else None
+    tf = c.args[1] if len(c.args) >= 2 else None
+    if tf and tf not in HA_TF:
+        await reply(u, f"{E.BOT} 週期須為：" + " / ".join(TF_LIST)); return
+    ms = db_meta(sym, tf)
+    if not ms:
+        await reply(u, f"{E.BOT} 查無資料（收集器可能還在初始化）"); return
+    if sym and tf:
+        rows = db_latest(sym, tf, 5)
+        L = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：行情DB {sym} {tf}", "━" * 10,
+             f"筆數：{ms[0]['bars']}｜新鮮：{'✅' if db_fresh(sym, tf) else '⚠ 落後'}",
+             "━" * 10, "最近 5 根："]
+        for r in rows:
+            lg = "\U0001F7E9" if r["color"] == "G" else "\U0001F7E5"
+            ar = f"{r['atr14_ratio']:.4f}%" if r["atr14_ratio"] is not None else "-"
+            L.append(f"{r['dt']} {lg} 連{r['streak']}")
+            L.append(f"　實體{r['body_pct']:+.4f}% 振幅{r['range_pct']:.4f}% ATRr {ar}")
+            L.append(f"　連續段累計 實體{r['streak_body']:+.4f}% 振幅{r['streak_range']:.4f}%")
+        L += ["━" * 10, f"時間：{hhmmss()}"]
+        await reply(u, "\n".join(L)); return
+    tot = sum(m["bars"] or 0 for m in ms)
+    stale = [m for m in ms if not db_fresh(m["sym"], m["tf"])]
+    errs = [m for m in ms if m.get("err")]
+    L = [f"{E.BOT} OKX均K｜{ACCT}", "事件：行情DB 狀態", "━" * 10,
+         f"組合數：{len(ms)}（{len(db_symbols())} 幣種 x {len(TF_LIST)} 週期）",
+         f"總筆數：{tot}",
+         f"新鮮：{len(ms) - len(stale)}｜落後：{len(stale)}",
+         f"錯誤：{len(errs)}"]
+    if sym:
+        L += ["━" * 10, f"{sym} 各週期："]
+        for m in ms:
+            fr = "✅" if db_fresh(m["sym"], m["tf"]) else "⚠"
+            last = datetime.fromtimestamp((m["last_ts"] or 0) / 1000, TZ8).strftime("%m/%d %H:%M") if m["last_ts"] else "-"
+            L.append(f"{fr} {m['tf']:>6}｜{m['bars']} 根｜最新 {last}")
+    else:
+        if stale:
+            L += ["━" * 10, "落後的組合（前 10）："]
+            for m in stale[:10]:
+                L.append(f"⚠ {m['sym']} {m['tf']}")
+        if errs:
+            L += ["━" * 10, "錯誤（前 5）："]
+            for m in errs[:5]:
+                L.append(f"{E.LOSS} {m['sym']} {m['tf']}：{str(m['err'])[:40]}")
+        L += ["━" * 10, "細節：/db ETHUSDT 或 /db ETHUSDT 5m"]
+    L += ["━" * 10, f"時間：{hhmmss()}"]
+    await reply(u, "\n".join(L))
+
 async def cmd_coins(u, c):
     on = [s["symbol"] for s in SYMS if s["enabled"]]
     L = [f"{E.BOT} OKX均K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
@@ -1264,10 +1515,16 @@ async def _post_init(app):
             print("已排程：每日 23:59 自動 /summary")
     except Exception as e:
         print("schedule fail", e)
+    try:
+        db_open()
+    except Exception as e:
+        print("行情DB 開啟失敗", type(e).__name__, e)
     await startup_recover(app)
     hb = asyncio.create_task(hb_watch(app))
     _BG.add(hb); hb.add_done_callback(_BG.discard)
     print("心跳看門狗已啟動")
+    col = asyncio.create_task(collector(app))
+    _BG.add(col); col.add_done_callback(_BG.discard)
 
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -1278,7 +1535,7 @@ def main():
            .get_updates_connect_timeout(30.0).build())
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
-                    ("summary", cmd_summary), ("ha", cmd_ha),
+                    ("summary", cmd_summary), ("ha", cmd_ha), ("db", cmd_db),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
