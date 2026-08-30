@@ -1011,8 +1011,6 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
     for i in range(1, len(heads) + 1):
         cc = ws.cell(row=1, column=i); cc.font = hf; cc.fill = hfill
         cc.alignment = Alignment(horizontal="center")
-    gfill = PatternFill("solid", fgColor="C6EFCE")
-    rfill = PatternFill("solid", fgColor="FFC7CE")
     exp = -tick.as_tuple().exponent
     ndp = max(2, min(8, exp + 1))
     afmt = "0." + "0" * ndp
@@ -1021,11 +1019,10 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
         av, rv = atrs[i]
         up = x["color"] == "G"
         ws.append([sym, dt.strftime("%Y/%m/%d"), dt.strftime("%H:%M"),
-                   "漲" if up else "跌",
+                   "\U0001F7E9" if up else "\U0001F7E5",
                    float(av) if av is not None else None,
                    float(rv) if rv is not None else None])
         r = ws.max_row
-        ws.cell(row=r, column=4).fill = gfill if up else rfill
         ws.cell(row=r, column=4).alignment = Alignment(horizontal="center")
         ws.cell(row=r, column=5).number_format = afmt
         ws.cell(row=r, column=6).number_format = "0.0000"
@@ -1049,8 +1046,8 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
     rows = [["項目", "數值"],
             ["幣種", sym], ["週期", tf], ["根數", len(ha)],
             ["期間起", t0], ["期間迄", t1],
-            ["漲(綠)根數", ng], ["跌(紅)根數", len(ha) - ng],
-            ["漲佔比(%)", round(ng / len(ha) * 100, 2) if ha else 0],
+            ["\U0001F7E9 根數", ng], ["\U0001F7E5 根數", len(ha) - ng],
+            ["\U0001F7E9 佔比(%)", round(ng / len(ha) * 100, 2) if ha else 0],
             ["ATR14 平均", aA], ["ATR14 中位", aM], ["ATR14 最大", aX], ["ATR14 最小", aN],
             ["ATR14 ratio 平均(%)", rA], ["ATR14 ratio 中位(%)", rM],
             ["ATR14 ratio 最大(%)", rX], ["ATR14 ratio 最小(%)", rN],
