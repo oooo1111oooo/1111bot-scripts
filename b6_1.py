@@ -927,8 +927,8 @@ def build_amp_xlsx(sym, tf, kl, amps, path):
     wb = Workbook()
 
     ws = wb.active; ws.title = "明細"
-    heads = ["幣種", "日期", "時間", "漲跌", "開", "高", "低", "收", "振幅%", "漲跌幅%"]
-    widths = {"A": 3.3, "B": 12, "C": 11, "D": 8.5, "E": 6, "F": 13, "G": 13, "H": 13, "I": 13, "J": 11, "K": 11}
+    heads = ["幣種", "週期", "日期", "時間", "漲跌", "開", "高", "低", "收", "振幅%", "漲跌幅%"]
+    widths = {"A": 3.3, "B": 12, "C": 7, "D": 11, "E": 8.5, "F": 6, "G": 13, "H": 13, "I": 13, "J": 13, "K": 11, "L": 11}
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
     for i, h in enumerate(heads):
@@ -938,18 +938,19 @@ def build_amp_xlsx(sym, tf, kl, amps, path):
     r = 3
     for k, (amp, chg) in zip(kl, amps):
         dt = datetime.fromtimestamp(int(k["ts"]) / 1000, TZ8)
-        vals = [sym, dt.date(), dt.strftime("%H:%M:%S"),
+        vals = [sym, tf, dt.date(), dt.strftime("%H:%M:%S"),
                 "\U0001f7e9" if k["c"] >= k["o"] else "\U0001f7e5",
                 float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]),
                 float(amp) / 100, float(chg) / 100]
         for i, v in enumerate(vals):
             cc = ws.cell(row=r, column=2 + i, value=v)
             cc.font = Font(name=FONT, size=SIZE)
-        ws.cell(row=r, column=3).number_format = "m/d/yy"
-        ws.cell(row=r, column=4).number_format = "@"
-        ws.cell(row=r, column=5).alignment = Alignment(horizontal="center")
-        ws.cell(row=r, column=10).number_format = "0.0000%"
-        ws.cell(row=r, column=11).number_format = '0.0000%;[Red]-0.0000%'
+        ws.cell(row=r, column=3).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=4).number_format = "m/d/yy"
+        ws.cell(row=r, column=5).number_format = "@"
+        ws.cell(row=r, column=6).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=11).number_format = "0.0000%"
+        ws.cell(row=r, column=12).number_format = '0.0000%;[Red]-0.0000%'
         r += 1
     ws.freeze_panes = "A3"
 
