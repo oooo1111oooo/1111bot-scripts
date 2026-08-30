@@ -561,6 +561,85 @@ async def startup_recover(app):
             f"\nOKX 現況：掛單{n_ord} 持倉{n_pos}\n循環已接管，繼續運作\n時間：{hhmmss()}")
 
 # ---------- TG 指令 ----------
+# ---------- K 線 / 振幅（/amp 用） ----------
+NATIVE_BARS = {"3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1H"}
+
+async def get_klines(iid, bar, limit=300):
+    """只取已收線（confirm=1）的 K 線，回傳舊->新。"""
+    r = await pub(f"/api/v5/market/candles?instId={iid}&bar={bar}&limit={min(300, limit)}")
+    if r.get("code") != "0":
+        return []
+    out = []
+    for c in (r.get("data") or []):
+        try:
+            if len(c) >= 9 and str(c[8]) != "1":
+                continue
+            out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
+                        "l": Decimal(c[3]), "c": Decimal(c[4])})
+        except Exception:
+            continue
+    out.reverse()
+    return out
+
+def _merge2(kl5):
+    """兩根 5m 合成一根 10m，強制對齊 10 分鐘邊界。"""
+    out = []
+    i = 0
+    n = len(kl5)
+    while i < n:
+        a = kl5[i]
+        ts_a = int(a["ts"])
+        if ts_a % 600000 != 0:
+            i += 1; continue
+        if i + 1 >= n:
+            break
+        b = kl5[i + 1]
+        if int(b["ts"]) - ts_a != 300000:
+            i += 1; continue
+        out.append({"ts": ts_a, "o": a["o"], "h": max(a["h"], b["h"]),
+                    "l": min(a["l"], b["l"]), "c": b["c"]})
+        i += 2
+    return out
+
+async def klines_for_tf(iid, tf, want=300):
+    """依 TF 取原始 K 線。10m 由兩根 5m 合成；其餘須為 OKX 原生週期。"""
+    if tf == "10m":
+        return _merge2(await get_klines(iid, "5m", 300))
+    bar = NATIVE_BARS.get(tf)
+    if not bar:
+        return None
+    return await get_klines(iid, bar, want)
+
+def calc_amp(kl):
+    """每根回傳 (振幅%, 漲跌幅%)。
+    振幅% = (高-低) / 前一根收盤 * 100（恆正）
+    漲跌幅% = (收盤-前一根收盤) / 前一根收盤 * 100（帶正負）
+    第一根無前收，以本根開盤價替代。"""
+    out = []
+    for i, k in enumerate(kl):
+        base = kl[i-1]["c"] if i > 0 else k["o"]
+        if not base:
+            out.append((Decimal(0), Decimal(0))); continue
+        amp = (k["h"] - k["l"]) / base * 100
+        chg = (k["c"] - base) / base * 100
+        out.append((amp, chg))
+    return out
+
+async def _reply_long(u, head, lines, tail):
+    """長清單拆多則送出（Telegram 單則上限 4096 字元）。"""
+    LIM = 3500
+    buf = list(head); msgs = []
+    for ln in lines:
+        if sum(len(x) + 1 for x in buf) + len(ln) + 1 > LIM and len(buf) > len(head):
+            msgs.append("\n".join(buf)); buf = list(head)
+        buf.append(ln)
+    buf += tail
+    msgs.append("\n".join(buf))
+    for i, m in enumerate(msgs):
+        if len(msgs) > 1:
+            m = m.replace("事件：振幅檢視", "事件：振幅檢視（%d/%d）" % (i+1, len(msgs)), 1)
+        await reply(u, m)
+
 def strat_params(sym, dr):
     S = STRATS.get(skey(sym, dr))
     if not S or not S.get("alive"):
@@ -784,6 +863,224 @@ async def cmd_summary(u, c):
         D.append(f"時間:{hhmmss()}")
         await reply(u, "\n".join(D))
 
+# ---------- /amp 振幅報表（Excel + Email） ----------
+AMP_MAX = 2000       # 單次最多抓幾根
+AMP_BINS = [Decimal(str(x)) for x in
+            ("0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9","1.0","1.2","1.5")]
+
+async def get_klines_paged(iid, bar, want):
+    """分頁往前抓 K 線（OKX 單次上限 300），回傳舊->新、只含已收線。"""
+    out = []
+    after = ""
+    ep = "candles"          # 近期用 candles，翻不動時自動切 history-candles
+    for _ in range(40):
+        q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit=300"
+        if after:
+            q += f"&after={after}"
+        r = await pub(q)
+        if r.get("code") != "0":
+            break
+        batch = r.get("data") or []
+        if not batch:
+            if ep == "candles" and after:
+                ep = "history-candles"      # candles 只保留近 ~1440 根，改用歷史端點續抓
+                continue
+            break
+        got = []
+        for c in batch:
+            try:
+                if len(c) >= 9 and str(c[8]) != "1":
+                    continue
+                got.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
+                            "l": Decimal(c[3]), "c": Decimal(c[4])})
+            except Exception:
+                continue
+        if not got:
+            break
+        out.extend(got)                      # OKX 回傳為新->舊
+        after = str(min(int(x["ts"]) for x in got))
+        if len(out) >= want + 10:
+            break
+        await asyncio.sleep(0.15)
+    out.sort(key=lambda x: x["ts"])          # 轉成舊->新
+    seen = set(); uniq = []
+    for k in out:
+        if k["ts"] in seen:
+            continue
+        seen.add(k["ts"]); uniq.append(k)
+    return uniq[-want:] if want else uniq
+
+async def klines_paged_for_tf(iid, tf, want):
+    """依 TF 分頁取 K 線。10m 由兩根 5m 合成。"""
+    if tf == "10m":
+        return _merge2(await get_klines_paged(iid, "5m", want * 2 + 4))
+    bar = NATIVE_BARS.get(tf)
+    if not bar:
+        return None
+    return await get_klines_paged(iid, bar, want)
+
+def build_amp_xlsx(sym, tf, kl, amps, path):
+    """產生兩個工作表：明細 + 統計。日期與時間分欄，便於樞紐分析。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    FONT = "PingFang TC"; SIZE = 12
+    wb = Workbook()
+
+    ws = wb.active; ws.title = "明細"
+    heads = ["幣種", "日期", "時間", "漲跌", "開", "高", "低", "收", "振幅%", "漲跌幅%"]
+    widths = {"A": 3.3, "B": 12, "C": 11, "D": 8.5, "E": 6, "F": 13, "G": 13, "H": 13, "I": 13, "J": 11, "K": 11}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    for i, h in enumerate(heads):
+        c = ws.cell(row=2, column=2 + i, value=h)
+        c.font = Font(name=FONT, size=SIZE, bold=True)
+        c.alignment = Alignment(horizontal="center")
+    r = 3
+    for k, (amp, chg) in zip(kl, amps):
+        dt = datetime.fromtimestamp(int(k["ts"]) / 1000, TZ8)
+        vals = [sym, dt.date(), dt.strftime("%H:%M:%S"),
+                "\U0001f7e9" if k["c"] >= k["o"] else "\U0001f7e5",
+                float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]),
+                float(amp) / 100, float(chg) / 100]
+        for i, v in enumerate(vals):
+            cc = ws.cell(row=r, column=2 + i, value=v)
+            cc.font = Font(name=FONT, size=SIZE)
+        ws.cell(row=r, column=3).number_format = "m/d/yy"
+        ws.cell(row=r, column=4).number_format = "@"
+        ws.cell(row=r, column=5).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=10).number_format = "0.0000%"
+        ws.cell(row=r, column=11).number_format = '0.0000%;[Red]-0.0000%'
+        r += 1
+    ws.freeze_panes = "A3"
+
+    st = wb.create_sheet("統計")
+    for col, w in {"A": 3.3, "B": 18, "C": 20, "D": 12}.items():
+        st.column_dimensions[col].width = w
+    seg = [a for a, _ in amps]
+    chgs = [c for _, c in amps]
+    ss = sorted(seg); m = len(ss)
+    med = ss[m // 2] if m % 2 else (ss[m // 2 - 1] + ss[m // 2]) / 2
+    avg = sum(seg, Decimal(0)) / m
+    d0 = datetime.fromtimestamp(int(kl[0]["ts"]) / 1000, TZ8)
+    d1 = datetime.fromtimestamp(int(kl[-1]["ts"]) / 1000, TZ8)
+    up = sum(1 for c in chgs if c > 0); dn = sum(1 for c in chgs if c < 0)
+    rows = [("商品", sym, None), ("週期", tf, None), ("根數", m, None),
+            ("期間起", d0.strftime("%Y-%m-%d %H:%M"), None),
+            ("期間迄", d1.strftime("%Y-%m-%d %H:%M"), None),
+            ("漲/跌根數", "%d / %d" % (up, dn), None), ("", "", None),
+            ("平均振幅", float(avg) / 100, "pct"),
+            ("中位振幅", float(med) / 100, "pct"),
+            ("最大振幅", float(max(seg)) / 100, "pct"),
+            ("最小振幅", float(min(seg)) / 100, "pct"), ("", "", None),
+            ("最大漲幅", float(max(chgs)) / 100, "pct"),
+            ("最大跌幅", float(min(chgs)) / 100, "pct"), ("", "", None)]
+    rr = 2
+    for a, b, kind in rows:
+        st.cell(row=rr, column=2, value=a).font = Font(name=FONT, size=SIZE)
+        cb = st.cell(row=rr, column=3, value=b); cb.font = Font(name=FONT, size=SIZE)
+        if kind == "pct":
+            cb.number_format = '0.0000%;[Red]-0.0000%'
+        rr += 1
+    for i, h in enumerate(["振幅達標門檻", "根數", "佔比"]):
+        st.cell(row=rr, column=2 + i, value=h).font = Font(name=FONT, size=SIZE, bold=True)
+    rr += 1
+    for b in AMP_BINS:
+        n = sum(1 for a in seg if a >= b)
+        st.cell(row=rr, column=2, value="\u2265 " + str(b) + "%").font = Font(name=FONT, size=SIZE)
+        st.cell(row=rr, column=3, value=n).font = Font(name=FONT, size=SIZE)
+        cd = st.cell(row=rr, column=4, value=n / m)
+        cd.font = Font(name=FONT, size=SIZE); cd.number_format = "0.00%"
+        rr += 1
+    wb.save(path)
+
+def send_amp_mail(path, name, sym, tf, m, avg, med):
+    """寄出振幅報表。回傳 (ok, 訊息)。"""
+    import smtplib
+    from email.message import EmailMessage
+    env = {}
+    try:
+        for line in open("/srv/1111bot/.env"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception as e:
+        return False, "讀 .env 失敗：%s" % e
+    user = env.get("GMAIL_USER")
+    pwd = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "")
+    to = env.get("REPORT_TO") or user
+    if not user or not pwd:
+        return False, "未設定 GMAIL_USER / GMAIL_APP_PASSWORD"
+    msg = EmailMessage()
+    msg["Subject"] = "OKX %s 振幅報表 %s %s（%d 根）" % (ACCT, sym, tf, m)
+    msg["From"] = user; msg["To"] = to
+    msg.set_content("商品 %s\\n週期 %s\\n根數 %d\\n平均振幅 %.4f%%\\n中位振幅 %.4f%%\\n" % (sym, tf, m, avg, med))
+    msg.add_attachment(open(path, "rb").read(),
+                       maintype="application",
+                       subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       filename=name)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as sv:
+        sv.login(user, pwd); sv.send_message(msg)
+    return True, to
+
+async def cmd_amp(u, c):
+    """原K 振幅報表（Excel 寄信）。用法：/amp SOLUSDT [根數 3~2000]"""
+    supported = "3m/5m/10m/15m/30m/60m"
+    if not c.args:
+        await reply(u, f"{E.BOT} 用法：/amp SOLUSDT 900\n"
+                       f"根數 3~{AMP_MAX}（預設 300）\n"
+                       f"產生 Excel（明細＋統計）寄到信箱\n"
+                       f"支援週期：{supported}\n"
+                       f"目前週期：{ACCOUNT_TF}")
+        return
+    sym = c.args[0].upper()
+    n = 300
+    if len(c.args) >= 2:
+        try: n = max(3, min(AMP_MAX, int(c.args[1])))
+        except Exception: pass
+    if ACCOUNT_TF != "10m" and ACCOUNT_TF not in NATIVE_BARS:
+        await reply(u, f"{E.BOT} 目前週期 {ACCOUNT_TF} 無原生 K 線\n"
+                       f"可查週期：{supported}\n請先 /timeframe 切換")
+        return
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
+    await reply(u, f"{E.BOT} 產生 {sym} {ACCOUNT_TF} 振幅報表中（{n} 根），請稍候…")
+    try:
+        kl = await klines_paged_for_tf(spec["iid"], ACCOUNT_TF, n)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} K 線取得失敗：{type(e).__name__}"); return
+    if not kl:
+        await reply(u, f"{E.BOT} {sym} K 線取得失敗"); return
+    amps = calc_amp(kl)
+    m = len(kl)
+    seg = [a for a, _ in amps]
+    ss = sorted(seg)
+    med = ss[m // 2] if m % 2 else (ss[m // 2 - 1] + ss[m // 2]) / 2
+    avg = sum(seg, Decimal(0)) / m
+    day = now8().strftime("%Y%m%d")
+    name = f"OKX_{ACCT}_振幅_{sym}_{ACCOUNT_TF}_{m}根_{day}.xlsx"
+    path = f"/srv/1111bot/data/{name}"
+    try:
+        build_amp_xlsx(sym, ACCOUNT_TF, kl, amps, path)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 產生 Excel 失敗：{type(e).__name__}: {e}"); return
+    try:
+        ok, info = send_amp_mail(path, name, sym, ACCOUNT_TF, m, float(avg), float(med))
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
+    if not ok:
+        await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
+    t0 = datetime.fromtimestamp(int(kl[0]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(kl[-1]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    await reply(u, f"{E.BOT} ✅ 振幅報表已寄出\n"
+                   f"{sym} {ACCOUNT_TF}｜{m} 根\n"
+                   f"期間：{t0} ~ {t1}\n"
+                   f"平均 {avg:.4f}% | 中位 {med:.4f}%\n"
+                   f"最大 {max(seg):.4f}% | 最小 {min(seg):.4f}%\n"
+                   f"時間：{hhmmss()}")
+
 async def cmd_coins(u, c):
     on = [s["symbol"] for s in SYMS if s["enabled"]]
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
@@ -811,7 +1108,9 @@ async def cmd_menu(u, c):
         "/run 商品 方向 槓桿 保證金 埋伏 TP SL\n"
         f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5\n　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
-        "/status 所有策略現況\n/summary 當日戰報\n/timeframe 查看/設定週期\n/coins 幣種\n"
+        "/status 所有策略現況\n/summary 當日戰報\n"
+        "/amp 商品 根數  振幅報表 Excel 寄信（3~2000根）\n"
+        "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         f"一個 TF 一輪：TF 開始埋伏\n"
         f"未成交且剩餘不足 {ENTRY_CUTOFF}s → 撤單放棄本輪\n"
@@ -840,6 +1139,7 @@ async def _post_init(app):
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "當日戰報"),
             BotCommand("coins", "幣種"),
+            BotCommand("amp", "振幅報表 Excel"),
             BotCommand("stopall", "停全部"),
             BotCommand("stop", "停指定"),
             BotCommand("run", "建立策略"),
@@ -884,7 +1184,8 @@ def main():
            .get_updates_connect_timeout(30.0).build())
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
-                    ("summary", cmd_summary), ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
+                    ("summary", cmd_summary), ("amp", cmd_amp),
+                    ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.run_polling()
