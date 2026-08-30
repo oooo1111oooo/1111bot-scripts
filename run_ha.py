@@ -1004,7 +1004,7 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
     from openpyxl.utils import get_column_letter
     wb = Workbook()
     ws = wb.active; ws.title = "明細"
-    heads = ["幣種", "週期", "日期", "時間", "燈號", "ATR14", "ATR14 ratio(%)"]
+    heads = ["幣種", "週期", "日期", "時間", "燈號", "ATR14", "ATR14 ratio"]
     ws.append(heads)
     hf = Font(bold=True, color="FFFFFF")
     hfill = PatternFill("solid", fgColor="404040")
@@ -1026,7 +1026,7 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
         ws.cell(row=r, column=2).alignment = Alignment(horizontal="center")
         ws.cell(row=r, column=5).alignment = Alignment(horizontal="center")
         ws.cell(row=r, column=6).number_format = afmt
-        ws.cell(row=r, column=7).number_format = "0.0000"
+        ws.cell(row=r, column=7).number_format = '0.0000"%"' 
     ws.freeze_panes = "A2"
     for i, w in enumerate([12, 8, 12, 8, 8, 16, 16], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -1048,13 +1048,22 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
             ["幣種", sym], ["週期", tf], ["根數", len(ha)],
             ["期間起", t0], ["期間迄", t1],
             ["\U0001F7E9 根數", ng], ["\U0001F7E5 根數", len(ha) - ng],
-            ["\U0001F7E9 佔比(%)", round(ng / len(ha) * 100, 2) if ha else 0],
+            ["\U0001F7E9 佔比", round(ng / len(ha) * 100, 2) if ha else 0],
             ["ATR14 平均", aA], ["ATR14 中位", aM], ["ATR14 最大", aX], ["ATR14 最小", aN],
-            ["ATR14 ratio 平均(%)", rA], ["ATR14 ratio 中位(%)", rM],
-            ["ATR14 ratio 最大(%)", rX], ["ATR14 ratio 最小(%)", rN],
+            ["ATR14 ratio 平均", rA], ["ATR14 ratio 中位", rM],
+            ["ATR14 ratio 最大", rX], ["ATR14 ratio 最小", rN],
             ["燈號來源", "Heikin-Ashi"], ["ATR 來源", "原始 K 線（Wilder 平滑）"],
             ["產生時間", now8().strftime("%Y/%m/%d %H:%M:%S")]]
     for r in rows: w2.append(r)
+    for rr in range(2, w2.max_row + 1):
+        lab = w2.cell(row=rr, column=1).value or ""
+        cell = w2.cell(row=rr, column=2)
+        if "ratio" in str(lab) and isinstance(cell.value, (int, float)):
+            cell.number_format = '0.0000"%"'
+        elif "佔比" in str(lab) and isinstance(cell.value, (int, float)):
+            cell.number_format = '0.00"%"'
+        elif str(lab).startswith("ATR14 ") and isinstance(cell.value, (int, float)):
+            cell.number_format = afmt
     for i in range(1, 3):
         cc = w2.cell(row=1, column=i); cc.font = hf; cc.fill = hfill
     w2.column_dimensions["A"].width = 24
