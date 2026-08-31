@@ -274,6 +274,33 @@ def _from_orders(od_in, od_out, d, size, ctval):
     g = (xpx - opx) * size * ctval if d == "L" else (opx - xpx) * size * ctval
     return g, fee, g + fee, opx * size * ctval, xpx
 
+def _rec_epoch_ms(rec):
+    """由紀錄的 date + ts 還原出場時刻（毫秒）。"""
+    try:
+        s = str(rec.get("date")) + " " + str(rec.get("ts"))
+        return int(datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ8).timestamp() * 1000)
+    except Exception:
+        return 0
+
+async def _find_ph(iid, ps, t_ms, before=180000, after=1800000):
+    """在 positions-history 找出時間最接近 t_ms 的那筆平倉紀錄。"""
+    if not t_ms:
+        return None
+    r = await api("GET", f"/api/v5/account/positions-history?instType=SWAP&instId={iid}&limit=100")
+    if r.get("code") != "0":
+        return None
+    best = None; bd = None
+    for p in (r.get("data") or []):
+        if p.get("posSide") != ps:
+            continue
+        ut = int(p.get("uTime") or 0)
+        if ut < t_ms - before or ut > t_ms + after:
+            continue
+        dd = abs(ut - t_ms)
+        if bd is None or dd < bd:
+            best = p; bd = dd
+    return best
+
 async def reconcile_pending(app, days=3):
     """背景補帳：掃描近幾日紀錄檔，把 PENDING 的財務數字向 OKX 補齊。"""
     filled = 0
@@ -288,26 +315,27 @@ async def reconcile_pending(app, days=3):
         for rec in arr:
             if rec.get("src") != "PENDING":
                 continue
-            iid = rec.get("iid"); pos = rec.get("pos")
-            if not iid or not pos:
+            # 查詢鍵可能缺（舊紀錄），一律從 sym/dir/date/ts 推導，確保都能補
+            iid = rec.get("iid") or inst_id(rec.get("sym", ""))
+            pos = rec.get("pos") or ("long" if rec.get("dir") == "L" else "short")
+            t_ms = int(rec.get("t0") or 0) or _rec_epoch_ms(rec)
+            if not iid or not pos or not t_ms:
                 continue
+            try:
+                ctv = (await get_spec(rec["sym"]))["ctval"]
+            except Exception:
+                ctv = Decimal("1")
             fpx = Decimal(rec.get("in_px") or "0")
-            size = Decimal("0")
             g = fee = net = nv = xpx = None; src = None
-            ph = await close_record(iid, pos, int(rec.get("t0") or 0), tries=1)
+            ph = await _find_ph(iid, pos, t_ms)
             if ph:
-                g, fee, net, nv, xpx = _from_ph(ph, size, Decimal("1"), fpx)
+                g, fee, net, nv, xpx = _from_ph(ph, Decimal("0"), ctv, fpx)
                 src = "OKX"
-            else:
+            elif rec.get("xoid") and rec.get("eoid"):
                 od_out = await order_detail(iid, rec.get("xoid"), tries=1)
                 od_in = await order_detail(iid, rec.get("eoid"), tries=1)
                 if od_out and od_in:
                     sz = od_out.get("sz") or Decimal("0")
-                    try:
-                        sp = await get_spec(rec["sym"])
-                        ctv = sp["ctval"]
-                    except Exception:
-                        ctv = Decimal("1")
                     g, fee, net, nv, xpx = _from_orders(od_in, od_out, rec["dir"], sz, ctv)
                     src = "訂單"
             if src:
@@ -464,7 +492,20 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_en
                 except Exception:
                     pass
             if not p_chk:
-                await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉），本輪結束")
+                # 手動平倉也必須入 DB，否則 DB 與 OKX 永遠對不起來
+                log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": "Manual_Close",
+                           "ambush_s": round(ee - pt) if pt else 0,
+                           "hold_s": int(time.time() - ee),
+                           "gross": None, "fee": None, "net": None, "nv": None,
+                           "src": "PENDING", "ts": hhmmss(),
+                           "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
+                           "tf": S["tf"], "margin": str(S["margin"]),
+                           "in_px": str(fpx), "out_px": None,
+                           "iid": iid, "pos": pos, "t0": int(time.time() * 1000),
+                           "eoid": S.get("pos_oid"), "xoid": None})
+                await notify(app, S["chat"],
+                    f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉）\n"
+                    f"已記入 DB 並標記待補帳，背景任務會向 OKX 取回損益\n時間：{hhmmss()}")
                 for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_oid"):
                     S.pop(a, None)
                 save_state(); return
@@ -934,10 +975,12 @@ def sum_lines(rs_all, placed, entered):
     hit = (entered / placed * 100) if placed else 0
     amb = ("%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs_all) / len(rs_all))) if rs_all else "-"
     L.append("次數:%d | %d(%s) | %.2f%%" % (placed, entered, amb, hit))
-    if pend:
-        L.append("%s 待補帳:%d 筆（未計入損益）" % (E.LOSS, len(pend)))
+    L.append("帳已入DB:%d | 帳未入DB:%d" % (m, len(pend)))
     if not m:
-        L.append("尚無已確認損益")
+        if len(pend):
+            L.append("%s 損益待 OKX 回報後補入" % E.LOSS)
+        else:
+            L.append("本日無進場")
         return L
     NAME = {"Take_Profit": "TP", "Stop_Loss": "SL", "Time_Exit": "TE"}
     for lab, cats in (("獲利", ("Take_Profit", "Time_Exit")), ("虧損", ("Stop_Loss", "Time_Exit"))):
@@ -1252,23 +1295,19 @@ async def cmd_audit(u, c):
     from collections import Counter
     srcs = Counter(x.get("src") for x in recs)
     L = [f"{E.BOT} OKX原K｜{ACCT}", f"📋 對帳 {t}", "━" * 10,
-         f"本地筆數：{len(recs)}｜OKX：{len(ph)}",
+         ("%s " % E.LOSS if len(recs) != len(ph) else "") + f"DB筆數：{len(recs)}｜OKX：{len(ph)}",
          "來源分佈：" + "、".join(f"{k}×{v}" for k, v in srcs.items()),
          "━" * 10,
-         f"本地淨損益：{ln:+.6f}",
+         f"DB 淨損益：{ln:+.6f}",
          f"OKX 淨損益：{on:+.6f}",
          f"差異：{ln - on:+.6f}",
          "━" * 10,
-         f"本地手續費：{lf:+.6f}",
+         f"DB 手續費：{lf:+.6f}",
          f"OKX 手續費：{of:+.6f}",
          f"差異：{lf - of:+.6f}",
          "━" * 10]
-    if len(recs) != len(ph):
-        L.append(f"{E.LOSS} 筆數不符，OKX 可能尚未完全落帳")
-    elif abs(ln - on) < Decimal("0.000001") and abs(lf - of) < Decimal("0.000001"):
+    if len(recs) == len(ph) and abs(ln - on) < Decimal("0.000001") and abs(lf - of) < Decimal("0.000001"):
         L.append("✅ 完全一致")
-    else:
-        L.append(f"{E.LOSS} 有差異，請人工核對")
     zero = [x for x in recs if Decimal(str(x.get("fee") or "0")) == 0]
     if zero:
         L.append(f"⚠ 手續費為 0 的紀錄：{len(zero)} 筆")
