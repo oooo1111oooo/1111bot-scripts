@@ -98,7 +98,7 @@ def pct(v): return str(Decimal(str(v)).normalize())
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post",
                "pre_max","entry_min","exit_dd","chat",
-               "pos_open","pos_px","pos_ee","pos_sz","pos_peak","last_bar")
+               "pos_open","pos_px","pos_ee","pos_sz","pos_peak","pnl_hist","last_bar")
 
 SHUTTING_DOWN = False
 
@@ -645,6 +645,45 @@ async def close_record(iid, ps, after_ms, tries=10):
         await asyncio.sleep(1)
     return None
 
+async def notify_long(app, chat, head, lines, tail):
+    """把長明細拆成多則 TG 訊息（單則上限 4096）。"""
+    LIM = 3400
+    buf = list(head); msgs = []
+    for ln in lines:
+        if sum(len(x) + 1 for x in buf) + len(ln) + 1 > LIM and len(buf) > len(head):
+            msgs.append("\n".join(buf)); buf = list(head)
+        buf.append(ln)
+    buf += tail
+    msgs.append("\n".join(buf))
+    for i, m in enumerate(msgs):
+        if len(msgs) > 1:
+            m = f"（{i+1}/{len(msgs)}）\n" + m
+        await notify(app, chat, m)
+        await asyncio.sleep(0.3)
+
+def bar_line(r):
+    """單根明細：時間 燈號 漲跌幅 ATR14 ratio"""
+    lg = "\U0001F7E9" if r.get("color") == "G" else "\U0001F7E5"
+    b = float(r.get("body_pct") or 0)
+    a = r.get("atr14_ratio")
+    astr = ("%.4f%%" % float(a)) if a is not None else "-"
+    hm = str(r.get("dt") or "")[11:16]        # 只留 HH:MM，手機版面才不會折行
+    return f"{hm} {lg} {b:+.4f}% | {astr}"
+
+def seg_block(title, rows, want, op, thr, ok):
+    """一段視窗的完整明細 + 累計 + 位移計算式"""
+    L = [title]
+    for r in rows:
+        L.append(bar_line(r))
+    sb = sum(float(r.get("body_pct") or 0) for r in rows)
+    sa = sum(float(r.get("atr14_ratio") or 0) for r in rows)
+    dv = (abs(sb) / sa) if sa > 0 else 0
+    L.append(f"Σ漲跌幅 {sb:+.4f}% → 絕對值 {abs(sb):.4f}%")
+    L.append(f"ΣATR14r {sa:.4f}%")
+    L.append(f"位移 {abs(sb):.4f} ÷ {sa:.4f} = {dv:.4f}")
+    L.append(f"條件 {op} {thr}　{'✅ 通過' if ok else '❌ 未過'}")
+    return L
+
 # ---------- 訊號判定（資料一律來自本機 DB）----------
 def disp(rows):
     """ATR14 ratio 標準化位移 = |Σ 均K實體漲跌幅| / Σ ATR14 ratio
@@ -734,27 +773,36 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
     S["state"] = "持倉中"; S["pos_open"] = True
     S["pos_px"] = str(fpx); S["pos_ee"] = ee; S["pos_sz"] = str(size)
     S["pos_peak"] = 0.0                      # 進場即把最高利潤歸零
+    S["pnl_hist"] = []                       # 逐根利潤紀錄，出場時列出供核對
     save_state()
-    seq = "".join(x["color"] for x in (info.get("pre_seg", []) + info.get("post_seg", []))) if info else "-"
-    await notify(app, S["chat"],
-        f"{E.BOT} OKX均K｜{ACCT}\n事件：🔔 訊號進場（taker）\n"
-        f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['lev']}x\n"
-        f"週　　期：{S['tf']}\n進場價格：{fpx}\n下單張數：{size}\n"
-        f"燈號序列：{seq}（前{S['pre']}+後{S['post']}）\n"
-        f"前段位移：{info['pre_disp']:.4f} ≤ {pct(S['pre_max'])}\n"
-        f"後段位移：{info['entry_disp']:.4f} ≥ {pct(S['entry_min'])}\n"
-        f"出場條件：從最高利潤回吐 {pct(S['exit_dd'])}%\n"
-        f"⚠ 無 TP/SL/TE，僅靠回吐出場\n"
-        f"狀　　態：📌 持倉中\n時間：{hhmmss()}")
+    pre_rows = info.get("pre_seg", []) if info else []
+    post_rows = info.get("post_seg", []) if info else []
+    head = [f"{E.BOT} OKX均K｜{ACCT}", "事件：🔔 訊號進場（taker）",
+            f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['lev']}x",
+            f"週　　期：{S['tf']}",
+            "格式：時間 燈號 漲跌幅 | ATR14r", "━" * 10]
+    lines = []
+    lines += seg_block(f"【前段 {S['pre']} 根｜需盤整】", pre_rows, None, "≤",
+                       pct(S["pre_max"]), info["pre_ok"] if info else False)
+    lines.append("━" * 10)
+    want_lg = "\U0001F7E9" if d == "L" else "\U0001F7E5"
+    lines += seg_block(f"【後段 {S['post']} 根｜需突破】", post_rows, None, "≥",
+                       pct(S["entry_min"]), info["entry_ok"] if info else False)
+    lines.append(f"同色檢查 需全為 {want_lg}　{'✅ 通過' if (info and info['color_ok']) else '❌ 未過'}")
+    lines.append("━" * 10)
+    tail = [f"進場價格：{fpx}", f"下單張數：{size}",
+            f"出場條件：從最高利潤回吐 {pct(S['exit_dd'])}%",
+            "　（純價格變動%，不含槓桿，每根收線判斷）",
+            "⚠ 無 TP/SL/TE", f"時間：{hhmmss()}"]
+    await notify_long(app, S["chat"], head, lines, tail)
     return True
 
-# ---------- 出場 ----------
 async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     cs = "sell" if d == "L" else "buy"
     p_now = await okx_pos(iid, pos)
     if not p_now:
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 平倉時 OKX 已無持倉，略過")
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak"):
+        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
             S.pop(a, None)
         save_state()
         return True
@@ -805,14 +853,33 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
                "peak_pct": round(float(S.get("pos_peak") or 0), 4),
                "lev": S["lev"], "margin": str(S["margin"]),
                "in_px": str(fpx), "out_px": str(xpx)})
-    await notify(app, S["chat"],
-        f"{E.BOT} OKX均K｜{ACCT}\n事件：{'🟢' if net >= 0 else '🔴'} 已出場\n"
-        f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
-        f"進場價：{fpx}\n出場價：{xpx}\n"
-        f"持倉秒數：{hs}s（約 {hs / tfs:.1f} 根）\n"
-        f"毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
-        f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak"):
+    hist = S.get("pnl_hist") or []
+    ico = "🟢" if net >= 0 else "🔴"
+    head = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：{ico} 已出場",
+            f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['tf']}",
+            f"出場原因：{reason}",
+            f"進場價：{fpx}", f"出場價：{xpx}",
+            f"持倉秒數：{hs}s（約 {hs / tfs:.1f} 根）", "━" * 10]
+    lines = []
+    if hist:
+        lines.append(f"【逐根利潤核對】回吐門檻 {pct(S['exit_dd'])}%")
+        lines.append("序 時間 收盤 ／ 利潤 最高 回吐")
+        show = hist[-40:]
+        if len(hist) > len(show):
+            lines.append(f"　（共 {len(hist)} 根，只列最後 {len(show)} 根）")
+        for i, hrec in enumerate(show, start=len(hist) - len(show) + 1):
+            mark = " ⬅出場" if hrec.get("hit") else ""
+            hm = str(hrec.get("dt") or "")[11:16]
+            lines.append(f"{i:>3} {hm} 收{hrec['c']:g}")
+            lines.append(f"　利{hrec['pnl']:+.3f}% 高{hrec['peak']:+.3f}% 回{hrec['dd']:+.3f}%{mark}")
+        lines.append("━" * 10)
+    tail = [f"最高利潤：{float(S.get('pos_peak') or 0):+.4f}%（純價格變動）",
+            f"毛損益：{g:+.6f} ({gp:+.3f}%)",
+            f"手續費：{fee:+.6f} ({fp:+.3f}%)",
+            f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}",
+            f"損益來源：{src}", f"時間：{hhmmss()}"]
+    await notify_long(app, S["chat"], head, lines, tail)
+    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
         S.pop(a, None)
     save_state()
     return True
@@ -821,7 +888,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
 async def h_takeover(app, S, spec, iid, d, pos):
     p = await okx_pos(iid, pos)
     if not p:
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak"):
+        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
             S.pop(a, None)
         save_state()
         return None
@@ -893,7 +960,7 @@ async def hloop(app, chat, S):
                 p = await okx_pos(iid, pos)
                 if not p:
                     await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉），重回等訊號")
-                    for a2 in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak"):
+                    for a2 in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
                         S.pop(a2, None)
                     size = fpx = ee = None
                     save_state(); continue
@@ -906,12 +973,14 @@ async def hloop(app, chat, S):
                 if ee is None: ee = float(S.get("pos_ee") or time.time())
                 r = judge_exit_db(last["c"], fpx, d, S.get("pos_peak", 0.0), S["exit_dd"])
                 if r is None: continue
-                S["pos_peak"] = r["peak"]; save_state()
+                S["pos_peak"] = r["peak"]
+                hist = S.get("pnl_hist") or []
+                hist.append({"dt": str(last.get("dt") or ""), "c": float(last["c"]),
+                             "pnl": round(r["pnl_pct"], 4), "peak": round(r["peak"], 4),
+                             "dd": round(r["dd"], 4), "hit": bool(r["hit"])})
+                S["pnl_hist"] = hist[-120:]
+                save_state()
                 if r["hit"]:
-                    await notify(app, chat,
-                        f"{E.BOT} {S['sym']} {E.dir_word(d)} 觸發回吐出場\n"
-                        f"最高利潤 {r['peak']:+.4f}%｜目前 {r['pnl_pct']:+.4f}%\n"
-                        f"回吐 {r['dd']:+.4f}% ≤ {pct(S['exit_dd'])}%")
                     await h_exit(app, S, spec, iid, d, pos, size, fpx, ee, "Drawdown_Exit", k)
                     size = fpx = ee = None
             else:
@@ -989,7 +1058,7 @@ async def rebuild_strat(d):
          "exit_dd": Decimal(str(d["exit_dd"])), "spec": spec,
          "alive": True, "state": "等訊號", "chat": d.get("chat", CHAT_ID),
          "hb": time.time(), "hb_warned": False}
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "last_bar"):
+    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist", "last_bar"):
         if a in d: S[a] = d[a]
     return S
 
