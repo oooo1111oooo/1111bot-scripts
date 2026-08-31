@@ -19,8 +19,7 @@ from app.core import emoji as E
 from app.strategy.normal import next_open_epoch as _noe_unused, TF_SEC as _TFS_unused
 
 # 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
-TF_SEC = {"3m": 180, "4m": 240, "5m": 300, "6m": 360, "10m": 600,
-          "12m": 720, "15m": 900, "20m": 1200, "30m": 1800, "60m": 3600}
+TF_SEC = {"3m": 180, "4m": 240, "5m": 300, "6m": 360, "10m": 600}
 
 def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
@@ -31,8 +30,9 @@ ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
-ENTRY_CUTOFF = 60    # TF 剩餘不足幾秒就放棄進場（撤掉未成交單、也不補掛）
-CLOSE_LEAD = 2       # TF 結束前幾秒強制平倉（TE）
+HOLD_SEC = 90        # 固定持倉秒數（TE）：進場後最多持有幾秒
+ENTRY_CUTOFF = 90    # TF 剩餘不足幾秒就放棄進場（＝HOLD_SEC，確保持倉能跑滿）
+CLOSE_LEAD = 2       # 安全上限：無論如何不晚於 TF 結束前幾秒平倉
 
 def load_env(p):
     d = {}
@@ -467,7 +467,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
 
 # ---------- 持倉監控 ----------
 async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end):
-    """tf_end：本 TF 的結束時刻（epoch）。到 tf_end-CLOSE_LEAD 秒一律平倉。"""
+    """固定持倉 HOLD_SEC 秒即平倉（TE）；tf_end 僅作為不跨輪的安全上限。"""
     chk = 0
     while S["alive"]:
         await asyncio.sleep(1)
@@ -480,7 +480,8 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_en
         else:
             if last <= tp: reason = "Take_Profit"
             elif last >= sl: reason = "Stop_Loss"
-        if not reason and time.time() >= tf_end - CLOSE_LEAD: reason = "Time_Exit"
+        if not reason and (time.time() - ee >= HOLD_SEC or time.time() >= tf_end - CLOSE_LEAD):
+            reason = "Time_Exit"
         if not reason and chk % 16 == 0:
             p_chk = await okx_pos(iid, pos)
             if p_chk:
@@ -721,7 +722,7 @@ async def startup_recover(app):
 
 # ---------- TG 指令 ----------
 # ---------- K 線 / 振幅（/amp 用） ----------
-NATIVE_BARS = {"3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1H"}
+NATIVE_BARS = {"3m": "3m", "5m": "5m"}   # 4m/6m 無原生 K 線；10m 由兩根 5m 合成
 
 async def get_klines(iid, bar, limit=300):
     """只取已收線（confirm=1）的 K 線，回傳舊->新。"""
@@ -1194,7 +1195,7 @@ def send_amp_mail(path, name, sym, tf, m, avg, med):
 
 async def cmd_amp(u, c):
     """原K 振幅報表（Excel 寄信）。用法：/amp SOLUSDT [根數 3~2000]"""
-    supported = "3m/5m/10m/15m/30m/60m"
+    supported = "3m/5m/10m"
     if not c.args:
         await reply(u, f"{E.BOT} 用法：/amp SOLUSDT 900\n"
                        f"根數 3~{AMP_MAX}（預設 300）\n"
@@ -1350,7 +1351,7 @@ async def cmd_menu(u, c):
         "━━━━━━━━━━\n"
         f"一個 TF 一輪：TF 開始埋伏\n"
         f"未成交且剩餘不足 {ENTRY_CUTOFF}s → 撤單放棄本輪\n"
-        f"已進場未觸發 TP/SL → TF 結束前 {CLOSE_LEAD}s 平倉（TE）\n"
+        f"已進場未觸發 TP/SL → 持倉滿 {HOLD_SEC}s 平倉（TE）\n"
         "⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
 
 async def cmd_unknown(u, c):
