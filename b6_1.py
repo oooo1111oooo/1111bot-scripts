@@ -30,8 +30,8 @@ ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
-HOLD_SEC = 90        # 固定持倉秒數（TE）：進場後最多持有幾秒
-ENTRY_CUTOFF = 90    # TF 剩餘不足幾秒就放棄進場（＝HOLD_SEC，確保持倉能跑滿）
+HOLD_SEC = 120       # 固定持倉秒數（TE）：進場後最多持有幾秒
+ENTRY_CUTOFF = 120   # TF 剩餘不足幾秒就放棄進場（＝HOLD_SEC，確保持倉能跑滿）
 CLOSE_LEAD = 2       # 安全上限：無論如何不晚於 TF 結束前幾秒平倉
 
 def load_env(p):
