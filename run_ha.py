@@ -656,30 +656,33 @@ async def notify_long(app, chat, head, lines, tail):
         await notify(app, chat, m)
         await asyncio.sleep(0.3)
 
-def bar_line(r):
-    """單根明細：時間 燈號 漲跌幅 ATR14 ratio"""
-    lg = "\U0001F7E9" if r.get("color") == "G" else "\U0001F7E5"
+GRN = "\U0001F7E9"
+RED = "\U0001F7E5"
+
+def bar_line(r, want=None, sec=True):
+    """一根明細：要求色 時間 實際色 漲跌幅 | ATR14r（顏色不符則行尾標 ❌）
+    want 為 None 時只印實際色（例如逐根利潤那種不需要比對的場合）。"""
+    act = GRN if r.get("color") == "G" else RED
     b = float(r.get("body_pct") or 0)
     a = r.get("atr14_ratio")
     astr = ("%.4f%%" % float(a)) if a is not None else "-"
-    hm = str(r.get("dt") or "")[11:16]        # 只留 HH:MM，手機版面才不會折行
-    return f"{lg} {hm} {b:+.4f}% | {astr}"
+    dt = str(r.get("dt") or "")
+    hm = dt[11:19] if sec and len(dt) >= 19 else dt[11:16]
+    if want is None:
+        return f"{act}{hm}{b:+.4f}%|{astr}"
+    wl = GRN if want == "G" else RED
+    bad = "\u274c" if r.get("color") != want else ""
+    return f"{wl}{hm}{act}{b:+.4f}%|{astr}{bad}"
 
-def seg_block(title, rows, thr, ok, label):
-    """一段視窗的明細 + 累計 + 條件比對。
-    thr 為 None 時只做顏色檢查（前段），否則附上 ΣATR14r 門檻（後段）。"""
-    L = [title]
-    for r in rows:
-        L.append(bar_line(r))
-    sb = sum(float(r.get("body_pct") or 0) for r in rows)
-    sa = sum(float(r.get("atr14_ratio") or 0) for r in rows)
-    L.append(f"Σ漲跌幅 {sb:+.4f}%（參考）")
-    if thr is None:
-        L.append(f"ΣATR14r {sa:.4f}%（參考）")
-        L.append(f"{label}　{'✅ 通過' if ok else '❌ 未過'}")
-    else:
-        L.append(f"ΣATR14r {sa:.4f}%")
-        L.append(f"條件 ≥ {thr}%　{'✅ 通過' if ok else '❌ 未過'}")
+def entry_lines(info, dr, entry_min):
+    """進場條件明細：前段 → 虛線 → 後段 → ΣATR14r 比對。三個畫面共用。"""
+    opp = "R" if dr == "L" else "G"
+    want = "G" if dr == "L" else "R"
+    L = [bar_line(x, opp) for x in info["pre_seg"]]
+    L.append("\u2504" * 18)
+    L += [bar_line(x, want) for x in info["post_seg"]]
+    ok = "\u2705" if info["entry_ok"] else "\u274c"
+    L.append(f"ΣATR14r{info['atr_sum']:.4f}%{ok}≥{pct(entry_min)}%")
     return L
 
 # ---------- 訊號判定（資料一律來自本機 DB）----------
@@ -779,26 +782,14 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
     S["pos_peak"] = 0.0                      # 進場即把最高利潤歸零
     S["pnl_hist"] = []                       # 逐根利潤紀錄，出場時列出供核對
     save_state()
-    pre_rows = info.get("pre_seg", []) if info else []
-    post_rows = info.get("post_seg", []) if info else []
-    head = [f"{E.BOT} OKX均K｜{ACCT}", "事件：🔔 訊號進場（taker）",
-            f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['lev']}x",
-            f"週　　期：{S['tf']}",
-            "格式：時間 燈號 漲跌幅 | ATR14r", "━" * 10]
-    want_lg = "\U0001F7E9" if d == "L" else "\U0001F7E5"
-    opp_lg = "\U0001F7E5" if d == "L" else "\U0001F7E9"
-    lines = seg_block(f"【前段 {S['pre']} 根｜需反向】", pre_rows, None,
-                      info["pre_ok"] if info else False,
-                      f"需全為 {opp_lg}")
-    lines.append("━" * 10)
-    lines += seg_block(f"【後段 {S['post']} 根｜需順勢】", post_rows,
-                       pct(S["entry_min"]), info["entry_ok"] if info else False, None)
-    lines.append(f"同色檢查 需全為 {want_lg}　{'✅ 通過' if (info and info['color_ok']) else '❌ 未過'}")
-    lines.append("━" * 10)
-    tail = [f"進場價格：{fpx}", f"下單張數：{size}",
-            f"出場條件：從最高利潤回吐 {pct(S['exit_dd'])}%",
-            "　（純價格變動%，不含槓桿，每根收線判斷）",
-            "⚠ 無 TP/SL/TE", f"時間：{hhmmss()}"]
+    head = [f"{E.BOT} OKX均K｜{ACCT}", "事件：🔔 訊號進場",
+            f"{E.dir_emoji(d)} {d} {S['tf']}",
+            strat_params(S["sym"], d) or ""]
+    lines = entry_lines(info, d, S["entry_min"]) if info else []
+    tail = ["━" * 10,
+            f"進場價{fpx}｜{size}張",
+            f"回吐{pct(S['exit_dd'])}%出場",
+            f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
     return True
 
@@ -861,28 +852,24 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     hist = S.get("pnl_hist") or []
     ico = "🟢" if net >= 0 else "🔴"
     head = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：{ico} 已出場",
-            f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['tf']}",
-            f"出場原因：{reason}",
-            f"進場價：{fpx}", f"出場價：{xpx}",
-            f"持倉秒數：{hs}s（約 {hs / tfs:.1f} 根）", "━" * 10]
+            f"{E.dir_emoji(d)} {d} {S['tf']}",
+            strat_params(S["sym"], d) or "",
+            f"進場{fpx}→出場{xpx}",
+            f"持倉{hs}s（約{hs / tfs:.1f}根）", "━" * 10]
     lines = []
-    if hist:
-        lines.append(f"【逐根利潤核對】回吐門檻 {pct(S['exit_dd'])}%")
-        lines.append("序 時間 收盤 ／ 利潤 最高 回吐")
-        show = hist[-40:]
-        if len(hist) > len(show):
-            lines.append(f"　（共 {len(hist)} 根，只列最後 {len(show)} 根）")
-        for i, hrec in enumerate(show, start=len(hist) - len(show) + 1):
-            mark = " ⬅出場" if hrec.get("hit") else ""
-            hm = str(hrec.get("dt") or "")[11:16]
-            lines.append(f"{i:>3} {hm} 收{hrec['c']:g}")
-            lines.append(f"　利{hrec['pnl']:+.3f}% 高{hrec['peak']:+.3f}% 回{hrec['dd']:+.3f}%{mark}")
-        lines.append("━" * 10)
-    tail = [f"最高利潤：{float(S.get('pos_peak') or 0):+.4f}%（純價格變動）",
-            f"毛損益：{g:+.6f} ({gp:+.3f}%)",
-            f"手續費：{fee:+.6f} ({fp:+.3f}%)",
-            f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}",
-            f"損益來源：{src}", f"時間：{hhmmss()}"]
+    show = hist[-40:]
+    if len(hist) > len(show):
+        lines.append(f"（共{len(hist)}根，只列最後{len(show)}根）")
+    for i, hrec in enumerate(show, start=len(hist) - len(show) + 1):
+        mark = "\u274c" if hrec.get("hit") else ""
+        hm = str(hrec.get("dt") or "")[11:16]
+        lines.append(f"{i} {hm} 利{hrec['pnl']:+.3f}% 高{hrec['peak']:+.3f}% 回{hrec['dd']:+.3f}%{mark}")
+    tail = ["━" * 10,
+            f"最高利潤{float(S.get('pos_peak') or 0):+.4f}%",
+            f"毛損益{g:+.6f}({gp:+.3f}%)",
+            f"手續費{fee:+.6f}({fp:+.3f}%)",
+            f"淨損益{net:+.6f}({npv:+.3f}%){E.pnl_emoji(net)}",
+            f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
     for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
         S.pop(a, None)
@@ -1109,7 +1096,7 @@ def strat_detail(S, sym, dr, mark_px=None):
     """單一策略的完整現況：空手列進場條件明細，持倉列利潤與出場距離。"""
     L = []
     tf = S["tf"]
-    L.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)} {tf}")
+    L.append(f"{E.dir_emoji(dr)} {dr} {tf}")
     L.append(strat_params(sym, dr) or "")
     if not S.get("pos_open"):
         L.append("狀態：等訊號")
@@ -1121,12 +1108,7 @@ def strat_detail(S, sym, dr, mark_px=None):
         if not db_fresh(sym, tf):
             L.append("⚠ 行情DB 落後，以下為最後已知資料")
         r = judge_entry_db(rows, dr, pre, post, float(S["entry_min"]))
-        for x in r["pre_seg"]: L.append(bar_line(x))
-        L.append(f"反向色：{'✅' if r['pre_ok'] else '❌'}")
-        for x in r["post_seg"]: L.append(bar_line(x))
-        L.append(f"ΣATR14r {r['atr_sum']:.4f}% {'✅' if r['entry_ok'] else '❌'} ≥ {pct(S['entry_min'])}%")
-        L.append(f"順勢色：{'✅' if r['color_ok'] else '❌'}")
-        L.append(f"此刻：{'✅ 會進場' if r['hit'] else '❌ 不進場'}")
+        L += entry_lines(r, dr, S["entry_min"])
         return L
     # ---- 持倉中 ----
     L.append("狀態：📌 持倉中")
@@ -1225,16 +1207,7 @@ async def cmd_run(u, c):
                        f"請稍候收集器補齊，或用 /db {sym} {tf} 查看"); return
     fresh = db_fresh(sym, tf)
     r = judge_entry_db(rows, dr, pre, post, float(entry_min))
-    opp_lg = "\U0001F7E5" if dr == "L" else "\U0001F7E9"
-    want_lg = "\U0001F7E9" if dr == "L" else "\U0001F7E5"
-    d1 = "\n".join(bar_line(x) for x in r["pre_seg"])
-    d2 = "\n".join(bar_line(x) for x in r["post_seg"])
-    prev = (f"【前段 {pre} 根｜需全 {opp_lg}】\n{d1}\n"
-            f"反向色：{'✅' if r['pre_ok'] else '❌'}\n"
-            f"【後段 {post} 根｜需全 {want_lg}】\n{d2}\n"
-            f"ΣATR14r：{r['atr_sum']:.4f}% {'✅' if r['entry_ok'] else '❌'} ≥ {entry_min}%\n"
-            f"順勢色：{'✅' if r['color_ok'] else '❌'}\n"
-            f"此刻是否成立：{'✅ 會進場' if r['hit'] else '❌ 不進場'}")
+    prev = "\n".join(entry_lines(r, dr, entry_min))
     ps = "long" if dr == "L" else "short"
     exist = await okx_pos(spec["iid"], ps)
     warn = f"\n⚠ OKX 上 {sym} {E.dir_word(dr)} 已有 {exist['pos']} 張持倉（倉位會被合併）" if exist else ""
@@ -1242,11 +1215,13 @@ async def cmd_run(u, c):
     PENDING[u.effective_chat.id] = {"act": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": tf,
         "lev": lev, "margin": margin, "pre": pre, "post": post,
         "entry_min": entry_min, "exit_dd": exit_dd, "spec": spec}
-    await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
-        f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{tf}\n"
-        f"目前價格：{op}\n保 證 金：{margin} USDT\n預估張數：{size}\n"
+    await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n"
+        f"{E.dir_emoji(dr)} {dr} {tf}\n"
+        f"/run {sym} {dr} {lev} {pct(margin)} {pre} {post} {pct(entry_min)} {pct(exit_dd)}%\n"
+        f"目前價{op}｜預估{size}張\n"
         f"━━━━━━━━━━\n{prev}\n"
-        f"━━━━━━━━━━\n⚠ 無 TP/SL/TE，僅靠回吐出場{warn}\n"
+        f"━━━━━━━━━━\n"
+        f"回吐{pct(exit_dd)}%出場{warn}\n"
         f"下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
