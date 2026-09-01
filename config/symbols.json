@@ -1,18 +1,79 @@
 {
   "symbols": [
-    { "symbol": "BTCUSDT",  "enabled": true,  "note": "" },
-    { "symbol": "ETHUSDT",  "enabled": true,  "note": "" },
-    { "symbol": "DOGEUSDT", "enabled": true,  "note": "" },
-    { "symbol": "HYPEUSDT", "enabled": true,  "note": "demo API 異常 live 正常" },
-    { "symbol": "SOLUSDT",  "enabled": true,  "note": "" },
-    { "symbol": "SUIUSDT",  "enabled": true,  "note": "" },
-    { "symbol": "XRPUSDT",  "enabled": true,  "note": "" },
-    { "symbol": "XAUUSDT",  "enabled": true,  "note": "貴金屬 須驗證交易時段" },
-    { "symbol": "ADAUSDT",  "enabled": true,  "note": "v1.4 新增 待驗證" },
-    { "symbol": "LINKUSDT", "enabled": true,  "note": "8/26 新增 最低約1.14U" },
-    { "symbol": "PEPEUSDT", "enabled": true,  "note": "8/26 新增 面值1000萬 最低約3.85U" },
-    { "symbol": "AVAXUSDT", "enabled": true,  "note": "8/26 新增 最低約0.74U" },
-    { "symbol": "WIFUSDT",  "enabled": true,  "note": "8/26 新增 最低約0.20U" },
-    { "symbol": "WLDUSDT",  "enabled": true,  "note": "8/26 新增 最低約0.39U" }
+    {
+      "symbol": "BTCUSDT",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "symbol": "DOGEUSDT",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "symbol": "HYPEUSDT",
+      "enabled": true,
+      "note": "demo API 異常 live 正常"
+    },
+    {
+      "symbol": "SOLUSDT",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "symbol": "SUIUSDT",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "symbol": "XRPUSDT",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "symbol": "XAUUSDT",
+      "enabled": true,
+      "note": "貴金屬 須驗證交易時段"
+    },
+    {
+      "symbol": "ADAUSDT",
+      "enabled": true,
+      "note": "v1.4 新增 待驗證"
+    },
+    {
+      "symbol": "LINKUSDT",
+      "enabled": true,
+      "note": "8/26 新增 最低約1.14U"
+    },
+    {
+      "symbol": "PEPEUSDT",
+      "enabled": true,
+      "note": "8/26 新增 面值1000萬 最低約3.85U"
+    },
+    {
+      "symbol": "AVAXUSDT",
+      "enabled": true,
+      "note": "8/26 新增 最低約0.74U"
+    },
+    {
+      "symbol": "WIFUSDT",
+      "enabled": true,
+      "note": "8/26 新增 最低約0.20U"
+    },
+    {
+      "symbol": "WLDUSDT",
+      "enabled": true,
+      "note": "8/26 新增 最低約0.39U"
+    },
+    {
+      "symbol": "AAVEUSDT",
+      "enabled": true,
+      "note": "v1.5 新增 待驗證"
+    }
   ]
 }
