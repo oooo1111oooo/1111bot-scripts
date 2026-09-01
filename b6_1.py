@@ -467,7 +467,7 @@ async def do_exit(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, reason, 
 
 # ---------- 持倉監控 ----------
 async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end):
-    """固定持倉 HOLD_SEC 秒即平倉（TE）；tf_end 僅作為不跨輪的安全上限。"""
+    """固定持倉 HOLD_SEC 秒即平倉（TE），允許跨 TF。"""
     chk = 0
     while S["alive"]:
         await asyncio.sleep(1)
@@ -480,7 +480,7 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_en
         else:
             if last <= tp: reason = "Take_Profit"
             elif last >= sl: reason = "Stop_Loss"
-        if not reason and (time.time() - ee >= HOLD_SEC or time.time() >= tf_end - CLOSE_LEAD):
+        if not reason and time.time() - ee >= HOLD_SEC:
             reason = "Time_Exit"
         if not reason and chk % 16 == 0:
             p_chk = await okx_pos(iid, pos)
@@ -549,7 +549,9 @@ async def loop(app, chat, S):
             room = cur + tf_sec - now
             # 僅在「上一輪未成交、剛撤完單」的情況下才允許盤中補掛；
             # 新建策略與出場後一律等下一根 K 線開盤，嚴守一根 K 線一輪。
-            if S.get("catchup") and cur != S.get("last_open") and room >= ENTRY_CUTOFF:
+            # 撤單後或出場後：只要本 TF 剩餘 >= ENTRY_CUTOFF 就立刻掛，
+            # 允許同一個 TF 內再掛一輪（出場後若時間夠）。
+            if S.get("catchup") and room >= ENTRY_CUTOFF:
                 oe = cur
             else:
                 S["state"] = "等下輪"; save_state()
@@ -585,9 +587,9 @@ async def loop(app, chat, S):
                 print("dup orders cleared", S["sym"], d, dup)
                 await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} 已清除殘留掛單 {dup} 筆")
 
-            # 輪詢成交，直到 TF 剩餘不足 ENTRY_CUTOFF 秒
+            # 輪詢成交，直到本 TF 結束
             tf_end = oe + tf_sec
-            deadline = tf_end - ENTRY_CUTOFF   # 剩 60 秒就不再等成交
+            deadline = tf_end                  # 未成交等滿整個 TF 才撤，撤完立刻重掛
             filled = False; fpx = None
             while S["alive"] and time.time() < deadline:
                 await asyncio.sleep(2)
@@ -952,6 +954,7 @@ async def cmd_status(u, c):
     okxo = {(o["instId"], o.get("posSide")) for o in pdl}
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：現況（即時查 OKX）", "━━━━━━━━━━",
          f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
+         f"撤單/持倉秒數：{ENTRY_CUTOFF}秒",
          f"運行中策略：{len(alive)} 個"]
     for s in alive:
         k = skey(s["sym"], s["dir"]); placed, entered = get_stat(k)
@@ -1350,8 +1353,9 @@ async def cmd_menu(u, c):
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         f"一個 TF 一輪：TF 開始埋伏\n"
-        f"未成交且剩餘不足 {ENTRY_CUTOFF}s → 撤單放棄本輪\n"
+        f"未成交 → TF 結束時撤單，立刻重掛下一輪\n"
         f"已進場未觸發 TP/SL → 持倉滿 {HOLD_SEC}s 平倉（TE）\n"
+        f"出場後本 TF 剩餘 >= {ENTRY_CUTOFF}s 即再掛一輪\n"
         "⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
 
 async def cmd_unknown(u, c):
