@@ -1764,6 +1764,171 @@ async def cmd_menu(u, c):
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
 
+# ---------- 每日 Email 日報（00:05 寄前一日） ----------
+def build_daily_xlsx(day, trades, path):
+    """均K 日報：明細 + 統計。無底色。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    HF = Font(bold=True, color="FFFFFF"); HFILL = PatternFill("solid", fgColor="404040")
+    CEN = Alignment(horizontal="center")
+    ws = wb.active; ws.title = "明細"
+    H = ["日期", "幣種", "週期", "方向", "進場時間", "出場時間", "持倉秒數", "持倉根數",
+         "進場價", "出場價", "最高利潤", "淨損益%", "毛損益", "手續費", "淨損益",
+         "槓桿", "保證金", "前根數", "後根數", "ATR門檻", "回吐門檻", "損益來源"]
+    ws.append(H)
+    for i in range(1, len(H) + 1):
+        cc = ws.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
+    def fl(v, d=0.0):
+        try: return float(v)
+        except Exception: return d
+    def it(v, d=0):
+        try: return int(v)
+        except Exception: return d
+    for t in trades:
+        net = fl(t.get("net")); nv = fl(t.get("nv"))
+        ws.append([day, t.get("sym"), t.get("tf"), t.get("dir"),
+                   t.get("in_ts"), t.get("ts"), it(t.get("hold_s")), fl(t.get("bars")),
+                   fl(t.get("in_px")), fl(t.get("out_px")),
+                   fl(t.get("peak_pct")), (net / nv * 100) if nv else 0.0,
+                   fl(t.get("gross")), fl(t.get("fee")), net,
+                   it(t.get("lev"), 1), fl(t.get("margin")),
+                   it(t.get("pre")), it(t.get("post")),
+                   fl(t.get("entry_min")), fl(t.get("exit_dd")), t.get("src")])
+        r = ws.max_row
+        ws.cell(r, 4).alignment = CEN
+        for col in (11, 12, 20, 21): ws.cell(r, col).number_format = '0.0000"%"'
+        for col in (13, 14, 15): ws.cell(r, col).number_format = "0.000000"
+        for col in (9, 10): ws.cell(r, col).number_format = "0.######"
+    ws.freeze_panes = "A2"
+    if ws.max_row > 1:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(H))}{ws.max_row}"
+    for i, w in enumerate([11, 10, 7, 6, 10, 10, 10, 10, 12, 12, 11, 11,
+                           12, 12, 12, 7, 9, 8, 8, 10, 10, 10], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    w2 = wb.create_sheet("統計")
+    w2.append(["項目", "數值"])
+    for i in (1, 2):
+        cc = w2.cell(1, i); cc.font = HF; cc.fill = HFILL
+    nets = [fl(t.get("net")) for t in trades]
+    n = len(nets) or 1
+    win = [x for x in nets if x > 0]; los = [x for x in nets if x < 0]
+    tg_ = sum(fl(t.get("gross")) for t in trades)
+    tf_ = sum(fl(t.get("fee")) for t in trades)
+    tn_ = sum(nets); tnv = sum(fl(t.get("nv")) for t in trades)
+    rows = [["日期", day], ["帳號", ACCT], ["策略", "均K（Heikin-Ashi）"],
+            ["交易筆數", len(trades)], ["獲利筆數", len(win)], ["虧損筆數", len(los)],
+            ["勝率", len(win) / n * 100],
+            ["平均持倉秒數", sum(it(t.get("hold_s")) for t in trades) / n],
+            ["平均持倉根數", sum(fl(t.get("bars")) for t in trades) / n],
+            ["平均最高利潤", sum(fl(t.get("peak_pct")) for t in trades) / n],
+            ["毛損益", tg_], ["手續費", tf_], ["淨損益", tn_],
+            ["淨損益%", (tn_ / tnv * 100) if tnv else 0.0],
+            ["最大單筆獲利", max(nets) if nets else 0.0],
+            ["最大單筆虧損", min(nets) if nets else 0.0]]
+    for r in rows: w2.append(r)
+    for r in range(2, w2.max_row + 1):
+        lab = str(w2.cell(r, 1).value or ""); cc = w2.cell(r, 2)
+        if lab in ("勝率", "淨損益%", "平均最高利潤"): cc.number_format = '0.0000"%"'
+        elif lab in ("毛損益", "手續費", "淨損益", "最大單筆獲利", "最大單筆虧損"):
+            cc.number_format = "0.000000"
+        elif lab.startswith("平均持倉"): cc.number_format = "0.0"
+    def blk(title, header):
+        w2.append([]); w2.append([title])
+        w2.cell(w2.max_row, 1).font = Font(bold=True)
+        w2.append(header)
+    blk("── 依方向 ──", ["方向", "筆數", "勝率", "淨損益"])
+    for d in ("L", "S"):
+        sub = [t for t in trades if t.get("dir") == d]
+        if not sub: continue
+        sn = [fl(t.get("net")) for t in sub]
+        w2.append(["多" if d == "L" else "空", len(sub),
+                   len([x for x in sn if x > 0]) / len(sn) * 100, sum(sn)])
+        w2.cell(w2.max_row, 3).number_format = '0.00"%"'
+        w2.cell(w2.max_row, 4).number_format = "0.000000"
+    blk("── 依幣種 ──", ["幣種", "筆數", "勝率", "淨損益"])
+    for sy in sorted({t.get("sym") for t in trades if t.get("sym")}):
+        sub = [t for t in trades if t.get("sym") == sy]
+        sn = [fl(t.get("net")) for t in sub]
+        w2.append([sy, len(sub), len([x for x in sn if x > 0]) / len(sn) * 100, sum(sn)])
+        w2.cell(w2.max_row, 3).number_format = '0.00"%"'
+        w2.cell(w2.max_row, 4).number_format = "0.000000"
+    for col, w in (("A", 20), ("B", 14), ("C", 12), ("D", 14)):
+        w2.column_dimensions[col].width = w
+    wb.save(path)
+
+def send_report_mail(path, name, day, cnt, tn):
+    """寄出均K 日報。回傳 (ok, 訊息)。"""
+    import smtplib
+    from email.message import EmailMessage
+    env = {}
+    try:
+        for line in open("/srv/1111bot/.env"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception as e:
+        return False, "讀 .env 失敗：%s" % e
+    user = env.get("GMAIL_USER")
+    pwd = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "")
+    to = env.get("REPORT_TO") or user
+    if not user or not pwd:
+        return False, "未設定 GMAIL_USER / GMAIL_APP_PASSWORD"
+    msg = EmailMessage()
+    msg["Subject"] = "OKX %s 均K日報 %s（%d 筆）" % (ACCT, day, cnt)
+    msg["From"] = user; msg["To"] = to
+    msg.set_content("帳號 %s\n策略 均K\n日期 %s\n交易筆數 %d\n淨損益 %+.6f USDT\n"
+                    % (ACCT, day, cnt, tn))
+    msg.add_attachment(open(path, "rb").read(),
+                       maintype="application",
+                       subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       filename=name)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as sv:
+        sv.login(user, pwd); sv.send_message(msg)
+    return True, to
+
+async def job_report(ctx):
+    """00:05 寄出前一日日報。"""
+    day = (now8() - timedelta(days=1)).strftime("%Y-%m-%d")
+    trades = load_trades(day)
+    if not trades:
+        print("均K 日報：%s 無交易，未寄送" % day)
+        if CHAT_ID:
+            await notify(ctx.application, CHAT_ID,
+                         f"{E.BOT} 均K 日報 {day}：無交易，未寄送")
+        return
+    name = f"OKX_{ACCT}_均K日報_{day.replace('-', '')}.xlsx"
+    path = f"/srv/1111bot/data/{name}"
+    try:
+        build_daily_xlsx(day, trades, path)
+    except Exception as e:
+        print("日報產生失敗", e)
+        if CHAT_ID:
+            await notify(ctx.application, CHAT_ID,
+                         f"{E.BOT} {E.LOSS} 均K 日報產生失敗：{type(e).__name__}: {e}")
+        return
+    tn = 0.0
+    for t in trades:
+        try: tn += float(t.get("net") or 0)
+        except Exception: pass
+    try:
+        ok, info = send_report_mail(path, name, day, len(trades), tn)
+    except Exception as e:
+        if CHAT_ID:
+            await notify(ctx.application, CHAT_ID,
+                         f"{E.BOT} {E.LOSS} 均K 日報寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}")
+        return
+    if CHAT_ID:
+        if ok:
+            await notify(ctx.application, CHAT_ID,
+                         f"{E.BOT} ✅ 均K 日報已寄出\n{day}｜{len(trades)} 筆\n淨損益 {tn:+.6f} USDT")
+        else:
+            await notify(ctx.application, CHAT_ID,
+                         f"{E.BOT} {E.LOSS} 均K 日報未寄送：{info}\n檔案已存於 VPS：{name}")
+
 # ---------- 每日自動 summary ----------
 class _M:
     def __init__(self, app, chat): self._a = app; self._c = chat
@@ -1808,7 +1973,9 @@ async def _post_init(app):
         if jq:
             t2359 = datetime.strptime("23:59", "%H:%M").time().replace(tzinfo=TZ8)
             jq.run_daily(job_summary, time=t2359, name="daily_summary")
-            print("已排程：每日 23:59 自動 /summary")
+            t0005 = datetime.strptime("00:05", "%H:%M").time().replace(tzinfo=TZ8)
+            jq.run_daily(job_report, time=t0005, name="daily_report")
+            print("已排程：23:59 TG /summary｜00:05 Email 前一日日報")
     except Exception as e:
         print("schedule fail", e)
     try:
