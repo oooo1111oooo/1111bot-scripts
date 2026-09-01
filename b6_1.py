@@ -32,7 +32,6 @@ ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
 HOLD_SEC = 120       # 固定持倉秒數（TE）：進場後最多持有幾秒
 ENTRY_CUTOFF = 120   # TF 剩餘不足幾秒就放棄進場（＝HOLD_SEC，確保持倉能跑滿）
-CLOSE_LEAD = 2       # 安全上限：無論如何不晚於 TF 結束前幾秒平倉
 
 def load_env(p):
     d = {}
@@ -517,7 +516,7 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_en
     if await okx_pos(iid, pos):
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 策略停止但仍有持倉，請至 OKX 處理")
 
-# ---------- 主迴圈：一根 K 線一輪 ----------
+# ---------- 主迴圈：TF 埋伏 -> 成交後固定持倉 -> 出場後視剩餘時間再掛 ----------
 async def loop(app, chat, S):
     spec = S["spec"]; iid = spec["iid"]; d = S["dir"]
     pos = "long" if d == "L" else "short"
@@ -548,7 +547,6 @@ async def loop(app, chat, S):
             cur = int(now // tf_sec) * tf_sec
             room = cur + tf_sec - now
             # 僅在「上一輪未成交、剛撤完單」的情況下才允許盤中補掛；
-            # 新建策略與出場後一律等下一根 K 線開盤，嚴守一根 K 線一輪。
             # 撤單後或出場後：只要本 TF 剩餘 >= ENTRY_CUTOFF 就立刻掛，
             # 允許同一個 TF 內再掛一輪（出場後若時間夠）。
             if S.get("catchup") and room >= ENTRY_CUTOFF:
@@ -636,9 +634,7 @@ async def loop(app, chat, S):
                 f"止盈:{tp}({pct(S['tp'])}%)\n止損:{sl}({pct(S['sl'])}%)\n"
                 f"狀　　態：📌 持倉中\n時間：{hhmmss()}")
             await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k, tf_end)
-            # 出場後允許補掛：出場流程（查 OKX 真實損益）可能耗時數秒而跨進新 TF，
-            # 若新 TF 尚未掛過且剩餘 >= ENTRY_CUTOFF 就立刻掛，避免整輪被跳過。
-            # 若仍在同一個 TF（cur == last_open），迴圈頂端會照常睡到下一個 TF 開始。
+            # 出場後一律允許再掛：由迴圈頂端判斷本 TF 剩餘是否 >= ENTRY_CUTOFF
             S["catchup"] = True
     except asyncio.CancelledError:
         raise
