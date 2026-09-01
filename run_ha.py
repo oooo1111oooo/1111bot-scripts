@@ -1738,15 +1738,20 @@ async def cmd_timeframe(u, c):
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
+        "/status 策略現況\n"
+        "/summary 當日戰報\n"
+        "/coins 幣種\n"
+        "/ha 商品 根數  燈號+ATR 報表 Excel 寄信（3~2000根）\n"
+        "━━━━━━━━━━\n"
         "/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 回吐%\n"
         "例：/run BTCUSDT L 1 100 5 2 0.6 -2%\n"
         f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認執行（run/stop/stopall 共用）\n"
-        "/stop 商品 方向（需 /confirm）\n/stopall 停全部（需 /confirm）\n"
-        "/status 策略現況\n/summary 當日戰報\n"
-        "/ha 商品 根數  燈號+ATR 報表 Excel 寄信（3~2000根）\n"
+        "/stop 商品 方向（需 /confirm）\n"
+        "/stopall 停全部（需 /confirm）\n"
+        "━━━━━━━━━━\n"
         "/db 行情DB狀態（/db ETHUSDT 5m 看細節）\n"
-        f"/timeframe 查看/設定週期 共{len(TF_LIST)}種\n/coins 幣種\n"
+        f"/timeframe 查看/設定週期 共{len(TF_LIST)}種\n"
         "━━━━━━━━━━\n"
         "進場：前段全反向色 + 後段全順勢色\n"
         "　　　且後段 ΣATR14 ratio ≥ 門檻%\n"
@@ -1780,11 +1785,12 @@ async def _post_stop(app):
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
-    CMDS = [BotCommand("run", "建立均K策略"),
+    CMDS = [BotCommand("status", "策略現況"), BotCommand("summary", "當日戰報"),
+            BotCommand("coins", "幣種"), BotCommand("ha", "燈號+ATR 報表寄信"),
+            BotCommand("run", "建立均K策略"), BotCommand("confirm", "確認執行"),
             BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
-            BotCommand("status", "現況"), BotCommand("summary", "當日戰報"),
-            BotCommand("ha", "燈號+ATR14 3~2000根"), BotCommand("timeframe", "週期"),
-            BotCommand("coins", "幣種"), BotCommand("menu", "說明")]
+            BotCommand("db", "行情DB狀態"), BotCommand("timeframe", "週期"),
+            BotCommand("menu", "說明")]
     scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
     try:
         saved = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
