@@ -97,7 +97,7 @@ def pct(v): return str(Decimal(str(v)).normalize())
 
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post",
-               "pre_max","entry_min","exit_dd","chat",
+               "entry_min","exit_dd","chat",
                "pos_open","pos_px","pos_ee","pos_sz","pos_peak","pnl_hist","last_bar")
 
 SHUTTING_DOWN = False
@@ -670,18 +670,21 @@ def bar_line(r):
     hm = str(r.get("dt") or "")[11:16]        # 只留 HH:MM，手機版面才不會折行
     return f"{hm} {lg} {b:+.4f}% | {astr}"
 
-def seg_block(title, rows, want, op, thr, ok):
-    """一段視窗的完整明細 + 累計 + 位移計算式"""
+def seg_block(title, rows, thr, ok, label):
+    """一段視窗的明細 + 累計 + 條件比對。
+    thr 為 None 時只做顏色檢查（前段），否則附上 ΣATR14r 門檻（後段）。"""
     L = [title]
     for r in rows:
         L.append(bar_line(r))
     sb = sum(float(r.get("body_pct") or 0) for r in rows)
     sa = sum(float(r.get("atr14_ratio") or 0) for r in rows)
-    dv = (abs(sb) / sa) if sa > 0 else 0
-    L.append(f"Σ漲跌幅 {sb:+.4f}% → 絕對值 {abs(sb):.4f}%")
-    L.append(f"ΣATR14r {sa:.4f}%")
-    L.append(f"位移 {abs(sb):.4f} ÷ {sa:.4f} = {dv:.4f}")
-    L.append(f"條件 {op} {thr}　{'✅ 通過' if ok else '❌ 未過'}")
+    L.append(f"Σ漲跌幅 {sb:+.4f}%（參考）")
+    if thr is None:
+        L.append(f"ΣATR14r {sa:.4f}%（參考）")
+        L.append(f"{label}　{'✅ 通過' if ok else '❌ 未過'}")
+    else:
+        L.append(f"ΣATR14r {sa:.4f}%")
+        L.append(f"條件 ≥ {thr}%　{'✅ 通過' if ok else '❌ 未過'}")
     return L
 
 # ---------- 訊號判定（資料一律來自本機 DB）----------
@@ -694,22 +697,28 @@ def disp(rows):
     if den <= 0: return None
     return num / den
 
-def judge_entry_db(rows, d, pre, post, pre_max, entry_min):
+def judge_entry_db(rows, d, pre, post, entry_min):
     """rows 為舊->新，至少 pre+post 根。
-    進場：後 post 根同為順勢色，且
-          前 pre 根位移 <= pre_max（盤整），後 post 根位移 >= entry_min（突破）。"""
+    進場條件（三項同時成立）：
+      1. 前 pre 根全為反向色（確認是真反轉，不是順勢中途）
+      2. 後 post 根全為順勢色（做多綠、做空紅）
+      3. 後 post 根的 ATR14 ratio 累加 >= entry_min（單位：%）
+    漲跌幅一併回傳供核對，但不參與判定。"""
     need = pre + post
     if len(rows) < need: return None
     seg = rows[-need:]
     pre_seg, post_seg = seg[:pre], seg[pre:]
     want = "G" if d == "L" else "R"
+    opp = "R" if d == "L" else "G"
+    pre_ok = all(r.get("color") == opp for r in pre_seg)
     color_ok = all(r.get("color") == want for r in post_seg)
-    pd_ = disp(pre_seg); ed = disp(post_seg)
-    if pd_ is None or ed is None: return None
-    return {"pre_seg": pre_seg, "post_seg": post_seg, "color_ok": color_ok,
-            "pre_disp": pd_, "entry_disp": ed,
-            "pre_ok": pd_ <= pre_max, "entry_ok": ed >= entry_min,
-            "hit": color_ok and pd_ <= pre_max and ed >= entry_min}
+    atr_sum = sum(float(r.get("atr14_ratio") or 0) for r in post_seg)
+    body_sum = sum(float(r.get("body_pct") or 0) for r in post_seg)
+    return {"pre_seg": pre_seg, "post_seg": post_seg,
+            "pre_ok": pre_ok, "color_ok": color_ok,
+            "atr_sum": atr_sum, "body_sum": body_sum,
+            "entry_ok": atr_sum >= entry_min,
+            "hit": pre_ok and color_ok and atr_sum >= entry_min}
 
 def judge_exit_db(close_px, entry_px, d, peak, exit_dd):
     """回吐出場：進場時利潤歸零，逐根更新最高利潤，
@@ -781,13 +790,14 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
             f"商　　品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['lev']}x",
             f"週　　期：{S['tf']}",
             "格式：時間 燈號 漲跌幅 | ATR14r", "━" * 10]
-    lines = []
-    lines += seg_block(f"【前段 {S['pre']} 根｜需盤整】", pre_rows, None, "≤",
-                       pct(S["pre_max"]), info["pre_ok"] if info else False)
-    lines.append("━" * 10)
     want_lg = "\U0001F7E9" if d == "L" else "\U0001F7E5"
-    lines += seg_block(f"【後段 {S['post']} 根｜需突破】", post_rows, None, "≥",
-                       pct(S["entry_min"]), info["entry_ok"] if info else False)
+    opp_lg = "\U0001F7E5" if d == "L" else "\U0001F7E9"
+    lines = seg_block(f"【前段 {S['pre']} 根｜需反向】", pre_rows, None,
+                      info["pre_ok"] if info else False,
+                      f"需全為 {opp_lg}")
+    lines.append("━" * 10)
+    lines += seg_block(f"【後段 {S['post']} 根｜需順勢】", post_rows,
+                       pct(S["entry_min"]), info["entry_ok"] if info else False, None)
     lines.append(f"同色檢查 需全為 {want_lg}　{'✅ 通過' if (info and info['color_ok']) else '❌ 未過'}")
     lines.append("━" * 10)
     tail = [f"進場價格：{fpx}", f"下單張數：{size}",
@@ -848,7 +858,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
                "src": src, "ts": hhmmss(),
                "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
                "tf": S["tf"], "pre": str(S["pre"]), "post": str(S["post"]),
-               "pre_max": str(S["pre_max"]), "entry_min": str(S["entry_min"]),
+               "entry_min": str(S["entry_min"]),
                "exit_dd": str(S["exit_dd"]),
                "peak_pct": round(float(S.get("pos_peak") or 0), 4),
                "lev": S["lev"], "margin": str(S["margin"]),
@@ -986,8 +996,7 @@ async def hloop(app, chat, S):
             else:
                 # --- 空手：進場判斷 ---
                 if len(rows) < need: continue
-                r = judge_entry_db(rows, d, int(S["pre"]), int(S["post"]),
-                                   float(S["pre_max"]), float(S["entry_min"]))
+                r = judge_entry_db(rows, d, int(S["pre"]), int(S["post"]), float(S["entry_min"]))
                 if r and r["hit"]:
                     ok2 = await h_open(app, S, spec, iid, d, pos, r, k)
                     if ok2:
@@ -1053,7 +1062,6 @@ async def rebuild_strat(d):
     S = {"sym": d["sym"], "dir": d["dir"], "tf": d.get("tf", ACCOUNT_TF),
          "lev": int(d["lev"]), "margin": Decimal(str(d["margin"])),
          "pre": int(d["pre"]), "post": int(d["post"]),
-         "pre_max": Decimal(str(d["pre_max"])),
          "entry_min": Decimal(str(d["entry_min"])),
          "exit_dd": Decimal(str(d["exit_dd"])), "spec": spec,
          "alive": True, "state": "等訊號", "chat": d.get("chat", CHAT_ID),
@@ -1103,31 +1111,29 @@ def strat_params(sym, dr):
     if not S or not S.get("alive"):
         return f"{dr}（已停止）"
     return (f"{dr} {S['tf']} {S['lev']}x {pct(S['margin'])} "
-            f"{S['pre']}/{S['post']} {pct(S['pre_max'])}/{pct(S['entry_min'])} "
-            f"{pct(S['exit_dd'])}%")
+            f"{S['pre']}/{S['post']}根 ≥{pct(S['entry_min'])}% "
+            f"回吐{pct(S['exit_dd'])}%")
 
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"用法：/run 商品 方向 槓桿 保證金 前根數 後根數 前段位移上限 後段位移下限 回吐%\n"
-           f"例：/run BTCUSDT L 1 100 5 3 0.5 1.5 -2%\n"
+    fmt = (f"用法：/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 回吐%\n"
+           f"例：/run BTCUSDT L 1 100 5 2 0.6 -2%\n"
            f"━━━━━━━━━━\n"
-           f"前根數：反轉前觀察根數\n"
-           f"後根數：反轉後連續同色確認根數\n"
-           f"前段位移上限：該段需為盤整（位移 ≤ 此值）\n"
-           f"後段位移下限：該段需為突破（位移 ≥ 此值）\n"
-           f"位移 = |Σ均K實體漲跌幅| / Σ ATR14 ratio\n"
+           f"前根數：反轉前需連續反向色的根數\n"
+           f"後根數：反轉後需連續順勢色的根數\n"
+           f"ATR門檻：後段這幾根的 ATR14 ratio 累加需 ≥ 此值（%）\n"
            f"回吐%：從最高利潤跌多少即出場（負值）\n"
            f"━━━━━━━━━━\n"
            f"週期依 /timeframe，目前 {ACCOUNT_TF}")
-    if len(a) != 9:
-        await reply(u, f"{E.BOT} 參數數量錯誤（需9個，收到{len(a)}個）\n{fmt}"); return
+    if len(a) != 8:
+        await reply(u, f"{E.BOT} 參數數量錯誤（需8個，收到{len(a)}個）\n{fmt}"); return
     try:
         sym = a[0].upper(); dr = a[1].upper()
         lev = int(a[2].replace("x", "")); margin = Decimal(a[3])
         pre = int(a[4]); post = int(a[5])
-        pre_max = Decimal(a[6]); entry_min = Decimal(a[7])
-        exit_dd = Decimal(a[8].replace("%", "").strip())
+        entry_min = Decimal(a[6].replace("%", "").strip())
+        exit_dd = Decimal(a[7].replace("%", "").strip())
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     tf = ACCOUNT_TF
@@ -1140,8 +1146,8 @@ async def cmd_run(u, c):
             await reply(u, f"{E.BOT} {nm} 須 1~{DB_KEEP}"); return
     if pre + post > DB_KEEP:
         await reply(u, f"{E.BOT} 前根數+後根數 不可超過 {DB_KEEP}（行情DB 保留上限）"); return
-    if pre_max <= 0 or entry_min <= 0:
-        await reply(u, f"{E.BOT} 位移門檻須大於 0"); return
+    if entry_min <= 0:
+        await reply(u, f"{E.BOT} ATR門檻 須大於 0"); return
     if exit_dd >= 0:
         await reply(u, f"{E.BOT} 回吐% 須為負值，例如 -2%"); return
     k = skey(sym, dr)
@@ -1160,12 +1166,16 @@ async def cmd_run(u, c):
         await reply(u, f"{E.BOT} {E.LOSS} 行情DB 資料不足（{sym} {tf} 目前 {len(rows)} 根，需 {pre+post} 根）\n"
                        f"請稍候收集器補齊，或用 /db {sym} {tf} 查看"); return
     fresh = db_fresh(sym, tf)
-    r = judge_entry_db(rows, dr, pre, post, float(pre_max), float(entry_min))
-    seq = "".join(x["color"] for x in rows)
-    prev = (f"目前燈號：{seq}\n"
-            f"前{pre}根位移：{r['pre_disp']:.4f} {'✅' if r['pre_ok'] else '❌'} ≤ {pre_max}\n"
-            f"後{post}根位移：{r['entry_disp']:.4f} {'✅' if r['entry_ok'] else '❌'} ≥ {entry_min}\n"
-            f"後{post}根同色：{'✅' if r['color_ok'] else '❌'}\n"
+    r = judge_entry_db(rows, dr, pre, post, float(entry_min))
+    opp_lg = "\U0001F7E5" if dr == "L" else "\U0001F7E9"
+    want_lg = "\U0001F7E9" if dr == "L" else "\U0001F7E5"
+    d1 = "\n".join(bar_line(x) for x in r["pre_seg"])
+    d2 = "\n".join(bar_line(x) for x in r["post_seg"])
+    prev = (f"【前段 {pre} 根｜需全 {opp_lg}】\n{d1}\n"
+            f"反向色：{'✅' if r['pre_ok'] else '❌'}\n"
+            f"【後段 {post} 根｜需全 {want_lg}】\n{d2}\n"
+            f"ΣATR14r：{r['atr_sum']:.4f}% {'✅' if r['entry_ok'] else '❌'} ≥ {entry_min}%\n"
+            f"順勢色：{'✅' if r['color_ok'] else '❌'}\n"
             f"此刻是否成立：{'✅ 會進場' if r['hit'] else '❌ 不進場'}")
     ps = "long" if dr == "L" else "short"
     exist = await okx_pos(spec["iid"], ps)
@@ -1173,14 +1183,16 @@ async def cmd_run(u, c):
     if not fresh: warn += "\n⚠ 行情DB 落後，啟動後會等資料補齊才判斷"
     PENDING[u.effective_chat.id] = {"t": time.time(), "sym": sym, "dir": dr, "tf": tf,
         "lev": lev, "margin": margin, "pre": pre, "post": post,
-        "pre_max": pre_max, "entry_min": entry_min, "exit_dd": exit_dd, "spec": spec}
+        "entry_min": entry_min, "exit_dd": exit_dd, "spec": spec}
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{tf}\n"
         f"目前價格：{op}\n保 證 金：{margin} USDT\n預估張數：{size}\n"
         f"━━━━━━━━━━\n"
-        f"進場：前{pre}根位移 ≤ {pre_max}（盤整）\n"
-        f"　　　後{post}根同色且位移 ≥ {entry_min}（突破）\n"
-        f"出場：從最高利潤回吐 {exit_dd}%（純價格變動，不含槓桿）\n"
+        f"進場：前 {pre} 根全反向色\n"
+        f"　　　後 {post} 根全順勢色\n"
+        f"　　　且後段 ΣATR14 ratio ≥ {entry_min}%\n"
+        f"出場：從最高利潤回吐 {exit_dd}%\n"
+        f"　　　（純價格變動，不含槓桿）\n"
         f"進出場皆 taker 市價\n━━━━━━━━━━\n{prev}\n"
         f"━━━━━━━━━━\n⚠ 無 TP/SL/TE，僅靠回吐出場{warn}\n"
         f"下一步：60秒內 /confirm\n時間：{hhmmss()}")
@@ -1611,8 +1623,8 @@ async def cmd_timeframe(u, c):
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
-        "/run 商品 方向 槓桿 保證金 前根數 後根數 前段上限 後段下限 回吐%\n"
-        "例：/run BTCUSDT L 1 100 5 3 0.5 1.5 -2%\n"
+        "/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 回吐%\n"
+        "例：/run BTCUSDT L 1 100 5 2 0.6 -2%\n"
         f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部\n"
         "/status 策略現況\n/summary 當日戰報\n"
@@ -1620,9 +1632,8 @@ async def cmd_menu(u, c):
         "/db 行情DB狀態（/db ETHUSDT 5m 看細節）\n"
         f"/timeframe 查看/設定週期 共{len(TF_LIST)}種\n/coins 幣種\n"
         "━━━━━━━━━━\n"
-        "位移 = |Σ均K實體漲跌幅| / Σ ATR14 ratio\n"
-        "進場：前段位移 ≤ 上限（盤整）\n"
-        "　　　後段同色且位移 ≥ 下限（突破）\n"
+        "進場：前段全反向色 + 後段全順勢色\n"
+        "　　　且後段 ΣATR14 ratio ≥ 門檻%\n"
         "出場：從最高利潤回吐指定% 即 taker 平倉\n"
         "⚠ 無 TP/SL/TE，僅靠回吐出場\n"
         "✅ 判斷全讀本機行情DB，下單不等 API\n"
