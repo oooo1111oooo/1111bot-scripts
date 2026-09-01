@@ -1109,8 +1109,8 @@ def strat_params(sym, dr):
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"用法：/run 商品 方向 週期 槓桿 保證金 前根數 後根數 前段位移上限 後段位移下限 回吐%\n"
-           f"例：/run BTCUSDT L 5m 1 100 5 3 0.5 1.5 -2%\n"
+    fmt = (f"用法：/run 商品 方向 槓桿 保證金 前根數 後根數 前段位移上限 後段位移下限 回吐%\n"
+           f"例：/run BTCUSDT L 1 100 5 3 0.5 1.5 -2%\n"
            f"━━━━━━━━━━\n"
            f"前根數：反轉前觀察根數\n"
            f"後根數：反轉後連續同色確認根數\n"
@@ -1118,21 +1118,23 @@ async def cmd_run(u, c):
            f"後段位移下限：該段需為突破（位移 ≥ 此值）\n"
            f"位移 = |Σ均K實體漲跌幅| / Σ ATR14 ratio\n"
            f"回吐%：從最高利潤跌多少即出場（負值）\n"
-           f"週期：" + " / ".join(TF_LIST))
-    if len(a) != 10:
-        await reply(u, f"{E.BOT} 參數數量錯誤（需10個，收到{len(a)}個）\n{fmt}"); return
+           f"━━━━━━━━━━\n"
+           f"週期依 /timeframe，目前 {ACCOUNT_TF}")
+    if len(a) != 9:
+        await reply(u, f"{E.BOT} 參數數量錯誤（需9個，收到{len(a)}個）\n{fmt}"); return
     try:
-        sym = a[0].upper(); dr = a[1].upper(); tf = a[2]
-        lev = int(a[3].replace("x", "")); margin = Decimal(a[4])
-        pre = int(a[5]); post = int(a[6])
-        pre_max = Decimal(a[7]); entry_min = Decimal(a[8])
-        exit_dd = Decimal(a[9].replace("%", "").strip())
+        sym = a[0].upper(); dr = a[1].upper()
+        lev = int(a[2].replace("x", "")); margin = Decimal(a[3])
+        pre = int(a[4]); post = int(a[5])
+        pre_max = Decimal(a[6]); entry_min = Decimal(a[7])
+        exit_dd = Decimal(a[8].replace("%", "").strip())
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
+    tf = ACCOUNT_TF
     if dr not in ("L", "S"):
         await reply(u, f"{E.BOT} 方向須 L 或 S"); return
     if tf not in HA_TF:
-        await reply(u, f"{E.BOT} 週期須為：" + " / ".join(TF_LIST)); return
+        await reply(u, f"{E.BOT} 目前週期 {tf} 無效，請先 /timeframe 設定"); return
     for nm, v in (("前根數", pre), ("後根數", post)):
         if not 1 <= v <= DB_KEEP:
             await reply(u, f"{E.BOT} {nm} 須 1~{DB_KEEP}"); return
@@ -1605,17 +1607,18 @@ async def cmd_timeframe(u, c):
     if tf not in HA_TF:
         await reply(u, f"{E.BOT} 週期須為：{opts}"); return
     ACCOUNT_TF = tf; save_state()
-    await reply(u, f"{E.BOT} ✅ 預設週期已設為 {tf}\n（/run 現在自帶週期參數，此設定僅作參考預設）")
+    await reply(u, f"{E.BOT} ✅ 帳戶週期已設為 {tf}\n（僅影響之後新建立的策略）")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
-        "/run 商品 方向 週期 槓桿 保證金 前根數 後根數 前段上限 後段下限 回吐%\n"
-        "例：/run BTCUSDT L 5m 1 100 5 3 0.5 1.5 -2%\n"
+        "/run 商品 方向 槓桿 保證金 前根數 後根數 前段上限 後段下限 回吐%\n"
+        "例：/run BTCUSDT L 1 100 5 3 0.5 1.5 -2%\n"
+        f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部\n"
         "/status 策略現況\n/summary 當日戰報\n"
         "/ha 商品 根數  燈號+ATR 報表 Excel 寄信（3~2000根）\n"
         "/db 行情DB狀態（/db ETHUSDT 5m 看細節）\n"
-        f"/timeframe 預設週期 共{len(TF_LIST)}種\n/coins 幣種\n"
+        f"/timeframe 查看/設定週期 共{len(TF_LIST)}種\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "位移 = |Σ均K實體漲跌幅| / Σ ATR14 ratio\n"
         "進場：前段位移 ≤ 上限（盤整）\n"
