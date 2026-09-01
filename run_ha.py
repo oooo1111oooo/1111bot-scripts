@@ -93,7 +93,7 @@ def inst_id(s): return s.replace("USDT", "") + "-USDT-SWAP"
 def now8(): return datetime.now(TZ8)
 def hhmmss(): return now8().strftime("%H:%M:%S")
 def today8(): return now8().strftime("%Y-%m-%d")
-def pct(v): return str(Decimal(str(v)).normalize())
+def pct(v): return format(Decimal(str(v)).normalize(), "f")   # 用 f 格式，避免 10 變成 1E+1
 
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post",
@@ -1094,11 +1094,7 @@ async def startup_recover(app):
             rec.append(f"{E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}")
         except Exception as e:
             print("重建失敗", d, e)
-    n_pos = 0
-    posr = await api("GET", "/api/v5/account/positions")
-    if posr.get("code") == "0":
-        n_pos = len([p for p in posr.get("data", []) if float(p.get("pos", "0")) != 0])
-    print(f"已接管均K 策略 {len(rec)}｜OKX 帳戶持倉{n_pos}（含普K）")
+    print(f"已接管均K 策略 {len(rec)}")
     if CHAT_ID and rec:
         await notify(app, CHAT_ID,
             f"{E.BOT} OKX均K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
@@ -1107,12 +1103,85 @@ async def startup_recover(app):
 
 # ---------- TG 指令 ----------
 def strat_params(sym, dr):
+    """回傳與 /run 輸入完全相同的參數字串，方便直接複製重下。"""
     S = STRATS.get(skey(sym, dr))
     if not S or not S.get("alive"):
-        return f"{dr}（已停止）"
-    return (f"{dr} {S['tf']} {S['lev']}x {pct(S['margin'])} "
-            f"{S['pre']}/{S['post']}根 ≥{pct(S['entry_min'])}% "
-            f"回吐{pct(S['exit_dd'])}%")
+        return None
+    return (f"/run {sym} {dr} {S['lev']} {pct(S['margin'])} "
+            f"{S['pre']} {S['post']} {pct(S['entry_min'])} {pct(S['exit_dd'])}%")
+
+def strat_detail(S, sym, dr, mark_px=None):
+    """單一策略的完整現況：空手列進場條件明細，持倉列利潤與出場距離。"""
+    L = []
+    tf = S["tf"]
+    hb = S.get("hb")
+    age = f"{int(time.time()-hb)}s" if hb else "-"
+    L.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)} {tf}")
+    L.append(strat_params(sym, dr) or "")
+    if not S.get("pos_open"):
+        L.append(f"狀態：等訊號｜心跳 {age}")
+        pre = int(S["pre"]); post = int(S["post"])
+        rows = db_latest(sym, tf, pre + post)
+        if len(rows) < pre + post:
+            L.append(f"⚠ 行情DB 僅 {len(rows)} 根，需 {pre+post} 根")
+            return L
+        if not db_fresh(sym, tf):
+            L.append("⚠ 行情DB 落後，以下為最後已知資料")
+        r = judge_entry_db(rows, dr, pre, post, float(S["entry_min"]))
+        opp_lg = "\U0001F7E5" if dr == "L" else "\U0001F7E9"
+        want_lg = "\U0001F7E9" if dr == "L" else "\U0001F7E5"
+        L.append(f"【前段 {pre} 根｜需全 {opp_lg}】")
+        for x in r["pre_seg"]: L.append(bar_line(x))
+        L.append(f"反向色：{'✅' if r['pre_ok'] else '❌'}")
+        L.append(f"【後段 {post} 根｜需全 {want_lg}】")
+        for x in r["post_seg"]: L.append(bar_line(x))
+        L.append(f"ΣATR14r {r['atr_sum']:.4f}% {'✅' if r['entry_ok'] else '❌'} ≥ {pct(S['entry_min'])}%")
+        L.append(f"順勢色：{'✅' if r['color_ok'] else '❌'}")
+        L.append(f"此刻：{'✅ 會進場' if r['hit'] else '❌ 不進場'}")
+        return L
+    # ---- 持倉中 ----
+    L.append(f"狀態：📌 持倉中｜心跳 {age}")
+    try: epx = Decimal(str(S.get("pos_px") or "0"))
+    except Exception: epx = Decimal(0)
+    sz = S.get("pos_sz") or "?"
+    L.append(f"進場價 {epx}｜{sz} 張")
+    cur = None
+    if mark_px:
+        try: cur = Decimal(str(mark_px))
+        except Exception: cur = None
+    if cur is None:
+        rr = db_latest(sym, tf, 1)
+        if rr: cur = Decimal(str(rr[-1]["c"]))
+    peak = float(S.get("pos_peak") or 0)
+    dd_thr = float(S["exit_dd"])
+    if cur is not None and epx:
+        r = judge_exit_db(cur, epx, dr, peak, dd_thr)
+        L.append(f"目前價 {cur}")
+        L.append(f"目前利潤 {r['pnl_pct']:+.4f}%")
+        L.append(f"最高利潤 {peak:+.4f}%")
+        L.append(f"回吐 {r['dd']:+.4f}%（門檻 {pct(S['exit_dd'])}%）")
+        room = r["dd"] - dd_thr
+        if room > 0:
+            L.append(f"再回吐 {room:.4f}% 即出場")
+        else:
+            L.append("⚠ 已達出場條件，下一根收線觸發")
+        # 出場觸發價（以目前最高利潤推算）
+        tgt = peak + dd_thr
+        px = epx * (Decimal(1) + Decimal(str(tgt)) / 100) if dr == "L" \
+             else epx * (Decimal(1) - Decimal(str(tgt)) / 100)
+        L.append(f"出場觸發價 ≈ {px:.6g}")
+    else:
+        L.append("⚠ 取不到目前價")
+    hist = S.get("pnl_hist") or []
+    if hist:
+        show = hist[-5:]
+        L.append(f"【近 {len(show)} 根收線利潤】共 {len(hist)} 根")
+        for h in show:
+            hm = str(h.get("dt") or "")[11:16]
+            L.append(f"{hm} 利{h['pnl']:+.3f}% 高{h['peak']:+.3f}% 回{h['dd']:+.3f}%")
+    else:
+        L.append("（尚未有收線紀錄，進場後第一根收線才會出現）")
+    return L
 
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
@@ -1187,13 +1256,7 @@ async def cmd_run(u, c):
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商　　品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週　　期：{tf}\n"
         f"目前價格：{op}\n保 證 金：{margin} USDT\n預估張數：{size}\n"
-        f"━━━━━━━━━━\n"
-        f"進場：前 {pre} 根全反向色\n"
-        f"　　　後 {post} 根全順勢色\n"
-        f"　　　且後段 ΣATR14 ratio ≥ {entry_min}%\n"
-        f"出場：從最高利潤回吐 {exit_dd}%\n"
-        f"　　　（純價格變動，不含槓桿）\n"
-        f"進出場皆 taker 市價\n━━━━━━━━━━\n{prev}\n"
+        f"━━━━━━━━━━\n{prev}\n"
         f"━━━━━━━━━━\n⚠ 無 TP/SL/TE，僅靠回吐出場{warn}\n"
         f"下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
@@ -1279,6 +1342,7 @@ async def cmd_stopall(u, c):
     await reply(u, m + f"時間：{hhmmss()}")
 
 async def cmd_status(u, c):
+    """總覽一則 + 每個幣種各一則（兩個方向）。空手列進場條件，持倉列出場距離。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     posr = await api("GET", "/api/v5/account/positions")
     bal = await api("GET", "/api/v5/account/balance")
@@ -1289,23 +1353,51 @@ async def cmd_status(u, c):
             eq = f"{Decimal(x.get('eq','0')):.4f}"
             av = f"{Decimal(x.get('availEq') or x.get('availBal') or '0'):.4f}"
     pl = [p for p in posr.get("data", []) if float(p.get("pos", "0")) != 0] if posr.get("code") == "0" else []
-    alive = [s for s in STRATS.values() if s.get("alive")]
-    L = [f"{E.BOT} OKX均K｜{ACCT}", "事件：現況（即時查 OKX）", "━━━━━━━━━━",
-         f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
-         f"均K 策略：{len(alive)} 個"]
-    for s in alive:
-        k = skey(s["sym"], s["dir"]); placed, entered = get_stat(k)
-        live = "持倉中" if s.get("pos_open") else "等訊號"
-        hb = s.get("hb")
-        age = f"{int(time.time()-hb)}s" if hb else "-"
-        L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(進{entered}/{placed}) 心跳{age}")
-        L.append(f"　　策略　　：{strat_params(s['sym'], s['dir'])}")
-    L += ["━━━━━━━━━━", f"OKX 帳戶總持倉：{len(pl)}（含普K）"]
+    # 只取均K 自己策略對應的持倉；帳戶上其他倉位（原K 或手動單）一律不列入
+    mark = {}; okxpos = {}
     for p in pl:
-        d = "L" if p["posSide"] == "long" else "S"
-        L.append(f"{E.dir_emoji(d)} {p['instId'].replace('-USDT-SWAP','USDT')} {d} {p['pos']}張")
-    L += ["━━━━━━━━━━", f"時間：{hhmmss()} UTC+8"]
+        sy = p["instId"].replace("-USDT-SWAP", "USDT")
+        dk = "L" if p["posSide"] == "long" else "S"
+        mark[(sy, dk)] = p.get("markPx") or p.get("last")
+        okxpos[(sy, dk)] = p
+    alive = [s for s in STRATS.values() if s.get("alive")]
+    syms = sorted({s["sym"] for s in alive})
+    held = [s for s in alive if s.get("pos_open")]
+    L = [f"{E.BOT} OKX均K｜{ACCT}", "事件：現況總覽", "━" * 10,
+         f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
+         "━" * 10,
+         f"均K 策略：{len(alive)} 個｜幣種 {len(syms)} 個",
+         f"均K 持倉：{len(held)} 個"]
+    for s in held:
+        dk = s["dir"]; key = (s["sym"], dk)
+        pinfo = okxpos.get(key)
+        szs = (pinfo or {}).get("pos") or s.get("pos_sz") or "?"
+        L.append(f"{E.dir_emoji(dk)} {s['sym']} {dk} {szs}張")
+        if pinfo is None:
+            L.append("　⚠ OKX 查無此倉，可能已手動平倉")
+    if not held:
+        L.append("（目前全部等訊號）")
+    if syms:
+        L.append("━" * 10)
+        L.append(f"以下分 {len(syms)} 則列出各幣種明細")
+    L += ["━" * 10, f"時間：{hhmmss()} UTC+8"]
     await reply(u, "\n".join(L))
+    for i, sym in enumerate(syms, 1):
+        M = [f"{E.BOT} {sym}（{i}/{len(syms)}）", "━" * 10]
+        for dr in ("L", "S"):
+            S = STRATS.get(skey(sym, dr))
+            if not S or not S.get("alive"):
+                M.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)}：未設定")
+                M.append("━" * 10)
+                continue
+            try:
+                M += strat_detail(S, sym, dr, mark.get((sym, dr)))
+            except Exception as e:
+                M.append(f"{E.LOSS} 明細產生失敗：{type(e).__name__}: {e}")
+            M.append("━" * 10)
+        M.append(f"時間：{hhmmss()}")
+        await reply(u, "\n".join(M))
+        await asyncio.sleep(0.3)
 
 # ---------- /summary ----------
 def sum_lines(rs, entered):
@@ -1357,7 +1449,7 @@ async def cmd_summary(u, c):
             rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
             st_ = ts.get(skey(sy, dr)) or {"placed": 0, "entered": 0}
             D.append("━" * 10)
-            D.append(f"策略：{E.dir_emoji(dr)} {strat_params(sy, dr)}")
+            D.append(f"策略：{E.dir_emoji(dr)} {strat_params(sy, dr) or (dr + '（已停止）')}")
             D += sum_lines(rows, st_["entered"])
         D += ["━" * 10, f"時間：{hhmmss()}"]
         await reply(u, "\n".join(D))
