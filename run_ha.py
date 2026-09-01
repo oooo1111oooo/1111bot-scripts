@@ -549,12 +549,7 @@ async def collector(app):
         for sym in syms:
             if await collect_one(sym, tf, warm=True): ok += 1
             await asyncio.sleep(DB_GAP)
-    print(f"行情DB 初始化完成：{ok}/{len(syms)*len(TF_LIST)} 組")
-    if CHAT_ID:
-        await notify(app, CHAT_ID,
-            f"{E.BOT} OKX均K｜{ACCT}\n事件：📚 行情DB 初始化完成\n"
-            f"{len(syms)} 幣種 x {len(TF_LIST)} 週期 = {ok} 組就緒\n"
-            f"每根收線後自動更新，下單時只讀本機不打 API\n時間：{hhmmss()}")
+    print(f"行情DB 初始化完成：{ok}/{len(syms)*len(TF_LIST)} 組（不發 TG，用 /db 查看）")
     while True:
         try:
             await asyncio.sleep(DB_TICK)
@@ -668,7 +663,7 @@ def bar_line(r):
     a = r.get("atr14_ratio")
     astr = ("%.4f%%" % float(a)) if a is not None else "-"
     hm = str(r.get("dt") or "")[11:16]        # 只留 HH:MM，手機版面才不會折行
-    return f"{hm} {lg} {b:+.4f}% | {astr}"
+    return f"{lg} {hm} {b:+.4f}% | {astr}"
 
 def seg_block(title, rows, thr, ok, label):
     """一段視窗的明細 + 累計 + 條件比對。
@@ -1114,12 +1109,10 @@ def strat_detail(S, sym, dr, mark_px=None):
     """單一策略的完整現況：空手列進場條件明細，持倉列利潤與出場距離。"""
     L = []
     tf = S["tf"]
-    hb = S.get("hb")
-    age = f"{int(time.time()-hb)}s" if hb else "-"
     L.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)} {tf}")
     L.append(strat_params(sym, dr) or "")
     if not S.get("pos_open"):
-        L.append(f"狀態：等訊號｜心跳 {age}")
+        L.append("狀態：等訊號")
         pre = int(S["pre"]); post = int(S["post"])
         rows = db_latest(sym, tf, pre + post)
         if len(rows) < pre + post:
@@ -1128,19 +1121,15 @@ def strat_detail(S, sym, dr, mark_px=None):
         if not db_fresh(sym, tf):
             L.append("⚠ 行情DB 落後，以下為最後已知資料")
         r = judge_entry_db(rows, dr, pre, post, float(S["entry_min"]))
-        opp_lg = "\U0001F7E5" if dr == "L" else "\U0001F7E9"
-        want_lg = "\U0001F7E9" if dr == "L" else "\U0001F7E5"
-        L.append(f"【前段 {pre} 根｜需全 {opp_lg}】")
         for x in r["pre_seg"]: L.append(bar_line(x))
         L.append(f"反向色：{'✅' if r['pre_ok'] else '❌'}")
-        L.append(f"【後段 {post} 根｜需全 {want_lg}】")
         for x in r["post_seg"]: L.append(bar_line(x))
         L.append(f"ΣATR14r {r['atr_sum']:.4f}% {'✅' if r['entry_ok'] else '❌'} ≥ {pct(S['entry_min'])}%")
         L.append(f"順勢色：{'✅' if r['color_ok'] else '❌'}")
         L.append(f"此刻：{'✅ 會進場' if r['hit'] else '❌ 不進場'}")
         return L
     # ---- 持倉中 ----
-    L.append(f"狀態：📌 持倉中｜心跳 {age}")
+    L.append("狀態：📌 持倉中")
     try: epx = Decimal(str(S.get("pos_px") or "0"))
     except Exception: epx = Decimal(0)
     sz = S.get("pos_sz") or "?"
@@ -1250,7 +1239,7 @@ async def cmd_run(u, c):
     exist = await okx_pos(spec["iid"], ps)
     warn = f"\n⚠ OKX 上 {sym} {E.dir_word(dr)} 已有 {exist['pos']} 張持倉（倉位會被合併）" if exist else ""
     if not fresh: warn += "\n⚠ 行情DB 落後，啟動後會等資料補齊才判斷"
-    PENDING[u.effective_chat.id] = {"t": time.time(), "sym": sym, "dir": dr, "tf": tf,
+    PENDING[u.effective_chat.id] = {"act": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": tf,
         "lev": lev, "margin": margin, "pre": pre, "post": post,
         "entry_min": entry_min, "exit_dd": exit_dd, "spec": spec}
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
@@ -1261,19 +1250,31 @@ async def cmd_run(u, c):
         f"下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
+ACT_NAME = {"run": "/run 建立策略", "stop": "/stop 停止策略", "stopall": "/stopall 停止全部"}
+
 async def _to(app, chat, stamp):
     await asyncio.sleep(61)
     p = PENDING.get(chat)
     if p and p["t"] == stamp:
+        nm = ACT_NAME.get(p.get("act", "run"), "動作")
         del PENDING[chat]
-        await notify(app, chat, f"{E.BOT} 參數逾時已取消，請重新 /run")
+        await notify(app, chat, f"{E.BOT} 逾時已取消：{nm}\n如仍要執行請重新輸入")
 
 async def cmd_confirm(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     p = PENDING.get(u.effective_chat.id)
-    if not p: await reply(u, f"{E.BOT} 沒有待確認的 /run"); return
+    if not p: await reply(u, f"{E.BOT} 沒有待確認的動作"); return
     if time.time() - p["t"] > 60:
-        del PENDING[u.effective_chat.id]; await reply(u, f"{E.BOT} 確認逾時"); return
+        nm = ACT_NAME.get(p.get("act", "run"), "動作")
+        del PENDING[u.effective_chat.id]
+        await reply(u, f"{E.BOT} 確認逾時（{nm}），請重新輸入"); return
+    act = p.get("act", "run")
+    if act == "stop":
+        del PENDING[u.effective_chat.id]
+        await do_stop(u, p["key"]); return
+    if act == "stopall":
+        del PENDING[u.effective_chat.id]
+        await do_stopall(u); return
     del PENDING[u.effective_chat.id]
     k = skey(p["sym"], p["dir"])
     # 同 key 若還有舊策略/舊 task，先停掉並等它收工，避免兩個 task 同時對同一倉位下單
@@ -1296,6 +1297,8 @@ async def cmd_confirm(u, c):
     await reply(u, f"{E.BOT} ✅ 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
 
 async def cmd_stop(u, c):
+    """只做預覽並登記待確認，實際停止在 /confirm 之後。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
     alive = [k for k, s in STRATS.items() if s.get("alive")]
     if not alive: await reply(u, f"{E.BOT} 目前無運行中策略"); return
@@ -1307,22 +1310,74 @@ async def cmd_stop(u, c):
          else [k for k in alive if STRATS[k]["sym"] == sym]
     if not tg: await reply(u, f"{E.BOT} 找不到運行中的 {sym}"); return
     if len(tg) > 1: await reply(u, f"{E.BOT} {sym} 有多方向，請指定 /stop {sym} L 或 S"); return
-    S = STRATS[tg[0]]; d = S["dir"]; iid = S["spec"]["iid"]
+    key = tg[0]
+    S = STRATS[key]; d = S["dir"]; iid = S["spec"]["iid"]
+    ps = "long" if d == "L" else "short"
+    p = await okx_pos(iid, ps)
+    L = [f"{E.BOT} OKX均K｜{ACCT}", "事件：停止策略確認", "━" * 10,
+         f"{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['tf']}",
+         strat_params(S["sym"], d) or ""]
+    if p:
+        L += ["━" * 10,
+              f"⚠ 目前持倉 {p['pos']} 張",
+              f"均價 {p.get('avgPx','?')}｜浮動 {p.get('upl','?')}",
+              "停止後不會自動平倉，也不再監控回吐",
+              "倉位將完全交由你手動處理"]
+    else:
+        L += ["━" * 10, "目前空手，停止後不再等訊號"]
+    L += ["━" * 10, "下一步：60秒內 /confirm 確認停止", f"時間：{hhmmss()}"]
+    PENDING[u.effective_chat.id] = {"act": "stop", "t": time.time(), "key": key}
+    await reply(u, "\n".join(L))
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stop(u, key):
+    """真正執行停止（由 /confirm 呼叫）。"""
+    S = STRATS.get(key)
+    if not S or not S.get("alive"):
+        await reply(u, f"{E.BOT} 該策略已不在運行中"); return
+    d = S["dir"]; iid = S["spec"]["iid"]
     ps = "long" if d == "L" else "short"
     p = await okx_pos(iid, ps)
     S["alive"] = False
     # 立刻移出並寫回存檔，不等迴圈醒來——否則重啟會把停掉的策略撈回來（幽靈策略）
-    STRATS.pop(tg[0], None); TASKS.pop(tg[0], None)
+    STRATS.pop(key, None); TASKS.pop(key, None)
     save_state(True)
     if p:
-        await reply(u, f"{E.BOT} /stop（持倉中）\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+        await reply(u, f"{E.BOT} ✅ 已停止\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                        f"⚠ 已進場不自動平倉\n倉位 {p['pos']} 張 均價 {p.get('avgPx','?')} 浮 {p.get('upl','?')}\n"
                        f"請至 OKX 手動平倉")
     else:
-        await reply(u, f"{E.BOT} /stop\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n已停止")
+        await reply(u, f"{E.BOT} ✅ 已停止\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}")
 
 async def cmd_stopall(u, c):
+    """只做預覽並登記待確認，實際停止在 /confirm 之後。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
     alive = [k for k, s in STRATS.items() if s.get("alive")]
+    if not alive: await reply(u, f"{E.BOT} 目前無運行中策略"); return
+    held = []; flat = []
+    for k in alive:
+        S = STRATS[k]; d = S["dir"]
+        ps = "long" if d == "L" else "short"
+        p = await okx_pos(S["spec"]["iid"], ps)
+        line = f"{E.dir_emoji(d)} {S['sym']} {d} {S['tf']}"
+        if p: held.append(f"{line}｜持倉 {p['pos']} 張")
+        else: flat.append(line)
+    L = [f"{E.BOT} OKX均K｜{ACCT}", "事件：停止全部確認", "━" * 10,
+         f"將停止 {len(alive)} 個策略"]
+    if flat: L += ["━" * 10, f"空手（{len(flat)}）："] + flat
+    if held:
+        L += ["━" * 10, f"⚠ 持倉中（{len(held)}）："] + held
+        L += ["停止後不會自動平倉，也不再監控回吐", "倉位將完全交由你手動處理"]
+    L += ["━" * 10, "下一步：60秒內 /confirm 確認停止", f"時間：{hhmmss()}"]
+    PENDING[u.effective_chat.id] = {"act": "stopall", "t": time.time()}
+    await reply(u, "\n".join(L))
+    asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
+
+async def do_stopall(u):
+    """真正執行停止全部（由 /confirm 呼叫）。"""
+    alive = [k for k, s in STRATS.items() if s.get("alive")]
+    if not alive:
+        await reply(u, f"{E.BOT} 目前無運行中策略"); return
     held = []; done = []
     for k in list(alive):
         S = STRATS[k]; d = S["dir"]; iid = S["spec"]["iid"]
@@ -1333,12 +1388,10 @@ async def cmd_stopall(u, c):
         (held if p else done).append(f"{S['sym']} {S['dir']}")
     orphan = await sweep_h()
     save_state(True)
-    m = f"{E.BOT} /stopall（均K）\n━━━━━━━━━━\n"
+    m = f"{E.BOT} ✅ /stopall 已執行\n━━━━━━━━━━\n"
     if done: m += f"已停止策略（{len(done)}）：\n" + "\n".join("・" + x for x in done) + "\n"
     if orphan: m += f"另清除均K 殘留掛單：{orphan} 筆\n"
     if held: m += f"⚠ 持倉需手動平倉（{len(held)}）：\n" + "\n".join("・" + x for x in held) + "\n"
-    if not done and not orphan and not held: m += "目前無策略、無殘單\n"
-    m += "（普K 不受影響）\n"
     await reply(u, m + f"時間：{hhmmss()}")
 
 async def cmd_status(u, c):
@@ -1375,11 +1428,6 @@ async def cmd_status(u, c):
         L.append(f"{E.dir_emoji(dk)} {s['sym']} {dk} {szs}張")
         if pinfo is None:
             L.append("　⚠ OKX 查無此倉，可能已手動平倉")
-    if not held:
-        L.append("（目前全部等訊號）")
-    if syms:
-        L.append("━" * 10)
-        L.append(f"以下分 {len(syms)} 則列出各幣種明細")
     L += ["━" * 10, f"時間：{hhmmss()} UTC+8"]
     await reply(u, "\n".join(L))
     for i, sym in enumerate(syms, 1):
@@ -1718,7 +1766,8 @@ async def cmd_menu(u, c):
         "/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 回吐%\n"
         "例：/run BTCUSDT L 1 100 5 2 0.6 -2%\n"
         f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
-        "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部\n"
+        "/confirm 確認執行（run/stop/stopall 共用）\n"
+        "/stop 商品 方向（需 /confirm）\n/stopall 停全部（需 /confirm）\n"
         "/status 策略現況\n/summary 當日戰報\n"
         "/ha 商品 根數  燈號+ATR 報表 Excel 寄信（3~2000根）\n"
         "/db 行情DB狀態（/db ETHUSDT 5m 看細節）\n"
