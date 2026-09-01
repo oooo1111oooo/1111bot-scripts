@@ -1759,7 +1759,7 @@ async def cmd_menu(u, c):
         "⚠ 無 TP/SL/TE，僅靠回吐出場\n"
         "✅ 判斷全讀本機行情DB，下單不等 API\n"
         "✅ 重啟接管持倉\n"
-        "✅ 與原K 完全獨立，不互相撤單")
+        "✅ 獨立進程，不影響其他策略")
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
@@ -1775,8 +1775,7 @@ def build_daily_xlsx(day, trades, path):
     CEN = Alignment(horizontal="center")
     ws = wb.active; ws.title = "明細"
     H = ["日期", "幣種", "週期", "方向", "進場時間", "出場時間", "持倉秒數", "持倉根數",
-         "進場價", "出場價", "最高利潤", "淨損益%", "毛損益", "手續費", "淨損益",
-         "槓桿", "保證金", "前根數", "後根數", "ATR門檻", "回吐門檻", "損益來源"]
+         "進場價", "出場價", "最高利潤", "淨損益%", "毛損益", "手續費", "淨損益"]
     ws.append(H)
     for i in range(1, len(H) + 1):
         cc = ws.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
@@ -1792,20 +1791,17 @@ def build_daily_xlsx(day, trades, path):
                    t.get("in_ts"), t.get("ts"), it(t.get("hold_s")), fl(t.get("bars")),
                    fl(t.get("in_px")), fl(t.get("out_px")),
                    fl(t.get("peak_pct")), (net / nv * 100) if nv else 0.0,
-                   fl(t.get("gross")), fl(t.get("fee")), net,
-                   it(t.get("lev"), 1), fl(t.get("margin")),
-                   it(t.get("pre")), it(t.get("post")),
-                   fl(t.get("entry_min")), fl(t.get("exit_dd")), t.get("src")])
+                   fl(t.get("gross")), fl(t.get("fee")), net])
         r = ws.max_row
         ws.cell(r, 4).alignment = CEN
-        for col in (11, 12, 20, 21): ws.cell(r, col).number_format = '0.0000"%"'
+        for col in (11, 12): ws.cell(r, col).number_format = '0.0000"%"'
         for col in (13, 14, 15): ws.cell(r, col).number_format = "0.000000"
         for col in (9, 10): ws.cell(r, col).number_format = "0.######"
     ws.freeze_panes = "A2"
     if ws.max_row > 1:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(H))}{ws.max_row}"
     for i, w in enumerate([11, 10, 7, 6, 10, 10, 10, 10, 12, 12, 11, 11,
-                           12, 12, 12, 7, 9, 8, 8, 10, 10, 10], 1):
+                           12, 12, 12], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     w2 = wb.create_sheet("統計")
