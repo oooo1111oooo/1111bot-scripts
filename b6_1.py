@@ -30,7 +30,7 @@ ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
-HOLD_SEC = 120       # 固定持倉秒數（TE）：進場後最多持有幾秒
+HOLD_SEC = 120       # 固定持倉秒數（TE）：可用 /te 30~300 動態調整，存檔保留
 ENTRY_CUTOFF = 120   # TF 剩餘不足幾秒就放棄進場（＝HOLD_SEC，確保持倉能跑滿）
 
 def load_env(p):
@@ -74,7 +74,7 @@ def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump
     if SHUTTING_DOWN:
         return
     try:
-        data = {"chat": CHAT_ID, "tf": ACCOUNT_TF, "stats": STATS, "strats": []}
+        data = {"chat": CHAT_ID, "tf": ACCOUNT_TF, "te": HOLD_SEC, "stats": STATS, "strats": []}
         for k, S in STRATS.items():
             if S.get("alive"):
                 data["strats"].append({a: S[a] for a in SAVE_FIELDS if a in S})
@@ -678,7 +678,7 @@ async def rebuild_strat(d):
     return S
 
 async def startup_recover(app):
-    global CHAT_ID, ACCOUNT_TF, STATS
+    global CHAT_ID, ACCOUNT_TF, STATS, HOLD_SEC
     if not os.path.exists(STATE_FILE):
         print("無存檔"); return
     try:
@@ -686,6 +686,10 @@ async def startup_recover(app):
     except Exception as e:
         print("讀存檔失敗", e); return
     CHAT_ID = data.get("chat"); ACCOUNT_TF = data.get("tf", "5m"); STATS = data.get("stats", {})
+    try:
+        v = int(data.get("te") or HOLD_SEC)
+        if 30 <= v <= 300: HOLD_SEC = v
+    except Exception: pass
     saved = data.get("strats", [])
     if not saved:
         print("存檔無策略"); return
@@ -950,7 +954,7 @@ async def cmd_status(u, c):
     okxo = {(o["instId"], o.get("posSide")) for o in pdl}
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：現況（即時查 OKX）", "━━━━━━━━━━",
          f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
-         f"撤單/持倉秒數：{ENTRY_CUTOFF}秒",
+         f"持倉秒數 TE：{HOLD_SEC}秒｜再掛門檻：{ENTRY_CUTOFF}秒",
          f"運行中策略：{len(alive)} 個"]
     for s in alive:
         k = skey(s["sym"], s["dir"]); placed, entered = get_stat(k)
@@ -1329,6 +1333,26 @@ async def cmd_coins(u, c):
     L += ["━━━━━━━━━━", f"時間：{hhmmss()}"]
     await reply(u, "\n".join(L))
 
+async def cmd_te(u, c):
+    """設定固定持倉秒數。用法：/te 120（30~300）"""
+    global HOLD_SEC
+    if not c.args:
+        await reply(u, f"{E.BOT} 目前持倉秒數 TE：{HOLD_SEC} 秒\n"
+                       f"可設 30~300\n變更：/te 90\n"
+                       f"（出場後再掛的門檻固定 {ENTRY_CUTOFF} 秒，不受此設定影響）")
+        return
+    try:
+        v = int(c.args[0])
+    except Exception:
+        await reply(u, f"{E.BOT} 請輸入整數秒數，例如 /te 90"); return
+    if not 30 <= v <= 300:
+        await reply(u, f"{E.BOT} 秒數須介於 30~300"); return
+    old = HOLD_SEC
+    HOLD_SEC = v
+    save_state()
+    await reply(u, f"{E.BOT} ✅ 持倉秒數 TE：{old} → {v} 秒\n"
+                   f"立即對所有策略生效（含已在持倉中的）\n時間：{hhmmss()}")
+
 async def cmd_timeframe(u, c):
     global ACCOUNT_TF
     if not c.args:
@@ -1346,7 +1370,7 @@ async def cmd_menu(u, c):
         "/status 所有策略現況\n/summary 當日戰報\n"
         "/amp 商品 根數  振幅報表 Excel 寄信（3~2000根）\n"
         "/audit [YYYYMMDD]  與 OKX 對帳\n"
-        "/timeframe 查看/設定週期\n/coins 幣種\n"
+        "/timeframe 查看/設定週期\n/te 持倉秒數（30~300）\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         f"一個 TF 一輪：TF 開始埋伏\n"
         f"未成交 → TF 結束時撤單，立刻重掛下一輪\n"
@@ -1382,6 +1406,7 @@ async def _post_init(app):
             BotCommand("stop", "停指定"),
             BotCommand("run", "建立策略"),
             BotCommand("timeframe", "週期"),
+            BotCommand("te", "持倉秒數 30~300"),
             BotCommand("menu", "說明")]
     # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
     # 只刪 Default 會被舊清單蓋住，導致左下 Menu 卡在舊版）
@@ -1426,7 +1451,7 @@ def main():
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
                     ("summary", cmd_summary), ("amp", cmd_amp), ("audit", cmd_audit),
-                    ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
+                    ("timeframe", cmd_timeframe), ("te", cmd_te), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.run_polling()
