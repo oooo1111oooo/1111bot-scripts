@@ -962,11 +962,30 @@ async def cmd_status(u, c):
         live = "持倉中" if key in okxp else ("委託中" if key in okxo else "等下輪")
         L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(掛{placed}/進{entered})")
         L.append(f"策略:{strat_params(s['sym'], s['dir'])}")
-    L.append(f"掛單數：{len(pdl)}")
-    L.append(f"持倉數：{len(pl)}")
-    for p in pl:
+    # 掛單依 clOrdId 前綴分類：n/x=原K、h/y=均K、其餘=孤兒
+    n_own = n_ha = n_orph = 0
+    for o in pdl:
+        cid = str(o.get("clOrdId") or "")
+        if cid[:1] in ("n", "x"): n_own += 1
+        elif cid[:1] in ("h", "y"): n_ha += 1
+        else: n_orph += 1
+    seg = [f"原K {n_own}"]
+    if n_ha: seg.append(f"均K {n_ha}")
+    if n_orph: seg.append(f"{E.LOSS} 孤兒 {n_orph}")
+    L.append(f"掛單數：{len(pdl)}（" + " / ".join(seg) + "）")
+    # 持倉無 clOrdId，只能比對原K 策略清單
+    own_keys = {(s["spec"]["iid"], "long" if s["dir"] == "L" else "short") for s in alive}
+    p_own = [p for p in pl if (p["instId"], p["posSide"]) in own_keys]
+    p_other = [p for p in pl if (p["instId"], p["posSide"]) not in own_keys]
+    ps = [f"原K {len(p_own)}"]
+    if p_other: ps.append(f"{E.LOSS} 非原K {len(p_other)}")
+    L.append(f"持倉數：{len(pl)}（" + " / ".join(ps) + "）")
+    for p in p_own:
         d = "L" if p["posSide"] == "long" else "S"
         L.append(f"{E.dir_emoji(d)} {p['instId'].replace('-USDT-SWAP','USDT')} {d}")
+    for p in p_other:
+        d = "L" if p["posSide"] == "long" else "S"
+        L.append(f"{E.LOSS} {p['instId'].replace('-USDT-SWAP','USDT')} {d}（非原K）")
     L += ["━━━━━━━━━━", f"時間：{hhmmss()} UTC+8"]
     await reply(u, "\n".join(L))
 
@@ -1292,14 +1311,33 @@ async def cmd_audit(u, c):
         after = batch[-1].get("posId") or ""
         if not after:
             break
+    # 只比對「原K 自己的」平倉：以幣種+方向+時間（±3分）與 DB 紀錄配對，
+    # 配不上的視為非原K（均K 或手動），單獨列出不計入差異。
+    used = set(); ph_own = []; ph_other = []
+    for p in ph:
+        sym_p = p["instId"].replace("-USDT-SWAP", "USDT")
+        d_p = "L" if p.get("posSide") == "long" else "S"
+        ut = int(p.get("uTime") or 0)
+        hit = None
+        for i, x in enumerate(recs):
+            if i in used or x.get("sym") != sym_p or x.get("dir") != d_p:
+                continue
+            tx = _rec_epoch_ms(x)
+            if tx and abs(tx - ut) <= 180000:
+                hit = i; break
+        if hit is None:
+            ph_other.append(p)
+        else:
+            used.add(hit); ph_own.append(p)
     ln = sum(Decimal(str(x.get("net") or "0")) for x in recs)
     lf = sum(Decimal(str(x.get("fee") or "0")) for x in recs)
-    on = sum(Decimal(p.get("realizedPnl") or "0") for p in ph)
-    of = sum(Decimal(p.get("fee") or "0") + Decimal(p.get("fundingFee") or "0") for p in ph)
+    on = sum(Decimal(p.get("realizedPnl") or "0") for p in ph_own)
+    of = sum(Decimal(p.get("fee") or "0") + Decimal(p.get("fundingFee") or "0") for p in ph_own)
     from collections import Counter
     srcs = Counter(x.get("src") for x in recs)
+    same = len(recs) == len(ph_own)
     L = [f"{E.BOT} OKX原K｜{ACCT}", f"📋 對帳 {t}", "━" * 10,
-         ("%s " % E.LOSS if len(recs) != len(ph) else "") + f"DB筆數：{len(recs)}｜OKX：{len(ph)}",
+         ("%s " % E.LOSS if not same else "") + f"DB筆數：{len(recs)}｜OKX原K：{len(ph_own)}",
          "來源分佈：" + "、".join(f"{k}×{v}" for k, v in srcs.items()),
          "━" * 10,
          f"DB 淨損益：{ln:+.6f}",
@@ -1310,8 +1348,15 @@ async def cmd_audit(u, c):
          f"OKX 手續費：{of:+.6f}",
          f"差異：{lf - of:+.6f}",
          "━" * 10]
-    if len(recs) == len(ph) and abs(ln - on) < Decimal("0.000001") and abs(lf - of) < Decimal("0.000001"):
+    if same and abs(ln - on) < Decimal("0.000001") and abs(lf - of) < Decimal("0.000001"):
         L.append("✅ 完全一致")
+    if ph_other:
+        L.append(f"（另有 {len(ph_other)} 筆非原K 平倉，未計入）")
+        for p in ph_other[:5]:
+            sy = p["instId"].replace("-USDT-SWAP", "USDT")
+            dd = "L" if p.get("posSide") == "long" else "S"
+            tt = datetime.fromtimestamp(int(p.get("uTime") or 0) / 1000, TZ8).strftime("%H:%M:%S")
+            L.append(f"　{tt} {sy} {dd} {Decimal(p.get('realizedPnl') or '0'):+.6f}")
     zero = [x for x in recs if Decimal(str(x.get("fee") or "0")) == 0]
     if zero:
         L.append(f"⚠ 手續費為 0 的紀錄：{len(zero)} 筆")
