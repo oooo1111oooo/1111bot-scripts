@@ -19,7 +19,8 @@ from app.core import emoji as E
 from app.strategy.normal import next_open_epoch as _noe_unused, TF_SEC as _TFS_unused
 
 # 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
-TF_SEC = {"3m": 180, "4m": 240, "5m": 300, "6m": 360, "10m": 600}
+TF_SEC = {"3m": 180, "4m": 240, "5m": 300, "6m": 360, "10m": 600,
+          "12m": 720, "15m": 900}
 
 def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
@@ -724,7 +725,7 @@ async def startup_recover(app):
 
 # ---------- TG 指令 ----------
 # ---------- K 線 / 振幅（/amp 用） ----------
-NATIVE_BARS = {"3m": "3m", "5m": "5m"}   # 4m/6m 無原生 K 線；10m 由兩根 5m 合成
+NATIVE_BARS = {"3m": "3m", "5m": "5m", "15m": "15m"}   # 4m/6m/12m 無原生 K 線；10m 由兩根 5m 合成
 
 async def get_klines(iid, bar, limit=300):
     """只取已收線（confirm=1）的 K 線，回傳舊->新。"""
@@ -1217,7 +1218,7 @@ def send_amp_mail(path, name, sym, tf, m, avg, med):
 
 async def cmd_amp(u, c):
     """原K 振幅報表（Excel 寄信）。用法：/amp SOLUSDT [根數 3~2000]"""
-    supported = "3m/5m/10m"
+    supported = "3m/5m/10m/15m"
     if not c.args:
         await reply(u, f"{E.BOT} 用法：/amp SOLUSDT 900\n"
                        f"根數 3~{AMP_MAX}（預設 300）\n"
