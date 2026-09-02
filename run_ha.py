@@ -464,7 +464,8 @@ def build_rows(sym, tf, kl, ha, atrs):
             streak = 1; sbody = body; srange = rng
         prev_color = x["color"]
         a, r = atrs[i]
-        dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%Y-%m-%d %H:%M")
+        # ts 是 OKX 給的「開盤」時間戳；顯示一律用「收線」時間，加一個週期
+        dt = datetime.fromtimestamp(int(x["ts"]) / 1000 + tf_sec(tf), TZ8).strftime("%Y-%m-%d %H:%M")
         rows.append((sym, tf, int(x["ts"]), dt, x["color"],
                      1 if x["color"] == "G" else -1,
                      _f(ho), _f(hh), _f(hl), _f(hc),
@@ -571,6 +572,61 @@ async def collector(app):
             print("collector loop error", type(e).__name__, e)
             await asyncio.sleep(5)
 
+async def get_klines_live(iid, bar, limit=HA_HIST):
+    """取 K 線並保留「進行中」那根（confirm=0），標記 live=True。"""
+    r = await pub(f"/api/v5/market/candles?instId={iid}&bar={bar}&limit={min(300, limit)}")
+    if r.get("code") != "0": return []
+    out = []
+    for c in (r.get("data") or []):
+        try:
+            out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
+                        "l": Decimal(c[3]), "c": Decimal(c[4]),
+                        "live": (len(c) >= 9 and str(c[8]) != "1")})
+        except Exception:
+            continue
+    out.reverse()
+    return out
+
+async def live_rows(sym, tf, need):
+    """回傳最近 need 根（最後一根是進行中的即時快照）。
+    只給 /status 預覽用；真正的進出場判斷仍只用已收線資料。"""
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        return []
+    sec, bar, mul = HA_TF[tf]
+    if mul == 1:
+        kl = await get_klines_live(spec["iid"], bar, HA_HIST)
+    else:
+        raw = await get_klines_live(spec["iid"], bar, min(300, HA_HIST * mul + mul * 2))
+        pms = sec * 1000
+        while raw and int(raw[0]["ts"]) % pms != 0:
+            raw.pop(0)
+        kl = []
+        for i in range(0, len(raw), mul):
+            g = raw[i:i+mul]
+            kl.append({"ts": g[0]["ts"], "o": g[0]["o"],
+                       "h": max(x["h"] for x in g), "l": min(x["l"] for x in g),
+                       "c": g[-1]["c"],
+                       "live": (len(g) < mul) or any(x.get("live") for x in g)})
+    if len(kl) < 15: return []
+    ha = calc_ha(kl)
+    atrs = calc_atr(kl, 14)
+    nowstr = now8().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for i, x in enumerate(ha):
+        a, rr = atrs[i]
+        ho, hc = x["ho"], x["hc"]
+        body = float((hc - ho) / ho * 100) if ho else 0.0
+        lv = kl[i].get("live", False)
+        dt = nowstr if lv else datetime.fromtimestamp(
+            int(x["ts"]) / 1000 + sec, TZ8).strftime("%Y-%m-%d %H:%M:00")
+        rows.append({"ts": int(x["ts"]), "dt": dt, "color": x["color"],
+                     "body_pct": body,
+                     "atr14_ratio": float(rr) if rr is not None else None,
+                     "live": lv})
+    return rows[-need:] if len(rows) > need else rows
+
 # ---------- Telegram（旁路） ----------
 _BG = set()
 
@@ -668,11 +724,12 @@ def bar_line(r, want=None, sec=True):
     astr = ("%.4f%%" % float(a)) if a is not None else "-"
     dt = str(r.get("dt") or "")
     hm = dt[11:19] if sec and len(dt) >= 19 else dt[11:16]
+    lv = "*" if r.get("live") else ""
     if want is None:
-        return f"{act}{hm}{b:+.4f}%|{astr}"
+        return f"{act}{hm}{lv}{b:+.4f}%|{astr}"
     wl = GRN if want == "G" else RED
     bad = "\u274c" if r.get("color") != want else ""
-    return f"{wl}{hm}{act}{b:+.4f}%|{astr}{bad}"
+    return f"{wl}{hm}{lv}{act}{b:+.4f}%|{astr}{bad}"
 
 def entry_lines(info, dr, entry_min):
     """進場條件明細：前段 → 虛線 → 後段 → ΣATR14r 比對。三個畫面共用。"""
@@ -1092,7 +1149,7 @@ def strat_params(sym, dr):
     return (f"/run {sym} {dr} {S['lev']} {pct(S['margin'])} "
             f"{S['pre']} {S['post']} {pct(S['entry_min'])} {pct(S['exit_dd'])}%")
 
-def strat_detail(S, sym, dr, mark_px=None):
+async def strat_detail(S, sym, dr, mark_px=None):
     """單一策略的完整現況：空手列進場條件明細，持倉列利潤與出場距離。"""
     L = []
     tf = S["tf"]
@@ -1101,14 +1158,19 @@ def strat_detail(S, sym, dr, mark_px=None):
     if not S.get("pos_open"):
         L.append("狀態：等訊號")
         pre = int(S["pre"]); post = int(S["post"])
-        rows = db_latest(sym, tf, pre + post)
-        if len(rows) < pre + post:
-            L.append(f"⚠ 行情DB 僅 {len(rows)} 根，需 {pre+post} 根")
-            return L
-        if not db_fresh(sym, tf):
-            L.append("⚠ 行情DB 落後，以下為最後已知資料")
+        # 即時抓（含進行中那根）；失敗才退回 DB 的已收線資料
+        rows = await live_rows(sym, tf, pre + post)
+        src_live = bool(rows) and len(rows) >= pre + post
+        if not src_live:
+            rows = db_latest(sym, tf, pre + post)
+            if len(rows) < pre + post:
+                L.append(f"⚠ 資料不足（{len(rows)}/{pre+post} 根）")
+                return L
+            L.append("⚠ 即時取價失敗，以下為最後已收線資料")
         r = judge_entry_db(rows, dr, pre, post, float(S["entry_min"]))
         L += entry_lines(r, dr, S["entry_min"])
+        if src_live and rows[-1].get("live"):
+            L.append("* 為進行中，收線前仍會變動")
         return L
     # ---- 持倉中 ----
     L.append("狀態：📌 持倉中")
@@ -1414,7 +1476,7 @@ async def cmd_status(u, c):
                 M.append("━" * 10)
                 continue
             try:
-                M += strat_detail(S, sym, dr, mark.get((sym, dr)))
+                M += await strat_detail(S, sym, dr, mark.get((sym, dr)))
             except Exception as e:
                 M.append(f"{E.LOSS} 明細產生失敗：{type(e).__name__}: {e}")
             M.append("━" * 10)
@@ -1501,8 +1563,9 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
     exp = -tick.as_tuple().exponent
     ndp = max(2, min(8, exp + 1))
     afmt = "0." + "0" * ndp
+    csec = tf_sec(tf)
     for i, x in enumerate(ha):
-        dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8)
+        dt = datetime.fromtimestamp(int(x["ts"]) / 1000 + csec, TZ8)   # 收線時間
         av, rv = atrs[i]
         up = x["color"] == "G"
         ws.append([sym, tf, dt.strftime("%Y/%m/%d"), dt.strftime("%H:%M"),
@@ -1528,8 +1591,8 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
         return (sum(v) / m, med, max(v), min(v))
     aA, aM, aX, aN = stat(va)
     rA, rM, rX, rN = stat(vr)
-    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
-    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
+    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000 + csec, TZ8).strftime("%Y/%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000 + csec, TZ8).strftime("%Y/%m/%d %H:%M")
     w2 = wb.create_sheet("統計")
     rows = [["項目", "數值"],
             ["幣種", sym], ["週期", tf], ["根數", len(ha)],
@@ -1642,8 +1705,9 @@ async def cmd_ha(u, c):
         await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
     if not ok:
         await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
-    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
-    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    csec2 = tf_sec(ACCOUNT_TF)
+    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000 + csec2, TZ8).strftime("%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000 + csec2, TZ8).strftime("%m/%d %H:%M")
     ng = sum(1 for x in ha if x["color"] == "G")
     await reply(u, f"{E.BOT} ✅ 均K 報表已寄出\n"
                    f"{sym} {ACCOUNT_TF}｜{m} 根\n"
