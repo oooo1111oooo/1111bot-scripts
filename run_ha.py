@@ -26,7 +26,7 @@ ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_ha_o3333o.json"
-HA_LAG = 5           # 收線後幾秒才抓 K 線（等 OKX 資料落定）
+HA_LAG = 1           # 收線後幾秒才抓 K 線（越小越貼近開盤價）
 HA_HIST = 120        # 抓幾根歷史 K 線做 HA 遞迴
 HB_BARS = 3          # 心跳超過幾根 K 線未推進就告警
 EXIT_FLOOR = 0.1     # 出場條件二之一：累計損益低於此值(%)
@@ -624,7 +624,7 @@ async def live_rows(sym, tf, need):
         dt = nowstr if lv else datetime.fromtimestamp(
             int(x["ts"]) / 1000, TZ8).strftime("%Y-%m-%d %H:%M:00")
         rows.append({"ts": int(x["ts"]), "dt": dt, "color": x["color"],
-                     "body_pct": body,
+                     "body_pct": body, "c": float(kl[i]["c"]),
                      "atr14_ratio": float(rr) if rr is not None else None,
                      "live": lv})
     return rows[-need:] if len(rows) > need else rows
@@ -701,6 +701,9 @@ async def close_record(iid, ps, after_ms, tries=10):
 async def notify_long(app, chat, head, lines, tail):
     """把長明細拆成多則 TG 訊息（單則上限 4096）。"""
     LIM = 3400
+    head = [x for x in head if x != ""]
+    lines = [x for x in lines if x != ""]
+    tail = [x for x in tail if x != ""]
     buf = list(head); msgs = []
     for ln in lines:
         if sum(len(x) + 1 for x in buf) + len(ln) + 1 > LIM and len(buf) > len(head):
@@ -801,7 +804,14 @@ def judge_exit_db(rows, d, entry_px, bar_min):
 
 # ---------- 進場 ----------
 async def h_open(app, S, spec, iid, d, pos, info, k):
-    last = await get_last(iid)
+    # 用剛收線那根的收盤價估張數，省掉一次 ticker API（越少往返越貼近開盤價）
+    ref_px = None; ref_ts = None
+    try:
+        lastrow = (info.get("post_seg") or [])[-1]
+        ref_px = Decimal(str(lastrow["c"])); ref_ts = int(lastrow["ts"])
+    except Exception:
+        pass
+    last = ref_px if ref_px else await get_last(iid)
     size = csize(S["margin"], Decimal(S["lev"]), last, spec["ctval"], spec["lot"])
     if size < spec["minsz"]:
         await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 保證金不足，循環停止")
@@ -855,9 +865,17 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
             f"{E.dir_emoji(d)} {d} {S['tf']}",
             strat_params(S["sym"], d) or ""]
     lines = entry_lines(info, d, S["entry_min"]) if info else []
-    ein = datetime.fromtimestamp(ee, TZ8).strftime("%H:%M")
+    ein = datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S")
+    lag = slip = None
+    if ref_ts is not None:
+        lag = ee - (ref_ts / 1000 + tf_sec(S["tf"]))
+    if ref_px:
+        slip = (fpx - ref_px) / ref_px * 100
+        if d == "S": slip = -slip
     tail = ["━" * 10,
             f"進場{ein}｜{fpx}｜{size}張",
+            (f"參考收盤{ref_px}｜偏離{slip:+.4f}%"
+             + (f"｜延遲{lag:.1f}s" if lag is not None else "")) if ref_px else "",
             f"出場：反向燈號＋(累計<{EXIT_FLOOR}% 或 本根<{pct(S['bar_min'])}%)",
             f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
@@ -889,6 +907,9 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
         em = (xr.get("data") or [{}])[0].get("sMsg") or xr.get("msg")
         await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 平倉失敗：{em}\n⚠ 倉位可能仍在，請至 OKX 確認")
         return False
+    rr = db_latest(S["sym"], S["tf"], 1)
+    ref_px = Decimal(str(rr[-1]["c"])) if rr else None
+    ref_ts = int(rr[-1]["ts"]) if rr else None
     ph = await close_record(iid, pos, t0)
     src = "OKX"
     if ph:
@@ -937,7 +958,15 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
         hm2 = str(hrec.get("dt") or "")[11:16]
         lg2 = "\U0001F7E9" if hrec.get("color") == "G" else "\U0001F7E5"
         lines.append(f"{i} {hm2}{lg2}本{hrec.get('one', 0):+.3f}% 累{hrec['pnl']:+.3f}%{mark}")
+    xlag = xslip = None
+    if ref_ts is not None:
+        xlag = time.time() - (ref_ts / 1000 + tfs)
+    if ref_px and xpx:
+        xslip = (Decimal(str(xpx)) - ref_px) / ref_px * 100
+        if d == "L": xslip = -xslip
     tail = ["━" * 10,
+            (f"參考收盤{ref_px}｜偏離{xslip:+.4f}%"
+             + (f"｜延遲{xlag:.1f}s" if xlag is not None else "")) if ref_px else "",
             f"毛損益{g:+.6f}({gp:+.3f}%)",
             f"手續費{fee:+.6f}({fp:+.3f}%)",
             f"淨損益{net:+.6f}({npv:+.3f}%){E.pnl_emoji(net)}",
@@ -966,18 +995,18 @@ async def h_takeover(app, S, spec, iid, d, pos):
     return (size, fpx, ee)
 
 # ---------- 主迴圈 ----------
-async def wait_db_bar(sym, tf, want_ts, limit=90):
-    """等收集器把剛收線那根寫進 DB；逾時就自己補抓一次。"""
-    t0 = time.time()
-    while time.time() - t0 < limit:
+async def wait_db_bar(sym, tf, want_ts, tries=25):
+    """收線後【立刻自己抓】，不等背景收集器巡邏（那會多等最多 DB_TICK 秒）。
+    抓到就寫進 DB 並回傳，把下單延遲壓到收線後數秒內。"""
+    r = db_latest(sym, tf, 1)
+    if r and int(r[-1]["ts"]) >= want_ts:
+        return True
+    for i in range(tries):
+        await collect_one(sym, tf)
         r = db_latest(sym, tf, 1)
         if r and int(r[-1]["ts"]) >= want_ts:
             return True
-        await asyncio.sleep(1)
-    n = await collect_one(sym, tf)      # 後備：自己抓，確保不漏一根
-    if n:
-        r = db_latest(sym, tf, 1)
-        return bool(r and int(r[-1]["ts"]) >= want_ts)
+        await asyncio.sleep(0.4)      # 密集重試，讓下單盡量貼近開盤價
     return False
 
 async def hloop(app, chat, S):
@@ -1199,20 +1228,27 @@ async def strat_detail(S, sym, dr, mark_px=None):
     if cur is None:
         rr = db_latest(sym, tf, 1)
         if rr: cur = Decimal(str(rr[-1]["c"]))
-    tf_rows = db_latest(sym, tf, 2)
-    if cur is not None and epx:
-        c_now = float(cur); ep = float(epx)
+    # 即時抓（含進行中那根），失敗才退回 DB 已收線資料
+    lr = await live_rows(sym, tf, 2)
+    live_row = lr[-1] if lr and lr[-1].get("live") else None
+    if lr and len(lr) >= 2:
+        ref = lr; is_live = live_row is not None
+    else:
+        ref = db_latest(sym, tf, 2); is_live = False
+    ep = float(epx) if epx else 0.0
+    if ref and ep:
+        c_now = float(ref[-1]["c"])
+        base = float(ref[-2]["c"]) if len(ref) >= 2 else ep
         pnl = (c_now - ep) / ep * 100 if dr == "L" else (ep - c_now) / ep * 100
-        base = float(tf_rows[-2]["c"]) if len(tf_rows) >= 2 else ep
         one = (c_now - base) / base * 100 if dr == "L" else (base - c_now) / base * 100
-        col = tf_rows[-1]["color"] if tf_rows else "?"
+        col = ref[-1].get("color")
         want_rev = "R" if dr == "L" else "G"
         rev_lg = "\U0001F7E5" if dr == "L" else "\U0001F7E9"
         cur_lg = "\U0001F7E9" if col == "G" else "\U0001F7E5"
         c1 = (col == want_rev)
         c2 = pnl < EXIT_FLOOR
         c3 = one < float(S["bar_min"])
-        L.append(f"目前價 {cur}")
+        L.append(f"目前價 {c_now:g}" + ("（進行中）" if is_live else "（最後收線）"))
         L.append(f"累計損益 {pnl:+.4f}%")
         L.append(f"本根損益 {one:+.4f}%")
         L.append(f"最新燈號 {cur_lg}（需 {rev_lg}）{'✅' if c1 else '❌'}")
@@ -1221,14 +1257,19 @@ async def strat_detail(S, sym, dr, mark_px=None):
         L.append("出場判定：" + ("✅ 會出場" if (c1 and (c2 or c3)) else "❌ 續抱"))
     else:
         L.append("⚠ 取不到目前價")
+        one = pnl = None; live_row = None
     hist = S.get("pnl_hist") or []
     if hist:
-        show = hist[-5:]
-        L.append(f"【近 {len(show)} 根收線】共 {len(hist)} 根")
+        show = hist[-4:]
+        L.append(f"【近 {len(show)} 根收線 + 進行中】共 {len(hist)} 根")
         for h in show:
             hm = str(h.get("dt") or "")[11:16]
             lg = "\U0001F7E9" if h.get("color") == "G" else "\U0001F7E5"
             L.append(f"{hm}{lg}本{h.get('one', 0):+.3f}% 累{h['pnl']:+.3f}%")
+    if live_row is not None and pnl is not None:
+        lg = "\U0001F7E9" if live_row.get("color") == "G" else "\U0001F7E5"
+        L.append(f"{hhmmss()}*{lg}本{one:+.3f}% 累{pnl:+.3f}%")
+        L.append("* 為進行中，收線前仍會變動")
     else:
         L.append("（尚未有收線紀錄，進場後第一根收線才會出現）")
     return L
