@@ -92,6 +92,7 @@ def skey(s, d): return f"{s}_{d}"
 def inst_id(s): return s.replace("USDT", "") + "-USDT-SWAP"
 def now8(): return datetime.now(TZ8)
 def hhmmss(): return now8().strftime("%H:%M:%S")
+def hhmm(): return now8().strftime("%H:%M")
 def today8(): return now8().strftime("%Y-%m-%d")
 def pct(v): return format(Decimal(str(v)).normalize(), "f")   # 用 f 格式，避免 10 變成 1E+1
 
@@ -464,8 +465,8 @@ def build_rows(sym, tf, kl, ha, atrs):
             streak = 1; sbody = body; srange = rng
         prev_color = x["color"]
         a, r = atrs[i]
-        # ts 是 OKX 給的「開盤」時間戳；顯示一律用「收線」時間，加一個週期
-        dt = datetime.fromtimestamp(int(x["ts"]) / 1000 + tf_sec(tf), TZ8).strftime("%Y-%m-%d %H:%M")
+        # 一律用 K 線「開盤」時間，方便與交易所圖表對照
+        dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%Y-%m-%d %H:%M")
         rows.append((sym, tf, int(x["ts"]), dt, x["color"],
                      1 if x["color"] == "G" else -1,
                      _f(ho), _f(hh), _f(hl), _f(hc),
@@ -620,7 +621,7 @@ async def live_rows(sym, tf, need):
         body = float((hc - ho) / ho * 100) if ho else 0.0
         lv = kl[i].get("live", False)
         dt = nowstr if lv else datetime.fromtimestamp(
-            int(x["ts"]) / 1000 + sec, TZ8).strftime("%Y-%m-%d %H:%M:00")
+            int(x["ts"]) / 1000, TZ8).strftime("%Y-%m-%d %H:%M:00")
         rows.append({"ts": int(x["ts"]), "dt": dt, "color": x["color"],
                      "body_pct": body,
                      "atr14_ratio": float(rr) if rr is not None else None,
@@ -843,8 +844,9 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
             f"{E.dir_emoji(d)} {d} {S['tf']}",
             strat_params(S["sym"], d) or ""]
     lines = entry_lines(info, d, S["entry_min"]) if info else []
+    ein = datetime.fromtimestamp(ee, TZ8).strftime("%H:%M")
     tail = ["━" * 10,
-            f"進場價{fpx}｜{size}張",
+            f"進場{ein}｜{fpx}｜{size}張",
             f"回吐{pct(S['exit_dd'])}%出場",
             f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
@@ -911,7 +913,8 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     head = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：{ico} 已出場",
             f"{E.dir_emoji(d)} {d} {S['tf']}",
             strat_params(S["sym"], d) or "",
-            f"進場{fpx}→出場{xpx}",
+            f"進場{datetime.fromtimestamp(ee, TZ8).strftime('%H:%M')}｜{fpx}"
+            f"→出場{hhmm()}｜{xpx}",
             f"持倉{hs}s（約{hs / tfs:.1f}根）", "━" * 10]
     lines = []
     show = hist[-40:]
@@ -1563,9 +1566,8 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
     exp = -tick.as_tuple().exponent
     ndp = max(2, min(8, exp + 1))
     afmt = "0." + "0" * ndp
-    csec = tf_sec(tf)
     for i, x in enumerate(ha):
-        dt = datetime.fromtimestamp(int(x["ts"]) / 1000 + csec, TZ8)   # 收線時間
+        dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8)          # K 線開盤時間
         av, rv = atrs[i]
         up = x["color"] == "G"
         ws.append([sym, tf, dt.strftime("%Y/%m/%d"), dt.strftime("%H:%M"),
@@ -1591,8 +1593,8 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
         return (sum(v) / m, med, max(v), min(v))
     aA, aM, aX, aN = stat(va)
     rA, rM, rX, rN = stat(vr)
-    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000 + csec, TZ8).strftime("%Y/%m/%d %H:%M")
-    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000 + csec, TZ8).strftime("%Y/%m/%d %H:%M")
+    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
     w2 = wb.create_sheet("統計")
     rows = [["項目", "數值"],
             ["幣種", sym], ["週期", tf], ["根數", len(ha)],
@@ -1705,9 +1707,8 @@ async def cmd_ha(u, c):
         await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
     if not ok:
         await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
-    csec2 = tf_sec(ACCOUNT_TF)
-    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000 + csec2, TZ8).strftime("%m/%d %H:%M")
-    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000 + csec2, TZ8).strftime("%m/%d %H:%M")
+    t0 = datetime.fromtimestamp(int(ha[0]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
+    t1 = datetime.fromtimestamp(int(ha[-1]["ts"]) / 1000, TZ8).strftime("%m/%d %H:%M")
     ng = sum(1 for x in ha if x["color"] == "G")
     await reply(u, f"{E.BOT} ✅ 均K 報表已寄出\n"
                    f"{sym} {ACCOUNT_TF}｜{m} 根\n"
@@ -1951,25 +1952,17 @@ def send_report_mail(path, name, day, cnt, tn):
     return True, to
 
 async def job_report(ctx):
-    """00:05 寄出前一日日報。"""
+    """00:05 寄出前一日日報（不發 TG，結果只寫 log）。"""
     day = (now8() - timedelta(days=1)).strftime("%Y-%m-%d")
     trades = load_trades(day)
     if not trades:
-        print("均K 日報：%s 無交易，未寄送" % day)
-        if CHAT_ID:
-            await notify(ctx.application, CHAT_ID,
-                         f"{E.BOT} 均K 日報 {day}：無交易，未寄送")
-        return
+        print("均K 日報：%s 無交易，未寄送" % day); return
     name = f"OKX_{ACCT}_均K日報_{day.replace('-', '')}.xlsx"
     path = f"/srv/1111bot/data/{name}"
     try:
         build_daily_xlsx(day, trades, path)
     except Exception as e:
-        print("日報產生失敗", e)
-        if CHAT_ID:
-            await notify(ctx.application, CHAT_ID,
-                         f"{E.BOT} {E.LOSS} 均K 日報產生失敗：{type(e).__name__}: {e}")
-        return
+        print("均K 日報產生失敗", type(e).__name__, e); return
     tn = 0.0
     for t in trades:
         try: tn += float(t.get("net") or 0)
@@ -1977,17 +1970,11 @@ async def job_report(ctx):
     try:
         ok, info = send_report_mail(path, name, day, len(trades), tn)
     except Exception as e:
-        if CHAT_ID:
-            await notify(ctx.application, CHAT_ID,
-                         f"{E.BOT} {E.LOSS} 均K 日報寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}")
-        return
-    if CHAT_ID:
-        if ok:
-            await notify(ctx.application, CHAT_ID,
-                         f"{E.BOT} ✅ 均K 日報已寄出\n{day}｜{len(trades)} 筆\n淨損益 {tn:+.6f} USDT")
-        else:
-            await notify(ctx.application, CHAT_ID,
-                         f"{E.BOT} {E.LOSS} 均K 日報未寄送：{info}\n檔案已存於 VPS：{name}")
+        print("均K 日報寄送失敗", type(e).__name__, e, "檔案：", path); return
+    if ok:
+        print("均K 日報已寄出 %s（%d 筆，淨損益 %+.6f）-> %s" % (day, len(trades), tn, info))
+    else:
+        print("均K 日報未寄送：%s，檔案：%s" % (info, path))
 
 # ---------- 每日自動 summary ----------
 class _M:
