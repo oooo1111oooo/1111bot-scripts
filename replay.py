@@ -13,7 +13,7 @@ except ImportError:
 SYM      = "BTCUSDT"
 TF       = "5m"
 FROM     = "2026-09-02 23:10"    # 顯示起點（K線開盤時間，UTC+8）
-TO       = "2026-09-03 00:35"    # 顯示終點
+TO       = "2026-09-03 01:20"    # 顯示終點
 ENTRY_AT = "2026-09-02 23:25"    # 進場後第一根的開盤時間
 ENTRY_PX = 76950.1               # 實際成交均價
 DIR      = "L"                   # L / S
@@ -144,7 +144,7 @@ for i,k in enumerate(kl):
 print("\n" + "="*78)
 print("各回吐門檻試算（以收線價計，不含手續費與滑價）")
 print("-"*78)
-print(f"{'門檻':>8}{'出場時間':>14}{'出場價':>11}{'出場利潤':>11}{'持有根數':>10}")
+print(f"{'門檻':>8}{'出場時間':>14}{'出場價':>11}{'觸發回吐':>11}{'出場利潤':>11}{'持有根數':>10}")
 print("-"*78)
 for th in TRIALS:
     hit=None
@@ -152,14 +152,30 @@ for th in TRIALS:
         if r["dd"]<=th: hit=(j,r); break
     if hit:
         j,r=hit
-        print(f"{th:>7.1f}%{hm(r['ts']):>14}{r['c']:>11.1f}{r['pnl']:>+10.3f}%{j+1:>10}")
-    else:
-        last=table[-1] if table else None
-        if last:
-            print(f"{th:>7.1f}%{'未觸發':>14}{last['c']:>11.1f}{last['pnl']:>+10.3f}%{len(table):>10}"
-                  f"   ← 到區間結束仍持有")
+        print(f"{th:>7.1f}%{hm(r['ts']):>14}{r['c']:>11.1f}"
+              f"{r['dd']:>+10.3f}%{r['pnl']:>+10.3f}%{j+1:>10}")
+    elif table:
+        last=table[-1]
+        print(f"{th:>7.1f}%{'未觸發':>14}{last['c']:>11.1f}"
+              f"{last['dd']:>+10.3f}%{last['pnl']:>+10.3f}%{len(table):>10}   ← 區間結束仍持有")
+
 if table:
     best=max(table,key=lambda r:r["pnl"])
+    worst=min(table,key=lambda r:r["dd"])
     print("-"*78)
-    print(f"區間內最高利潤 {best['pnl']:+.3f}% 出現在 {hm(best['ts'])}（收盤 {best['c']:.1f}）")
-    print(f"區間結束時利潤 {table[-1]['pnl']:+.3f}%")
+    print(f"區間內最高利潤　{best['pnl']:+.3f}%　於 {hm(best['ts'])}（收盤 {best['c']:.1f}）")
+    print(f"區間內最大回吐　{worst['dd']:+.3f}%　於 {hm(worst['ts'])}"
+          f"（當時利潤 {worst['pnl']:+.3f}%，最高 {worst['peak']:+.3f}%）")
+    print(f"區間結束時利潤　{table[-1]['pnl']:+.3f}%（回吐 {table[-1]['dd']:+.3f}%）")
+    print("-"*78)
+    print("解讀：門檻要設在「大於區間內最大回吐」才不會被洗掉。")
+    print("　　　例如最大回吐 -0.25%，門檻設 -0.1% 會提早出場，設 -0.3% 才抱得住。")
+
+    # 逐根列出「若此刻門檻剛好等於當下回吐」會拿到多少
+    print("\n" + "="*78)
+    print("回吐分佈（每根的回吐值排序，幫你看門檻該壓在哪）")
+    print("-"*78)
+    dds=sorted((r["dd"] for r in table))
+    n=len(dds)
+    for q,lab in ((0,"最深"),(n//10,"前10%"),(n//4,"前25%"),(n//2,"中位")):
+        print(f"  {lab:>6}回吐 {dds[min(q,n-1)]:+.3f}%")
