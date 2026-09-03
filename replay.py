@@ -138,11 +138,11 @@ print(f"\n進場 {ENTRY_AT}｜{ENTRY_PX}｜{'做多' if DIR=='L' else '做空'}"
 print("="*70)
 W  = [7, 12, 7, 12, 4, 11, 10, 12, 12, 12]
 HD = ["開盤", "均K開", "收盤", "均K收", "燈",
-      "漲跌幅", "ATR14r", "本根損益", "累計損益", "最高利潤"]
+      "漲跌幅", "ATR14r", "本根損益", "累計損益", "變動損益"]
 print("".join(R(HD[i], W[i]) for i in range(len(HD))))
 print("-" * sum(W))
 
-peak = 0.0; table = []; prev_px = None
+peak = 0.0; table = []; prev_px = None; prev_pnl = None
 for i, k in enumerate(kl):
     if k["ts"] < start or k["ts"] > end: continue
     x = ha[i]
@@ -157,11 +157,14 @@ for i, k in enumerate(kl):
         # 本根損益：與前一根基準價相比（第一根與進場價相比）
         base = prev_px if prev_px is not None else ENTRY_PX
         one = (px - base) / base * 100 if DIR == "L" else (base - px) / base * 100
+        # 變動損益：本根累計損益 − 上一根累計損益（第一根無前值，留空）
+        chg = None if prev_pnl is None else pnl - prev_pnl
         peak = max(peak, pnl)
         table.append({"ts": k["ts"], "pnl": pnl, "peak": peak, "dd": pnl - peak,
-                      "c": px, "one": one})
-        prev_px = px
-        s1, s2, s3 = f"{one:+.3f}%", f"{pnl:+.3f}%", f"{peak:+.3f}%"
+                      "c": px, "one": one, "chg": chg})
+        prev_px = px; prev_pnl = pnl
+        s1, s2 = f"{one:+.3f}%", f"{pnl:+.3f}%"
+        s3 = "-" if chg is None else f"{chg:+.3f}%"
     else:
         s1 = s2 = s3 = "-"
     print(R(t_open, W[0]) + R(f"{float(x['ho']):.1f}", W[1])
@@ -173,7 +176,8 @@ for i, k in enumerate(kl):
 print("-" * sum(W))
 print(f"損益基準：{'均K收盤價' if PNL_ON == 'ha' else '原始K線收盤價（與實際下單一致）'}"
       f"｜進場價 {ENTRY_PX}｜{'做多' if DIR == 'L' else '做空'}")
-print("本根損益＝與前一根基準價相比；累計損益＝與進場價相比；最高利潤只升不降")
+print("本根損益＝與前一根基準價相比；累計損益＝與進場價相比")
+print("變動損益＝本根累計損益 − 上一根累計損益（第一根無前值故留空）")
 
 # 各回吐門檻試算
 print("\n" + "="*78)
