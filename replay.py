@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """均K 回溯分析：抓 OKX 歷史 K 線，重算 HA 燈號 / ATR14，並試算不同回吐門檻。
 用法：改下面 CONFIG 區塊再執行。時間一律 UTC+8，用 K 線開盤時間。"""
-import json, sys
+import json, sys, unicodedata
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 try:
@@ -18,6 +18,7 @@ ENTRY_AT = "2026-09-02 23:25"    # 進場後第一根的開盤時間
 ENTRY_PX = 76950.1               # 實際成交均價
 DIR      = "L"                   # L / S
 TRIALS   = [-0.1, -0.2, -0.3, -0.5, -0.8, -1.2]   # 想試算的回吐門檻(%)
+PNL_ON   = "raw"                 # 損益用哪個價：raw=原始K線收盤（與實際下單一致）/ ha=均K收盤
 DEBUG    = True                  # 印出每次請求的結果
 # ──────────────────────────────
 
@@ -29,6 +30,21 @@ SEC = {"5m":300,"10m":600,"15m":900,"30m":1800,"60m":3600,
 IID = SYM.replace("USDT","") + "-USDT-SWAP"
 UA  = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+def dw(t):
+    """顯示寬度：中文/全形/emoji 算 2 格，其餘 1 格。"""
+    n = 0
+    for ch in str(t):
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+def R(t, n):
+    """靠右對齊到 n 格（依顯示寬度）"""
+    return " " * max(0, n - dw(t)) + str(t)
+
+def L(t, n):
+    """靠左對齊到 n 格（依顯示寬度）"""
+    return str(t) + " " * max(0, n - dw(t))
 
 def ms(s): return int(datetime.strptime(s,"%Y-%m-%d %H:%M").replace(tzinfo=TZ8).timestamp()*1000)
 def hm(t): return datetime.fromtimestamp(t/1000,TZ8).strftime("%m/%d %H:%M")
@@ -119,62 +135,84 @@ if len(kl)>=14:
 
 ent_ts = ms(ENTRY_AT)
 print(f"\n進場 {ENTRY_AT}｜{ENTRY_PX}｜{'做多' if DIR=='L' else '做空'}")
-print("="*78)
-print(f"{'開盤時間':<12}{'燈':<3}{'收盤':>10}{'漲跌幅':>10}{'ATR14r':>9}{'利潤':>9}{'最高':>9}{'回吐':>9}")
-print("-"*78)
-peak=0.0; table=[]
-for i,k in enumerate(kl):
-    if k["ts"]<start or k["ts"]>end: continue
-    x=ha[i]
-    body=float((x["hc"]-x["ho"])/x["ho"]*100) if x["ho"] else 0.0
-    ar=float(atr[i]/k["c"]*100) if atr[i] is not None and k["c"] else None
-    lg="🟩" if x["color"]=="G" else "🟥"
-    c=float(k["c"])
-    if k["ts"]>=ent_ts:
-        pnl=(c-ENTRY_PX)/ENTRY_PX*100 if DIR=="L" else (ENTRY_PX-c)/ENTRY_PX*100
-        peak=max(peak,pnl); dd=pnl-peak
-        table.append({"ts":k["ts"],"pnl":pnl,"peak":peak,"dd":dd,"c":c})
-        ps=f"{pnl:>+8.3f}%"; qs=f"{peak:>+8.3f}%"; ds=f"{dd:>+8.3f}%"
+print("="*70)
+W  = [7, 12, 7, 12, 4, 11, 10, 12, 12, 12]
+HD = ["開盤", "均K開", "收盤", "均K收", "燈",
+      "漲跌幅", "ATR14r", "本根損益", "累計損益", "最高利潤"]
+print("".join(R(HD[i], W[i]) for i in range(len(HD))))
+print("-" * sum(W))
+
+peak = 0.0; table = []; prev_px = None
+for i, k in enumerate(kl):
+    if k["ts"] < start or k["ts"] > end: continue
+    x = ha[i]
+    body = float((x["hc"] - x["ho"]) / x["ho"] * 100) if x["ho"] else 0.0
+    ar = float(atr[i] / k["c"] * 100) if atr[i] is not None and k["c"] else None
+    lg = "\U0001F7E9" if x["color"] == "G" else "\U0001F7E5"
+    px = float(x["hc"]) if PNL_ON == "ha" else float(k["c"])   # 損益基準價
+    t_open = datetime.fromtimestamp(k["ts"] / 1000, TZ8).strftime("%H:%M")
+    t_close = datetime.fromtimestamp(k["ts"] / 1000 + SEC, TZ8).strftime("%H:%M")
+    if k["ts"] >= ent_ts:
+        pnl = (px - ENTRY_PX) / ENTRY_PX * 100 if DIR == "L" else (ENTRY_PX - px) / ENTRY_PX * 100
+        # 本根損益：與前一根基準價相比（第一根與進場價相比）
+        base = prev_px if prev_px is not None else ENTRY_PX
+        one = (px - base) / base * 100 if DIR == "L" else (base - px) / base * 100
+        peak = max(peak, pnl)
+        table.append({"ts": k["ts"], "pnl": pnl, "peak": peak, "dd": pnl - peak,
+                      "c": px, "one": one})
+        prev_px = px
+        s1, s2, s3 = f"{one:+.3f}%", f"{pnl:+.3f}%", f"{peak:+.3f}%"
     else:
-        ps=qs=ds="        -"
-    print(f"{hm(k['ts']):<12}{lg:<3}{c:>10.1f}{body:>+9.4f}%"
-          f"{(f'{ar:.4f}%' if ar is not None else '-'):>9}{ps}{qs}{ds}")
+        s1 = s2 = s3 = "-"
+    print(R(t_open, W[0]) + R(f"{float(x['ho']):.1f}", W[1])
+          + R(t_close, W[2]) + R(f"{float(x['hc']):.1f}", W[3])
+          + L(" " + lg, W[4])
+          + R(f"{body:+.4f}%", W[5]) + R(f"{ar:.4f}%" if ar is not None else "-", W[6])
+          + R(s1, W[7]) + R(s2, W[8]) + R(s3, W[9]))
+
+print("-" * sum(W))
+print(f"損益基準：{'均K收盤價' if PNL_ON == 'ha' else '原始K線收盤價（與實際下單一致）'}"
+      f"｜進場價 {ENTRY_PX}｜{'做多' if DIR == 'L' else '做空'}")
+print("本根損益＝與前一根基準價相比；累計損益＝與進場價相比；最高利潤只升不降")
 
 # 各回吐門檻試算
 print("\n" + "="*78)
 print("各回吐門檻試算（以收線價計，不含手續費與滑價）")
-print("-"*78)
-print(f"{'門檻':>8}{'出場時間':>14}{'出場價':>11}{'觸發回吐':>11}{'出場利潤':>11}{'持有根數':>10}")
-print("-"*78)
+print("-"*70)
+TW = [9, 15, 12, 12, 12, 11]
+TH = ["門檻", "出場時間", "出場價", "觸發回吐", "出場利潤", "持有根數"]
+print("".join(R(TH[i], TW[i]) for i in range(6)))
+print("-" * sum(TW))
 for th in TRIALS:
     hit=None
     for j,r in enumerate(table):
         if r["dd"]<=th: hit=(j,r); break
     if hit:
         j,r=hit
-        print(f"{th:>7.1f}%{hm(r['ts']):>14}{r['c']:>11.1f}"
-              f"{r['dd']:>+10.3f}%{r['pnl']:>+10.3f}%{j+1:>10}")
+        print(R(f"{th:.1f}%", TW[0]) + R(hm(r["ts"]), TW[1]) + R(f"{r['c']:.1f}", TW[2])
+              + R(f"{r['dd']:+.3f}%", TW[3]) + R(f"{r['pnl']:+.3f}%", TW[4]) + R(j+1, TW[5]))
     elif table:
         last=table[-1]
-        print(f"{th:>7.1f}%{'未觸發':>14}{last['c']:>11.1f}"
-              f"{last['dd']:>+10.3f}%{last['pnl']:>+10.3f}%{len(table):>10}   ← 區間結束仍持有")
+        print(R(f"{th:.1f}%", TW[0]) + R("未觸發", TW[1]) + R(f"{last['c']:.1f}", TW[2])
+              + R(f"{last['dd']:+.3f}%", TW[3]) + R(f"{last['pnl']:+.3f}%", TW[4])
+              + R(len(table), TW[5]) + "  ← 區間結束仍持有")
+print("-" * sum(TW))
 
 if table:
     best=max(table,key=lambda r:r["pnl"])
     worst=min(table,key=lambda r:r["dd"])
-    print("-"*78)
     print(f"區間內最高利潤　{best['pnl']:+.3f}%　於 {hm(best['ts'])}（收盤 {best['c']:.1f}）")
     print(f"區間內最大回吐　{worst['dd']:+.3f}%　於 {hm(worst['ts'])}"
           f"（當時利潤 {worst['pnl']:+.3f}%，最高 {worst['peak']:+.3f}%）")
     print(f"區間結束時利潤　{table[-1]['pnl']:+.3f}%（回吐 {table[-1]['dd']:+.3f}%）")
-    print("-"*78)
+    print("-"*70)
     print("解讀：門檻要設在「大於區間內最大回吐」才不會被洗掉。")
     print("　　　例如最大回吐 -0.25%，門檻設 -0.1% 會提早出場，設 -0.3% 才抱得住。")
 
     # 逐根列出「若此刻門檻剛好等於當下回吐」會拿到多少
     print("\n" + "="*78)
     print("回吐分佈（每根的回吐值排序，幫你看門檻該壓在哪）")
-    print("-"*78)
+    print("-"*70)
     dds=sorted((r["dd"] for r in table))
     n=len(dds)
     for q,lab in ((0,"最深"),(n//10,"前10%"),(n//4,"前25%"),(n//2,"中位")):
