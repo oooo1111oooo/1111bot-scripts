@@ -29,6 +29,7 @@ STATE_FILE = "/srv/1111bot/data/strategies_ha_o3333o.json"
 HA_LAG = 5           # 收線後幾秒才抓 K 線（等 OKX 資料落定）
 HA_HIST = 120        # 抓幾根歷史 K 線做 HA 遞迴
 HB_BARS = 3          # 心跳超過幾根 K 線未推進就告警
+EXIT_FLOOR = 0.1     # 出場條件二之一：累計損益低於此值(%)
 HA_MAX  = 2000       # /ha 單次最多抓幾根
 DB_FILE = "/srv/1111bot/data/ha_market.db"
 DB_KEEP = 30         # 每個 (幣種,週期) 在 DB 保留幾根（連續均K 很少超過30）
@@ -98,8 +99,8 @@ def pct(v): return format(Decimal(str(v)).normalize(), "f")   # 用 f 格式，�
 
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post",
-               "entry_min","exit_dd","chat",
-               "pos_open","pos_px","pos_ee","pos_sz","pos_peak","pnl_hist","last_bar")
+               "entry_min","bar_min","chat",
+               "pos_open","pos_px","pos_ee","pos_sz","pnl_hist","last_bar")
 
 SHUTTING_DOWN = False
 
@@ -776,16 +777,27 @@ def judge_entry_db(rows, d, pre, post, entry_min):
             "entry_ok": atr_sum >= entry_min,
             "hit": pre_ok and color_ok and atr_sum >= entry_min}
 
-def judge_exit_db(close_px, entry_px, d, peak, exit_dd):
-    """回吐出場：進場時利潤歸零，逐根更新最高利潤，
-    當「目前利潤 − 最高利潤」跌破 exit_dd（負值）即出場。
-    利潤為純價格變動%，不含槓桿。"""
-    ep = float(entry_px); cp = float(close_px)
+def judge_exit_db(rows, d, entry_px, bar_min):
+    """出場判定（rows 為最後兩根，舊->新）。
+    條件一：出現反向燈號（做多要紅、做空要綠）—— 必要條件
+    條件二：累計損益 < EXIT_FLOOR%  或  本根損益 < bar_min%  —— 擇一
+    兩者同時成立才出場。"""
+    if not rows: return None
+    last = rows[-1]
+    prev = rows[-2] if len(rows) >= 2 else None
+    ep = float(entry_px)
     if ep == 0: return None
-    pnl = (cp - ep) / ep * 100 if d == "L" else (ep - cp) / ep * 100
-    npk = max(float(peak), pnl)
-    dd = pnl - npk
-    return {"pnl_pct": pnl, "peak": npk, "dd": dd, "hit": dd <= float(exit_dd)}
+    c = float(last["c"])
+    pnl = (c - ep) / ep * 100 if d == "L" else (ep - c) / ep * 100
+    base = float(prev["c"]) if prev else ep
+    one = (c - base) / base * 100 if d == "L" else (base - c) / base * 100
+    want_rev = "R" if d == "L" else "G"
+    rev_ok = last.get("color") == want_rev
+    floor_ok = pnl < EXIT_FLOOR
+    bar_ok = one < float(bar_min)
+    return {"pnl": pnl, "one": one, "color": last.get("color"),
+            "rev_ok": rev_ok, "floor_ok": floor_ok, "bar_ok": bar_ok,
+            "hit": rev_ok and (floor_ok or bar_ok)}
 
 # ---------- 進場 ----------
 async def h_open(app, S, spec, iid, d, pos, info, k):
@@ -837,7 +849,6 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
     ee = time.time()
     S["state"] = "持倉中"; S["pos_open"] = True
     S["pos_px"] = str(fpx); S["pos_ee"] = ee; S["pos_sz"] = str(size)
-    S["pos_peak"] = 0.0                      # 進場即把最高利潤歸零
     S["pnl_hist"] = []                       # 逐根利潤紀錄，出場時列出供核對
     save_state()
     head = [f"{E.BOT} OKX均K｜{ACCT}", "事件：🔔 訊號進場",
@@ -847,7 +858,7 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
     ein = datetime.fromtimestamp(ee, TZ8).strftime("%H:%M")
     tail = ["━" * 10,
             f"進場{ein}｜{fpx}｜{size}張",
-            f"回吐{pct(S['exit_dd'])}%出場",
+            f"出場：反向燈號＋(累計<{EXIT_FLOOR}% 或 本根<{pct(S['bar_min'])}%)",
             f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
     return True
@@ -857,7 +868,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     p_now = await okx_pos(iid, pos)
     if not p_now:
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 平倉時 OKX 已無持倉，略過")
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
+        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
             S.pop(a, None)
         save_state()
         return True
@@ -904,8 +915,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
                "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
                "tf": S["tf"], "pre": str(S["pre"]), "post": str(S["post"]),
                "entry_min": str(S["entry_min"]),
-               "exit_dd": str(S["exit_dd"]),
-               "peak_pct": round(float(S.get("pos_peak") or 0), 4),
+               "bar_min": str(S["bar_min"]),
                "lev": S["lev"], "margin": str(S["margin"]),
                "in_px": str(fpx), "out_px": str(xpx)})
     hist = S.get("pnl_hist") or []
@@ -917,21 +927,23 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
             f"→出場{hhmm()}｜{xpx}",
             f"持倉{hs}s（約{hs / tfs:.1f}根）", "━" * 10]
     lines = []
+    if hist:
+        lines.append(f"本根<{pct(S['bar_min'])}% 或 累計<{EXIT_FLOOR}%")
     show = hist[-40:]
     if len(hist) > len(show):
         lines.append(f"（共{len(hist)}根，只列最後{len(show)}根）")
     for i, hrec in enumerate(show, start=len(hist) - len(show) + 1):
         mark = "\u274c" if hrec.get("hit") else ""
-        hm = str(hrec.get("dt") or "")[11:16]
-        lines.append(f"{i} {hm} 利{hrec['pnl']:+.3f}% 高{hrec['peak']:+.3f}% 回{hrec['dd']:+.3f}%{mark}")
+        hm2 = str(hrec.get("dt") or "")[11:16]
+        lg2 = "\U0001F7E9" if hrec.get("color") == "G" else "\U0001F7E5"
+        lines.append(f"{i} {hm2}{lg2}本{hrec.get('one', 0):+.3f}% 累{hrec['pnl']:+.3f}%{mark}")
     tail = ["━" * 10,
-            f"最高利潤{float(S.get('pos_peak') or 0):+.4f}%",
             f"毛損益{g:+.6f}({gp:+.3f}%)",
             f"手續費{fee:+.6f}({fp:+.3f}%)",
             f"淨損益{net:+.6f}({npv:+.3f}%){E.pnl_emoji(net)}",
             f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
+    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
         S.pop(a, None)
     save_state()
     return True
@@ -940,7 +952,7 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
 async def h_takeover(app, S, spec, iid, d, pos):
     p = await okx_pos(iid, pos)
     if not p:
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
+        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
             S.pop(a, None)
         save_state()
         return None
@@ -1012,7 +1024,7 @@ async def hloop(app, chat, S):
                 p = await okx_pos(iid, pos)
                 if not p:
                     await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉），重回等訊號")
-                    for a2 in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist"):
+                    for a2 in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
                         S.pop(a2, None)
                     size = fpx = ee = None
                     save_state(); continue
@@ -1023,17 +1035,16 @@ async def hloop(app, chat, S):
                     except Exception: pass
                 if fpx is None: fpx = Decimal(S.get("pos_px") or p.get("avgPx") or "0")
                 if ee is None: ee = float(S.get("pos_ee") or time.time())
-                r = judge_exit_db(last["c"], fpx, d, S.get("pos_peak", 0.0), S["exit_dd"])
+                r = judge_exit_db(rows[-2:], d, fpx, S["bar_min"])
                 if r is None: continue
-                S["pos_peak"] = r["peak"]
                 hist = S.get("pnl_hist") or []
                 hist.append({"dt": str(last.get("dt") or ""), "c": float(last["c"]),
-                             "pnl": round(r["pnl_pct"], 4), "peak": round(r["peak"], 4),
-                             "dd": round(r["dd"], 4), "hit": bool(r["hit"])})
+                             "pnl": round(r["pnl"], 4), "one": round(r["one"], 4),
+                             "color": r["color"], "hit": bool(r["hit"])})
                 S["pnl_hist"] = hist[-120:]
                 save_state()
                 if r["hit"]:
-                    await h_exit(app, S, spec, iid, d, pos, size, fpx, ee, "Drawdown_Exit", k)
+                    await h_exit(app, S, spec, iid, d, pos, size, fpx, ee, "Signal_Exit", k)
                     size = fpx = ee = None
             else:
                 # --- 空手：進場判斷 ---
@@ -1105,10 +1116,10 @@ async def rebuild_strat(d):
          "lev": int(d["lev"]), "margin": Decimal(str(d["margin"])),
          "pre": int(d["pre"]), "post": int(d["post"]),
          "entry_min": Decimal(str(d["entry_min"])),
-         "exit_dd": Decimal(str(d["exit_dd"])), "spec": spec,
+         "bar_min": Decimal(str(d["bar_min"])), "spec": spec,
          "alive": True, "state": "等訊號", "chat": d.get("chat", CHAT_ID),
          "hb": time.time(), "hb_warned": False}
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pos_peak", "pnl_hist", "last_bar"):
+    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist", "last_bar"):
         if a in d: S[a] = d[a]
     return S
 
@@ -1150,7 +1161,7 @@ def strat_params(sym, dr):
     if not S or not S.get("alive"):
         return None
     return (f"/run {sym} {dr} {S['lev']} {pct(S['margin'])} "
-            f"{S['pre']} {S['post']} {pct(S['entry_min'])} {pct(S['exit_dd'])}%")
+            f"{S['pre']} {S['post']} {pct(S['entry_min'])} {pct(S['bar_min'])}%")
 
 async def strat_detail(S, sym, dr, mark_px=None):
     """單一策略的完整現況：空手列進場條件明細，持倉列利潤與出場距離。"""
@@ -1188,33 +1199,36 @@ async def strat_detail(S, sym, dr, mark_px=None):
     if cur is None:
         rr = db_latest(sym, tf, 1)
         if rr: cur = Decimal(str(rr[-1]["c"]))
-    peak = float(S.get("pos_peak") or 0)
-    dd_thr = float(S["exit_dd"])
+    tf_rows = db_latest(sym, tf, 2)
     if cur is not None and epx:
-        r = judge_exit_db(cur, epx, dr, peak, dd_thr)
+        c_now = float(cur); ep = float(epx)
+        pnl = (c_now - ep) / ep * 100 if dr == "L" else (ep - c_now) / ep * 100
+        base = float(tf_rows[-2]["c"]) if len(tf_rows) >= 2 else ep
+        one = (c_now - base) / base * 100 if dr == "L" else (base - c_now) / base * 100
+        col = tf_rows[-1]["color"] if tf_rows else "?"
+        want_rev = "R" if dr == "L" else "G"
+        rev_lg = "\U0001F7E5" if dr == "L" else "\U0001F7E9"
+        cur_lg = "\U0001F7E9" if col == "G" else "\U0001F7E5"
+        c1 = (col == want_rev)
+        c2 = pnl < EXIT_FLOOR
+        c3 = one < float(S["bar_min"])
         L.append(f"目前價 {cur}")
-        L.append(f"目前利潤 {r['pnl_pct']:+.4f}%")
-        L.append(f"最高利潤 {peak:+.4f}%")
-        L.append(f"回吐 {r['dd']:+.4f}%（門檻 {pct(S['exit_dd'])}%）")
-        room = r["dd"] - dd_thr
-        if room > 0:
-            L.append(f"再回吐 {room:.4f}% 即出場")
-        else:
-            L.append("⚠ 已達出場條件，下一根收線觸發")
-        # 出場觸發價（以目前最高利潤推算）
-        tgt = peak + dd_thr
-        px = epx * (Decimal(1) + Decimal(str(tgt)) / 100) if dr == "L" \
-             else epx * (Decimal(1) - Decimal(str(tgt)) / 100)
-        L.append(f"出場觸發價 ≈ {px:.6g}")
+        L.append(f"累計損益 {pnl:+.4f}%")
+        L.append(f"本根損益 {one:+.4f}%")
+        L.append(f"最新燈號 {cur_lg}（需 {rev_lg}）{'✅' if c1 else '❌'}")
+        L.append(f"累計<{EXIT_FLOOR}% {'✅' if c2 else '❌'}"
+                 f"｜本根<{pct(S['bar_min'])}% {'✅' if c3 else '❌'}")
+        L.append("出場判定：" + ("✅ 會出場" if (c1 and (c2 or c3)) else "❌ 續抱"))
     else:
         L.append("⚠ 取不到目前價")
     hist = S.get("pnl_hist") or []
     if hist:
         show = hist[-5:]
-        L.append(f"【近 {len(show)} 根收線利潤】共 {len(hist)} 根")
+        L.append(f"【近 {len(show)} 根收線】共 {len(hist)} 根")
         for h in show:
             hm = str(h.get("dt") or "")[11:16]
-            L.append(f"{hm} 利{h['pnl']:+.3f}% 高{h['peak']:+.3f}% 回{h['dd']:+.3f}%")
+            lg = "\U0001F7E9" if h.get("color") == "G" else "\U0001F7E5"
+            L.append(f"{hm}{lg}本{h.get('one', 0):+.3f}% 累{h['pnl']:+.3f}%")
     else:
         L.append("（尚未有收線紀錄，進場後第一根收線才會出現）")
     return L
@@ -1222,13 +1236,15 @@ async def strat_detail(S, sym, dr, mark_px=None):
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"用法：/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 回吐%\n"
-           f"例：/run BTCUSDT L 1 100 5 2 0.6 -2%\n"
+    fmt = (f"用法：/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 本根損益率%\n"
+           f"例：/run BTCUSDT L 1 100 5 2 0.6 -0.1%\n"
            f"━━━━━━━━━━\n"
            f"前根數：反轉前需連續反向色的根數\n"
            f"後根數：反轉後需連續順勢色的根數\n"
            f"ATR門檻：後段這幾根的 ATR14 ratio 累加需 ≥ 此值（%）\n"
-           f"回吐%：從最高利潤跌多少即出場（負值）\n"
+           f"本根損益率：出場條件二之一，本根損益低於此值（負值，如 -0.1%）\n"
+           f"　另一條件：累計損益 < {EXIT_FLOOR}%（兩者擇一）\n"
+           f"　出場須先出現反向燈號才成立\n"
            f"━━━━━━━━━━\n"
            f"週期依 /timeframe，目前 {ACCOUNT_TF}")
     if len(a) != 8:
@@ -1238,7 +1254,7 @@ async def cmd_run(u, c):
         lev = int(a[2].replace("x", "")); margin = Decimal(a[3])
         pre = int(a[4]); post = int(a[5])
         entry_min = Decimal(a[6].replace("%", "").strip())
-        exit_dd = Decimal(a[7].replace("%", "").strip())
+        bar_min = Decimal(a[7].replace("%", "").strip())
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     tf = ACCOUNT_TF
@@ -1253,8 +1269,8 @@ async def cmd_run(u, c):
         await reply(u, f"{E.BOT} 前根數+後根數 不可超過 {DB_KEEP}（行情DB 保留上限）"); return
     if entry_min <= 0:
         await reply(u, f"{E.BOT} ATR門檻 須大於 0"); return
-    if exit_dd >= 0:
-        await reply(u, f"{E.BOT} 回吐% 須為負值，例如 -2%"); return
+    if bar_min >= 0:
+        await reply(u, f"{E.BOT} 本根損益率 須為負值，例如 -0.1%"); return
     k = skey(sym, dr)
     if k in STRATS and STRATS[k].get("alive"):
         await reply(u, f"{E.BOT} {sym} {E.dir_word(dr)} 已在運行"); return
@@ -1279,14 +1295,14 @@ async def cmd_run(u, c):
     if not fresh: warn += "\n⚠ 行情DB 落後，啟動後會等資料補齊才判斷"
     PENDING[u.effective_chat.id] = {"act": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": tf,
         "lev": lev, "margin": margin, "pre": pre, "post": post,
-        "entry_min": entry_min, "exit_dd": exit_dd, "spec": spec}
+        "entry_min": entry_min, "bar_min": bar_min, "spec": spec}
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n"
         f"{E.dir_emoji(dr)} {dr} {tf}\n"
-        f"/run {sym} {dr} {lev} {pct(margin)} {pre} {post} {pct(entry_min)} {pct(exit_dd)}%\n"
+        f"/run {sym} {dr} {lev} {pct(margin)} {pre} {post} {pct(entry_min)} {pct(bar_min)}%\n"
         f"目前價{op}｜預估{size}張\n"
         f"━━━━━━━━━━\n{prev}\n"
         f"━━━━━━━━━━\n"
-        f"回吐{pct(exit_dd)}%出場{warn}\n"
+        f"出場：反向燈號＋(累計<{EXIT_FLOOR}% 或 本根<{pct(bar_min)}%){warn}\n"
         f"下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
@@ -1808,8 +1824,8 @@ async def cmd_menu(u, c):
         "/coins 幣種\n"
         "/ha 商品 根數  燈號+ATR 報表 Excel 寄信（3~2000根）\n"
         "━━━━━━━━━━\n"
-        "/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 回吐%\n"
-        "例：/run BTCUSDT L 1 100 5 2 0.6 -2%\n"
+        "/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 本根損益率%\n"
+        "例：/run BTCUSDT L 1 100 5 2 0.6 -0.1%\n"
         f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認執行（run/stop/stopall 共用）\n"
         "/stop 商品 方向（需 /confirm）\n"
@@ -1820,7 +1836,8 @@ async def cmd_menu(u, c):
         "━━━━━━━━━━\n"
         "進場：前段全反向色 + 後段全順勢色\n"
         "　　　且後段 ΣATR14 ratio ≥ 門檻%\n"
-        "出場：從最高利潤回吐指定% 即 taker 平倉\n"
+        "出場：反向燈號 ＋ (累計損益<門檻 或 本根損益<門檻)\n"
+        "　　　兩條件同時成立才 taker 平倉\n"
         "⚠ 無 TP/SL/TE，僅靠回吐出場\n"
         "✅ 判斷全讀本機行情DB，下單不等 API\n"
         "✅ 重啟接管持倉\n"
