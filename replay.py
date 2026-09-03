@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """均K 回溯分析：抓 OKX 歷史 K 線，重算 HA 燈號 / ATR14，並試算不同回吐門檻。
-用法：直接改下面 CONFIG 區塊再執行。時間一律 UTC+8，用 K 線開盤時間。"""
-import json, urllib.request
+用法：改下面 CONFIG 區塊再執行。時間一律 UTC+8，用 K 線開盤時間。"""
+import json, sys
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
+try:
+    import httpx
+except ImportError:
+    sys.exit("需要 httpx：/srv/1111bot/.venv/bin/python -m pip install httpx")
 
 # ─────────── CONFIG ───────────
 SYM      = "BTCUSDT"
@@ -14,6 +18,7 @@ ENTRY_AT = "2026-09-02 23:25"    # 進場後第一根的開盤時間
 ENTRY_PX = 76950.1               # 實際成交均價
 DIR      = "L"                   # L / S
 TRIALS   = [-0.1, -0.2, -0.3, -0.5, -0.8, -1.2]   # 想試算的回吐門檻(%)
+DEBUG    = True                  # 印出每次請求的結果
 # ──────────────────────────────
 
 TZ8 = timezone(timedelta(hours=8))
@@ -22,43 +27,76 @@ BAR = {"5m":"5m","10m":"5m","15m":"15m","30m":"30m","60m":"1H",
 SEC = {"5m":300,"10m":600,"15m":900,"30m":1800,"60m":3600,
        "120m":7200,"240m":14400,"480m":28800,"720m":43200,"1440m":86400}[TF]
 IID = SYM.replace("USDT","") + "-USDT-SWAP"
+UA  = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 def ms(s): return int(datetime.strptime(s,"%Y-%m-%d %H:%M").replace(tzinfo=TZ8).timestamp()*1000)
 def hm(t): return datetime.fromtimestamp(t/1000,TZ8).strftime("%m/%d %H:%M")
 
+CLI = httpx.Client(timeout=20, headers=UA, follow_redirects=True)
+
 def fetch(ep, after=None, limit=100):
     u = f"https://www.okx.com/api/v5/market/{ep}?instId={IID}&bar={BAR}&limit={limit}"
     if after: u += f"&after={after}"
-    with urllib.request.urlopen(u, timeout=20) as r:
-        return json.load(r)
+    try:
+        r = CLI.get(u)
+    except Exception as e:
+        if DEBUG: print(f"  [{ep}] 連線失敗 {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        if DEBUG: print(f"  [{ep}] HTTP {r.status_code}: {r.text[:150]}")
+        return None
+    try:
+        j = r.json()
+    except Exception as e:
+        if DEBUG: print(f"  [{ep}] 回應非 JSON: {r.text[:150]}")
+        return None
+    if j.get("code") != "0":
+        if DEBUG: print(f"  [{ep}] OKX code={j.get('code')} msg={j.get('msg')}")
+        return None
+    n = len(j.get("data") or [])
+    if DEBUG:
+        rng = ""
+        if n: rng = f"｜{hm(int(j['data'][-1][0]))} ~ {hm(int(j['data'][0][0]))}"
+        print(f"  [{ep}] after={after} -> {n} 根{rng}")
+    return j
 
-# 往回抓，涵蓋顯示區間 + 40 根 ATR 暖身
 start, end = ms(FROM), ms(TO)
 need_from = start - 40*SEC*1000
+print(f"目標區間：{hm(start)} ~ {hm(end)}（含 40 根暖身，往回抓到 {hm(need_from)}）")
+
 got = {}
 after = end + SEC*1000
-for _ in range(12):
-    ok = False
-    for ep in ("candles","history-candles"):
-        try:
-            r = fetch(ep, after)
-        except Exception as e:
-            continue
-        if r.get("code")!="0" or not r.get("data"): continue
-        for c in r["data"]:
-            if len(c)>=9 and str(c[8])!="1": continue
-            t=int(c[0])
-            if t not in got:
-                got[t]={"ts":t,"o":Decimal(c[1]),"h":Decimal(c[2]),
-                        "l":Decimal(c[3]),"c":Decimal(c[4])}
-        after = int(r["data"][-1][0]); ok = True
+ep = "candles"
+for page in range(15):
+    j = fetch(ep, after)
+    if j is None or not j.get("data"):
+        if ep == "candles":
+            print("  改用 history-candles 續抓")
+            ep = "history-candles"; continue
         break
-    if not ok or (got and min(got) <= need_from): break
+    before = len(got)
+    for c in j["data"]:
+        if len(c) >= 9 and str(c[8]) != "1": continue
+        t = int(c[0])
+        if t not in got:
+            got[t] = {"ts":t,"o":Decimal(c[1]),"h":Decimal(c[2]),
+                      "l":Decimal(c[3]),"c":Decimal(c[4])}
+    after = int(j["data"][-1][0])
+    if len(got) == before:
+        if ep == "candles":
+            ep = "history-candles"; continue
+        break
+    if got and min(got) <= need_from: break
 
 kl = [got[t] for t in sorted(got)]
 if not kl:
-    raise SystemExit("抓不到 K 線，請檢查網路或時間區間")
-print(f"取得 {len(kl)} 根 {SYM} {TF}｜{hm(kl[0]['ts'])} ~ {hm(kl[-1]['ts'])}")
+    sys.exit("抓不到 K 線（上面有每次請求的結果，請貼給我）")
+print(f"\n取得 {len(kl)} 根 {SYM} {TF}｜{hm(kl[0]['ts'])} ~ {hm(kl[-1]['ts'])}")
+inwin = [k for k in kl if start <= k["ts"] <= end]
+print(f"其中落在目標區間：{len(inwin)} 根")
+if not inwin:
+    sys.exit("目標區間內沒有資料，請確認 FROM / TO 設定")
 
 # HA
 ha=[]
