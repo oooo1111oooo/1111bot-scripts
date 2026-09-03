@@ -614,15 +614,15 @@ async def live_rows(sym, tf, need):
     if len(kl) < 15: return []
     ha = calc_ha(kl)
     atrs = calc_atr(kl, 14)
-    nowstr = now8().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     for i, x in enumerate(ha):
         a, rr = atrs[i]
         ho, hc = x["ho"], x["hc"]
         body = float((hc - ho) / ho * 100) if ho else 0.0
         lv = kl[i].get("live", False)
-        dt = nowstr if lv else datetime.fromtimestamp(
-            int(x["ts"]) / 1000, TZ8).strftime("%Y-%m-%d %H:%M:00")
+        # 一律用該根 K 線自己的開盤時間，方便與交易所圖表對照；
+        # 進行中那根由 bar_line 於時間後補上 * 記號
+        dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8).strftime("%Y-%m-%d %H:%M:00")
         rows.append({"ts": int(x["ts"]), "dt": dt, "color": x["color"],
                      "body_pct": body, "c": float(kl[i]["c"]),
                      "atr14_ratio": float(rr) if rr is not None else None,
@@ -1268,7 +1268,8 @@ async def strat_detail(S, sym, dr, mark_px=None):
             L.append(f"{hm}{lg}本{h.get('one', 0):+.3f}% 累{h['pnl']:+.3f}%")
     if live_row is not None and pnl is not None:
         lg = "\U0001F7E9" if live_row.get("color") == "G" else "\U0001F7E5"
-        L.append(f"{hhmmss()}*{lg}本{one:+.3f}% 累{pnl:+.3f}%")
+        lvhm = str(live_row.get("dt") or "")[11:16]
+        L.append(f"{lvhm}*{lg}本{one:+.3f}% 累{pnl:+.3f}%")
         L.append("* 為進行中，收線前仍會變動")
     else:
         L.append("（尚未有收線紀錄，進場後第一根收線才會出現）")
