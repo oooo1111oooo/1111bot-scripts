@@ -74,6 +74,11 @@
       "symbol": "AAVEUSDT",
       "enabled": true,
       "note": "v1.5 新增 待驗證"
+    },
+    {
+      "symbol": "TAOUSDT",
+      "enabled": true,
+      "note": "9/02 新增 原K 用"
     }
   ]
 }
