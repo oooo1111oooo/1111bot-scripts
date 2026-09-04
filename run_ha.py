@@ -1656,14 +1656,19 @@ def _fmt_atr(v, tick):
     q = Decimal(1).scaleb(-max(2, min(8, exp + 1)))
     return str(v.quantize(q))
 
-def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
-    """明細＋統計兩張表。欄位：幣種 / 日期 / 時間 / 燈號 / ATR14 / ATR14 ratio"""
+def build_ha_xlsx(sym, tf, ha, atrs, tick, path, kl=None):
+    """明細＋統計兩張表。
+    欄位：幣種 / 週期 / 日期 / 時間 / 原K OHLC / 原K燈 / 原K漲跌幅 /
+          均K OHLC / 均K燈 / 均K漲跌幅 / ATR14 / ATR14 ratio"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
     wb = Workbook()
     ws = wb.active; ws.title = "明細"
-    heads = ["幣種", "週期", "日期", "時間", "燈號", "ATR14", "ATR14 ratio"]
+    heads = ["幣種", "週期", "日期", "時間",
+             "原K開", "原K高", "原K低", "原K收", "原K燈", "原K漲跌幅",
+             "均K開", "均K高", "均K低", "均K收", "均K燈", "均K漲跌幅",
+             "ATR14", "ATR14 ratio"]
     ws.append(heads)
     hf = Font(bold=True, color="FFFFFF")
     hfill = PatternFill("solid", fgColor="404040")
@@ -1673,21 +1678,38 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
     exp = -tick.as_tuple().exponent
     ndp = max(2, min(8, exp + 1))
     afmt = "0." + "0" * ndp
+    pfmt = "0." + "0" * ndp
     for i, x in enumerate(ha):
         dt = datetime.fromtimestamp(int(x["ts"]) / 1000, TZ8)          # K 線開盤時間
         av, rv = atrs[i]
         up = x["color"] == "G"
+        k = kl[i] if (kl and i < len(kl)) else None
+        ro = float(k["o"]) if k else None
+        rh = float(k["h"]) if k else None
+        rl = float(k["l"]) if k else None
+        rc = float(k["c"]) if k else None
+        rbody = ((rc - ro) / ro * 100) if (ro and rc is not None) else None
+        hbody = float((x["hc"] - x["ho"]) / x["ho"] * 100) if x["ho"] else None
         ws.append([sym, tf, dt.strftime("%Y/%m/%d"), dt.strftime("%H:%M"),
+                   ro, rh, rl, rc,
+                   ("\U0001F7E9" if rc >= ro else "\U0001F7E5") if (ro is not None and rc is not None) else None,
+                   rbody,
+                   float(x["ho"]), float(x["hh"]), float(x["hl"]), float(x["hc"]),
                    "\U0001F7E9" if up else "\U0001F7E5",
+                   hbody,
                    float(av) if av is not None else None,
                    float(rv) if rv is not None else None])
         r = ws.max_row
-        ws.cell(row=r, column=2).alignment = Alignment(horizontal="center")
-        ws.cell(row=r, column=5).alignment = Alignment(horizontal="center")
-        ws.cell(row=r, column=6).number_format = afmt
-        ws.cell(row=r, column=7).number_format = '0.0000"%"' 
+        for col in (2, 9, 15): ws.cell(row=r, column=col).alignment = Alignment(horizontal="center")
+        for col in (5, 6, 7, 8, 11, 12, 13, 14): ws.cell(row=r, column=col).number_format = pfmt
+        for col in (10, 16): ws.cell(row=r, column=col).number_format = '0.0000"%"'
+        ws.cell(row=r, column=17).number_format = afmt
+        ws.cell(row=r, column=18).number_format = '0.0000"%"' 
     ws.freeze_panes = "A2"
-    for i, w in enumerate([12, 8, 12, 8, 8, 16, 16], start=1):
+    for i, w in enumerate([12, 8, 12, 8,
+                           13, 13, 13, 13, 8, 12,
+                           13, 13, 13, 13, 8, 12,
+                           14, 14], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     va = [float(a) for a, _ in atrs if a is not None]
@@ -1711,7 +1733,9 @@ def build_ha_xlsx(sym, tf, ha, atrs, tick, path):
             ["ATR14 平均", aA], ["ATR14 中位", aM], ["ATR14 最大", aX], ["ATR14 最小", aN],
             ["ATR14 ratio 平均", rA], ["ATR14 ratio 中位", rM],
             ["ATR14 ratio 最大", rX], ["ATR14 ratio 最小", rN],
-            ["燈號來源", "Heikin-Ashi"], ["ATR 來源", "原始 K 線（Wilder 平滑）"],
+            ["燈號來源", "均K燈=Heikin-Ashi｜原K燈=原始收≥開"],
+            ["ATR 來源", "原始 K 線（Wilder 平滑，14 週期）"],
+            ["ATR14 ratio", "ATR14 ÷ 該根原始收盤價 × 100%"],
             ["產生時間", now8().strftime("%Y/%m/%d %H:%M:%S")]]
     for r in rows: w2.append(r)
     for rr in range(2, w2.max_row + 1):
@@ -1800,7 +1824,7 @@ async def cmd_ha(u, c):
     name = f"OKX_{ACCT}_均K_{sym}_{ACCOUNT_TF}_{m}根_{day}.xlsx"
     path = f"/srv/1111bot/data/{name}"
     try:
-        build_ha_xlsx(sym, ACCOUNT_TF, ha, atrs, spec["tick"], path)
+        build_ha_xlsx(sym, ACCOUNT_TF, ha, atrs, spec["tick"], path, kl[st:])
     except Exception as e:
         await reply(u, f"{E.LOSS} 產生 Excel 失敗：{type(e).__name__}: {e}"); return
     va = [a for a, _ in atrs if a is not None]
