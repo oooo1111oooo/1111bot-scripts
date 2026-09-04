@@ -2062,11 +2062,12 @@ async def build_replay_xlsx(day, trades, path):
         hi = exi_bar + 2 * sec
 
         w2 = wb.create_sheet(tab)
-        H = ["標記", "開盤時間", "均K開", "均K收", "原K收",
-             "參考收盤", "成交價", "偏離%", "延遲s",
-             "燈", "漲跌幅", "ATR14r",
-             "本根損益", "累計損益", "反向燈號", f"累計<{EXIT_FLOOR}%",
-             "本根<門檻", "出場成立"]
+        H = ["標記", "開盤時間",
+             "均K開", "原K開", "均K收", "原K收",
+             "均K燈", "原K燈", "均K漲跌幅", "原K漲跌幅", "ATR14r",
+             "本根損益", "累計損益",
+             "反向燈號", f"累計<{EXIT_FLOOR}%", "本根<門檻", "出場成立",
+             "進場價", "出場價", "參考收盤", "偏離%", "延遲s"]
         w2.append(H)
         for i in range(1, len(H) + 1):
             cc = w2.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
@@ -2093,38 +2094,44 @@ async def build_replay_xlsx(day, trades, path):
             c3 = (one is not None and one < bmin)
             fire = bool(c1 and (c2 or c3) and pnl is not None)
             # 進出場那兩根補上實際成交價與滑價
-            ref_c = fill = slip = lagv = None
+            ref_c = in_p = out_p = slip = lagv = None
             if bts == ent_bar:
                 ref_c = fl(t.get("in_ref")) or None
-                fill = ep
+                in_p = ep
                 slip = fl(t.get("in_slip")) if t.get("in_slip") is not None else None
                 lagv = fl(t.get("in_lag")) if t.get("in_lag") is not None else None
             elif bts == exi_bar:
                 ref_c = fl(t.get("out_ref")) or None
-                fill = fl(t.get("out_px")) or None
+                out_p = fl(t.get("out_px")) or None
                 slip = fl(t.get("out_slip")) if t.get("out_slip") is not None else None
                 lagv = fl(t.get("out_lag")) if t.get("out_lag") is not None else None
+            # 原K 的燈號與漲跌幅（以原始開收計，與交易所K棒一致）
+            ro = float(k["o"]); rc = c
+            rbody = (rc - ro) / ro * 100 if ro else 0.0
             w2.append([tag,
                        datetime.fromtimestamp(bts, TZ8).strftime("%m/%d %H:%M"),
-                       float(x["ho"]), float(x["hc"]), c,
-                       ref_c, fill, slip, lagv,
+                       float(x["ho"]), ro, float(x["hc"]), rc,
                        "\U0001F7E9" if x["color"] == "G" else "\U0001F7E5",
-                       body, float(rr) if rr is not None else None,
+                       "\U0001F7E9" if rc >= ro else "\U0001F7E5",
+                       body, rbody, float(rr) if rr is not None else None,
                        one, pnl,
                        "V" if c1 else "",
                        "V" if c2 else "",
                        "V" if c3 else "",
-                       "V" if fire else ""])
+                       "V" if fire else "",
+                       in_p, out_p, ref_c, slip, lagv])
             rr2 = w2.max_row
-            for col in (8, 11, 12, 13, 14): w2.cell(rr2, col).number_format = '0.0000"%"'
-            for col in (3, 4, 5, 6, 7): w2.cell(rr2, col).number_format = "0.######"
-            w2.cell(rr2, 9).number_format = "0.000"
-            for col in (1, 10, 15, 16, 17, 18): w2.cell(rr2, col).alignment = CEN
+            for col in (9, 10, 11, 12, 13, 21): w2.cell(rr2, col).number_format = '0.0000"%"'
+            for col in (3, 4, 5, 6, 18, 19, 20): w2.cell(rr2, col).number_format = "0.######"
+            w2.cell(rr2, 22).number_format = "0.000"
+            for col in (1, 7, 8, 14, 15, 16, 17): w2.cell(rr2, col).alignment = CEN
         w2.freeze_panes = "A2"
-        for i, wdt in enumerate([9, 13, 12, 12, 12,
-                                 12, 12, 11, 9,
-                                 5, 11, 11,
-                                 12, 12, 11, 12, 11, 11], 1):
+        for i, wdt in enumerate([9, 13,
+                                 13, 13, 13, 13,
+                                 7, 7, 12, 12, 10,
+                                 12, 12,
+                                 10, 11, 11, 10,
+                                 12, 12, 12, 10, 9], 1):
             w2.column_dimensions[get_column_letter(i)].width = wdt
         made += 1
 
