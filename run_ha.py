@@ -26,7 +26,10 @@ ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = "/srv/1111bot/data/strategies_ha_o3333o.json"
-HA_LAG = 1           # 收線後幾秒才抓 K 線（越小越貼近開盤價）
+HA_LAG = 0           # 收線後幾秒開始抓（0＝收線瞬間就開始輪詢）
+POLL_MS = 100        # 密集輪詢間隔（毫秒），直到 OKX 標記該根已收線
+POLL_MAX = 12.0      # 密集輪詢最長等幾秒，逾時放棄本輪
+COLLECT_LAG = 3      # 背景收集器的延後秒數（非交易用途，不必搶快）
 HA_HIST = 120        # 抓幾根歷史 K 線做 HA 遞迴
 HB_BARS = 3          # 心跳超過幾根 K 線未推進就告警
 EXIT_FLOOR = 0.1     # 出場條件二之一：累計損益低於此值(%)
@@ -514,14 +517,16 @@ def db_fresh(sym, tf, tol=2):
     want = next_open_epoch(int(time.time()), tf) - 2 * sec
     return int(m[0]["last_ts"]) >= (want - tol * sec) * 1000
 
-async def collect_one(sym, tf, warm=False):
-    """抓一個 (幣種,週期) 並寫入 DB。回傳寫入根數，失敗回 0。"""
+async def collect_one(sym, tf, warm=False, fast=False):
+    """抓一個 (幣種,週期) 並寫入 DB。回傳寫入根數，失敗回 0。
+    fast=True 時只抓最少必要根數，縮短傳輸時間（下單前的密集輪詢用）。"""
     try:
         spec = await get_spec(sym)
     except Exception as e:
         COLLECT_ERR[(sym, tf)] = f"spec:{type(e).__name__}"; return 0
     try:
-        kl, ha = await klines_and_ha(spec["iid"], tf, DB_WARM if warm else HA_HIST)
+        lim = DB_WARM if warm else (60 if fast else HA_HIST)
+        kl, ha = await klines_and_ha(spec["iid"], tf, lim)
         if not ha:
             COLLECT_ERR[(sym, tf)] = "無K線"; return 0
         atrs = calc_atr(kl, 14)
@@ -560,7 +565,7 @@ async def collector(app):
             for tf in TF_LIST:
                 sec = tf_sec(tf)
                 closed = next_open_epoch(int(now), tf) - 2 * sec   # 最後一根已收線的開盤 epoch
-                if now < closed + sec + HA_LAG:                    # 還沒到可抓的時間
+                if now < closed + sec + COLLECT_LAG:               # 還沒到可抓的時間
                     continue
                 want = closed * 1000
                 todo = [s for s in db_symbols() if COLLECT_LAST.get((s, tf), 0) < want]
@@ -875,7 +880,8 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
     tail = ["━" * 10,
             f"進場{ein}｜{fpx}｜{size}張",
             (f"參考收盤{ref_px}｜偏離{slip:+.4f}%"
-             + (f"｜延遲{lag:.1f}s" if lag is not None else "")) if ref_px else "",
+             + (f"｜延遲{lag:.2f}s" if lag is not None else "")) if ref_px else "",
+            (f"取線輪詢{S['_poll'][0]}次／{S['_poll'][1]:.2f}s" if S.get("_poll") else ""),
             f"出場：反向燈號＋(累計<{EXIT_FLOOR}% 或 本根<{pct(S['bar_min'])}%)",
             f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
@@ -966,12 +972,27 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
         if d == "L": xslip = -xslip
     tail = ["━" * 10,
             (f"參考收盤{ref_px}｜偏離{xslip:+.4f}%"
-             + (f"｜延遲{xlag:.1f}s" if xlag is not None else "")) if ref_px else "",
+             + (f"｜延遲{xlag:.2f}s" if xlag is not None else "")) if ref_px else "",
+            (f"取線輪詢{S['_poll'][0]}次／{S['_poll'][1]:.2f}s" if S.get("_poll") else ""),
             f"毛損益{g:+.6f}({gp:+.3f}%)",
             f"手續費{fee:+.6f}({fp:+.3f}%)",
             f"淨損益{net:+.6f}({npv:+.3f}%){E.pnl_emoji(net)}",
             f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
+    # 送單時沒先查持倉，這裡補驗一次有無殘量（不影響上面的下單速度）
+    try:
+        p_left = await okx_pos(iid, pos)
+        if p_left:
+            lft = abs(Decimal(str(p_left.get("availPos") or p_left.get("pos") or "0")))
+            if lft > 0:
+                await api("POST", "/api/v5/trade/order",
+                          {"instId": iid, "tdMode": "isolated", "side": cs, "posSide": pos,
+                           "ordType": "market", "sz": str(lft),
+                           "clOrdId": "y" + uuid.uuid4().hex[:14]})
+                await notify(app, S["chat"],
+                    f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 平倉後仍有 {lft} 張殘量，已補平")
+    except Exception as e:
+        print("residual close fail", e)
     for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
         S.pop(a, None)
     save_state()
@@ -995,19 +1016,23 @@ async def h_takeover(app, S, spec, iid, d, pos):
     return (size, fpx, ee)
 
 # ---------- 主迴圈 ----------
-async def wait_db_bar(sym, tf, want_ts, tries=25):
-    """收線後【立刻自己抓】，不等背景收集器巡邏（那會多等最多 DB_TICK 秒）。
-    抓到就寫進 DB 並回傳，把下單延遲壓到收線後數秒內。"""
+async def wait_db_bar(sym, tf, want_ts):
+    """收線瞬間就開始密集輪詢，直到 OKX 把那根標記為已收線（confirm=1）。
+    回傳 (是否成功, 輪詢次數, 耗時秒)。這是下單延遲的主要來源，
+    間隔設得很短是為了讓成交價盡量貼近下一根的開盤價。"""
+    t0 = time.time()
     r = db_latest(sym, tf, 1)
     if r and int(r[-1]["ts"]) >= want_ts:
-        return True
-    for i in range(tries):
-        await collect_one(sym, tf)
+        return True, 0, 0.0
+    n = 0
+    while time.time() - t0 < POLL_MAX:
+        n += 1
+        await collect_one(sym, tf, fast=True)
         r = db_latest(sym, tf, 1)
         if r and int(r[-1]["ts"]) >= want_ts:
-            return True
-        await asyncio.sleep(0.4)      # 密集重試，讓下單盡量貼近開盤價
-    return False
+            return True, n, time.time() - t0
+        await asyncio.sleep(POLL_MS / 1000.0)
+    return False, n, time.time() - t0
 
 async def hloop(app, chat, S):
     """均K 主迴圈：每根 K 收線後讀 DB 判燈號，決策不打 API。"""
@@ -1034,7 +1059,8 @@ async def hloop(app, chat, S):
             if not S["alive"]: break
 
             want = (oe - tf_sec_v) * 1000
-            ok = await wait_db_bar(S["sym"], S["tf"], want)
+            ok, poll_n, poll_s = await wait_db_bar(S["sym"], S["tf"], want)
+            S["_poll"] = (poll_n, poll_s)
             S["hb"] = time.time(); S["hb_warned"] = False
             if not ok:
                 await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} "
