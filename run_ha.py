@@ -103,7 +103,8 @@ def pct(v): return format(Decimal(str(v)).normalize(), "f")   # 用 f 格式，�
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post",
                "entry_min","bar_min","chat",
-               "pos_open","pos_px","pos_ee","pos_sz","pnl_hist","last_bar")
+               "pos_open","pos_px","pos_ee","pos_sz","pnl_hist","last_bar",
+               "in_lag","in_slip","in_ref","in_poll_n","in_poll_s")
 
 SHUTTING_DOWN = False
 
@@ -873,10 +874,17 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
     ein = datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S")
     lag = slip = None
     if ref_ts is not None:
-        lag = ee - (ref_ts / 1000 + tf_sec(S["tf"]))
+        lag = t_send - (ref_ts / 1000 + tf_sec(S["tf"]))   # 以「送單時刻」計
     if ref_px:
         slip = (fpx - ref_px) / ref_px * 100
         if d == "S": slip = -slip
+    # 存進策略狀態，出場時一併寫入交易紀錄（/replay 報表要用）
+    _pn, _ps = (S.get("_poll") or (None, None))
+    S["in_lag"] = round(lag, 3) if lag is not None else None
+    S["in_slip"] = round(float(slip), 4) if slip is not None else None
+    S["in_ref"] = str(ref_px) if ref_px else None
+    S["in_poll_n"] = _pn
+    S["in_poll_s"] = round(_ps, 3) if _ps is not None else None
     tail = ["━" * 10,
             f"進場{ein}｜{fpx}｜{size}張",
             (f"參考收盤{ref_px}｜偏離{slip:+.4f}%"
@@ -892,7 +900,8 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     p_now = await okx_pos(iid, pos)
     if not p_now:
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 平倉時 OKX 已無持倉，略過")
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
+        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
+              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
             S.pop(a, None)
         save_state()
         return True
@@ -935,6 +944,13 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
     npv = (net / nv * 100) if nv else Decimal(0)
     hs = int(time.time() - ee)
     tfs = tf_sec(S["tf"])
+    xlag = xslip = None
+    if ref_ts is not None:
+        xlag = t_send - (ref_ts / 1000 + tfs)     # 以「送單時刻」計，不含事後查損益
+    if ref_px and xpx:
+        xslip = (Decimal(str(xpx)) - ref_px) / ref_px * 100
+        if d == "L": xslip = -xslip
+    _xpn, _xps = (S.get("_poll") or (None, None))
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
                "hold_s": hs, "bars": round(hs / tfs, 1),
                "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
@@ -944,7 +960,16 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
                "entry_min": str(S["entry_min"]),
                "bar_min": str(S["bar_min"]),
                "lev": S["lev"], "margin": str(S["margin"]),
-               "in_px": str(fpx), "out_px": str(xpx)})
+               "in_px": str(fpx), "out_px": str(xpx),
+               # ── 執行品質 ──
+               "in_lag": S.get("in_lag"), "in_slip": S.get("in_slip"),
+               "in_ref": S.get("in_ref"),
+               "in_poll_n": S.get("in_poll_n"), "in_poll_s": S.get("in_poll_s"),
+               "out_lag": round(xlag, 3) if xlag is not None else None,
+               "out_slip": round(float(xslip), 4) if xslip is not None else None,
+               "out_ref": str(ref_px) if ref_px else None,
+               "out_poll_n": _xpn,
+               "out_poll_s": round(_xps, 3) if _xps is not None else None})
     hist = S.get("pnl_hist") or []
     ico = "🟢" if net >= 0 else "🔴"
     head = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：{ico} 已出場",
@@ -964,12 +989,6 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
         hm2 = str(hrec.get("dt") or "")[11:16]
         lg2 = "\U0001F7E9" if hrec.get("color") == "G" else "\U0001F7E5"
         lines.append(f"{i} {hm2}{lg2}本{hrec.get('one', 0):+.3f}% 累{hrec['pnl']:+.3f}%{mark}")
-    xlag = xslip = None
-    if ref_ts is not None:
-        xlag = time.time() - (ref_ts / 1000 + tfs)
-    if ref_px and xpx:
-        xslip = (Decimal(str(xpx)) - ref_px) / ref_px * 100
-        if d == "L": xslip = -xslip
     tail = ["━" * 10,
             (f"參考收盤{ref_px}｜偏離{xslip:+.4f}%"
              + (f"｜延遲{xlag:.2f}s" if xlag is not None else "")) if ref_px else "",
@@ -993,7 +1012,8 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
                     f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 平倉後仍有 {lft} 張殘量，已補平")
     except Exception as e:
         print("residual close fail", e)
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
+    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
+              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
         S.pop(a, None)
     save_state()
     return True
@@ -1002,7 +1022,8 @@ async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
 async def h_takeover(app, S, spec, iid, d, pos):
     p = await okx_pos(iid, pos)
     if not p:
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
+        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
+              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
             S.pop(a, None)
         save_state()
         return None
@@ -1079,7 +1100,8 @@ async def hloop(app, chat, S):
                 p = await okx_pos(iid, pos)
                 if not p:
                     await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉），重回等訊號")
-                    for a2 in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist"):
+                    for a2 in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
+              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
                         S.pop(a2, None)
                     size = fpx = ee = None
                     save_state(); continue
@@ -1174,7 +1196,8 @@ async def rebuild_strat(d):
          "bar_min": Decimal(str(d["bar_min"])), "spec": spec,
          "alive": True, "state": "等訊號", "chat": d.get("chat", CHAT_ID),
          "hb": time.time(), "hb_warned": False}
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist", "last_bar"):
+    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist", "last_bar",
+              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
         if a in d: S[a] = d[a]
     return S
 
@@ -1990,8 +2013,10 @@ async def build_replay_xlsx(day, trades, path):
 
     wb = Workbook(); ws = wb.active; ws.title = "總表"
     SH = ["#", "幣種", "週期", "方向", "進場時間", "進場價", "出場時間", "出場價",
-          "持倉秒數", "持倉根數", "累計損益%", "淨損益", "前根數", "後根數",
-          "ATR門檻", "本根門檻", "分頁"]
+          "持倉秒數", "持倉根數", "累計損益%", "淨損益",
+          "進場參考價", "進場延遲s", "進場偏離%", "進場輪詢次", "進場輪詢s",
+          "出場參考價", "出場延遲s", "出場偏離%", "出場輪詢次", "出場輪詢s",
+          "前根數", "後根數", "ATR門檻", "本根門檻", "分頁"]
     ws.append(SH)
     for i in range(1, len(SH) + 1):
         cc = ws.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
@@ -2008,14 +2033,23 @@ async def build_replay_xlsx(day, trades, path):
         hm_in = str(t.get("in_ts") or "")[:5]
         tab = f"{idx}_{str(sym)[:6]}_{dr}_{hm_in.replace(':', '')}"[:31]
         nv = fl(t.get("nv")); net = fl(t.get("net"))
+        def nn(v):
+            try: return float(v) if v is not None else None
+            except Exception: return None
         ws.append([idx, sym, tf, dr, t.get("in_ts"), ep, t.get("ts"), fl(t.get("out_px")),
                    int(fl(t.get("hold_s"))), fl(t.get("bars")),
                    (net / nv * 100) if nv else 0.0, net,
+                   nn(t.get("in_ref")), nn(t.get("in_lag")), nn(t.get("in_slip")),
+                   t.get("in_poll_n"), nn(t.get("in_poll_s")),
+                   nn(t.get("out_ref")), nn(t.get("out_lag")), nn(t.get("out_slip")),
+                   t.get("out_poll_n"), nn(t.get("out_poll_s")),
                    int(fl(t.get("pre"), 0)), int(fl(t.get("post"), 0)),
                    fl(t.get("entry_min")), fl(t.get("bar_min")), tab])
         r = ws.max_row
-        for col in (11, 15, 16): ws.cell(r, col).number_format = '0.0000"%"'
+        for col in (11, 15, 20, 25, 26): ws.cell(r, col).number_format = '0.0000"%"'
         ws.cell(r, 12).number_format = "0.000000"
+        for col in (14, 17, 19, 22): ws.cell(r, col).number_format = "0.000"
+        for col in (6, 8, 13, 18): ws.cell(r, col).number_format = "0.######"
         if key not in series or ent is None or exi is None: continue
 
         kl, ha, atrs = series[key]
@@ -2075,8 +2109,45 @@ async def build_replay_xlsx(day, trades, path):
             w2.column_dimensions[get_column_letter(i)].width = wdt
         made += 1
 
+    # ── 執行品質統計 ──
+    def col(name):
+        v = [float(t[name]) for t in trades if t.get(name) is not None]
+        return v
+    w3 = wb.create_sheet("執行品質")
+    w3.append(["項目", "筆數", "平均", "中位", "最大", "最小"])
+    for i in range(1, 7):
+        cc = w3.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
+    for lab, key, fmtn in [("進場延遲(s)", "in_lag", "0.000"),
+                           ("出場延遲(s)", "out_lag", "0.000"),
+                           ("進場偏離(%)", "in_slip", '0.0000"%"'),
+                           ("出場偏離(%)", "out_slip", '0.0000"%"'),
+                           ("進場輪詢(次)", "in_poll_n", "0"),
+                           ("出場輪詢(次)", "out_poll_n", "0"),
+                           ("進場輪詢(s)", "in_poll_s", "0.000"),
+                           ("出場輪詢(s)", "out_poll_s", "0.000")]:
+        v = col(key)
+        if not v:
+            w3.append([lab, 0, None, None, None, None]); continue
+        sv = sorted(v); m = len(sv)
+        med = sv[m // 2] if m % 2 else (sv[m // 2 - 1] + sv[m // 2]) / 2
+        w3.append([lab, m, sum(v) / m, med, max(v), min(v)])
+        for c2 in range(3, 7):
+            w3.cell(w3.max_row, c2).number_format = fmtn
+    w3.append([])
+    w3.append(["說明"])
+    w3.cell(w3.max_row, 1).font = Font(bold=True)
+    for line in ["延遲＝K線收線到送出委託的秒數",
+                 "偏離＝成交價相對該根收盤價的差距，正值代表對你有利",
+                 "輪詢＝等 OKX 標記該根已收線所打的次數與耗時"]:
+        w3.append([line])
+    for c3, wd in (("A", 16), ("B", 9), ("C", 12), ("D", 12), ("E", 12), ("F", 12)):
+        w3.column_dimensions[c3].width = wd
+
     ws.freeze_panes = "A2"
-    for i, wdt in enumerate([5, 11, 7, 6, 11, 12, 11, 12, 10, 10, 12, 12, 8, 8, 11, 11, 18], 1):
+    for i, wdt in enumerate([5, 11, 7, 6, 11, 12, 11, 12, 10, 10, 12, 12,
+                             12, 11, 11, 11, 11,
+                             12, 11, 11, 11, 11,
+                             8, 8, 11, 11, 18], 1):
         ws.column_dimensions[get_column_letter(i)].width = wdt
     wb.save(path)
     return made
