@@ -2062,7 +2062,9 @@ async def build_replay_xlsx(day, trades, path):
         hi = exi_bar + 2 * sec
 
         w2 = wb.create_sheet(tab)
-        H = ["標記", "開盤時間", "均K開", "均K收", "燈", "漲跌幅", "ATR14r",
+        H = ["標記", "開盤時間", "均K開", "均K收", "原K收",
+             "參考收盤", "成交價", "偏離%", "延遲s",
+             "燈", "漲跌幅", "ATR14r",
              "本根損益", "累計損益", "反向燈號", f"累計<{EXIT_FLOOR}%",
              "本根<門檻", "出場成立"]
         w2.append(H)
@@ -2090,9 +2092,22 @@ async def build_replay_xlsx(day, trades, path):
             c2 = (pnl is not None and pnl < EXIT_FLOOR)
             c3 = (one is not None and one < bmin)
             fire = bool(c1 and (c2 or c3) and pnl is not None)
+            # 進出場那兩根補上實際成交價與滑價
+            ref_c = fill = slip = lagv = None
+            if bts == ent_bar:
+                ref_c = fl(t.get("in_ref")) or None
+                fill = ep
+                slip = fl(t.get("in_slip")) if t.get("in_slip") is not None else None
+                lagv = fl(t.get("in_lag")) if t.get("in_lag") is not None else None
+            elif bts == exi_bar:
+                ref_c = fl(t.get("out_ref")) or None
+                fill = fl(t.get("out_px")) or None
+                slip = fl(t.get("out_slip")) if t.get("out_slip") is not None else None
+                lagv = fl(t.get("out_lag")) if t.get("out_lag") is not None else None
             w2.append([tag,
                        datetime.fromtimestamp(bts, TZ8).strftime("%m/%d %H:%M"),
-                       float(x["ho"]), float(x["hc"]),
+                       float(x["ho"]), float(x["hc"]), c,
+                       ref_c, fill, slip, lagv,
                        "\U0001F7E9" if x["color"] == "G" else "\U0001F7E5",
                        body, float(rr) if rr is not None else None,
                        one, pnl,
@@ -2101,11 +2116,15 @@ async def build_replay_xlsx(day, trades, path):
                        "V" if c3 else "",
                        "V" if fire else ""])
             rr2 = w2.max_row
-            for col in (6, 7, 8, 9): w2.cell(rr2, col).number_format = '0.0000"%"'
-            for col in (3, 4): w2.cell(rr2, col).number_format = "0.######"
-            for col in (1, 5, 10, 11, 12, 13): w2.cell(rr2, col).alignment = CEN
+            for col in (8, 11, 12, 13, 14): w2.cell(rr2, col).number_format = '0.0000"%"'
+            for col in (3, 4, 5, 6, 7): w2.cell(rr2, col).number_format = "0.######"
+            w2.cell(rr2, 9).number_format = "0.000"
+            for col in (1, 10, 15, 16, 17, 18): w2.cell(rr2, col).alignment = CEN
         w2.freeze_panes = "A2"
-        for i, wdt in enumerate([9, 13, 12, 12, 5, 11, 11, 12, 12, 11, 12, 11, 11], 1):
+        for i, wdt in enumerate([9, 13, 12, 12, 12,
+                                 12, 12, 11, 9,
+                                 5, 11, 11,
+                                 12, 12, 11, 12, 11, 11], 1):
             w2.column_dimensions[get_column_letter(i)].width = wdt
         made += 1
 
