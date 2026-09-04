@@ -1865,6 +1865,7 @@ async def cmd_menu(u, c):
         "/summary 當日戰報\n"
         "/coins 幣種\n"
         "/ha 商品 根數  燈號+ATR 報表 Excel 寄信（3~2000根）\n"
+        "/replay 逐筆回溯報表 Excel 寄信（/replay 20260904）\n"
         "━━━━━━━━━━\n"
         "/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 本根損益率%\n"
         "例：/run BTCUSDT L 1 100 5 2 0.6 -0.1%\n"
@@ -1887,6 +1888,209 @@ async def cmd_menu(u, c):
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
+
+# ---------- /replay 逐筆回溯報表 ----------
+def send_xlsx_mail(path, name, subject, body):
+    """通用：寄出一個 xlsx 附件。回傳 (ok, 訊息)。"""
+    import smtplib
+    from email.message import EmailMessage
+    env = {}
+    try:
+        for line in open("/srv/1111bot/.env"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                kk, vv = line.split("=", 1)
+                env[kk.strip()] = vv.strip().strip('"').strip("'")
+    except Exception as e:
+        return False, "讀 .env 失敗：%s" % e
+    user = env.get("GMAIL_USER")
+    pwd = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "")
+    to = env.get("REPORT_TO") or user
+    if not user or not pwd:
+        return False, "未設定 GMAIL_USER / GMAIL_APP_PASSWORD"
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = user; msg["To"] = to
+    msg.set_content(body)
+    msg.add_attachment(open(path, "rb").read(),
+                       maintype="application",
+                       subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       filename=name)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as sv:
+        sv.login(user, pwd); sv.send_message(msg)
+    return True, to
+
+def _epoch(day, hms):
+    """day 'YYYY-MM-DD' + hms 'HH:MM:SS' -> epoch 秒（UTC+8）"""
+    try:
+        return datetime.strptime(day + " " + str(hms)[:8],
+                                 "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ8).timestamp()
+    except Exception:
+        return None
+
+async def build_replay_xlsx(day, trades, path):
+    """每筆成交一個分頁，逐根列出燈號 / ATR / 損益 / 出場條件檢查。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    HF = Font(bold=True, color="FFFFFF"); HFILL = PatternFill("solid", fgColor="404040")
+    CEN = Alignment(horizontal="center")
+
+    # 先把每筆的進出場 epoch 算出來（跨日則進場歸前一天）
+    for t in trades:
+        et = _epoch(day, t.get("in_ts")); xt = _epoch(day, t.get("ts"))
+        if et is not None and xt is not None and et > xt:
+            et -= 86400
+        t["_ent"] = et; t["_exi"] = xt
+
+    # 依 (幣種,週期) 分組，一組只抓一次 K 線
+    groups = {}
+    for t in trades:
+        groups.setdefault((t.get("sym"), t.get("tf") or ACCOUNT_TF), []).append(t)
+    series = {}
+    for (sym, tf), ts_ in groups.items():
+        if tf not in HA_TF: continue
+        try:
+            spec = await get_spec(sym)
+        except Exception:
+            continue
+        sec = tf_sec(tf)
+        ents = [t["_ent"] for t in ts_ if t.get("_ent")]
+        if not ents: continue
+        need = int((time.time() - min(ents)) / sec) + 60
+        kl = await klines_paged_for_tf(spec["iid"], tf, max(60, min(2000, need)))
+        if not kl: continue
+        series[(sym, tf)] = (kl, calc_ha(kl), calc_atr(kl, 14))
+
+    wb = Workbook(); ws = wb.active; ws.title = "總表"
+    SH = ["#", "幣種", "週期", "方向", "進場時間", "進場價", "出場時間", "出場價",
+          "持倉秒數", "持倉根數", "累計損益%", "淨損益", "前根數", "後根數",
+          "ATR門檻", "本根門檻", "分頁"]
+    ws.append(SH)
+    for i in range(1, len(SH) + 1):
+        cc = ws.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
+
+    def fl(v, d=0.0):
+        try: return float(v)
+        except Exception: return d
+
+    made = 0
+    for idx, t in enumerate(trades, 1):
+        sym = t.get("sym"); tf = t.get("tf") or ACCOUNT_TF; dr = t.get("dir")
+        key = (sym, tf)
+        ep = fl(t.get("in_px")); ent = t.get("_ent"); exi = t.get("_exi")
+        hm_in = str(t.get("in_ts") or "")[:5]
+        tab = f"{idx}_{str(sym)[:6]}_{dr}_{hm_in.replace(':', '')}"[:31]
+        nv = fl(t.get("nv")); net = fl(t.get("net"))
+        ws.append([idx, sym, tf, dr, t.get("in_ts"), ep, t.get("ts"), fl(t.get("out_px")),
+                   int(fl(t.get("hold_s"))), fl(t.get("bars")),
+                   (net / nv * 100) if nv else 0.0, net,
+                   int(fl(t.get("pre"), 0)), int(fl(t.get("post"), 0)),
+                   fl(t.get("entry_min")), fl(t.get("bar_min")), tab])
+        r = ws.max_row
+        for col in (11, 15, 16): ws.cell(r, col).number_format = '0.0000"%"'
+        ws.cell(r, 12).number_format = "0.000000"
+        if key not in series or ent is None or exi is None: continue
+
+        kl, ha, atrs = series[key]
+        sec = tf_sec(tf)
+        pre = int(fl(t.get("pre"), 1)); post = int(fl(t.get("post"), 1))
+        bmin = fl(t.get("bar_min"), -0.1)
+        ent_bar = int(ent // sec) * sec
+        exi_bar = int(exi // sec) * sec
+        lo = ent_bar - (pre + post + 3) * sec
+        hi = exi_bar + 2 * sec
+
+        w2 = wb.create_sheet(tab)
+        H = ["標記", "開盤時間", "均K開", "均K收", "燈", "漲跌幅", "ATR14r",
+             "本根損益", "累計損益", "反向燈號", f"累計<{EXIT_FLOOR}%",
+             "本根<門檻", "出場成立"]
+        w2.append(H)
+        for i in range(1, len(H) + 1):
+            cc = w2.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
+        want_rev = "R" if dr == "L" else "G"
+        prev_c = None; fired = False
+        for i, k in enumerate(kl):
+            bts = int(k["ts"]) // 1000
+            if bts < lo or bts > hi: continue
+            x = ha[i]; a, rr = atrs[i]
+            c = float(k["c"])
+            body = float((x["hc"] - x["ho"]) / x["ho"] * 100) if x["ho"] else 0.0
+            if bts < ent_bar:
+                tag = "訊號"; one = pnl = None
+            else:
+                tag = ("進場" if bts == ent_bar else
+                       "出場" if bts == exi_bar else
+                       "出場後" if bts > exi_bar else "持倉")
+                pnl = (c - ep) / ep * 100 if dr == "L" else (ep - c) / ep * 100
+                base = prev_c if prev_c is not None else ep
+                one = (c - base) / base * 100 if dr == "L" else (base - c) / base * 100
+            if bts >= ent_bar: prev_c = c
+            c1 = (x["color"] == want_rev)
+            c2 = (pnl is not None and pnl < EXIT_FLOOR)
+            c3 = (one is not None and one < bmin)
+            fire = bool(c1 and (c2 or c3) and pnl is not None)
+            w2.append([tag,
+                       datetime.fromtimestamp(bts, TZ8).strftime("%m/%d %H:%M"),
+                       float(x["ho"]), float(x["hc"]),
+                       "\U0001F7E9" if x["color"] == "G" else "\U0001F7E5",
+                       body, float(rr) if rr is not None else None,
+                       one, pnl,
+                       "V" if c1 else "",
+                       "V" if c2 else "",
+                       "V" if c3 else "",
+                       "V" if fire else ""])
+            rr2 = w2.max_row
+            for col in (6, 7, 8, 9): w2.cell(rr2, col).number_format = '0.0000"%"'
+            for col in (3, 4): w2.cell(rr2, col).number_format = "0.######"
+            for col in (1, 5, 10, 11, 12, 13): w2.cell(rr2, col).alignment = CEN
+        w2.freeze_panes = "A2"
+        for i, wdt in enumerate([9, 13, 12, 12, 5, 11, 11, 12, 12, 11, 12, 11, 11], 1):
+            w2.column_dimensions[get_column_letter(i)].width = wdt
+        made += 1
+
+    ws.freeze_panes = "A2"
+    for i, wdt in enumerate([5, 11, 7, 6, 11, 12, 11, 12, 10, 10, 12, 12, 8, 8, 11, 11, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = wdt
+    wb.save(path)
+    return made
+
+async def cmd_replay(u, c):
+    """逐筆回溯報表（Excel 寄信）。用法：/replay 或 /replay 20260904"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    day = today8()
+    if c.args:
+        a0 = str(c.args[0]).strip()
+        if a0 in ("yesterday", "昨天"):
+            day = (now8() - timedelta(days=1)).strftime("%Y-%m-%d")
+        elif len(a0) == 8 and a0.isdigit():
+            day = f"{a0[:4]}-{a0[4:6]}-{a0[6:]}"
+        elif len(a0) == 10 and a0.count("-") == 2:
+            day = a0
+        else:
+            await reply(u, f"{E.BOT} 日期格式：/replay 20260904 或 /replay 昨天"); return
+    trades = load_trades(day)
+    if not trades:
+        await reply(u, f"{E.BOT} {day} 無成交紀錄"); return
+    await reply(u, f"{E.BOT} 產生 {day} 逐筆回溯報表中（{len(trades)} 筆），請稍候…")
+    name = f"OKX_{ACCT}_均K回溯_{day.replace('-', '')}.xlsx"
+    path = f"/srv/1111bot/data/{name}"
+    try:
+        made = await build_replay_xlsx(day, trades, path)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 產生失敗：{type(e).__name__}: {e}"); return
+    tn = sum((float(t.get("net") or 0) for t in trades), 0.0)
+    body = ("帳號 %s\n策略 均K\n日期 %s\n成交筆數 %d\n明細分頁 %d\n淨損益 %+.6f USDT\n\n"
+            "每筆一個分頁，逐根列出燈號 / ATR14r / 本根損益 / 累計損益，\n"
+            "並標示三個出場條件是否成立。\n" % (ACCT, day, len(trades), made, tn))
+    try:
+        ok, info = send_xlsx_mail(path, name, f"OKX {ACCT} 均K逐筆回溯 {day}（{len(trades)} 筆）", body)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
+    if not ok:
+        await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
+    await reply(u, f"{E.BOT} ✅ 回溯報表已寄出\n{day}｜{len(trades)} 筆｜明細分頁 {made}\n"
+                   f"淨損益 {tn:+.6f} USDT\n時間：{hhmmss()}")
 
 # ---------- 每日 Email 日報（00:05 寄前一日） ----------
 def build_daily_xlsx(day, trades, path):
@@ -2060,7 +2264,7 @@ async def _post_init(app):
             BotCommand("coins", "幣種"), BotCommand("ha", "燈號+ATR 報表寄信"),
             BotCommand("run", "建立均K策略"), BotCommand("confirm", "確認執行"),
             BotCommand("stop", "停指定"), BotCommand("stopall", "停全部"),
-            BotCommand("db", "行情DB狀態"), BotCommand("timeframe", "週期"),
+            BotCommand("replay", "逐筆回溯報表寄信"), BotCommand("db", "行情DB狀態"), BotCommand("timeframe", "週期"),
             BotCommand("menu", "說明")]
     scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
     try:
@@ -2104,7 +2308,7 @@ def main():
            .get_updates_connect_timeout(30.0).build())
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
-                    ("summary", cmd_summary), ("ha", cmd_ha), ("db", cmd_db),
+                    ("summary", cmd_summary), ("ha", cmd_ha), ("replay", cmd_replay), ("db", cmd_db),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
