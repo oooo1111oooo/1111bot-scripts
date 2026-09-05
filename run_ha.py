@@ -32,7 +32,8 @@ POLL_MAX = 12.0      # 密集輪詢最長等幾秒，逾時放棄本輪
 COLLECT_LAG = 3      # 背景收集器的延後秒數（非交易用途，不必搶快）
 HA_HIST = 120        # 抓幾根歷史 K 線做 HA 遞迴
 HB_BARS = 3          # 心跳超過幾根 K 線未推進就告警
-EXIT_FLOOR = 0.1     # 出場條件二之一：累計損益低於此值(%)
+MOVE_TICK = 1.0      # 框架移動任務心跳（秒）；各策略依自己的間隔對齊整秒觸發
+ALGO_PFX = "a"       # 止盈止損 algo 單的 clOrdId 前綴（與 h/y/n/x 區隔）
 HA_MAX  = 2000       # /ha 單次最多抓幾根
 DB_FILE = "/srv/1111bot/data/ha_market.db"
 DB_KEEP = 30         # 每個 (幣種,週期) 在 DB 保留幾根（連續均K 很少超過30）
@@ -102,8 +103,9 @@ def pct(v): return format(Decimal(str(v)).normalize(), "f")   # 用 f 格式，�
 
 # ---------- 狀態持久化（原子寫入） ----------
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","pre","post",
-               "entry_min","bar_min","chat",
+               "tp_pct","sl_pct","move_pct","interval","chat",
                "pos_open","pos_px","pos_ee","pos_sz","pnl_hist","last_bar",
+               "algo_id","tp_px","sl_px","frame_base","move_n","last_move",
                "in_lag","in_slip","in_ref","in_poll_n","in_poll_s")
 
 SHUTTING_DOWN = False
@@ -204,6 +206,11 @@ async def get_spec(s):
 async def get_last(iid):
     r = await pub(f"/api/v5/market/ticker?instId={iid}")
     return Decimal(r["data"][0]["last"])
+
+def align(px, tick, d):
+    """價格對齊 tickSz：d="L" 向下取、d="S" 向上取（保守方向）。"""
+    return (Decimal(str(px)) / tick).to_integral_value(
+        rounding=ROUND_FLOOR if d == "L" else ROUND_CEILING) * tick
 
 def csize(m, lev, px, cv, lot):
     return ((m * lev / px) / cv / lot).to_integral_value(rounding=ROUND_DOWN) * lot
@@ -726,50 +733,42 @@ async def notify_long(app, chat, head, lines, tail):
 GRN = "\U0001F7E9"
 RED = "\U0001F7E5"
 
-def bar_line(r, want=None, sec=True):
-    """一根明細：要求色 時間 實際色 漲跌幅 | ATR14r（顏色不符則行尾標 ❌）
-    want 為 None 時只印實際色（例如逐根利潤那種不需要比對的場合）。"""
+def bar_line(r, want=None, v1=None, v2=None, sec=True):
+    """一根明細：要求色 時間 實際色 值1｜值2（顏色不符則行尾標 ❌）
+    預設 值1=本根 ATR14 ratio、值2=累計 ATR14 ratio。"""
     act = GRN if r.get("color") == "G" else RED
-    b = float(r.get("body_pct") or 0)
     a = r.get("atr14_ratio")
-    astr = ("%.4f%%" % float(a)) if a is not None else "-"
+    n1 = v1 if v1 is not None else (("%.4f%%" % float(a)) if a is not None else "-")
+    n2 = v2 if v2 is not None else "-"
     dt = str(r.get("dt") or "")
-    hm = dt[11:19] if sec and len(dt) >= 19 else dt[11:16]
+    hm_ = dt[11:19] if sec and len(dt) >= 19 else dt[11:16]
     lv = "*" if r.get("live") else ""
     if want is None:
-        return f"{act}{hm}{lv}{b:+.4f}%|{astr}"
+        return f"{act}{hm_}{lv} {n1}｜{n2}"
     wl = GRN if want == "G" else RED
     bad = "\u274c" if r.get("color") != want else ""
-    return f"{wl}{hm}{lv}{act}{b:+.4f}%|{astr}{bad}"
+    return f"{wl}{hm_}{lv}{act} {n1}｜{n2}{bad}"
 
-def entry_lines(info, dr, entry_min):
-    """進場條件明細：前段 → 虛線 → 後段 → ΣATR14r 比對。三個畫面共用。"""
+def entry_lines(info, dr):
+    """進場條件明細：前段 → 虛線 → 後段。
+    每根顯示 本根ATR14r｜累計ATR14r（累計只在順向段內累加）。"""
     opp = "R" if dr == "L" else "G"
     want = "G" if dr == "L" else "R"
     L = [bar_line(x, opp) for x in info["pre_seg"]]
     L.append("\u2504" * 18)
-    L += [bar_line(x, want) for x in info["post_seg"]]
-    ok = "\u2705" if info["entry_ok"] else "\u274c"
-    L.append(f"ΣATR14r{info['atr_sum']:.4f}%{ok}≥{pct(entry_min)}%")
+    acc = 0.0
+    for x in info["post_seg"]:
+        v = float(x.get("atr14_ratio") or 0)
+        acc += v
+        L.append(bar_line(x, want, "%.4f%%" % v, "%.4f%%" % acc))
     return L
 
-# ---------- 訊號判定（資料一律來自本機 DB）----------
-def disp(rows):
-    """ATR14 ratio 標準化位移 = |Σ 均K實體漲跌幅| / Σ ATR14 ratio
-    分子取絕對值，代表這段走了多遠；分母是同段的波動總量。
-    比值大 = 單向推進；比值小 = 來回盤整。"""
-    num = abs(sum(float(r.get("body_pct") or 0) for r in rows))
-    den = sum(float(r.get("atr14_ratio") or 0) for r in rows)
-    if den <= 0: return None
-    return num / den
-
-def judge_entry_db(rows, d, pre, post, entry_min):
+def judge_entry_db(rows, d, pre, post):
     """rows 為舊->新，至少 pre+post 根。
-    進場條件（三項同時成立）：
+    進場條件（兩項同時成立）：
       1. 前 pre 根全為反向色（確認是真反轉，不是順勢中途）
       2. 後 post 根全為順勢色（做多綠、做空紅）
-      3. 後 post 根的 ATR14 ratio 累加 >= entry_min（單位：%）
-    漲跌幅一併回傳供核對，但不參與判定。"""
+    ATR 仍照常計算並顯示，但目前不參與判定。"""
     need = pre + post
     if len(rows) < need: return None
     seg = rows[-need:]
@@ -779,34 +778,99 @@ def judge_entry_db(rows, d, pre, post, entry_min):
     pre_ok = all(r.get("color") == opp for r in pre_seg)
     color_ok = all(r.get("color") == want for r in post_seg)
     atr_sum = sum(float(r.get("atr14_ratio") or 0) for r in post_seg)
-    body_sum = sum(float(r.get("body_pct") or 0) for r in post_seg)
     return {"pre_seg": pre_seg, "post_seg": post_seg,
-            "pre_ok": pre_ok, "color_ok": color_ok,
-            "atr_sum": atr_sum, "body_sum": body_sum,
-            "entry_ok": atr_sum >= entry_min,
-            "hit": pre_ok and color_ok and atr_sum >= entry_min}
+            "pre_ok": pre_ok, "color_ok": color_ok, "atr_sum": atr_sum,
+            "hit": pre_ok and color_ok}
 
-def judge_exit_db(rows, d, entry_px, bar_min):
-    """出場判定（rows 為最後兩根，舊->新）。
-    條件一：出現反向燈號（做多要紅、做空要綠）—— 必要條件
-    條件二：累計損益 < EXIT_FLOOR%  或  本根損益 < bar_min%  —— 擇一
-    兩者同時成立才出場。"""
-    if not rows: return None
-    last = rows[-1]
-    prev = rows[-2] if len(rows) >= 2 else None
-    ep = float(entry_px)
-    if ep == 0: return None
-    c = float(last["c"])
-    pnl = (c - ep) / ep * 100 if d == "L" else (ep - c) / ep * 100
-    base = float(prev["c"]) if prev else ep
-    one = (c - base) / base * 100 if d == "L" else (base - c) / base * 100
-    want_rev = "R" if d == "L" else "G"
-    rev_ok = last.get("color") == want_rev
-    floor_ok = pnl < EXIT_FLOOR
-    bar_ok = one < float(bar_min)
-    return {"pnl": pnl, "one": one, "color": last.get("color"),
-            "rev_ok": rev_ok, "floor_ok": floor_ok, "bar_ok": bar_ok,
-            "hit": rev_ok and (floor_ok or bar_ok)}
+# ---------- 止盈止損框架（OKX algo 單，交易所端保護） ----------
+def frame_px(entry_px, d, tp_pct, sl_pct, tick):
+    """由進場價算出初始止盈 / 止損觸發價，並對齊 tickSz。"""
+    ep = Decimal(str(entry_px))
+    if d == "L":
+        tp = ep * (Decimal(1) + Decimal(str(tp_pct)) / 100)
+        sl = ep * (Decimal(1) - Decimal(str(sl_pct)) / 100)
+        return align(tp, tick, "S"), align(sl, tick, "L")
+    tp = ep * (Decimal(1) - Decimal(str(tp_pct)) / 100)
+    sl = ep * (Decimal(1) + Decimal(str(sl_pct)) / 100)
+    return align(tp, tick, "L"), align(sl, tick, "S")
+
+async def place_frame(S, spec, iid, d, pos, size, entry_px):
+    """掛一張 OCO：止盈 + 止損同時存在，先觸發的平倉、另一邊由交易所自動取消。
+    掛在交易所端，程式掛掉保護仍在。"""
+    tp, sl = frame_px(entry_px, d, S["tp_pct"], S["sl_pct"], spec["tick"])
+    cs = "sell" if d == "L" else "buy"
+    body = {"instId": iid, "tdMode": "isolated", "side": cs, "posSide": pos,
+            "ordType": "oco", "sz": str(size),
+            "tpTriggerPx": str(tp), "tpOrdPx": "-1",
+            "slTriggerPx": str(sl), "slOrdPx": "-1",
+            "tpTriggerPxType": "last", "slTriggerPxType": "last",
+            "algoClOrdId": ALGO_PFX + uuid.uuid4().hex[:14]}
+    r = await api("POST", "/api/v5/trade/order-algo", body)
+    if r.get("code") != "0":
+        em = (r.get("data") or [{}])[0].get("sMsg") or r.get("msg")
+        return None, str(tp), str(sl), em
+    aid = (r.get("data") or [{}])[0].get("algoId")
+    return aid, str(tp), str(sl), None
+
+async def cancel_frame(iid, algo_id):
+    """撤掉 algo 單。回傳是否成功。"""
+    if not algo_id: return True
+    r = await api("POST", "/api/v5/trade/cancel-algos",
+                  [{"instId": iid, "algoId": str(algo_id)}])
+    return r.get("code") == "0"
+
+async def algo_pending(iid=None):
+    """查未觸發的 algo 單（只認自己的前綴）。"""
+    q = "/api/v5/trade/orders-algo-pending?ordType=oco"
+    if iid: q += f"&instId={iid}"
+    r = await api("GET", q)
+    if r.get("code") != "0": return []
+    out = []
+    for o in (r.get("data") or []):
+        if str(o.get("algoClOrdId") or "").startswith(ALGO_PFX):
+            out.append(o)
+    return out
+
+def frame_shift(S, px, d):
+    """依現價決定框架是否上移（做多）/下移（做空）。
+    移動幅度＝相對上次基準價的漲跌幅，止盈止損整體同步平移。
+    回傳 (新止盈, 新止損, 新基準, 移動幅度%) 或 None（不需移動）。"""
+    try:
+        base = Decimal(str(S.get("frame_base") or S.get("pos_px")))
+        cur = Decimal(str(px))
+        tp = Decimal(str(S["tp_px"])); sl = Decimal(str(S["sl_px"]))
+    except Exception:
+        return None
+    if base <= 0: return None
+    thr = Decimal(str(S["move_pct"])) / 100
+    if d == "L":
+        gain = (cur - base) / base
+        if gain < thr: return None
+    else:
+        gain = (base - cur) / base
+        if gain < thr: return None
+    ratio = cur / base                      # 框架整體按同樣比例平移
+    tick = S["spec"]["tick"]
+    ntp = align(tp * ratio, tick, "S" if d == "L" else "L")
+    nsl = align(sl * ratio, tick, "L" if d == "L" else "S")
+    return ntp, nsl, cur, float(gain * 100)
+
+async def amend_frames(items):
+    """批次修改 algo 單的止盈止損觸發價。items: [(instId, algoId, tp, sl)]
+    OKX 一次最多 10 筆，超過自動分批。回傳成功筆數。"""
+    ok = 0
+    for i in range(0, len(items), 10):
+        chunk = items[i:i+10]
+        body = [{"instId": a, "algoId": str(b),
+                 "newTpTriggerPx": str(c), "newSlTriggerPx": str(e)}
+                for a, b, c, e in chunk]
+        r = await api("POST", "/api/v5/trade/amend-algos", body)
+        if r.get("code") == "0":
+            ok += len(chunk)
+        else:
+            print("amend-algos fail", r.get("code"), r.get("msg"),
+                  (r.get("data") or [{}])[0].get("sMsg") if r.get("data") else "")
+    return ok
 
 # ---------- 進場 ----------
 async def h_open(app, S, spec, iid, d, pos, info, k):
@@ -865,12 +929,21 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
     ee = time.time()
     S["state"] = "持倉中"; S["pos_open"] = True
     S["pos_px"] = str(fpx); S["pos_ee"] = ee; S["pos_sz"] = str(size)
-    S["pnl_hist"] = []                       # 逐根利潤紀錄，出場時列出供核對
+    S["pnl_hist"] = []                       # 逐根損益紀錄，供 /status 與出場核對
+    S["frame_base"] = str(fpx); S["move_n"] = 0; S["last_move"] = ee
     save_state()
+    # 成交後立刻在交易所端掛上止盈止損（OCO），程式掛掉保護仍在
+    aid, tpx, spx, aerr = await place_frame(S, spec, iid, d, pos, size, fpx)
+    S["algo_id"] = aid; S["tp_px"] = tpx; S["sl_px"] = spx
+    save_state()
+    if aerr:
+        await notify(app, S["chat"],
+            f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 止盈止損掛單失敗：{aerr}\n"
+            f"⚠ 目前是裸倉，請至 OKX 手動設定或平倉")
     head = [f"{E.BOT} OKX均K｜{ACCT}", "事件：🔔 訊號進場",
             f"{E.dir_emoji(d)} {d} {S['tf']}",
             strat_params(S["sym"], d) or ""]
-    lines = entry_lines(info, d, S["entry_min"]) if info else []
+    lines = entry_lines(info, d) if info else []
     ein = datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S")
     lag = slip = None
     if ref_ts is not None:
@@ -890,150 +963,44 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
             (f"參考收盤{ref_px}｜偏離{slip:+.4f}%"
              + (f"｜延遲{lag:.2f}s" if lag is not None else "")) if ref_px else "",
             (f"取線輪詢{S['_poll'][0]}次／{S['_poll'][1]:.2f}s" if S.get("_poll") else ""),
-            f"出場：反向燈號＋(累計<{EXIT_FLOOR}% 或 本根<{pct(S['bar_min'])}%)",
+            f"止盈{S.get('tp_px')}（{pct(S['tp_pct'])}%）",
+            f"止損{S.get('sl_px')}（{pct(S['sl_pct'])}%）",
+            f"每{S['interval']}秒檢查，達{pct(S['move_pct'])}%整體平移",
             f"時間：{hhmmss()}"]
     await notify_long(app, S["chat"], head, lines, tail)
-    return True
-
-async def h_exit(app, S, spec, iid, d, pos, size, fpx, ee, reason, k):
-    cs = "sell" if d == "L" else "buy"
-    p_now = await okx_pos(iid, pos)
-    if not p_now:
-        await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 平倉時 OKX 已無持倉，略過")
-        for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
-              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
-            S.pop(a, None)
-        save_state()
-        return True
-    try:
-        real = abs(Decimal(str(p_now.get("availPos") or p_now.get("pos") or "0")))
-        if real > 0:
-            if real != size:
-                print("size mismatch", S.get("sym"), d, "local", size, "okx", real)
-            size = real
-    except Exception:
-        pass
-    t0 = int(time.time() * 1000)
-    xr = await api("POST", "/api/v5/trade/order",
-                   {"instId": iid, "tdMode": "isolated", "side": cs, "posSide": pos,
-                    "ordType": "market", "sz": str(size),
-                    "clOrdId": "y" + uuid.uuid4().hex[:14]})
-    if xr.get("code") != "0":
-        em = (xr.get("data") or [{}])[0].get("sMsg") or xr.get("msg")
-        await notify(app, S["chat"], f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 平倉失敗：{em}\n⚠ 倉位可能仍在，請至 OKX 確認")
-        return False
-    rr = db_latest(S["sym"], S["tf"], 1)
-    ref_px = Decimal(str(rr[-1]["c"])) if rr else None
-    ref_ts = int(rr[-1]["ts"]) if rr else None
-    ph = await close_record(iid, pos, t0)
-    src = "OKX"
-    if ph:
-        g = Decimal(ph.get("pnl") or "0")
-        fee = Decimal(ph.get("fee") or "0") + Decimal(ph.get("fundingFee") or "0")
-        net = Decimal(ph.get("realizedPnl") or "0")
-        xpx = Decimal(ph.get("closeAvgPx") or "0") or await get_last(iid)
-        nv = Decimal(ph.get("openAvgPx") or fpx) * Decimal(ph.get("closeTotalPos") or size) * spec["ctval"]
-    else:
-        src = "估算"
-        xpx = await get_last(iid)
-        g = (xpx - fpx) * size * spec["ctval"] if d == "L" else (fpx - xpx) * size * spec["ctval"]
-        fee = Decimal(0); net = g
-        nv = fpx * size * spec["ctval"]
-    gp = (g / nv * 100) if nv else Decimal(0)
-    fp = (fee / nv * 100) if nv else Decimal(0)
-    npv = (net / nv * 100) if nv else Decimal(0)
-    hs = int(time.time() - ee)
-    tfs = tf_sec(S["tf"])
-    xlag = xslip = None
-    if ref_ts is not None:
-        xlag = t_send - (ref_ts / 1000 + tfs)     # 以「送單時刻」計，不含事後查損益
-    if ref_px and xpx:
-        xslip = (Decimal(str(xpx)) - ref_px) / ref_px * 100
-        if d == "L": xslip = -xslip
-    _xpn, _xps = (S.get("_poll") or (None, None))
-    log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
-               "hold_s": hs, "bars": round(hs / tfs, 1),
-               "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
-               "src": src, "ts": hhmmss(),
-               "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
-               "tf": S["tf"], "pre": str(S["pre"]), "post": str(S["post"]),
-               "entry_min": str(S["entry_min"]),
-               "bar_min": str(S["bar_min"]),
-               "lev": S["lev"], "margin": str(S["margin"]),
-               "in_px": str(fpx), "out_px": str(xpx),
-               # ── 執行品質 ──
-               "in_lag": S.get("in_lag"), "in_slip": S.get("in_slip"),
-               "in_ref": S.get("in_ref"),
-               "in_poll_n": S.get("in_poll_n"), "in_poll_s": S.get("in_poll_s"),
-               "out_lag": round(xlag, 3) if xlag is not None else None,
-               "out_slip": round(float(xslip), 4) if xslip is not None else None,
-               "out_ref": str(ref_px) if ref_px else None,
-               "out_poll_n": _xpn,
-               "out_poll_s": round(_xps, 3) if _xps is not None else None})
-    hist = S.get("pnl_hist") or []
-    ico = "🟢" if net >= 0 else "🔴"
-    head = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：{ico} 已出場",
-            f"{E.dir_emoji(d)} {d} {S['tf']}",
-            strat_params(S["sym"], d) or "",
-            f"進場{datetime.fromtimestamp(ee, TZ8).strftime('%H:%M')}｜{fpx}"
-            f"→出場{hhmm()}｜{xpx}",
-            f"持倉{hs}s（約{hs / tfs:.1f}根）", "━" * 10]
-    lines = []
-    if hist:
-        lines.append(f"本根<{pct(S['bar_min'])}% 或 累計<{EXIT_FLOOR}%")
-    show = hist[-40:]
-    if len(hist) > len(show):
-        lines.append(f"（共{len(hist)}根，只列最後{len(show)}根）")
-    for i, hrec in enumerate(show, start=len(hist) - len(show) + 1):
-        mark = "\u274c" if hrec.get("hit") else ""
-        hm2 = str(hrec.get("dt") or "")[11:16]
-        lg2 = "\U0001F7E9" if hrec.get("color") == "G" else "\U0001F7E5"
-        lines.append(f"{i} {hm2}{lg2}本{hrec.get('one', 0):+.3f}% 累{hrec['pnl']:+.3f}%{mark}")
-    tail = ["━" * 10,
-            (f"參考收盤{ref_px}｜偏離{xslip:+.4f}%"
-             + (f"｜延遲{xlag:.2f}s" if xlag is not None else "")) if ref_px else "",
-            (f"取線輪詢{S['_poll'][0]}次／{S['_poll'][1]:.2f}s" if S.get("_poll") else ""),
-            f"毛損益{g:+.6f}({gp:+.3f}%)",
-            f"手續費{fee:+.6f}({fp:+.3f}%)",
-            f"淨損益{net:+.6f}({npv:+.3f}%){E.pnl_emoji(net)}",
-            f"時間：{hhmmss()}"]
-    await notify_long(app, S["chat"], head, lines, tail)
-    # 送單時沒先查持倉，這裡補驗一次有無殘量（不影響上面的下單速度）
-    try:
-        p_left = await okx_pos(iid, pos)
-        if p_left:
-            lft = abs(Decimal(str(p_left.get("availPos") or p_left.get("pos") or "0")))
-            if lft > 0:
-                await api("POST", "/api/v5/trade/order",
-                          {"instId": iid, "tdMode": "isolated", "side": cs, "posSide": pos,
-                           "ordType": "market", "sz": str(lft),
-                           "clOrdId": "y" + uuid.uuid4().hex[:14]})
-                await notify(app, S["chat"],
-                    f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 平倉後仍有 {lft} 張殘量，已補平")
-    except Exception as e:
-        print("residual close fail", e)
-    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
-              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
-        S.pop(a, None)
-    save_state()
     return True
 
 # ---------- 重啟接管 ----------
 async def h_takeover(app, S, spec, iid, d, pos):
+    """重啟後接回既有持倉，並把交易所端的止盈止損單接回來。"""
     p = await okx_pos(iid, pos)
     if not p:
         for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
-              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
+                  "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "last_move",
+                  "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
             S.pop(a, None)
         save_state()
         return None
     fpx = Decimal(S.get("pos_px") or p.get("avgPx") or "0")
     ee = float(S.get("pos_ee") or time.time())
     size = abs(Decimal(p.get("pos") or "0"))
-    S["state"] = "持倉中"; save_state()
+    S["state"] = "持倉中"
+    try:
+        for o in await algo_pending(iid):
+            if o.get("posSide") == pos:
+                S["algo_id"] = o.get("algoId")
+                if o.get("tpTriggerPx"): S["tp_px"] = o["tpTriggerPx"]
+                if o.get("slTriggerPx"): S["sl_px"] = o["slTriggerPx"]
+                break
+    except Exception as e:
+        print("algo takeover fail", e)
+    if not S.get("frame_base"): S["frame_base"] = str(fpx)
+    save_state()
     await notify(app, S["chat"],
         f"{E.BOT} {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} 已接管既有持倉\n"
-        f"進場價 {fpx}｜{size} 張\n繼續等待反向訊號出場")
+        f"進場價 {fpx}｜{size} 張\n"
+        f"止盈{S.get('tp_px', '-')}／止損{S.get('sl_px', '-')}"
+        + ("｜已接回交易所單" if S.get("algo_id") else "｜⚠ 交易所無止盈止損單"))
     return (size, fpx, ee)
 
 # ---------- 主迴圈 ----------
@@ -1061,11 +1028,9 @@ async def hloop(app, chat, S):
     pos = "long" if d == "L" else "short"
     k = skey(S["sym"], d)
     need = int(S["pre"]) + int(S["post"])
-    size = fpx = None; ee = None
     try:
         if S.get("pos_open"):
-            tk = await h_takeover(app, S, spec, iid, d, pos)
-            if tk: size, fpx, ee = tk
+            await h_takeover(app, S, spec, iid, d, pos)
 
         while S["alive"]:
             tf_sec_v = tf_sec(S["tf"])
@@ -1096,42 +1061,31 @@ async def hloop(app, chat, S):
             S["last_bar"] = bar_ts; save_state()
 
             if S.get("pos_open"):
-                # --- 持倉中：回吐判斷 ---
-                p = await okx_pos(iid, pos)
-                if not p:
-                    await notify(app, chat, f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（可能手動平倉），重回等訊號")
-                    for a2 in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
-              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
-                        S.pop(a2, None)
-                    size = fpx = ee = None
-                    save_state(); continue
-                if S.get("pos_sz"):
-                    size = Decimal(str(S["pos_sz"]))
-                else:
-                    try: size = abs(Decimal(p.get("pos") or "0"))
-                    except Exception: pass
-                if fpx is None: fpx = Decimal(S.get("pos_px") or p.get("avgPx") or "0")
-                if ee is None: ee = float(S.get("pos_ee") or time.time())
-                r = judge_exit_db(rows[-2:], d, fpx, S["bar_min"])
-                if r is None: continue
-                hist = S.get("pnl_hist") or []
-                hist.append({"dt": str(last.get("dt") or ""), "c": float(last["c"]),
-                             "pnl": round(r["pnl"], 4), "one": round(r["one"], 4),
-                             "color": r["color"], "hit": bool(r["hit"])})
-                S["pnl_hist"] = hist[-120:]
-                save_state()
-                if r["hit"]:
-                    await h_exit(app, S, spec, iid, d, pos, size, fpx, ee, "Signal_Exit", k)
-                    size = fpx = ee = None
+                # --- 持倉中：出場已交給交易所端的止盈止損框架，這裡只記錄逐根損益 ---
+                try:
+                    ep2 = Decimal(str(S.get("pos_px") or "0"))
+                    c2 = Decimal(str(last["c"]))
+                    if ep2:
+                        pnl2 = float((c2 - ep2) / ep2 * 100) if d == "L" \
+                               else float((ep2 - c2) / ep2 * 100)
+                        base2 = Decimal(str(rows[-2]["c"])) if len(rows) >= 2 else ep2
+                        one2 = float((c2 - base2) / base2 * 100) if d == "L" \
+                               else float((base2 - c2) / base2 * 100)
+                        hist = S.get("pnl_hist") or []
+                        hist.append({"dt": str(last.get("dt") or ""),
+                                     "c": float(last["c"]),
+                                     "pnl": round(pnl2, 4), "one": round(one2, 4),
+                                     "color": last.get("color")})
+                        S["pnl_hist"] = hist[-120:]
+                        save_state()
+                except Exception as e:
+                    print("pnl_hist fail", e)
             else:
                 # --- 空手：進場判斷 ---
                 if len(rows) < need: continue
-                r = judge_entry_db(rows, d, int(S["pre"]), int(S["post"]), float(S["entry_min"]))
+                r = judge_entry_db(rows, d, int(S["pre"]), int(S["post"]))
                 if r and r["hit"]:
-                    ok2 = await h_open(app, S, spec, iid, d, pos, r, k)
-                    if ok2:
-                        fpx = Decimal(S["pos_px"]); ee = float(S["pos_ee"])
-                        size = Decimal(str(S["pos_sz"]))
+                    await h_open(app, S, spec, iid, d, pos, r, k)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1160,6 +1114,146 @@ async def hloop(app, chat, S):
                 await notify(app, chat, f"{E.BOT} ⚠ {S['sym']} {E.dir_word(d)} 已停止但仍有持倉，請至 OKX 處理")
         except Exception:
             pass
+
+# ---------- 止盈止損框架移動 + 出場偵測 ----------
+async def close_bookkeeping(app, S, reason):
+    """偵測到倉位已不在（止盈或止損觸發）後的收尾：取真實損益、撤殘單、寫紀錄。"""
+    spec = S["spec"]; iid = spec["iid"]; d = S["dir"]
+    pos = "long" if d == "L" else "short"
+    try:
+        fpx = Decimal(str(S.get("pos_px") or "0"))
+    except Exception:
+        fpx = Decimal(0)
+    ee = float(S.get("pos_ee") or time.time())
+    size = Decimal(str(S.get("pos_sz") or "0"))
+    t0 = int(ee * 1000)
+    # 撤掉可能殘留的 algo 單（OCO 通常會自動撤另一邊，這裡保險）
+    try:
+        await cancel_frame(iid, S.get("algo_id"))
+    except Exception as e:
+        print("cancel_frame fail", e)
+    ph = await close_record(iid, pos, t0)
+    src = "OKX"
+    if ph:
+        g = Decimal(ph.get("pnl") or "0")
+        fee = Decimal(ph.get("fee") or "0") + Decimal(ph.get("fundingFee") or "0")
+        net = Decimal(ph.get("realizedPnl") or "0")
+        xpx = Decimal(ph.get("closeAvgPx") or "0") or await get_last(iid)
+        nv = Decimal(ph.get("openAvgPx") or fpx) * Decimal(ph.get("closeTotalPos") or size) * spec["ctval"]
+    else:
+        src = "估算"
+        xpx = await get_last(iid)
+        g = (xpx - fpx) * size * spec["ctval"] if d == "L" else (fpx - xpx) * size * spec["ctval"]
+        fee = Decimal(0); net = g
+        nv = fpx * size * spec["ctval"]
+    gp = (g / nv * 100) if nv else Decimal(0)
+    fp = (fee / nv * 100) if nv else Decimal(0)
+    npv = (net / nv * 100) if nv else Decimal(0)
+    hs = int(time.time() - ee)
+    tfs = tf_sec(S["tf"])
+    log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason,
+               "hold_s": hs, "bars": round(hs / tfs, 1),
+               "gross": str(g), "fee": str(fee), "net": str(net), "nv": str(nv),
+               "src": src, "ts": hhmmss(),
+               "in_ts": datetime.fromtimestamp(ee, TZ8).strftime("%H:%M:%S"),
+               "tf": S["tf"], "pre": str(S["pre"]), "post": str(S["post"]),
+               "tp_pct": str(S["tp_pct"]), "sl_pct": str(S["sl_pct"]),
+               "move_pct": str(S["move_pct"]), "interval": S["interval"],
+               "move_n": S.get("move_n", 0),
+               "tp_px": S.get("tp_px"), "sl_px": S.get("sl_px"),
+               "lev": S["lev"], "margin": str(S["margin"]),
+               "in_px": str(fpx), "out_px": str(xpx),
+               "in_lag": S.get("in_lag"), "in_slip": S.get("in_slip"),
+               "in_ref": S.get("in_ref"),
+               "in_poll_n": S.get("in_poll_n"), "in_poll_s": S.get("in_poll_s")})
+    hist = S.get("pnl_hist") or []
+    ico = "🟢" if net >= 0 else "🔴"
+    head = [f"{E.BOT} OKX均K｜{ACCT}", f"事件：{ico} 已出場",
+            f"{E.dir_emoji(d)} {S['sym']} {d} {S['tf']}",
+            strat_params(S["sym"], d) or "",
+            f"進場{datetime.fromtimestamp(ee, TZ8).strftime('%H:%M')}｜{fpx}"
+            f"→出場{hhmm()}｜{xpx}",
+            f"出場原因：{reason}",
+            f"持倉{hs}s（約{hs / tfs:.1f}根）｜框架移動{S.get('move_n', 0)}次", "━" * 10]
+    lines = []
+    show = hist[-40:]
+    for i, hrec in enumerate(show, start=len(hist) - len(show) + 1):
+        hm2 = str(hrec.get("dt") or "")[11:16]
+        lg2 = "\U0001F7E9" if hrec.get("color") == "G" else "\U0001F7E5"
+        lines.append(f"{i} {hm2}{lg2}本{hrec.get('one', 0):+.3f}% 累{hrec['pnl']:+.3f}%")
+    tail = ["━" * 10,
+            f"毛損益{g:+.6f}({gp:+.3f}%)",
+            f"手續費{fee:+.6f}({fp:+.3f}%)",
+            f"淨損益{net:+.6f}({npv:+.3f}%){E.pnl_emoji(net)}",
+            f"時間：{hhmmss()}"]
+    await notify_long(app, S["chat"], head, lines, tail)
+    for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist",
+              "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "last_move",
+              "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
+        S.pop(a, None)
+    S["state"] = "等訊號"
+    save_state(True)
+
+async def frame_mover(app):
+    """每秒對齊整秒；到了各策略的間隔就查一次全部持倉，
+    需要平移的批次送出 amend-algos。同時偵測倉位消失（止盈/止損已觸發）。"""
+    await asyncio.sleep(5)
+    print("止盈止損框架移動任務已啟動")
+    while True:
+        try:
+            await asyncio.sleep(MOVE_TICK - (time.time() % MOVE_TICK))
+            now = int(time.time())
+            held = [S for S in list(STRATS.values())
+                    if S.get("alive") and S.get("pos_open")]
+            if not held: continue
+            due = [S for S in held if now % max(1, int(S.get("interval", 5))) == 0]
+            if not due: continue
+            r = await api("GET", "/api/v5/account/positions")   # 一次拿全部
+            if r.get("code") != "0": continue
+            live = {}
+            for p in (r.get("data") or []):
+                try:
+                    if float(p.get("pos") or 0) == 0: continue
+                except Exception:
+                    continue
+                sy = p["instId"].replace("-USDT-SWAP", "USDT")
+                live[(sy, "L" if p["posSide"] == "long" else "S")] = p
+            amends = []
+            for S in due:
+                key = (S["sym"], S["dir"])
+                p = live.get(key)
+                if p is None:
+                    # 倉位不在了 -> 止盈或止損已觸發
+                    try:
+                        await close_bookkeeping(app, S, "Frame_Exit")
+                    except Exception as e:
+                        print("close_bookkeeping fail", S["sym"], type(e).__name__, e)
+                    continue
+                px = p.get("last") or p.get("markPx")
+                if not px or not S.get("algo_id"): continue
+                mv = frame_shift(S, px, S["dir"])
+                if not mv: continue
+                ntp, nsl, nbase, gain = mv
+                S["_pending"] = (str(ntp), str(nsl), str(nbase), gain)
+                amends.append((S["spec"]["iid"], S["algo_id"], ntp, nsl, S))
+            if amends:
+                items = [(a, b, c, d2) for a, b, c, d2, _ in amends]
+                okn = await amend_frames(items)
+                for a, b, c, d2, S in amends:
+                    if okn:
+                        ntp, nsl, nbase, gain = S.pop("_pending")
+                        S["tp_px"] = ntp; S["sl_px"] = nsl
+                        S["frame_base"] = nbase
+                        S["move_n"] = int(S.get("move_n", 0)) + 1
+                        S["last_move"] = time.time()
+                    else:
+                        S.pop("_pending", None)
+                if okn: save_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("frame_mover error", type(e).__name__, e)
+            await asyncio.sleep(2)
 
 # ---------- 心跳看門狗 ----------
 async def hb_watch(app):
@@ -1192,11 +1286,14 @@ async def rebuild_strat(d):
     S = {"sym": d["sym"], "dir": d["dir"], "tf": d.get("tf", ACCOUNT_TF),
          "lev": int(d["lev"]), "margin": Decimal(str(d["margin"])),
          "pre": int(d["pre"]), "post": int(d["post"]),
-         "entry_min": Decimal(str(d["entry_min"])),
-         "bar_min": Decimal(str(d["bar_min"])), "spec": spec,
+         "tp_pct": Decimal(str(d["tp_pct"])),
+         "sl_pct": Decimal(str(d["sl_pct"])),
+         "move_pct": Decimal(str(d["move_pct"])),
+         "interval": int(d["interval"]), "spec": spec,
          "alive": True, "state": "等訊號", "chat": d.get("chat", CHAT_ID),
          "hb": time.time(), "hb_warned": False}
     for a in ("pos_open", "pos_px", "pos_ee", "pos_sz", "pnl_hist", "last_bar",
+              "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "last_move",
               "in_lag", "in_slip", "in_ref", "in_poll_n", "in_poll_s"):
         if a in d: S[a] = d[a]
     return S
@@ -1238,38 +1335,38 @@ def strat_params(sym, dr):
     S = STRATS.get(skey(sym, dr))
     if not S or not S.get("alive"):
         return None
-    return (f"/run {sym} {dr} {S['lev']} {pct(S['margin'])} "
-            f"{S['pre']} {S['post']} {pct(S['entry_min'])} {pct(S['bar_min'])}%")
+    return (f"/run {sym} {dr} {S['lev']}x {pct(S['margin'])} "
+            f"{S['pre']} {S['post']} {pct(S['tp_pct'])}% {pct(S['sl_pct'])}% "
+            f"{pct(S['move_pct'])}% {S['interval']}")
 
 async def strat_detail(S, sym, dr, mark_px=None):
-    """單一策略的完整現況：空手列進場條件明細，持倉列利潤與出場距離。"""
+    """單一策略現況。空手列進場燈號，持倉列止盈止損框架。"""
     L = []
     tf = S["tf"]
-    L.append(f"{E.dir_emoji(dr)} {dr} {tf}")
+    L.append(f"{E.dir_emoji(dr)} {sym} {dr} {tf}")
     L.append(strat_params(sym, dr) or "")
     if not S.get("pos_open"):
-        L.append("狀態：等訊號")
         pre = int(S["pre"]); post = int(S["post"])
-        # 即時抓（含進行中那根）；失敗才退回 DB 的已收線資料
         rows = await live_rows(sym, tf, pre + post)
         src_live = bool(rows) and len(rows) >= pre + post
         if not src_live:
             rows = db_latest(sym, tf, pre + post)
             if len(rows) < pre + post:
-                L.append(f"⚠ 資料不足（{len(rows)}/{pre+post} 根）")
+                L.append(f"狀態：⚠ 資料不足（{len(rows)}/{pre+post} 根）")
                 return L
+        r = judge_entry_db(rows, dr, pre, post)
+        L.append("狀態：" + ("有機會進場（差收線）" if r and r["hit"] else "尚無符合條件"))
+        if not src_live:
             L.append("⚠ 即時取價失敗，以下為最後已收線資料")
-        r = judge_entry_db(rows, dr, pre, post, float(S["entry_min"]))
-        L += entry_lines(r, dr, S["entry_min"])
+        L += entry_lines(r, dr)
         if src_live and rows[-1].get("live"):
             L.append("* 為進行中，收線前仍會變動")
         return L
-    # ---- 持倉中 ----
+    # ── 持倉中 ──
     L.append("狀態：📌 持倉中")
-    try: epx = Decimal(str(S.get("pos_px") or "0"))
-    except Exception: epx = Decimal(0)
-    sz = S.get("pos_sz") or "?"
-    L.append(f"進場價 {epx}｜{sz} 張")
+    now = hhmmss()
+    ein = datetime.fromtimestamp(float(S.get("pos_ee") or time.time()),
+                                 TZ8).strftime("%H:%M:%S")
     cur = None
     if mark_px:
         try: cur = Decimal(str(mark_px))
@@ -1277,91 +1374,87 @@ async def strat_detail(S, sym, dr, mark_px=None):
     if cur is None:
         rr = db_latest(sym, tf, 1)
         if rr: cur = Decimal(str(rr[-1]["c"]))
-    # 即時抓（含進行中那根），失敗才退回 DB 已收線資料
-    lr = await live_rows(sym, tf, 2)
-    live_row = lr[-1] if lr and lr[-1].get("live") else None
-    if lr and len(lr) >= 2:
-        ref = lr; is_live = live_row is not None
+    tp = S.get("tp_px"); sl = S.get("sl_px"); ep = S.get("pos_px")
+    if dr == "L":
+        L.append(f"止盈價：{tp}｜{now}")
+        L.append(f"進場價：{ep}｜{ein}")
+        L.append(f"止損價：{sl}｜{now}")
     else:
-        ref = db_latest(sym, tf, 2); is_live = False
-    ep = float(epx) if epx else 0.0
-    if ref and ep:
-        c_now = float(ref[-1]["c"])
-        base = float(ref[-2]["c"]) if len(ref) >= 2 else ep
-        pnl = (c_now - ep) / ep * 100 if dr == "L" else (ep - c_now) / ep * 100
-        one = (c_now - base) / base * 100 if dr == "L" else (base - c_now) / base * 100
-        col = ref[-1].get("color")
-        want_rev = "R" if dr == "L" else "G"
-        rev_lg = "\U0001F7E5" if dr == "L" else "\U0001F7E9"
-        cur_lg = "\U0001F7E9" if col == "G" else "\U0001F7E5"
-        c1 = (col == want_rev)
-        c2 = pnl < EXIT_FLOOR
-        c3 = one < float(S["bar_min"])
-        L.append(f"目前價 {c_now:g}" + ("（進行中）" if is_live else "（最後收線）"))
-        L.append(f"累計損益 {pnl:+.4f}%")
-        L.append(f"本根損益 {one:+.4f}%")
-        L.append(f"最新燈號 {cur_lg}（需 {rev_lg}）{'✅' if c1 else '❌'}")
-        L.append(f"累計<{EXIT_FLOOR}% {'✅' if c2 else '❌'}"
-                 f"｜本根<{pct(S['bar_min'])}% {'✅' if c3 else '❌'}")
-        L.append("出場判定：" + ("✅ 會出場" if (c1 and (c2 or c3)) else "❌ 續抱"))
-    else:
-        L.append("⚠ 取不到目前價")
-        one = pnl = None; live_row = None
+        L.append(f"止損價：{sl}｜{now}")
+        L.append(f"進場價：{ep}｜{ein}")
+        L.append(f"止盈價：{tp}｜{now}")
+    L.append(f"目前價：{cur if cur is not None else '-'}｜{now}")
+    if cur is not None and ep:
+        try:
+            e2 = Decimal(str(ep))
+            pnl = (cur - e2) / e2 * 100 if dr == "L" else (e2 - cur) / e2 * 100
+            L.append(f"未實現：{pnl:+.4f}%")
+        except Exception:
+            pass
+    lm = S.get("last_move")
+    lms = datetime.fromtimestamp(float(lm), TZ8).strftime("%H:%M:%S") if lm else "-"
+    L.append(f"框架移動 {S.get('move_n', 0)} 次｜上次 {lms}｜每 {S['interval']}s 檢查")
+    if not S.get("algo_id"):
+        L.append("⚠ 交易所端無止盈止損單，目前是裸倉")
     hist = S.get("pnl_hist") or []
     if hist:
-        show = hist[-4:]
-        L.append(f"【近 {len(show)} 根收線 + 進行中】共 {len(hist)} 根")
+        show = hist[-5:]
         for h in show:
-            hm = str(h.get("dt") or "")[11:16]
-            lg = "\U0001F7E9" if h.get("color") == "G" else "\U0001F7E5"
-            L.append(f"{hm}{lg}本{h.get('one', 0):+.3f}% 累{h['pnl']:+.3f}%")
-    if live_row is not None and pnl is not None:
-        lg = "\U0001F7E9" if live_row.get("color") == "G" else "\U0001F7E5"
-        lvhm = str(live_row.get("dt") or "")[11:16]
-        L.append(f"{lvhm}*{lg}本{one:+.3f}% 累{pnl:+.3f}%")
-        L.append("* 為進行中，收線前仍會變動")
-    else:
-        L.append("（尚未有收線紀錄，進場後第一根收線才會出現）")
+            hm_ = str(h.get("dt") or "")[11:16]
+            lg = GRN if h.get("color") == "G" else RED
+            L.append(f"{hm_}{lg}本{h.get('one', 0):+.3f}% 累{h['pnl']:+.3f}%")
     return L
+
+def _pctarg(v):
+    """必須帶 % 的參數。回傳 Decimal，格式不符回 None。"""
+    v = str(v).strip()
+    if not v.endswith("%"): return None
+    try: return Decimal(v[:-1])
+    except Exception: return None
 
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"用法：/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 本根損益率%\n"
-           f"例：/run BTCUSDT L 1 100 5 2 0.6 -0.1%\n"
+    fmt = (f"用法：/run 商品 方向 槓桿x 資金 反向燈號數 順向燈號數 止盈% 止損% 移動門檻% 間隔秒\n"
+           f"例：/run BTCUSDT L 1x 10 1 5 0.4% 0.2% 0.05% 5\n"
            f"━━━━━━━━━━\n"
-           f"前根數：反轉前需連續反向色的根數\n"
-           f"後根數：反轉後需連續順勢色的根數\n"
-           f"ATR門檻：後段這幾根的 ATR14 ratio 累加需 ≥ 此值（%）\n"
-           f"本根損益率：出場條件二之一，本根損益低於此值（負值，如 -0.1%）\n"
-           f"　另一條件：累計損益 < {EXIT_FLOOR}%（兩者擇一）\n"
-           f"　出場須先出現反向燈號才成立\n"
-           f"━━━━━━━━━━\n"
+           f"槓桿要帶 x；止盈/止損/移動門檻要帶 %\n"
+           f"反向燈號數：做多=紅燈數，做空=綠燈數\n"
+           f"順向燈號數：做多=綠燈數，做空=紅燈數\n"
+           f"止盈止損掛在交易所端（OCO），程式掛掉仍有效\n"
+           f"間隔秒：每幾秒查價一次，達門檻就把止盈止損框架整體平移（1~60）\n"
            f"週期依 /timeframe，目前 {ACCOUNT_TF}")
-    if len(a) != 8:
-        await reply(u, f"{E.BOT} 參數數量錯誤（需8個，收到{len(a)}個）\n{fmt}"); return
-    try:
-        sym = a[0].upper(); dr = a[1].upper()
-        lev = int(a[2].replace("x", "")); margin = Decimal(a[3])
-        pre = int(a[4]); post = int(a[5])
-        entry_min = Decimal(a[6].replace("%", "").strip())
-        bar_min = Decimal(a[7].replace("%", "").strip())
-    except Exception:
-        await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
-    tf = ACCOUNT_TF
+    if len(a) != 10:
+        await reply(u, f"{E.BOT} 參數數量錯誤（需10個，收到{len(a)}個）\n{fmt}"); return
+    sym = a[0].upper(); dr = a[1].upper()
     if dr not in ("L", "S"):
         await reply(u, f"{E.BOT} 方向須 L 或 S"); return
+    lv = str(a[2]).strip().lower()
+    if not lv.endswith("x"):
+        await reply(u, f"{E.BOT} 槓桿要帶 x，例如 1x"); return
+    try:
+        lev = int(lv[:-1]); margin = Decimal(a[3])
+        pre = int(a[4]); post = int(a[5]); interval = int(a[9])
+    except Exception:
+        await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
+    tp_pct = _pctarg(a[6]); sl_pct = _pctarg(a[7]); move_pct = _pctarg(a[8])
+    for nm, v in (("止盈", tp_pct), ("止損", sl_pct), ("移動門檻", move_pct)):
+        if v is None:
+            await reply(u, f"{E.BOT} {nm} 要帶 %，例如 0.4%"); return
+        if v <= 0:
+            await reply(u, f"{E.BOT} {nm} 須大於 0"); return
+    tf = ACCOUNT_TF
     if tf not in HA_TF:
         await reply(u, f"{E.BOT} 目前週期 {tf} 無效，請先 /timeframe 設定"); return
-    for nm, v in (("前根數", pre), ("後根數", post)):
+    for nm, v in (("反向燈號數", pre), ("順向燈號數", post)):
         if not 1 <= v <= DB_KEEP:
             await reply(u, f"{E.BOT} {nm} 須 1~{DB_KEEP}"); return
     if pre + post > DB_KEEP:
-        await reply(u, f"{E.BOT} 前根數+後根數 不可超過 {DB_KEEP}（行情DB 保留上限）"); return
-    if entry_min <= 0:
-        await reply(u, f"{E.BOT} ATR門檻 須大於 0"); return
-    if bar_min >= 0:
-        await reply(u, f"{E.BOT} 本根損益率 須為負值，例如 -0.1%"); return
+        await reply(u, f"{E.BOT} 兩個燈號數相加不可超過 {DB_KEEP}（行情DB 保留上限）"); return
+    if not 1 <= interval <= 60:
+        await reply(u, f"{E.BOT} 間隔秒須 1~60"); return
+    if lev < 1:
+        await reply(u, f"{E.BOT} 槓桿須 ≥ 1"); return
     k = skey(sym, dr)
     if k in STRATS and STRATS[k].get("alive"):
         await reply(u, f"{E.BOT} {sym} {E.dir_word(dr)} 已在運行"); return
@@ -1372,28 +1465,29 @@ async def cmd_run(u, c):
     if size < spec["minsz"]:
         nd = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {nd:.4f} USDT"); return
-    # 現況預覽（讀 DB，不打 API）
     rows = db_latest(sym, tf, pre + post)
     if len(rows) < pre + post:
-        await reply(u, f"{E.BOT} {E.LOSS} 行情DB 資料不足（{sym} {tf} 目前 {len(rows)} 根，需 {pre+post} 根）\n"
-                       f"請稍候收集器補齊，或用 /db {sym} {tf} 查看"); return
-    fresh = db_fresh(sym, tf)
-    r = judge_entry_db(rows, dr, pre, post, float(entry_min))
-    prev = "\n".join(entry_lines(r, dr, entry_min))
+        await reply(u, f"{E.BOT} {E.LOSS} 行情DB 資料不足（{sym} {tf} 目前 {len(rows)} 根，需 {pre+post} 根）"); return
+    r = judge_entry_db(rows, dr, pre, post)
+    prev = "\n".join(entry_lines(r, dr))
+    tp0, sl0 = frame_px(op, dr, tp_pct, sl_pct, spec["tick"])
     ps = "long" if dr == "L" else "short"
     exist = await okx_pos(spec["iid"], ps)
-    warn = f"\n⚠ OKX 上 {sym} {E.dir_word(dr)} 已有 {exist['pos']} 張持倉（倉位會被合併）" if exist else ""
-    if not fresh: warn += "\n⚠ 行情DB 落後，啟動後會等資料補齊才判斷"
-    PENDING[u.effective_chat.id] = {"act": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": tf,
-        "lev": lev, "margin": margin, "pre": pre, "post": post,
-        "entry_min": entry_min, "bar_min": bar_min, "spec": spec}
+    warn = f"\n⚠ OKX 上 {sym} {E.dir_word(dr)} 已有 {exist['pos']} 張持倉" if exist else ""
+    if not db_fresh(sym, tf): warn += "\n⚠ 行情DB 落後，啟動後會等資料補齊才判斷"
+    PENDING[u.effective_chat.id] = {"act": "run", "t": time.time(), "sym": sym, "dir": dr,
+        "tf": tf, "lev": lev, "margin": margin, "pre": pre, "post": post,
+        "tp_pct": tp_pct, "sl_pct": sl_pct, "move_pct": move_pct,
+        "interval": interval, "spec": spec}
     await reply(u, f"{E.BOT} OKX均K｜{ACCT}\n事件：交易參數預覽\n"
-        f"{E.dir_emoji(dr)} {dr} {tf}\n"
-        f"/run {sym} {dr} {lev} {pct(margin)} {pre} {post} {pct(entry_min)} {pct(bar_min)}%\n"
+        f"{E.dir_emoji(dr)} {sym} {dr} {tf}\n"
+        f"/run {sym} {dr} {lev}x {pct(margin)} {pre} {post} "
+        f"{pct(tp_pct)}% {pct(sl_pct)}% {pct(move_pct)}% {interval}\n"
         f"目前價{op}｜預估{size}張\n"
         f"━━━━━━━━━━\n{prev}\n"
         f"━━━━━━━━━━\n"
-        f"出場：反向燈號＋(累計<{EXIT_FLOOR}% 或 本根<{pct(bar_min)}%){warn}\n"
+        f"以現價估：止盈{tp0}／止損{sl0}\n"
+        f"每{interval}秒檢查，達{pct(move_pct)}%整體平移{warn}\n"
         f"下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
@@ -1492,7 +1586,7 @@ async def do_stop(u, key):
     if p:
         await reply(u, f"{E.BOT} ✅ 已停止\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                        f"⚠ 已進場不自動平倉\n倉位 {p['pos']} 張 均價 {p.get('avgPx','?')} 浮 {p.get('upl','?')}\n"
-                       f"請至 OKX 手動平倉")
+                       f"止盈止損單仍留在交易所端，但框架停止移動\n請至 OKX 手動處理")
     else:
         await reply(u, f"{E.BOT} ✅ 已停止\n{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}")
 
@@ -1940,8 +2034,8 @@ async def cmd_menu(u, c):
         "/ha 商品 根數  燈號+ATR 報表 Excel 寄信（3~2000根）\n"
         "/replay 逐筆回溯報表 Excel 寄信（/replay 20260904）\n"
         "━━━━━━━━━━\n"
-        "/run 商品 方向 槓桿 保證金 前根數 後根數 ATR門檻 本根損益率%\n"
-        "例：/run BTCUSDT L 1 100 5 2 0.6 -0.1%\n"
+        "/run 商品 方向 槓桿x 資金 反向燈號數 順向燈號數 止盈% 止損% 移動門檻% 間隔秒\n"
+        "例：/run BTCUSDT L 1x 10 1 5 0.4% 0.2% 0.05% 5\n"
         f"　週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認執行（run/stop/stopall 共用）\n"
         "/stop 商品 方向（需 /confirm）\n"
@@ -1950,10 +2044,10 @@ async def cmd_menu(u, c):
         "/db 行情DB狀態（/db ETHUSDT 5m 看細節）\n"
         f"/timeframe 查看/設定週期 共{len(TF_LIST)}種\n"
         "━━━━━━━━━━\n"
-        "進場：前段全反向色 + 後段全順勢色\n"
-        "　　　且後段 ΣATR14 ratio ≥ 門檻%\n"
-        "出場：反向燈號 ＋ (累計損益<門檻 或 本根損益<門檻)\n"
-        "　　　兩條件同時成立才 taker 平倉\n"
+        "進場：前段全反向色 + 後段全順勢色（taker）\n"
+        "出場：止盈止損掛在交易所端（OCO）\n"
+        "　　　每 N 秒查價，達門檻就把框架整體平移\n"
+        "　　　程式掛掉止盈止損仍然有效\n"
         "⚠ 無 TP/SL/TE，僅靠回吐出場\n"
         "✅ 判斷全讀本機行情DB，下單不等 API\n"
         "✅ 重啟接管持倉\n"
@@ -2040,7 +2134,8 @@ async def build_replay_xlsx(day, trades, path):
           "持倉秒數", "持倉根數", "累計損益%", "淨損益",
           "進場參考價", "進場延遲s", "進場偏離%", "進場輪詢次", "進場輪詢s",
           "出場參考價", "出場延遲s", "出場偏離%", "出場輪詢次", "出場輪詢s",
-          "前根數", "後根數", "ATR門檻", "本根門檻", "分頁"]
+          "反向燈號數", "順向燈號數", "止盈%", "止損%", "移動門檻%", "間隔秒",
+          "框架移動次數", "分頁"]
     ws.append(SH)
     for i in range(1, len(SH) + 1):
         cc = ws.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
@@ -2068,9 +2163,10 @@ async def build_replay_xlsx(day, trades, path):
                    nn(t.get("out_ref")), nn(t.get("out_lag")), nn(t.get("out_slip")),
                    t.get("out_poll_n"), nn(t.get("out_poll_s")),
                    int(fl(t.get("pre"), 0)), int(fl(t.get("post"), 0)),
-                   fl(t.get("entry_min")), fl(t.get("bar_min")), tab])
+                   fl(t.get("tp_pct")), fl(t.get("sl_pct")), fl(t.get("move_pct")),
+                   t.get("interval"), t.get("move_n"), tab])
         r = ws.max_row
-        for col in (11, 15, 20, 25, 26): ws.cell(r, col).number_format = '0.0000"%"'
+        for col in (11, 15, 20, 25, 26, 27): ws.cell(r, col).number_format = '0.0000"%"'
         ws.cell(r, 12).number_format = "0.000000"
         for col in (14, 17, 19, 22): ws.cell(r, col).number_format = "0.000"
         for col in (6, 8, 13, 18): ws.cell(r, col).number_format = "0.######"
@@ -2079,7 +2175,7 @@ async def build_replay_xlsx(day, trades, path):
         kl, ha, atrs = series[key]
         sec = tf_sec(tf)
         pre = int(fl(t.get("pre"), 1)); post = int(fl(t.get("post"), 1))
-        bmin = fl(t.get("bar_min"), -0.1)
+
         ent_bar = int(ent // sec) * sec
         exi_bar = int(exi // sec) * sec
         lo = ent_bar - (pre + post + 3) * sec
@@ -2090,13 +2186,11 @@ async def build_replay_xlsx(day, trades, path):
              "均K開", "原K開", "均K收", "原K收",
              "均K燈", "原K燈", "均K漲跌幅", "原K漲跌幅", "ATR14r",
              "本根損益", "累計損益",
-             "反向燈號", f"累計<{EXIT_FLOOR}%", "本根<門檻", "出場成立",
              "進場價", "出場價", "參考收盤", "偏離%", "延遲s"]
         w2.append(H)
         for i in range(1, len(H) + 1):
             cc = w2.cell(1, i); cc.font = HF; cc.fill = HFILL; cc.alignment = CEN
-        want_rev = "R" if dr == "L" else "G"
-        prev_c = None; fired = False
+        prev_c = None
         for i, k in enumerate(kl):
             bts = int(k["ts"]) // 1000
             if bts < lo or bts > hi: continue
@@ -2113,10 +2207,6 @@ async def build_replay_xlsx(day, trades, path):
                 base = prev_c if prev_c is not None else ep
                 one = (c - base) / base * 100 if dr == "L" else (base - c) / base * 100
             if bts >= ent_bar: prev_c = c
-            c1 = (x["color"] == want_rev)
-            c2 = (pnl is not None and pnl < EXIT_FLOOR)
-            c3 = (one is not None and one < bmin)
-            fire = bool(c1 and (c2 or c3) and pnl is not None)
             # 進出場那兩根補上實際成交價與滑價
             ref_c = in_p = out_p = slip = lagv = None
             if bts == ent_bar:
@@ -2139,22 +2229,17 @@ async def build_replay_xlsx(day, trades, path):
                        "\U0001F7E9" if rc >= ro else "\U0001F7E5",
                        body, rbody, float(rr) if rr is not None else None,
                        one, pnl,
-                       "V" if c1 else "",
-                       "V" if c2 else "",
-                       "V" if c3 else "",
-                       "V" if fire else "",
                        in_p, out_p, ref_c, slip, lagv])
             rr2 = w2.max_row
-            for col in (9, 10, 11, 12, 13, 21): w2.cell(rr2, col).number_format = '0.0000"%"'
-            for col in (3, 4, 5, 6, 18, 19, 20): w2.cell(rr2, col).number_format = "0.######"
-            w2.cell(rr2, 22).number_format = "0.000"
-            for col in (1, 7, 8, 14, 15, 16, 17): w2.cell(rr2, col).alignment = CEN
+            for col in (9, 10, 11, 12, 13, 17): w2.cell(rr2, col).number_format = '0.0000"%"'
+            for col in (3, 4, 5, 6, 14, 15, 16): w2.cell(rr2, col).number_format = "0.######"
+            w2.cell(rr2, 18).number_format = "0.000"
+            for col in (1, 7, 8): w2.cell(rr2, col).alignment = CEN
         w2.freeze_panes = "A2"
         for i, wdt in enumerate([9, 13,
                                  13, 13, 13, 13,
                                  7, 7, 12, 12, 10,
                                  12, 12,
-                                 10, 11, 11, 10,
                                  12, 12, 12, 10, 9], 1):
             w2.column_dimensions[get_column_letter(i)].width = wdt
         made += 1
@@ -2197,7 +2282,7 @@ async def build_replay_xlsx(day, trades, path):
     for i, wdt in enumerate([5, 11, 7, 6, 11, 12, 11, 12, 10, 10, 12, 12,
                              12, 11, 11, 11, 11,
                              12, 11, 11, 11, 11,
-                             8, 8, 11, 11, 18], 1):
+                             12, 12, 10, 10, 12, 10, 12, 18], 1):
         ws.column_dimensions[get_column_letter(i)].width = wdt
     wb.save(path)
     return made
@@ -2445,6 +2530,8 @@ async def _post_init(app):
     print("心跳看門狗已啟動")
     col = asyncio.create_task(collector(app))
     _BG.add(col); col.add_done_callback(_BG.discard)
+    fm = asyncio.create_task(frame_mover(app))
+    _BG.add(fm); fm.add_done_callback(_BG.discard)
 
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
