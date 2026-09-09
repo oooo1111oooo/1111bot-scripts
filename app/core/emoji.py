@@ -11,7 +11,7 @@ HA_RED   = "🟥"   # 🟥 HA 紅棒
 HA_GREEN = "🟩"   # 🟩 HA 綠棒
 
 def dir_emoji(d): return LONG if d == "L" else SHORT
-def dir_word(d):  return "Long" if d == "L" else "Short"
+def dir_word(d):  return "L" if d == "L" else "S"
 def pnl_emoji(v):
     if v > 0: return WIN
     if v < 0: return LOSS

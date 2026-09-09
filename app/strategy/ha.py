@@ -16,17 +16,29 @@ def calc_ha(klines):
     return ha
 
 def merge_5m_to_10m(kl5):
-    """兩根5m合成一根10m，00:00對齊（B4 待10m啟用時使用）。"""
+    """兩根 5m 合成一根 10m，強制對齊 10 分鐘邊界。"""
     out = []
-    # 以 ts 對齊 10 分鐘邊界
-    buf = []
-    for k in kl5:
-        buf.append(k)
-        # 該根屬於哪個10m桶：ts(ms)//600000
-        if len(buf) == 2:
-            a, b = buf
-            out.append({"ts": a["ts"], "o": a["o"],
-                        "h": max(a["h"], b["h"]), "l": min(a["l"], b["l"]),
-                        "c": b["c"]})
-            buf = []
+    i = 0
+    n = len(kl5)
+    while i < n:
+        a = kl5[i]
+        try:
+            ts_a = int(a["ts"])
+        except Exception:
+            i += 1; continue
+        if ts_a % 600000 != 0:
+            i += 1; continue
+        if i + 1 >= n:
+            break
+        b = kl5[i + 1]
+        try:
+            ts_b = int(b["ts"])
+        except Exception:
+            i += 1; continue
+        if ts_b - ts_a != 300000:
+            i += 1; continue
+        out.append({"ts": ts_a, "o": a["o"],
+                    "h": max(a["h"], b["h"]), "l": min(a["l"], b["l"]),
+                    "c": b["c"]})
+        i += 2
     return out
