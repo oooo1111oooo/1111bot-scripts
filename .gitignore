@@ -13,3 +13,7 @@ __pycache__/
 venv/
 archive/
 .stage/
+*.bak
+*.bak-*
+.env
+config/accounts.env.bak*
