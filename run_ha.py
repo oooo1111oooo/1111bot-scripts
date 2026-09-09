@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B6-2 均K（Heikin-Ashi）｜o3333o — 獨立進程
+"""B6-2 均K（Heikin-Ashi）｜多帳戶 — 獨立進程
 規格：
   1. 每根 K 線收線後 +5 秒抓 K 線，算 HA，判燈號。
   2. 進場：PRE根反轉前色 + POST根反轉後色 + POST振幅累加達門檻 -> maker 限價進場（掛最後一根收盤價）。
@@ -22,10 +22,10 @@ from app.core import emoji as E
 from app.strategy.ha import calc_ha
 
 BASE = "https://www.okx.com"
-ACCT = "o3333o"
+ACCT = os.environ["ACCT"]
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
-STATE_FILE = "/srv/1111bot/data/strategies_ha_o3333o.json"
+STATE_FILE = f"/srv/1111bot/data/strategies_ha_{ACCT}.json"
 HA_LAG = 0           # 收線後幾秒開始抓（0＝收線瞬間就開始輪詢）
 POLL_MS = 100        # 密集輪詢間隔（毫秒），直到 OKX 標記該根已收線
 POLL_MAX = 12.0      # 密集輪詢最長等幾秒，逾時放棄本輪
@@ -96,7 +96,7 @@ def load_env(p):
 
 ACC = load_env("/srv/1111bot/config/accounts.env")
 BOTS = load_env("/srv/1111bot/config/bots.env")
-TOKEN = BOTS["BOT_o3333o_HA"]
+TOKEN = BOTS[f"BOT_{ACCT}_HA"]
 SYMS = json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 
 PENDING = {}; STRATS = {}; TASKS = {}; STATS = {}
