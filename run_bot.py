@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B6-1 原K｜多帳戶 — 核心重寫版
+"""B6-1 原K｜o3333o — 核心重寫版
 規格：
   1. 每根 K 線開盤即掛限價埋伏單；未成交於收線前 3 秒撤單。
   2. 遲到一律立刻補掛，除非距離收線不足 30 秒（避免與下一根碰撞）才跳過。
@@ -27,10 +27,10 @@ def next_open_epoch(now_epoch, tf):
     return ((now_epoch // sec) + 1) * sec
 
 BASE = "https://www.okx.com"
-ACCT = os.environ["ACCT"]
+ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
-STATE_FILE = f"/srv/1111bot/data/strategies_{ACCT}.json"
+STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
 ENTRY_CUTOFF = 60    # TF 剩餘不足幾秒就放棄進場（撤掉未成交單、也不補掛）
 MOVE_TICK = 1.0      # frame_mover 心跳（秒）
 FORCE_MV_INTERVAL = 60  # 每 N 秒固定推格一次（定時止損調整）
@@ -46,7 +46,7 @@ def load_env(p):
 
 ACC = load_env("/srv/1111bot/config/accounts.env")
 BOTS = load_env("/srv/1111bot/config/bots.env")
-TOKEN = BOTS[f"BOT_{ACCT}_NORMAL"]
+TOKEN = BOTS["BOT_o3333o_NORMAL"]
 SYMS = json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 
 PENDING = {}; STRATS = {}; TASKS = {}; STATS = {}
@@ -542,12 +542,8 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
                 except Exception:
                     pass
             if not p_chk:
-                await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（手動平倉或 TP/SL 觸發），本輪結束")
-                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt",
-                          "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "move_hist",
-                          "last_move", "last_force_mv_t"):
-                    S.pop(a, None)
-                save_state(); return
+                await close_bookkeeping(app, S, "TP/SL")
+                return
     # 策略被停止但仍持倉
     if await okx_pos(iid, pos):
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 策略停止但仍有持倉，請至 OKX 處理")
