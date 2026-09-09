@@ -27,10 +27,10 @@ def next_open_epoch(now_epoch, tf):
     return ((now_epoch // sec) + 1) * sec
 
 BASE = "https://www.okx.com"
-ACCT = "o3333o"
+ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd Environment=ACCT=oXXXXo 注入
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
-STATE_FILE = "/srv/1111bot/data/strategies_o3333o.json"
+STATE_FILE = f"/srv/1111bot/data/strategies_{ACCT}.json"
 ENTRY_CUTOFF = 60    # TF 剩餘不足幾秒就放棄進場（撤掉未成交單、也不補掛）
 MOVE_TICK = 1.0      # frame_mover 心跳（秒）
 FORCE_MV_INTERVAL = 60  # 每 N 秒固定推格一次（定時止損調整）
@@ -46,7 +46,7 @@ def load_env(p):
 
 ACC = load_env("/srv/1111bot/config/accounts.env")
 BOTS = load_env("/srv/1111bot/config/bots.env")
-TOKEN = BOTS["BOT_o3333o_NORMAL"]
+TOKEN = BOTS[f"BOT_{ACCT}_NORMAL"]
 SYMS = json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 
 PENDING = {}; STRATS = {}; TASKS = {}; STATS = {}
@@ -1458,7 +1458,7 @@ async def _post_stop(app):
 
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    print(f"啟動 o3333o 原K B6-1 核心重寫版（token ...{TOKEN[-6:]}）")
+    print(f"啟動 {ACCT} 原K B6-1 核心重寫版（token ...{TOKEN[-6:]}）")
     app = (Application.builder().token(TOKEN).post_init(_post_init).post_stop(_post_stop)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .pool_timeout(30.0).get_updates_read_timeout(40.0)
