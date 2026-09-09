@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B6-2 均K（Heikin-Ashi）｜多帳戶 — 獨立進程
+"""B6-2 均K（Heikin-Ashi）｜o3333o — 獨立進程
 規格：
   1. 每根 K 線收線後 +5 秒抓 K 線，算 HA，判燈號。
   2. 進場：PRE根反轉前色 + POST根反轉後色 + POST振幅累加達門檻 -> maker 限價進場（掛最後一根收盤價）。
@@ -22,10 +22,10 @@ from app.core import emoji as E
 from app.strategy.ha import calc_ha
 
 BASE = "https://www.okx.com"
-ACCT = os.environ["ACCT"]
+ACCT = "o3333o"
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
-STATE_FILE = f"/srv/1111bot/data/strategies_ha_{ACCT}.json"
+STATE_FILE = "/srv/1111bot/data/strategies_ha_o3333o.json"
 HA_LAG = 0           # 收線後幾秒開始抓（0＝收線瞬間就開始輪詢）
 POLL_MS = 100        # 密集輪詢間隔（毫秒），直到 OKX 標記該根已收線
 POLL_MAX = 12.0      # 密集輪詢最長等幾秒，逾時放棄本輪
@@ -96,7 +96,7 @@ def load_env(p):
 
 ACC = load_env("/srv/1111bot/config/accounts.env")
 BOTS = load_env("/srv/1111bot/config/bots.env")
-TOKEN = BOTS[f"BOT_{ACCT}_HA"]
+TOKEN = BOTS["BOT_o3333o_HA"]
 SYMS = json.load(open("/srv/1111bot/config/symbols.json"))["symbols"]
 
 PENDING = {}; STRATS = {}; TASKS = {}; STATS = {}
@@ -978,6 +978,7 @@ async def h_open(app, S, spec, iid, d, pos, info, k):
             f"{E.BOT} ⏰ {S['sym']} {E.dir_word(d)} 本TF限價進場未成交，此輪跳過")
         return False
     S.pop("pending_px", None); S.pop("pending_t", None)
+    S["last_force_mv_t"] = time.time()   # 新倉進場，重置定時推格計時
     bump(k, "entered")
     ee = time.time()
     S["entry_bar_ts"] = ref_ts   # 進場根的開盤 ts（ms），供出場報告精確定位
@@ -1366,7 +1367,7 @@ async def close_bookkeeping(app, S, reason):
         lines.append("\u2504" * 18)
         lines.append(f"框架移動 {mn} 次（定時{mb}｜現價{mn - mb}）")
         for mrec in mhist[-10:]:
-            lines.append(f"{mrec.get('t', '')} | 現{mrec.get('px', '')} | 止{mrec.get('sl', '')}")
+            lines.append(f"{mrec.get('t', '')} | {mrec.get('type', '現價')} | 現{mrec.get('px', '')} | 止{mrec.get('sl', '')}")
     tail = ["\u2504" * 18,
             f"毛損益{g:+.6f}({gp:+.3f}%)",
             f"手續費{fee:+.6f}({fp:+.3f}%)",
@@ -1691,7 +1692,7 @@ async def strat_detail(S, sym, dr, mark_px=None):
     mn = S.get("move_n", 0); mb = S.get("move_n_bar", 0)
     L.append(f"框架移動 {mn} 次（定時{mb}｜現價{mn - mb}）")
     for mrec in (S.get("move_hist") or [])[-10:]:
-        L.append(f"{mrec.get('t', '')} | 現{mrec.get('px', '')} | 止{mrec.get('sl', '')}")
+        L.append(f"{mrec.get('t', '')} | {mrec.get('type', '現價')} | 現{mrec.get('px', '')} | 止{mrec.get('sl', '')}")
     if not S.get("algo_id"):
         L.append("⚠ 交易所端無止盈止損單，目前是裸倉")
     return L
