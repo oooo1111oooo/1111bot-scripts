@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B6-1 原K｜多帳戶 — 核心重寫版
+"""B6-1 原K｜o3333o — 核心重寫版
 規格：
   1. 每根 K 線開盤即掛限價埋伏單；未成交於收線前 3 秒撤單。
   2. 遲到一律立刻補掛，除非距離收線不足 30 秒（避免與下一根碰撞）才跳過。
@@ -27,7 +27,7 @@ def next_open_epoch(now_epoch, tf):
     return ((now_epoch // sec) + 1) * sec
 
 BASE = "https://www.okx.com"
-ACCT = os.environ["ACCT"]
+ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = f"/srv/1111bot/data/strategies_{ACCT}.json"
@@ -1462,7 +1462,7 @@ async def _post_stop(app):
 
 def main():
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    print(f"啟動 o3333o 原K B6-1 核心重寫版（token ...{TOKEN[-6:]}）")
+    print(f"啟動 {ACCT} 原K B6-1 核心重寫版（token ...{TOKEN[-6:]}）")
     app = (Application.builder().token(TOKEN).post_init(_post_init).post_stop(_post_stop)
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .pool_timeout(30.0).get_updates_read_timeout(40.0)

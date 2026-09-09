@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B6-2 均K（Heikin-Ashi）｜多帳戶 — 獨立進程
+"""B6-2 均K（Heikin-Ashi）｜o3333o — 獨立進程
 規格：
   1. 每根 K 線收線後 +5 秒抓 K 線，算 HA，判燈號。
   2. 進場：PRE根反轉前色 + POST根反轉後色 + POST振幅累加達門檻 -> maker 限價進場（掛最後一根收盤價）。
@@ -22,7 +22,7 @@ from app.core import emoji as E
 from app.strategy.ha import calc_ha
 
 BASE = "https://www.okx.com"
-ACCT = os.environ["ACCT"]
+ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
 STATE_FILE = f"/srv/1111bot/data/strategies_ha_{ACCT}.json"
