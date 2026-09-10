@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B6-1 原K｜o3333o — 核心重寫版
+"""B6-1 原K｜多帳戶 — 核心重寫版
 規格：
   1. 每根 K 線開盤即掛限價埋伏單；未成交於收線前 3 秒撤單。
   2. 遲到一律立刻補掛，除非距離收線不足 30 秒（避免與下一根碰撞）才跳過。
@@ -397,11 +397,7 @@ async def close_bookkeeping(app, S, reason):
                "in_px": str(fpx), "out_px": str(xpx)})
     ico = "🟢" if net >= 0 else "🔴"
     mhist = S.get("move_hist") or []
-    move_lines = []
-    if mn > 0:
-        move_lines.append(f"SL移動 {mn} 次")
-        for mrec in mhist[-5:]:
-            move_lines.append(f"{mrec.get('t','')} | 現{mrec.get('px','')} | 止{mrec.get('sl','')}")
+    # 出場主通知
     await notify(app, S["chat"],
         f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico} 已出場\n"
         f"━━━━━━━━━━\n"
@@ -410,9 +406,18 @@ async def close_bookkeeping(app, S, reason):
         f"進場：{fpx}({pct(S['offset'])}%) | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')} | {amb_s}\n"
         f"止盈TP：{tp_px}({pct(S['tp'])}%)\n止損SL：{sl_px}({pct(S['sl'])}%)\n"
         f"出場：{xpx}({gp:+.3f}%) | {hhmmss()} | {hs}s\n"
-        + ("━━━━━━━━━━\n" + "\n".join(move_lines) + "\n" if move_lines else "")
-        + f"━━━━━━━━━━\n毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
+        f"━━━━━━━━━━\n毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
         f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
+    # SL 移動紀錄：每20筆一頁，全部顯示
+    if mn > 0 and mhist:
+        PAGE = 20
+        pages = [mhist[i:i+PAGE] for i in range(0, len(mhist), PAGE)]
+        total_pages = len(pages)
+        for pi, page in enumerate(pages, 1):
+            lines = [f"SL移動 {mn} 次（{pi}/{total_pages}）"]
+            for mrec in page:
+                lines.append(f"{mrec.get('t','')} | 現{mrec.get('px','')} | 止{mrec.get('sl','')}")
+            await notify(app, S["chat"], "\n".join(lines))
     for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_sz",
               "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "move_hist", "last_move",
               "last_force_mv_t"):
@@ -542,12 +547,8 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
                 except Exception:
                     pass
             if not p_chk:
-                await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} OKX 已無持倉（手動平倉或 TP/SL 觸發），本輪結束")
-                for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt",
-                          "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "move_hist",
-                          "last_move", "last_force_mv_t"):
-                    S.pop(a, None)
-                save_state(); return
+                await close_bookkeeping(app, S, "TP/SL")
+                return
     # 策略被停止但仍持倉
     if await okx_pos(iid, pos):
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 策略停止但仍有持倉，請至 OKX 處理")
