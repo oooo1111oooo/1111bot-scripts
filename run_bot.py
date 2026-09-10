@@ -1436,7 +1436,8 @@ async def cmd_summary(u, c):
         await reply(u, "\n".join(D))
 
 # ---------- /amp 振幅報表（Excel + Email） ----------
-AMP_MAX = 2000       # 單次最多抓幾根
+AMP_MAX = 110000     # 單次最多抓幾根（支援整年 5m ≈ 105,120 根）
+AMP_YEAR_BARS = 12 * 24 * 365  # 整年 5m 根數 = 105,120
 AMP_BINS = [Decimal(str(x)) for x in
             ("0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9","1.0","1.2","1.5",
              "2.0","2.5","3.0","3.5","4.0","5.0")]
@@ -1446,7 +1447,7 @@ async def get_klines_paged(iid, bar, want):
     out = []
     after = ""
     ep = "candles"          # 近期用 candles，翻不動時自動切 history-candles
-    for _ in range(40):
+    for _ in range(400):    # 最多 400 頁（支援整年 5m ≈ 351 頁）
         q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit=300"
         if after:
             q += f"&after={after}"
@@ -1637,70 +1638,72 @@ def send_amp_mail(path, name, subject, body):
     return True, to
 
 async def cmd_amp(u, c):
-    """原K 振幅分析報表（多幣種 Excel 寄信）。
-    用法：/amp <根數> <幣種1> [幣種2 ... 幣種20]
-    例：/amp 2000 BTCUSDT ETHUSDT DOGEUSDT
-    根數 3~2000，幣種最多 20 個，TF 依當前設定。
+    """原K 振幅分析報表（單幣種整年 Excel 寄信）。
+    用法：/amp <幣種> <年份>
+    例：/amp ETHUSDT 2025
+    TF 固定 5m，抓整年資料，產生 Excel 寄到信箱。
     """
-    if not c.args or len(c.args) < 2:
-        await reply(u, f"{E.BOT} 用法：/amp <根數> <幣種1> [幣種2 ... 幣種20]\n"
-                       f"例：/amp 2000 BTCUSDT ETHUSDT DOGEUSDT\n"
-                       f"根數 3~{AMP_MAX}｜幣種最多 20 個｜TF 依當前設定（{ACCOUNT_TF}）\n"
-                       f"產生 Excel（每幣一個 sheet）寄到信箱")
-        return
+    fmt = f"{E.BOT} 用法：/amp <幣種> <年份>\n例：/amp ETHUSDT 2025\nTF 固定 5m，產生整年 Excel 寄到信箱"
+    if not c.args or len(c.args) != 2:
+        await reply(u, fmt); return
+    sym = c.args[0].upper()
     try:
-        n = max(3, min(AMP_MAX, int(c.args[0])))
+        year = int(c.args[1])
+        if not 2020 <= year <= 2030:
+            raise ValueError
     except (ValueError, TypeError):
-        await reply(u, f"{E.LOSS} 第一個參數必須是根數（整數），例：/amp 2000 BTCUSDT"); return
-    raw_syms = [a.upper() for a in c.args[1:]]
-    if len(raw_syms) > 20:
-        await reply(u, f"{E.LOSS} 幣種最多 20 個，你輸入了 {len(raw_syms)} 個"); return
-    tf = ACCOUNT_TF
+        await reply(u, f"{E.LOSS} 年份格式錯誤，例：2025"); return
+
+    tf = "5m"
+    # 計算該年的起訖 timestamp（ms）
+    from calendar import isleap
+    days = 366 if isleap(year) else 365
+    n = 12 * 24 * days  # 整年 5m 根數
+    ts_start = int(datetime(year, 1, 1, 0, 0, 0, tzinfo=TZ8).timestamp() * 1000)
+    ts_end   = int(datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=TZ8).timestamp() * 1000)
+
     await reply(u, f"{E.BOT} 振幅分析報表中…\n"
-                   f"幣種：{' / '.join(raw_syms)}\n"
-                   f"TF：{tf}｜根數：{n}\n請稍候…")
-    results = []; failed = []
-    for sym in raw_syms:
-        try:
-            spec = await get_spec(sym)
-        except Exception:
-            failed.append(f"{sym}（找不到商品）"); continue
-        try:
-            kl = await klines_paged_for_tf(spec["iid"], tf, n)
-        except Exception as e:
-            failed.append(f"{sym}（K 線失敗：{type(e).__name__}）"); continue
-        if not kl:
-            failed.append(f"{sym}（K 線為空）"); continue
-        kl = kl[-n:]
-        amps = calc_amp(kl)
-        results.append((sym, kl, amps, spec["tick"]))
-    if not results:
-        await reply(u, f"{E.LOSS} 全部幣種取得失敗：{', '.join(failed)}"); return
+                   f"幣種：{sym}\nTF：{tf}｜{year}全年（{days}天，約{n}根）\n"
+                   f"預計需要 5~10 分鐘，請稍候…")
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
+
+    # 抓整年 K 線（帶起訖時間過濾）
+    try:
+        kl_raw = await get_klines_paged(spec["iid"], "5m", n)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} K 線抓取失敗：{type(e).__name__}: {e}"); return
+
+    # 只保留該年度的 K 線
+    kl = [k for k in kl_raw if ts_start <= k["ts"] < ts_end]
+    if not kl:
+        await reply(u, f"{E.LOSS} {sym} {year} 年無資料"); return
+
+    amps = calc_amp(kl)
+    results = [(sym, kl, amps, spec["tick"])]
+
     day = now8().strftime("%Y%m%d")
-    sym_tag = results[0][0] if len(results) == 1 else f"{len(results)}coins"
-    name = f"OKX.{sym_tag}.{tf}{n}K.{day}.xlsx"
+    name = f"OKX.{sym}.5m.{year}.{day}.xlsx"
     path = f"/srv/1111bot/data/{name}"
     try:
         build_amp_xlsx(results, tf, path)
     except Exception as e:
         await reply(u, f"{E.LOSS} 產生 Excel 失敗：{type(e).__name__}: {e}"); return
-    bars_info = " / ".join(f"{s}({len(kl)}根)" for s, kl, _, __ in results)
-    subject = f"OKX 振幅分析 {tf} {n}根 {day}（{', '.join(s for s,_,_,__ in results)}）"
-    body = f"TF：{tf}｜根數上限：{n}\n{bars_info}\n產生時間：{now8().strftime('%Y/%m/%d %H:%M:%S')}\n"
-    if failed:
-        body += f"\n取得失敗：{', '.join(failed)}\n"
+
+    subject = f"OKX 振幅分析 {sym} 5m {year}全年（{len(kl)}根）"
+    body = (f"幣種：{sym}｜TF：5m｜{year}全年\n"
+            f"實際根數：{len(kl)} 根（{days}天）\n"
+            f"產生時間：{now8().strftime('%Y/%m/%d %H:%M:%S')}\n")
     try:
         ok, info = send_amp_mail(path, name, subject, body)
     except Exception as e:
         await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
     if not ok:
         await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
-    msg = (f"{E.BOT} ✅ 振幅分析報表已寄出\n"
-           f"TF：{tf}｜根數：{n}\n{bars_info}\n")
-    if failed:
-        msg += f"⚠️ 失敗：{', '.join(failed)}\n"
-    msg += f"時間：{hhmmss()}"
-    await reply(u, msg)
+    await reply(u, f"{E.BOT} ✅ {sym} {year}全年振幅報表已寄出\n"
+                   f"TF：5m｜實際根數：{len(kl)}\n時間：{hhmmss()}")
 
 async def cmd_coins(u, c):
     on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
@@ -1730,7 +1733,7 @@ async def cmd_menu(u, c):
         f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 0.05 5\n週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 當日戰報\n"
-        "/amp 商品 根數  振幅報表 Excel 寄信（3~2000根）\n"
+        "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         f"一個 TF 一輪：TF 開始埋伏\n"
