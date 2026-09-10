@@ -788,8 +788,6 @@ async def loop_martin(app, chat, S, spec, iid, d, pos, k):
                     for a in ("pos_open", "martin_paused"):
                         S.pop(a, None)
                     S["state"] = "等下輪（馬丁）"; save_state()
-                    await notify(app, chat,
-                        f"{E.BOT} {S['sym']} {E.dir_word(d)} 馬丁本輪未成交，已撤單，等下根TF")
                     break  # 跳出監控迴圈，進入下一輪
 
 # ---------- 主迴圈：一根 K 線一輪 ----------
