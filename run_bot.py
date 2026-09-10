@@ -34,7 +34,7 @@ STATE_FILE = f"/srv/1111bot/data/strategies_{ACCT}.json"
 ENTRY_CUTOFF = 60    # TF 剩餘不足幾秒就放棄進場（撤掉未成交單、也不補掛）
 MOVE_TICK = 1.0      # frame_mover 心跳（秒）
 FORCE_MV_INTERVAL = 60  # 每 N 秒固定推格一次（定時止損調整）
-FEE_RATE = Decimal("0.001")  # 進場後一律緊貼現價 0.1%（方案D）
+FEE_RATE = Decimal("0.001")  # 手續費率 0.1%：獲利超過此值時 SL 緊貼現價（距離=FEE_RATE）
 
 def load_env(p):
     d = {}
@@ -296,32 +296,57 @@ async def amend_frames(items):
 
 def sl_shift(S, px, d):
     """依現價追蹤 SL；TP 永遠不動。
-    方案D：不管獲利與否，一律緊貼現價 0.1%（FEE_RATE）。
-    SL 只能往有利方向移，不能後退。
+    兩段邏輯：
+      ① 當下浮動獲利 ≥ FEE_RATE（0.1%）→ SL 緊貼現價，距離固定 FEE_RATE
+      ② 否則 → 原邏輯：現價超過上次基準才跟移 delta U
     收盤推格由 frame_mover 另行處理，此函式只處理現價追蹤。"""
     try:
         fpx = Decimal(str(S.get("pos_px") or "0"))
+        base = Decimal(str(S.get("frame_base") or fpx))
         cur = Decimal(str(px))
         tp = Decimal(str(S["tp_px"]))
         sl = Decimal(str(S["sl_px"]))
     except Exception:
         return None
-    if fpx <= 0:
+    if fpx <= 0 or base <= 0:
         return None
     tick = S["spec"]["tick"]
 
-    # 方案D：一律緊貼現價，距離固定 FEE_RATE（0.1%）
+    # 計算當下浮動獲利%
     if d == "L":
-        nsl = align(cur * (Decimal("1") - FEE_RATE), tick, "S")
-        if nsl <= sl:
-            return None  # SL 不能後退
+        profit_pct = (cur - fpx) / fpx
     else:
-        nsl = align(cur * (Decimal("1") + FEE_RATE), tick, "L")
-        if nsl >= sl:
-            return None  # SL 不能後退
+        profit_pct = (fpx - cur) / fpx
 
-    gain = float((cur - fpx) / fpx * 100) if d == "L" else float((fpx - cur) / fpx * 100)
-    return tp, nsl, cur, gain
+    if profit_pct >= FEE_RATE:
+        # ① 獲利 ≥ 0.1%：SL 緊貼現價，距離 = FEE_RATE
+        if d == "L":
+            nsl = align(cur * (Decimal("1") - FEE_RATE), tick, "S")
+        else:
+            nsl = align(cur * (Decimal("1") + FEE_RATE), tick, "L")
+        # SL 只能往有利方向移，不能後退
+        if d == "L" and nsl <= sl:
+            return None
+        if d == "S" and nsl >= sl:
+            return None
+        gain = float(profit_pct * 100)
+        return tp, nsl, cur, gain
+    else:
+        # ② 獲利 < 0.1%：原邏輯，現價超過上次基準才跟移
+        if d == "L":
+            delta = cur - base
+            if delta <= 0:
+                return None
+            nsl = align(sl + delta, tick, "S")
+        else:
+            delta = base - cur
+            if delta <= 0:
+                return None
+            nsl = align(sl - delta, tick, "L")
+        if nsl == sl:
+            return None
+        gain = float(abs(delta) / base * 100)
+        return tp, nsl, cur, gain
 
 async def close_bookkeeping(app, S, reason):
     """偵測到倉位已不在（止盈或止損觸發）後的收尾：取真實損益、撤殘單、發通知。"""
@@ -961,7 +986,7 @@ async def loop(app, chat, S):
                 f"止盈TP：{tp}({pct(S['tp'])}%)\n止損SL：{sl}({pct(S['sl'])}%)\n"
                 f"━━━━━━━━━━\n"
                 f"移動SL：每{S['interval']}s追蹤 | 收盤推{pct(S['move_pct'])}%\n"
-                f"進場後立即緊貼現價0.1%\n"
+                f"獲利≥0.1%→緊貼現價0.1%\n"
                 f"狀態：📌 持倉中\n時間：{hhmmss()}")
             await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k)
             # 出場後允許補掛：出場流程（查 OKX 真實損益）可能耗時數秒而跨進新 TF，
@@ -1201,7 +1226,7 @@ async def cmd_run(u, c):
     preview += (f"止盈TP：{tp}%\n止損SL：{sl}%\n"
         f"所需總保證金：{total_margin} USDT\n"
         f"移動SL：每{interval}s追蹤 | 收盤推{pct(move_pct)}%\n"
-        f"進場後立即緊貼現價0.1%\n"
+        f"獲利≥0.1%→緊貼現價0.1%\n"
         f"━━━━━━━━━━\n⚠ 確認後真實循環交易\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
     await reply(u, preview)
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
@@ -1712,7 +1737,7 @@ async def cmd_menu(u, c):
         f"未成交且剩餘不足 {ENTRY_CUTOFF}s → 撤單放棄本輪\n"
         "已進場 → OKX algo OCO 單守 TP/SL\n"
         "每根收盤推 SL（移動門檻%）｜每 N 秒現價追蹤 SL\n"
-        "進場後立即緊貼現價0.1%\n"
+        "獲利≥0.1%→緊貼現價0.1%\n"
         "出場只有 TP / SL，無 TF 強平\n"
         "⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
 
