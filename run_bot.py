@@ -34,7 +34,7 @@ STATE_FILE = f"/srv/1111bot/data/strategies_{ACCT}.json"
 ENTRY_CUTOFF = 60    # TF 剩餘不足幾秒就放棄進場（撤掉未成交單、也不補掛）
 MOVE_TICK = 1.0      # frame_mover 心跳（秒）
 FORCE_MV_INTERVAL = 60  # 每 N 秒固定推格一次（定時止損調整）
-FEE_RATE = Decimal("0.001")  # 手續費率 0.1%：獲利超過此值時 SL 緊貼現價（距離=FEE_RATE）
+FEE_RATE = Decimal("0.001")  # 進場後一律緊貼現價 0.1%（方案D）
 
 def load_env(p):
     d = {}
@@ -961,7 +961,7 @@ async def loop(app, chat, S):
                 f"止盈TP：{tp}({pct(S['tp'])}%)\n止損SL：{sl}({pct(S['sl'])}%)\n"
                 f"━━━━━━━━━━\n"
                 f"移動SL：每{S['interval']}s追蹤 | 收盤推{pct(S['move_pct'])}%\n"
-                f"獲利≥0.1%→緊貼現價0.1%\n"
+                f"進場後立即緊貼現價0.1%\n"
                 f"狀態：📌 持倉中\n時間：{hhmmss()}")
             await monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k)
             # 出場後允許補掛：出場流程（查 OKX 真實損益）可能耗時數秒而跨進新 TF，
@@ -1201,7 +1201,7 @@ async def cmd_run(u, c):
     preview += (f"止盈TP：{tp}%\n止損SL：{sl}%\n"
         f"所需總保證金：{total_margin} USDT\n"
         f"移動SL：每{interval}s追蹤 | 收盤推{pct(move_pct)}%\n"
-        f"獲利≥0.1%→緊貼現價0.1%\n"
+        f"進場後立即緊貼現價0.1%\n"
         f"━━━━━━━━━━\n⚠ 確認後真實循環交易\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
     await reply(u, preview)
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
@@ -1712,7 +1712,7 @@ async def cmd_menu(u, c):
         f"未成交且剩餘不足 {ENTRY_CUTOFF}s → 撤單放棄本輪\n"
         "已進場 → OKX algo OCO 單守 TP/SL\n"
         "每根收盤推 SL（移動門檻%）｜每 N 秒現價追蹤 SL\n"
-        "獲利≥0.1% → SL 緊貼現價 0.1%｜否則跟移 delta\n"
+        "進場後立即緊貼現價0.1%\n"
         "出場只有 TP / SL，無 TF 強平\n"
         "⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
 
