@@ -7,15 +7,14 @@
 set -e
 
 ACCOUNTS=("o2222o" "o3333o" "o4444o" "o5555o")
-STRATEGIES=("ha" "normal")
 
 echo "==============================="
-echo "  1111bot 一鍵部署"
+echo "  1111bot 一鍵部署（原K）"
 echo "  $(date '+%Y-%m-%d %H:%M:%S')"
 echo "==============================="
 echo ""
 echo "部署目標：${ACCOUNTS[*]}"
-echo "策略：均K (ha) + 普K (normal)"
+echo "策略：原K (normal)"
 echo ""
 
 # 確認提示
@@ -29,18 +28,16 @@ echo ""
 echo "--- 開始重啟服務 ---"
 
 for acct in "${ACCOUNTS[@]}"; do
-    for strategy in "${STRATEGIES[@]}"; do
-        service="1111bot-${acct}-${strategy}.service"
-        echo -n "重啟 $service ... "
-        sudo systemctl restart "$service"
-        sleep 2
-        status=$(systemctl is-active "$service")
-        if [ "$status" = "active" ]; then
-            echo "✅ running"
-        else
-            echo "❌ $status（請檢查：sudo journalctl -u $service -n 20）"
-        fi
-    done
+    service="1111bot-${acct}-normal.service"
+    echo -n "重啟 $service ... "
+    sudo systemctl restart "$service"
+    sleep 2
+    status=$(systemctl is-active "$service")
+    if [ "$status" = "active" ]; then
+        echo "✅ running"
+    else
+        echo "❌ $status（請檢查：sudo journalctl -u $service -n 20）"
+    fi
 done
 
 echo ""
