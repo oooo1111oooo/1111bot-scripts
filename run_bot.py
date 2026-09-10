@@ -426,7 +426,7 @@ async def close_bookkeeping(app, S, reason):
             await notify(app, S["chat"], "\n".join(lines))
     for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_sz",
               "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "move_hist", "last_move",
-              "last_force_mv_t"):
+              "last_force_mv_t", "closing"):
         S.pop(a, None)
     S["state"] = "等下輪"
     save_state()
@@ -465,6 +465,9 @@ async def frame_mover(app):
                 p = live.get(key)
                 if p is None:
                     # 倉位不在了 -> 止盈或止損已觸發
+                    if S.get("closing"):
+                        continue  # 已有另一處在處理，跳過
+                    S["closing"] = True
                     try:
                         await close_bookkeeping(app, S, "Frame_Exit")
                     except Exception as e:
@@ -553,6 +556,9 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
                 except Exception:
                     pass
             if not p_chk:
+                if S.get("closing"):
+                    return  # 已有另一處在處理，跳過
+                S["closing"] = True
                 await close_bookkeeping(app, S, "TP/SL")
                 return
     # 策略被停止但仍持倉
