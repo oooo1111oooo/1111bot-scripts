@@ -397,9 +397,37 @@ async def close_bookkeeping(app, S, reason):
                "in_px": str(fpx), "out_px": str(xpx)})
     ico = "🟢" if net >= 0 else "🔴"
     mhist = S.get("move_hist") or []
-    # 出場主通知
+    martin = int(S.get("martin") or 1)
+    martin_orders = S.get("martin_orders") or []
+    # 判斷是第幾單出場
+    order_label = ""
+    if martin >= 2 and martin_orders:
+        filled_idx = next((i for i, p in enumerate(martin_orders) if p.get("filled")), None)
+        if filled_idx is not None:
+            order_label = f"第{filled_idx+1}單 "
+    # 判斷後續連動說明
+    next_note = ""
+    if martin >= 2 and martin_orders:
+        filled_count = sum(1 for p in martin_orders if p.get("filled"))
+        total = len(martin_orders)
+        if filled_count < total:
+            next_note = f"\n第{filled_count+1}單連動進場中"
+        else:
+            next_note = "\n全部出場，等下輪TF"
+    # 組 SL 移動明細行
+    def _sl_lines(mhist, mn):
+        lines = []
+        if mn > 0 and mhist:
+            lines.append(f"━━━━━━━━━━\nSL移動 {mn} 次")
+            for mrec in mhist:
+                tp_label = "收" if mrec.get("type") == "定時" else "現"
+                lines.append(f"{mrec.get('t','')} | {tp_label} | {mrec.get('px','')} | 止{mrec.get('sl','')}")
+        return lines
+    sl_detail = _sl_lines(mhist, mn)
+    sl_block = ("\n" + "\n".join(sl_detail)) if sl_detail else ""
+    # 出場主通知（含 SL 移動明細）
     await notify(app, S["chat"],
-        f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico} 已出場\n"
+        f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico} {order_label}已出場\n"
         f"━━━━━━━━━━\n"
         f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
         f"━━━━━━━━━━\n"
@@ -407,16 +435,18 @@ async def close_bookkeeping(app, S, reason):
         f"止盈TP：{tp_px}({pct(S['tp'])}%)\n止損SL：{sl_px}({pct(S['sl'])}%)\n"
         f"出場：{xpx}({gp:+.3f}%) | {hhmmss()} | {hs}s\n"
         f"━━━━━━━━━━\n毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
-        f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}\n時間：{hhmmss()}")
-    # SL 移動紀錄：每20筆一頁，全部顯示
-    if mn > 0 and mhist:
+        f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}"
+        f"{sl_block}{next_note}\n時間：{hhmmss()}")
+    # SL 移動超過20筆才分頁補發（主通知已含第一批）
+    if mn > 20 and mhist:
         PAGE = 20
-        pages = [mhist[i:i+PAGE] for i in range(0, len(mhist), PAGE)]
-        total_pages = len(pages)
-        for pi, page in enumerate(pages, 1):
+        pages = [mhist[i:i+PAGE] for i in range(20, len(mhist), PAGE)]
+        total_pages = len(pages) + 1
+        for pi, page in enumerate(pages, 2):
             lines = [f"SL移動 {mn} 次（{pi}/{total_pages}）"]
             for mrec in page:
-                lines.append(f"{mrec.get('t','')} | 現{mrec.get('px','')} | 止{mrec.get('sl','')}")
+                tp_label = "收" if mrec.get("type") == "定時" else "現"
+                lines.append(f"{mrec.get('t','')} | {tp_label} | {mrec.get('px','')} | 止{mrec.get('sl','')}")
             await notify(app, S["chat"], "\n".join(lines))
     for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt", "pos_sz",
               "algo_id", "tp_px", "sl_px", "frame_base", "move_n", "move_hist", "last_move",
@@ -1284,9 +1314,16 @@ async def cmd_status(u, c):
         k = skey(s["sym"], s["dir"]); placed, entered = get_stat(k)
         key = (s["spec"]["iid"], "long" if s["dir"] == "L" else "short")
         live = "持倉中" if key in okxp else ("委託中" if key in okxo else "等下輪")
+        martin = int(s.get("martin") or 1)
+        martin_label = f" 🎯馬丁x{martin}" if martin >= 2 else ""
         L.append("━━━━━━━━━━")
-        L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(掛{placed}/進{entered})")
+        L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(掛{placed}/進{entered}){martin_label}")
         L.append(f"參數：{strat_params(s['sym'], s['dir'])}")
+        # 馬丁模式：顯示各單狀態
+        if martin >= 2 and s.get("martin_orders"):
+            for i, p in enumerate(s["martin_orders"]):
+                tag = "✅已進場" if p.get("filled") else "⏳等待中"
+                L.append(f"第{i+1}單({p.get('margin_x','')}份)：埋伏{p.get('amb','')} SL{p.get('sl','')} TP{p.get('tp','')}｜{tag}")
         if s.get("pos_open"):
             fpx_s = s.get("pos_px", "-")
             tp_s = s.get("tp_px") or s.get("pos_tp", "-")
@@ -1296,6 +1333,10 @@ async def cmd_status(u, c):
             L.append(f"止盈TP：{tp_s}(固定)")
             L.append(f"止損SL：{sl_s}(目前)")
             L.append(f"SL移動：{mn}次")
+            mhist = s.get("move_hist") or []
+            for mrec in mhist:
+                tp_label = "收" if mrec.get("type") == "定時" else "現"
+                L.append(f"  {mrec.get('t','')} | {tp_label} | {mrec.get('px','')} | 止{mrec.get('sl','')}")
     L.append("━━━━━━━━━━")
     L.append(f"掛單數：{len(pdl)}｜持倉數：{len(pl)}")
     for p in pl:
