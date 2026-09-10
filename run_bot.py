@@ -296,57 +296,32 @@ async def amend_frames(items):
 
 def sl_shift(S, px, d):
     """依現價追蹤 SL；TP 永遠不動。
-    兩段邏輯：
-      ① 當下浮動獲利 ≥ FEE_RATE（0.1%）→ SL 緊貼現價，距離固定 FEE_RATE
-      ② 否則 → 原邏輯：現價超過上次基準才跟移 delta U
+    方案D：不管獲利與否，一律緊貼現價 0.1%（FEE_RATE）。
+    SL 只能往有利方向移，不能後退。
     收盤推格由 frame_mover 另行處理，此函式只處理現價追蹤。"""
     try:
         fpx = Decimal(str(S.get("pos_px") or "0"))
-        base = Decimal(str(S.get("frame_base") or fpx))
         cur = Decimal(str(px))
         tp = Decimal(str(S["tp_px"]))
         sl = Decimal(str(S["sl_px"]))
     except Exception:
         return None
-    if fpx <= 0 or base <= 0:
+    if fpx <= 0:
         return None
     tick = S["spec"]["tick"]
 
-    # 計算當下浮動獲利%
+    # 方案D：一律緊貼現價，距離固定 FEE_RATE（0.1%）
     if d == "L":
-        profit_pct = (cur - fpx) / fpx
+        nsl = align(cur * (Decimal("1") - FEE_RATE), tick, "S")
+        if nsl <= sl:
+            return None  # SL 不能後退
     else:
-        profit_pct = (fpx - cur) / fpx
+        nsl = align(cur * (Decimal("1") + FEE_RATE), tick, "L")
+        if nsl >= sl:
+            return None  # SL 不能後退
 
-    if profit_pct >= FEE_RATE:
-        # ① 獲利 ≥ 0.1%：SL 緊貼現價，距離 = FEE_RATE
-        if d == "L":
-            nsl = align(cur * (Decimal("1") - FEE_RATE), tick, "S")
-        else:
-            nsl = align(cur * (Decimal("1") + FEE_RATE), tick, "L")
-        # SL 只能往有利方向移，不能後退
-        if d == "L" and nsl <= sl:
-            return None
-        if d == "S" and nsl >= sl:
-            return None
-        gain = float(profit_pct * 100)
-        return tp, nsl, cur, gain
-    else:
-        # ② 獲利 < 0.1%：原邏輯，現價超過上次基準才跟移
-        if d == "L":
-            delta = cur - base
-            if delta <= 0:
-                return None
-            nsl = align(sl + delta, tick, "S")
-        else:
-            delta = base - cur
-            if delta <= 0:
-                return None
-            nsl = align(sl - delta, tick, "L")
-        if nsl == sl:
-            return None
-        gain = float(abs(delta) / base * 100)
-        return tp, nsl, cur, gain
+    gain = float((cur - fpx) / fpx * 100) if d == "L" else float((fpx - cur) / fpx * 100)
+    return tp, nsl, cur, gain
 
 async def close_bookkeeping(app, S, reason):
     """偵測到倉位已不在（止盈或止損觸發）後的收尾：取真實損益、撤殘單、發通知。"""
@@ -382,7 +357,6 @@ async def close_bookkeeping(app, S, reason):
     npv = (net / nv * 100) if nv else Decimal(0)
     hs = int(time.time() - ee)
     pt = float(S.get("pos_pt") or ee)
-    amb_s = f"{round(ee - pt)}s" if pt else "-"
     tp_px = Decimal(str(S.get("tp_px") or S.get("pos_tp") or "0"))
     sl_px = Decimal(str(S.get("sl_px") or S.get("pos_sl") or "0"))
     mn = S.get("move_n", 0)
@@ -425,15 +399,17 @@ async def close_bookkeeping(app, S, reason):
         return lines
     sl_detail = _sl_lines(mhist, mn)
     sl_block = ("\n" + "\n".join(sl_detail)) if sl_detail else ""
+    # 出場原因對應顯示
+    reason_label = {"Take_Profit": "TP", "Stop_Loss": "SL", "Frame_Exit": "SL"}.get(reason, reason)
     # 出場主通知（含 SL 移動明細）
     await notify(app, S["chat"],
         f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico} {order_label}已出場\n"
         f"━━━━━━━━━━\n"
-        f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason}\n"
+        f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n出場原因：{reason_label}\n"
         f"━━━━━━━━━━\n"
-        f"進場：{fpx}({pct(S['offset'])}%) | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')} | {amb_s}\n"
+        f"進場：{fpx}({pct(S['offset'])}%) | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')}\n"
         f"止盈TP：{tp_px}({pct(S['tp'])}%)\n止損SL：{sl_px}({pct(S['sl'])}%)\n"
-        f"出場：{xpx}({gp:+.3f}%) | {hhmmss()} | {hs}s\n"
+        f"出場：{xpx}({gp:+.3f}%) | {hhmmss()}\n"
         f"━━━━━━━━━━\n毛損益：{g:+.6f} ({gp:+.3f}%)\n手續費：{fee:+.6f} ({fp:+.3f}%)\n"
         f"淨損益：{net:+.6f} ({npv:+.3f}%) {E.pnl_emoji(net)}"
         f"{sl_block}{next_note}\n時間：{hhmmss()}")
@@ -975,7 +951,7 @@ async def loop(app, chat, S):
                 f"{E.BOT} OKX原K｜{ACCT}\n事件：🔔 已進場成交\n"
                 f"━━━━━━━━━━\n"
                 f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                f"進場：{fpx}({pct(S['offset'])}%) | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')} | {int(ee - pt)}s\n"
+                f"進場：{fpx}({pct(S['offset'])}%) | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')}\n"
                 f"止盈TP：{tp}({pct(S['tp'])}%)\n止損SL：{sl}({pct(S['sl'])}%)\n"
                 f"━━━━━━━━━━\n"
                 f"移動SL：每{S['interval']}s追蹤 | 收盤推{pct(S['move_pct'])}%\n"
