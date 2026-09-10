@@ -625,6 +625,7 @@ async def loop_martin(app, chat, S, spec, iid, d, pos, k):
     5. 所有單出場後（30s 輪詢確認）→ 重新下一輪
     """
     martin = int(S.get("martin", 2))
+    first_round = True
     try:
         while S["alive"]:
             # ── 等待下一根 TF 開盤 ──
@@ -708,13 +709,15 @@ async def loop_martin(app, chat, S, spec, iid, d, pos, k):
             S["state"] = "馬丁委託中"; save_state()
 
             labels = {1: "第1單", 2: "第2單", 3: "第3單"}
-            order_info = "\n".join(
-                f"{labels.get(i+1, f'第{i+1}單')}：埋伏{p['amb']} SL{p['sl']} TP{p['tp']}（{p['margin_x']}份）"
-                for i, p in enumerate(placed))
-            await notify(app, chat,
-                f"{E.BOT} OKX原K｜{ACCT}\n事件：🎯 馬丁x{martin} 已掛出 {len(placed)} 張單\n"
-                f"━━━━━━━━━━\n商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                f"{order_info}\n━━━━━━━━━━\n下單策略已暫停，等待連動\n時間：{hhmmss()}")
+            if first_round:
+                order_info = "\n".join(
+                    f"{labels.get(i+1, f'第{i+1}單')}：埋伏{p['amb']} SL{p['sl']} TP{p['tp']}（{p['margin_x']}份）"
+                    for i, p in enumerate(placed))
+                await notify(app, chat,
+                    f"{E.BOT} OKX原K｜{ACCT}\n事件：🎯 馬丁x{martin} 已掛出 {len(placed)} 張單\n"
+                    f"━━━━━━━━━━\n商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+                    f"{order_info}\n━━━━━━━━━━\n下單策略已暫停，等待連動\n時間：{hhmmss()}")
+                first_round = False
 
             # ── 監控：等待全部出場（或手動平倉/TP） ──
             active_algo_map = {}  # oid -> algo_id（已進場的單）
