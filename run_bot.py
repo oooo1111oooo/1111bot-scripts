@@ -71,7 +71,7 @@ def pct(v):
 SAVE_FIELDS = ("sym","dir","tf","lev","margin","offset","tp","sl","move_pct","interval","chat",
                "pos_open","pos_px","pos_tp","pos_sl","pos_ee","pos_pt","last_open","catchup",
                "algo_id","tp_px","sl_px","frame_base","move_n","move_hist","last_move",
-               "last_force_mv_t")
+               "last_force_mv_t","martin","martin_orders","martin_paused")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
     # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
@@ -553,6 +553,245 @@ async def monitor(app, S, spec, iid, d, pos, size, fpx, tp, sl, ee, pt, k):
     if await okx_pos(iid, pos):
         await notify(app, S["chat"], f"{E.BOT} {S['sym']} {E.dir_word(d)} 策略停止但仍有持倉，請至 OKX 處理")
 
+MARTIN_CHECK_INTERVAL = 30  # 馬丁模式：每 30 秒輪詢 OKX 確認是否全數出場
+
+async def _martin_place_order(iid, pos, d, amb, size_margin, lev, spec, prefix="n"):
+    """掛一張限價單，回傳 ordId 或 None。"""
+    sz = csize(size_margin, Decimal(str(lev)), amb, spec["ctval"], spec["lot"])
+    if sz < spec["minsz"]:
+        return None, sz
+    r = await api("POST", "/api/v5/trade/order",
+                  {"instId": iid, "tdMode": "isolated",
+                   "side": "buy" if d == "L" else "sell",
+                   "posSide": pos, "ordType": "limit", "px": str(amb), "sz": str(sz),
+                   "clOrdId": prefix + uuid.uuid4().hex[:14]})
+    if r.get("code") == "0" and r.get("data"):
+        return r["data"][0]["ordId"], sz
+    return None, sz
+
+async def _martin_all_clear(iid, pos):
+    """回傳 True 代表 OKX 上該幣種該方向：無持倉 且 無本 bot 掛單。"""
+    p = await okx_pos(iid, pos)
+    if p:
+        return False
+    orders = await okx_orders(iid, pos, prefix="n")
+    return len(orders) == 0
+
+async def _martin_cancel_pending(iid, pos, placed_oids):
+    """撤銷所有尚未成交的馬丁掛單。"""
+    for oid in placed_oids:
+        st = await api("GET", f"/api/v5/trade/order?instId={iid}&ordId={oid}")
+        if st.get("code") == "0" and st.get("data"):
+            state = st["data"][0].get("state", "")
+            if state in ("live", "partially_filled"):
+                await api("POST", "/api/v5/trade/cancel-order", {"instId": iid, "ordId": oid})
+
+async def loop_martin(app, chat, S, spec, iid, d, pos, k):
+    """馬丁模式主迴圈（M=2/3）：
+    1. 等 TF 開盤 → 一次掛 M 張限價單
+    2. 暫停下單，監控各單狀態
+    3. 任何單 TP 或手動平倉 → 取消所有掛單 → 重新開始
+    4. SL 連動：第1單SL出場 → 第2單進場 → 第3單等待
+    5. 所有單出場後（30s 輪詢確認）→ 重新下一輪
+    """
+    martin = int(S.get("martin", 2))
+
+    while S["alive"]:
+        # ── 等待下一根 TF 開盤 ──
+        tf_sec = TF_SEC[S["tf"]]
+        S["state"] = "等下輪（馬丁）"; save_state()
+        oe = next_open_epoch(int(time.time()), S["tf"])
+        w = oe - time.time()
+        if w > 0: await asyncio.sleep(w)
+        if not S["alive"]: break
+
+        # ── 開盤取現價，計算各單埋伏價與尺寸 ──
+        op = await get_last(iid)
+        lev = Decimal(str(S["lev"]))
+        margin = Decimal(str(S["margin"]))
+        sl_pct = Decimal(str(S["sl"])) / 100
+        tp_pct = Decimal(str(S["tp"])) / 100
+        tick = spec["tick"]
+
+        # 第1單埋伏價（同現行邏輯）
+        amb1 = align(op * (1 - Decimal(str(S["offset"])) / 100) if d == "L"
+                     else op * (1 + Decimal(str(S["offset"])) / 100), tick, d)
+
+        # 第1單 SL/TP（以 amb1 為基準）
+        if d == "L":
+            sl1 = align(amb1 * (1 - sl_pct), tick, "L")
+            tp1 = align(amb1 * (1 + tp_pct), tick, "S")
+        else:
+            sl1 = align(amb1 * (1 + sl_pct), tick, "S")
+            tp1 = align(amb1 * (1 - tp_pct), tick, "L")
+
+        # 第2單：埋伏價 = sl1，TP/SL 以 sl1 為基準
+        amb2 = sl1
+        if d == "L":
+            sl2 = align(amb2 * (1 - sl_pct), tick, "L")
+            tp2 = align(amb2 * (1 + tp_pct), tick, "S")
+        else:
+            sl2 = align(amb2 * (1 + sl_pct), tick, "S")
+            tp2 = align(amb2 * (1 - tp_pct), tick, "L")
+
+        # 第3單：埋伏價 = sl2，TP/SL 以 sl2 為基準
+        if martin >= 3:
+            amb3 = sl2
+            if d == "L":
+                sl3 = align(amb3 * (1 - sl_pct), tick, "L")
+                tp3 = align(amb3 * (1 + tp_pct), tick, "S")
+            else:
+                sl3 = align(amb3 * (1 + sl_pct), tick, "S")
+                tp3 = align(amb3 * (1 - tp_pct), tick, "L")
+        else:
+            amb3 = sl3 = tp3 = None
+
+        # ── 清殘單，一次掛出全部馬丁單 ──
+        await sweep(iid, pos)
+
+        placed = []  # [(ordId, amb, sz, tp, sl, margin_x)]
+
+        oid1, sz1 = await _martin_place_order(iid, pos, d, amb1, margin, lev, spec)
+        if not oid1:
+            await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} {E.dir_word(d)} 馬丁第1單掛單失敗，跳過本輪")
+            await asyncio.sleep(3); continue
+        placed.append({"oid": oid1, "amb": str(amb1), "sz": str(sz1),
+                        "tp": str(tp1), "sl": str(sl1), "margin_x": 1, "algo_id": None, "filled": False})
+        bump(k, "placed")
+
+        if martin >= 2:
+            oid2, sz2 = await _martin_place_order(iid, pos, d, amb2, margin * 2, lev, spec)
+            if oid2:
+                placed.append({"oid": oid2, "amb": str(amb2), "sz": str(sz2),
+                                "tp": str(tp2), "sl": str(sl2), "margin_x": 2, "algo_id": None, "filled": False})
+                bump(k, "placed")
+
+        if martin >= 3 and amb3:
+            oid3, sz3 = await _martin_place_order(iid, pos, d, amb3, margin * 4, lev, spec)
+            if oid3:
+                placed.append({"oid": oid3, "amb": str(amb3), "sz": str(sz3),
+                                "tp": str(tp3), "sl": str(sl3), "margin_x": 4, "algo_id": None, "filled": False})
+                bump(k, "placed")
+
+        S["martin_orders"] = placed
+        S["martin_paused"] = True
+        S["state"] = "馬丁委託中"; save_state()
+
+        labels = {1: "第1單", 2: "第2單", 3: "第3單"}
+        order_info = "\n".join(
+            f"{labels.get(i+1, f'第{i+1}單')}：埋伏{p['amb']} SL{p['sl']} TP{p['tp']}（{p['margin_x']}份）"
+            for i, p in enumerate(placed))
+        await notify(app, chat,
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：🎯 馬丁x{martin} 已掛出 {len(placed)} 張單\n"
+            f"━━━━━━━━━━\n商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+            f"{order_info}\n━━━━━━━━━━\n下單策略已暫停，等待連動\n時間：{hhmmss()}")
+
+        # ── 監控：等待全部出場（或手動平倉/TP） ──
+        active_algo_map = {}  # oid -> algo_id（已進場的單）
+        filled_set = set()    # 已成交的 oid
+
+        while S["alive"]:
+            await asyncio.sleep(MARTIN_CHECK_INTERVAL)
+
+            # 查詢 OKX 目前掛單（本 bot 的 n prefix）
+            pending_orders = await okx_orders(iid, pos, prefix="n")
+            pending_oids = {o["ordId"] for o in pending_orders}
+
+            # 查詢 OKX 目前持倉
+            cur_pos = await okx_pos(iid, pos)
+            has_position = cur_pos is not None
+
+            # 逐一檢查各單狀態
+            for p in placed:
+                oid = p["oid"]
+                if p["filled"]:
+                    continue  # 已知已成交，跳過
+                if oid in pending_oids:
+                    continue  # 仍在掛單中
+
+                # 不在掛單 -> 查詢該單狀態
+                st = await api("GET", f"/api/v5/trade/order?instId={iid}&ordId={oid}")
+                if st.get("code") == "0" and st.get("data"):
+                    order_state = st["data"][0].get("state", "")
+                    if order_state == "filled":
+                        if oid not in filled_set:
+                            filled_set.add(oid)
+                            p["filled"] = True
+                            fpx_i = Decimal(st["data"][0].get("avgPx") or p["amb"])
+                            sz_i = Decimal(p["sz"])
+                            tp_i = Decimal(p["tp"])
+                            sl_i = Decimal(p["sl"])
+                            # 掛 algo OCO 單
+                            algo_id_i = await place_algo(iid, pos, d, sz_i, tp_i, sl_i)
+                            if algo_id_i:
+                                p["algo_id"] = algo_id_i
+                                active_algo_map[oid] = algo_id_i
+                            bump(k, "entered")
+                            # 設定停損追蹤（覆寫 S，frame_mover 會跟進）
+                            ee_i = time.time()
+                            S["pos_open"] = True
+                            S["pos_px"] = str(fpx_i); S["pos_sz"] = str(sz_i)
+                            S["pos_tp"] = str(tp_i); S["pos_sl"] = str(sl_i)
+                            S["pos_ee"] = ee_i; S["pos_pt"] = ee_i
+                            S["tp_px"] = str(tp_i); S["sl_px"] = str(sl_i)
+                            S["frame_base"] = str(fpx_i)
+                            S["move_n"] = 0; S["move_hist"] = []
+                            S["last_move"] = ee_i; S["last_force_mv_t"] = 0
+                            if algo_id_i:
+                                S["algo_id"] = algo_id_i
+                            save_state()
+                            label_i = labels.get(placed.index(p) + 1, "第?單")
+                            await notify(app, chat,
+                                f"{E.BOT} OKX原K｜{ACCT}\n事件：🔔 {label_i} 已進場成交\n"
+                                f"━━━━━━━━━━\n商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+                                f"進場：{fpx_i}（{label_i}）\n"
+                                f"止盈TP：{tp_i}({pct(S['tp'])}%)\n止損SL：{sl_i}({pct(S['sl'])}%)\n"
+                                f"移動SL：每{S['interval']}s追蹤 | 收盤推{pct(S['move_pct'])}%\n"
+                                f"時間：{hhmmss()}")
+
+            # 判斷是否提前出場（TP 或手動平倉）：
+            # 有單已成交 但 OKX 現在無持倉 且 已成交的單的 algo 也不在了
+            any_filled = any(p["filled"] for p in placed)
+            if any_filled and not has_position:
+                # 確認是否所有已成交的單都已出場（algo 已消失）
+                algo_ids_active = [aid for aid in active_algo_map.values() if aid]
+                all_algo_gone = True
+                if algo_ids_active:
+                    r_algo = await api("GET", "/api/v5/trade/orders-algo-pending?ordType=oco")
+                    pending_algos = {o.get("algoId") for o in (r_algo.get("data") or [])}
+                    all_algo_gone = not any(aid in pending_algos for aid in algo_ids_active)
+
+                if all_algo_gone:
+                    # 取消所有尚未成交的掛單
+                    pending_oids_now = {p["oid"] for p in placed if not p["filled"]}
+                    await _martin_cancel_pending(iid, pos, pending_oids_now)
+                    # 清理 S 的持倉狀態
+                    for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt",
+                              "pos_sz", "algo_id", "tp_px", "sl_px", "frame_base",
+                              "move_n", "move_hist", "last_move", "last_force_mv_t"):
+                        S.pop(a, None)
+                    S["martin_paused"] = False
+                    S["state"] = "等下輪（馬丁）"; save_state()
+                    await notify(app, chat,
+                        f"{E.BOT} OKX原K｜{ACCT}\n事件：✅ 馬丁全部出場\n"
+                        f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+                        f"已進場：{len(filled_set)} 單｜已取消掛單：{len(pending_oids_now)} 單\n"
+                        f"下一輪等待下根TF開盤\n時間：{hhmmss()}")
+                    break  # 跳出監控迴圈，進入下一輪
+
+            # 全部單都未成交（第一單還沒進場）且 TF 已過期 → 撤單放棄本輪
+            if not any_filled:
+                tf_end = oe + tf_sec
+                if time.time() > tf_end - ENTRY_CUTOFF:
+                    not_filled_oids = [p["oid"] for p in placed if not p["filled"]]
+                    await _martin_cancel_pending(iid, pos, not_filled_oids)
+                    for a in ("pos_open", "martin_paused"):
+                        S.pop(a, None)
+                    S["state"] = "等下輪（馬丁）"; save_state()
+                    await notify(app, chat,
+                        f"{E.BOT} {S['sym']} {E.dir_word(d)} 馬丁本輪未成交，已撤單，等下根TF")
+                    break  # 跳出監控迴圈，進入下一輪
+
 # ---------- 主迴圈：一根 K 線一輪 ----------
 async def loop(app, chat, S):
     spec = S["spec"]; iid = spec["iid"]; d = S["dir"]
@@ -575,6 +814,12 @@ async def loop(app, chat, S):
                 for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt"):
                     S.pop(a, None)
                 save_state()
+
+        # ── 馬丁模式（M=2/3）：一次掛多單，暫停下單直到全部出場 ──
+        martin = int(S.get("martin") or 1)
+        if martin >= 2:
+            await loop_martin(app, chat, S, spec, iid, d, pos, k)
+            return
 
         while S["alive"]:
             tf_sec = TF_SEC[S["tf"]]
@@ -728,7 +973,7 @@ async def rebuild_strat(d):
     for a in ("pos_open", "pos_px", "pos_tp", "pos_sl", "pos_ee", "pos_pt",
               "last_open", "catchup", "algo_id", "tp_px", "sl_px",
               "frame_base", "move_n", "move_hist", "last_move", "last_force_mv_t",
-              "pos_sz"):
+              "pos_sz", "martin", "martin_orders", "martin_paused"):
         if a in d: S[a] = d[a]
     return S
 
@@ -863,15 +1108,17 @@ def strat_params(sym, dr):
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"用法：/run 商品 方向 槓桿 保證金 進場距離% TP% SL% 移動門檻% 間隔秒\n"
-           f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 0.05 5\n"
+    fmt = (f"用法：/run 商品 方向 槓桿 保證金 進場距離% TP% SL% 移動門檻% 間隔秒 馬丁(1/2/3)\n"
+           f"例：/run ETHUSDT L 1x 3 0.5 0.5 0.5 0.05 5 1\n"
+           f"馬丁=1單注；2=連下2單(1+2份)；3=連下3單(1+2+4份)\n"
            f"週期依 /timeframe，目前 {ACCOUNT_TF}")
-    if len(a) != 9: await reply(u, f"{E.BOT} 參數數量錯誤（需9個）\n{fmt}"); return
+    if len(a) != 10: await reply(u, f"{E.BOT} 參數數量錯誤（需10個）\n{fmt}"); return
     try:
         sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
         margin = Decimal(a[3]); offset = Decimal(a[4])
         tp = Decimal(a[5].rstrip("%")); sl = Decimal(a[6].rstrip("%"))
         move_pct = Decimal(a[7].rstrip("%")); interval = int(a[8])
+        martin = int(a[9])
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     if dr not in ("L", "S"): await reply(u, f"{E.BOT} 方向須 L 或 S"); return
@@ -879,6 +1126,8 @@ async def cmd_run(u, c):
         if v < 0: await reply(u, f"{E.BOT} {nm} 不可為負數"); return
     if not 1 <= interval <= 300:
         await reply(u, f"{E.BOT} 間隔秒須介於 1~300"); return
+    if martin not in (1, 2, 3):
+        await reply(u, f"{E.BOT} 馬丁參數須為 1、2 或 3"); return
     k = skey(sym, dr)
     if k in STRATS and STRATS[k].get("alive"):
         await reply(u, f"{E.BOT} {sym} {E.dir_word(dr)} 已在運行"); return
@@ -886,20 +1135,37 @@ async def cmd_run(u, c):
     except Exception: await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
     op = await get_last(spec["iid"])
     amb = align(op * (1 - offset / 100) if dr == "L" else op * (1 + offset / 100), spec["tick"], dr)
-    size = csize(margin, Decimal(lev), amb, spec["ctval"], spec["lot"])
-    if size < spec["minsz"]:
+    # 預覽：計算第一單的 SL，進而推算後續各單的埋伏價
+    if dr == "L":
+        sl1 = align(amb * (1 - sl / 100), spec["tick"], "L")
+        sl2 = align(sl1 * (1 - sl / 100), spec["tick"], "L") if martin >= 2 else None
+    else:
+        sl1 = align(amb * (1 + sl / 100), spec["tick"], "S")
+        sl2 = align(sl1 * (1 + sl / 100), spec["tick"], "S") if martin >= 2 else None
+    size1 = csize(margin, Decimal(lev), amb, spec["ctval"], spec["lot"])
+    if size1 < spec["minsz"]:
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
-        await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
+        await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：算出 {size1} 張 < 最小 {spec['minsz']}\n此槓桿下至少需約 {need:.4f} USDT"); return
+    total_margin = margin * (1 if martin == 1 else 3 if martin == 2 else 7)
     PENDING[u.effective_chat.id] = {"kind": "run", "t": time.time(), "sym": sym, "dir": dr, "tf": ACCOUNT_TF,
         "lev": lev, "margin": margin, "offset": offset, "tp": tp, "sl": sl,
-        "move_pct": move_pct, "interval": interval, "spec": spec}
-    await reply(u, f"{E.BOT} OKX原K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
+        "move_pct": move_pct, "interval": interval, "spec": spec, "martin": martin}
+    martin_label = {1: "單注模式", 2: "馬丁x2（1+2份）", 3: "馬丁x3（1+2+4份）"}[martin]
+    preview = (f"{E.BOT} OKX原K｜{ACCT}\n事件：交易參數預覽\n━━━━━━━━━━\n"
         f"商品：{E.dir_emoji(dr)} {sym} {E.dir_word(dr)} {lev}x\n週期：{ACCOUNT_TF}\n"
-        f"開盤估價：{op}\n進場距離：{offset}%\n進場價格：{amb}\n"
-        f"止盈TP：{tp}%\n止損SL：{sl}%\n保證金：{margin} USDT\n下單張數：{size}\n"
+        f"模式：{martin_label}\n"
+        f"開盤估價：{op}\n進場距離：{offset}%\n"
+        f"第1單埋伏：{amb}（保證金{margin}）\n")
+    if martin >= 2:
+        preview += f"第2單埋伏：{sl1}（保證金{margin*2}，即第1單SL）\n"
+    if martin >= 3:
+        preview += f"第3單埋伏：{sl2}（保證金{margin*4}，即第2單SL）\n"
+    preview += (f"止盈TP：{tp}%\n止損SL：{sl}%\n"
+        f"所需總保證金：{total_margin} USDT\n"
         f"移動SL：每{interval}s追蹤 | 收盤推{pct(move_pct)}%\n"
         f"獲利≥0.1%→緊貼現價0.1%\n"
         f"━━━━━━━━━━\n⚠ 確認後真實循環交易\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
+    await reply(u, preview)
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def _to(app, chat, stamp):
