@@ -1496,9 +1496,8 @@ async def klines_paged_for_tf(iid, tf, want):
 def build_amp_xlsx(results, tf, path):
     """振幅分析報表（多幣種，每幣一個 sheet，sheet name = 幣種）。
     results = [(sym, kl, amps, tick), ...]  tick = OKX tickSz（Decimal）
-    欄位：幣種/週期/日期/時間/漲跌/開/高/低/收/漲跌幅%/振幅%/開到高/開到高%/開到低/開到低%
-    右側分析表：開到高% / 開到低% 門檻統計（≥0.1% ~ ≥5.0%）
-    header 底色：開到高群組 theme6+tint0.8（淡藍）、開到低群組 theme9+tint0.8（淡橘）
+    欄位：幣種/週期/日期/時間/漲跌/開/高/低/收/漲跌幅%/振幅%/ABS(振幅%-漲跌幅%)/開到高/開到高%/開到低/開到低%/收到高/收到高%/收到低/收到低%
+    右側分析表：開到高% / 開到低% / 收到高% / 收到低% 門檻統計（≥0.1% ~ ≥5.0%）
     """
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Color
@@ -1513,16 +1512,16 @@ def build_amp_xlsx(results, tf, path):
         ("≥ 2.0%", 0.02),  ("≥ 2.5%", 0.025), ("≥ 3.0%", 0.03),
         ("≥ 3.5%", 0.035), ("≥ 4.0%", 0.04),  ("≥ 5.0%", 0.05),
     ]
-    # header 底色：theme6=淡藍（開到高群組 B~T）、theme9=淡橘（開到低群組 V~X）
     TINT = 0.7999816888943144
     fill_blue = PatternFill("solid", fgColor=Color(theme=6, tint=TINT, type="theme"))
     fill_orng = PatternFill("solid", fgColor=Color(theme=9, tint=TINT, type="theme"))
+    fill_grn  = PatternFill("solid", fgColor=Color(theme=6, tint=0.6, type="theme"))   # 收到高群組
+    fill_red  = PatternFill("solid", fgColor=Color(theme=9, tint=0.6, type="theme"))   # 收到低群組
 
     wb = Workbook()
     wb.remove(wb.active)
 
     for sym, kl, amps, tick in results:
-        # 依 OKX tickSz 決定價格小數位數
         dp = max(0, -tick.as_tuple().exponent)
         price_fmt = "0" if dp == 0 else "0." + "0" * dp
 
@@ -1532,18 +1531,30 @@ def build_amp_xlsx(results, tf, path):
         lft = Alignment(horizontal="left")
         cen = Alignment(horizontal="center")
 
-        # 主欄標頭（row 2，col B~P，淡藍底色）
+        # 主欄標頭（row 2，col B~U）
+        # B=幣種 C=週期 D=日期 E=時間 F=漲跌
+        # G=開 H=高 I=低 J=收
+        # K=漲跌幅% L=振幅% M=ABS(振幅%-漲跌幅%)
+        # N=開到高 O=開到高% P=開到低 Q=開到低%
+        # R=收到高 S=收到高% T=收到低 U=收到低%
         main_heads = ["幣種", "週期", "日期", "時間", "漲跌",
-                      "開", "高", "低", "收", "漲跌幅%", "振幅%",
-                      "開到高", "開到高%", "開到低", "開到低%"]
-        for ci, h in enumerate(main_heads, start=2):
+                      "開", "高", "低", "收", "漲跌幅%", "振幅%", "ABS(振幅%-漲跌幅%)",
+                      "開到高", "開到高%", "開到低", "開到低%",
+                      "收到高", "收到高%", "收到低", "收到低%"]
+        fills_main = [fill_blue] * 12 + [fill_blue] * 4 + [fill_grn] * 4
+        for ci, (h, f) in enumerate(zip(main_heads, fills_main), start=2):
             c = ws.cell(row=2, column=ci, value=h)
-            c.font = hdr; c.alignment = cen; c.fill = fill_blue
+            c.font = hdr; c.alignment = cen; c.fill = f
 
-        # 分析表標頭（row 2）：R/S/T 淡藍，V/W/X 淡橘
-        for col, label, fill in [(18, "開到高%門檻", fill_blue), (19, "根數", fill_blue),
-                                 (20, "佔比", fill_blue), (22, "開到低%門檻", fill_orng),
-                                 (23, "根數", fill_orng), (24, "佔比", fill_orng)]:
+        # 分析表標頭（row 2）：W/X/Y 淡藍（開到高%），AA/AB/AC 淡橘（開到低%）
+        #                       AE/AF/AG 收到高%，AI/AJ/AK 收到低%
+        # col: 23=W 24=X 25=Y  27=AA 28=AB 29=AC  31=AE 32=AF 33=AG  35=AI 36=AJ 37=AK
+        for col, label, fill in [
+            (23, "開到高%門檻", fill_blue), (24, "根數", fill_blue), (25, "佔比", fill_blue),
+            (27, "開到低%門檻", fill_orng), (28, "根數", fill_orng), (29, "佔比", fill_orng),
+            (31, "收到高%門檻", fill_grn),  (32, "根數", fill_grn),  (33, "佔比", fill_grn),
+            (35, "收到低%門檻", fill_red),  (36, "根數", fill_red),  (37, "佔比", fill_red),
+        ]:
             c = ws.cell(row=2, column=col, value=label)
             c.font = hdr; c.alignment = lft; c.fill = fill
 
@@ -1555,51 +1566,73 @@ def build_amp_xlsx(results, tf, path):
             lo = float(k["l"]); cl = float(k["c"])
             chg_pct = (cl - o) / o if o else 0
             amp_pct = (h - lo) / o if o else 0
-            h2o = h - o; h2o_pct = h2o / o if o else 0
+            abs_diff = abs(amp_pct - chg_pct)
+            h2o = h - o;  h2o_pct = h2o / o if o else 0
             l2o = o - lo; l2o_pct = l2o / o if o else 0
+            h2c = h - cl; h2c_pct = h2c / cl if cl else 0   # 收到高
+            c2l = cl - lo; c2l_pct = c2l / cl if cl else 0  # 收到低
             flag = "🟩" if cl >= o else "🟥"
             vals = [sym, tf, dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S"),
-                    flag, o, h, lo, cl, chg_pct, amp_pct,
-                    round(h2o, dp), h2o_pct, round(l2o, dp), l2o_pct]
+                    flag, o, h, lo, cl, chg_pct, amp_pct, abs_diff,
+                    round(h2o, dp), h2o_pct, round(l2o, dp), l2o_pct,
+                    round(h2c, dp), h2c_pct, round(c2l, dp), c2l_pct]
             for ci, v in enumerate(vals, start=2):
                 ws.cell(row=r, column=ci, value=v).font = dat
-            # 開/高/低/收/開到高/開到低：依 tickSz 小數位
-            for ci in [7, 8, 9, 10, 13, 15]:
+            # 價格欄（開/高/低/收/開到高/開到低/收到高/收到低）
+            for ci in [7, 8, 9, 10, 14, 16, 18, 20]:
                 ws.cell(r, ci).number_format = price_fmt
-            # 漲跌幅%：4位小數%（負數紅色）
+            # 漲跌幅%
             ws.cell(r, 11).number_format = "0.0000%;[Red]\\-0.0000%"
-            # 振幅%/開到高%/開到低%：4位小數%
-            ws.cell(r, 12).number_format = "0.0000%"
-            ws.cell(r, 14).number_format = "0.0000%"
-            ws.cell(r, 16).number_format = "0.0000%"
+            # 振幅%、ABS差、開到高%、開到低%、收到高%、收到低%
+            for ci in [12, 13, 15, 17, 19, 21]:
+                ws.cell(r, ci).number_format = "0.0000%"
 
-        # 分析表（row 1 SUM，row 3+ 門檻，佔比 2 位小數）
+        # 分析表（row 1 SUM，row 3+ 門檻）
         last_r = len(kl) + 2
-        ws.cell(1, 19, f"=COUNT($N3:$N{last_r})").font = Font(name=FONT, bold=True, size=11)
-        ws.cell(1, 23, f"=COUNT($P3:$P{last_r})").font = Font(name=FONT, bold=True, size=11)
+        # 開到高% → 欄 O(15)，根數欄 X(24)
+        ws.cell(1, 24, f"=COUNT($O3:$O{last_r})").font = Font(name=FONT, bold=True, size=11)
+        # 開到低% → 欄 Q(17)，根數欄 AB(28)
+        ws.cell(1, 28, f"=COUNT($Q3:$Q{last_r})").font = Font(name=FONT, bold=True, size=11)
+        # 收到高% → 欄 S(19)，根數欄 AF(32)
+        ws.cell(1, 32, f"=COUNT($S3:$S{last_r})").font = Font(name=FONT, bold=True, size=11)
+        # 收到低% → 欄 U(21)，根數欄 AJ(36)
+        ws.cell(1, 36, f"=COUNT($U3:$U{last_r})").font = Font(name=FONT, bold=True, size=11)
+
         for ti, (label, dec) in enumerate(THRESHOLDS):
             tr = ti + 3
             ps = f">={dec}"
-            ws.cell(tr, 18, label).font = dat; ws.cell(tr, 18).alignment = lft
-            ws.cell(tr, 19, f'=COUNTIF({sym}!$N3:$N{last_r},"{ps}")').font = dat
-            c = ws.cell(tr, 20, f"=S{tr}/S$1"); c.font = dat; c.number_format = "0.00%"
-            ws.cell(tr, 22, label).font = dat; ws.cell(tr, 22).alignment = lft
-            ws.cell(tr, 23, f'=COUNTIF({sym}!$P3:$P{last_r},"{ps}")').font = dat
-            c = ws.cell(tr, 24, f"=W{tr}/W$1"); c.font = dat; c.number_format = "0.00%"
+            # 開到高%
+            ws.cell(tr, 23, label).font = dat; ws.cell(tr, 23).alignment = lft
+            ws.cell(tr, 24, f'=COUNTIF({sym}!$O3:$O{last_r},"{ps}")').font = dat
+            c = ws.cell(tr, 25, f"=X{tr}/X$1"); c.font = dat; c.number_format = "0.00%"
+            # 開到低%
+            ws.cell(tr, 27, label).font = dat; ws.cell(tr, 27).alignment = lft
+            ws.cell(tr, 28, f'=COUNTIF({sym}!$Q3:$Q{last_r},"{ps}")').font = dat
+            c = ws.cell(tr, 29, f"=AB{tr}/AB$1"); c.font = dat; c.number_format = "0.00%"
+            # 收到高%
+            ws.cell(tr, 31, label).font = dat; ws.cell(tr, 31).alignment = lft
+            ws.cell(tr, 32, f'=COUNTIF({sym}!$S3:$S{last_r},"{ps}")').font = dat
+            c = ws.cell(tr, 33, f"=AF{tr}/AF$1"); c.font = dat; c.number_format = "0.00%"
+            # 收到低%
+            ws.cell(tr, 35, label).font = dat; ws.cell(tr, 35).alignment = lft
+            ws.cell(tr, 36, f'=COUNTIF({sym}!$U3:$U{last_r},"{ps}")').font = dat
+            c = ws.cell(tr, 37, f"=AJ{tr}/AJ$1"); c.font = dat; c.number_format = "0.00%"
 
-        # Row/Col 字體（防 Excel 用系統預設）
+        # Row/Col 字體
         for rd in ws.row_dimensions.values():
             rd.font = Font(name=FONT, size=11)
         for cd in ws.column_dimensions.values():
             cd.font = Font(name=FONT, size=11)
 
-        # 欄寬（依你修改後的版本）
+        # 欄寬
         col_widths = {
             1: 4.4,   2: 12.8,  3: 6.8,   4: 16.8,  5: 11.4,
-            6: 6.8,   7: 11.2,  11: 13.6, 12: 12.2, 13: 9.4,
-            14: 12.2, 15: 9.0,  16: 12.2, 17: 3.0,  18: 16.0,
-            19: 6.8,  20: 13.0, 21: 3.0,  22: 16.0, 23: 6.8,
-            24: 13.0,
+            6: 6.8,   7: 11.2,  11: 13.6, 12: 12.2, 13: 13.0,
+            14: 9.4,  15: 12.2, 16: 9.0,  17: 12.2, 18: 3.0,
+            19: 9.4,  20: 12.2, 21: 9.0,  22: 12.2, 23: 3.0,
+            24: 16.0, 25: 6.8,  26: 13.0, 27: 3.0,  28: 16.0,
+            29: 6.8,  30: 13.0, 31: 3.0,  32: 16.0, 33: 6.8,
+            34: 13.0, 35: 3.0,  36: 16.0, 37: 6.8,  38: 13.0,
         }
         for ci, w in col_widths.items():
             ws.column_dimensions[get_column_letter(ci)].width = w
