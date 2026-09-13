@@ -303,19 +303,20 @@ async def cancel_frame(iid, algo_id):
               [{"instId": iid, "algoId": algo_id}])
 
 async def amend_frames(items):
-    """批次修改 algo 單止損價。items: [(instId, algoId, tp, sl)]
+    """批次修改 algo 單止損價。items: [(instId, algoId, sl)]
+    只修改 SL，TP 固定不動。
     OKX 一次最多 10 筆，超過自動分批。回傳成功筆數。"""
     ok = 0
     for i in range(0, len(items), 10):
         batch = items[i:i+10]
-        body = [{"instId": a, "algoId": b,
-                 "newTpTriggerPx": str(c), "newSlTriggerPx": str(d2)}
-                for a, b, c, d2 in batch]
+        body = [{"instId": iid, "algoId": aid, "newSlTriggerPx": str(sl)}
+                for iid, aid, sl in batch]
         r = await api("POST", "/api/v5/trade/amend-algos", body)
         if r.get("code") == "0":
             ok += len(batch)
         else:
-            print("amend_frames fail", r.get("msg"))
+            print("amend_frames fail", r.get("msg"),
+                  [(d.get("sCode"), d.get("sMsg")) for d in (r.get("data") or [])])
     return ok
 
 def sl_shift(S, px, d):
@@ -562,7 +563,6 @@ async def frame_mover(app):
                     cur_sl = Decimal(str(S["front_sl_px"]))
                     cur_px = Decimal(str(px))
                     fpx    = Decimal(str(S["front_px"]))
-                    cur_tp = Decimal(str(S["front_tp_px"]))
                 except Exception:
                     continue
 
@@ -589,12 +589,12 @@ async def frame_mover(app):
                     continue
 
                 S["_pending_sl"] = (str(nsl), str(cur_px), float(profit_pct * 100))
-                amends.append((S["spec"]["iid"], algo_id, cur_tp, nsl, S))
+                amends.append((S["spec"]["iid"], algo_id, nsl, S))
 
             if amends:
-                items = [(a, b, c, d2) for a, b, c, d2, _ in amends]
+                items = [(iid, aid, sl) for iid, aid, sl, _ in amends]
                 okn = await amend_frames(items)
-                for a, b, c, d2, S in amends:
+                for iid, aid, sl, S in amends:
                     if okn:
                         nsl, npx, gain = S.pop("_pending_sl")
                         S["front_sl_px"] = nsl
@@ -629,10 +629,10 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     # 損益計算
     if d == "L":
         g = (xpx - fpx) * sz * ctval
-        gp = float((xpx - fpx) / fpx * 100)
+        _ = float((xpx - fpx) / fpx * 100)  # gp 保留計算但不使用
     else:
         g = (fpx - xpx) * sz * ctval
-        gp = float((fpx - xpx) / fpx * 100)
+        _ = float((fpx - xpx) / fpx * 100)  # gp 保留計算但不使用
 
     fee = abs(xpx * sz * ctval) * Decimal("0.0005") * 2
     net = g - fee
@@ -673,8 +673,10 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             f"━━━━━━━━━━\n"
             f"商品：{E.dir_emoji(d)} {S['sym']}\n"
             f"前單（{E.dir_word(d)}）：{reason_label}\n"
-            f"進場：{fpx} → 出場：{xpx}（{gp:+.3f}%）\n"
-            f"毛損益：{g:+.6f} ({gp:+.3f}%)\n"
+            f"進場：{fpx}\n"
+            f"出場：{xpx}\n"
+            f"━━━━━━━━━━\n"
+            f"毛損益：{g:+.6f}\n"
             f"手續費：{-fee:.6f}\n"
             f"淨損益：{net:+.6f} ({npv:+.3f}%) {ico}"
             f"{sl_block}\n"
@@ -751,8 +753,10 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             f"━━━━━━━━━━\n"
             f"商品：{E.dir_emoji(d)} {S['sym']}\n"
             f"前單（{E.dir_word(d)}）：{reason_label}\n"
-            f"進場：{fpx} → 出場：{xpx}（{gp:+.3f}%）\n"
-            f"毛損益：{g:+.6f} ({gp:+.3f}%)\n"
+            f"進場：{fpx}\n"
+            f"出場：{xpx}\n"
+            f"━━━━━━━━━━\n"
+            f"毛損益：{g:+.6f}\n"
             f"手續費：{-fee:.6f}\n"
             f"淨損益：{net:+.6f} ({npv:+.3f}%) {ico}"
             f"{sl_block}\n"
@@ -1330,10 +1334,13 @@ async def cmd_status(u, c):
         elif front_in:
             fpx = s.get("front_px", "-")
             tp_s = s.get("front_tp_px", "-")
+            static_sl = s.get("front_static_sl", "-")
             sl_s = s.get("front_sl_px", "-")
             mn = s.get("front_move_n", 0)
             L.append(f"前單（{E.dir_word(d)}）進場：{fpx}")
-            L.append(f"  TP：{tp_s} | 動態SL：{sl_s}（目前）")
+            L.append(f"  TP：{tp_s}（固定）")
+            L.append(f"  靜態SL：{static_sl}")
+            L.append(f"  動態SL：{sl_s}（目前）")
             L.append(f"  SL移動：{mn}次")
             mhist = s.get("front_move_hist") or []
             prev_px = None
@@ -1349,10 +1356,13 @@ async def cmd_status(u, c):
         elif back_in:
             fpx = s.get("back_px", "-")
             tp_s = s.get("back_tp_px", "-")
+            static_sl = s.get("back_static_sl", "-")
             sl_s = s.get("front_sl_px", "-")
             mn = s.get("front_move_n", 0)
             L.append(f"後單升格（{E.dir_word(back_d)}）進場：{fpx}")
-            L.append(f"  TP：{tp_s} | 動態SL：{sl_s}（目前）")
+            L.append(f"  TP：{tp_s}（固定）")
+            L.append(f"  靜態SL：{static_sl}")
+            L.append(f"  動態SL：{sl_s}（目前）")
             L.append(f"  SL移動：{mn}次")
             mhist = s.get("front_move_hist") or []
             prev_px = None
