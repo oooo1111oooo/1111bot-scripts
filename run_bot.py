@@ -619,6 +619,7 @@ async def frame_mover(app):
                         S["front_sl_px"] = nsl
                         S["front_move_n"] = int(S.get("front_move_n", 0)) + 1
                         S["_last_move_t"] = now_t
+                        print(f"[SL移動] {S['sym']} {S['dir']} 現價={npx} 新SL={nsl} 第{S['front_move_n']}次")
                         mh = S.get("front_move_hist")
                         if not isinstance(mh, list):
                             mh = []; S["front_move_hist"] = mh
@@ -927,6 +928,7 @@ async def loop(app, chat, S):
                     # 等到新 TF 開盤（最多等 2 秒）
                     await asyncio.sleep(min(secs_left + 0.2, 2))
                     # 查現價，立刻重掛
+                    print(f"[TF重掛] {S['sym']} {d} TF到期重掛")
                     ok = await _place_pair(S, iid, chat, app, label="TF重掛")
                     if not ok:
                         await asyncio.sleep(3)
@@ -944,6 +946,7 @@ async def loop(app, chat, S):
                 S["front_sl_px"]  = str(fpx)   # 動態SL從進場價開始
                 S["front_ee"]     = time.time()
                 S["state"]        = "持倉中"
+                print(f"[前單進場] {S['sym']} {d} 進場價={fpx}")
                 # 進場次數 +1
                 today = today8()
                 if S.get("round_date") != today:
@@ -982,6 +985,7 @@ async def loop(app, chat, S):
                         # 查實際成交
                         fill_px = r_algo["data"][0].get("avgPx") or r_algo["data"][0].get("triggerPx")
                         S["back_filled"] = True
+                        print(f"[後單觸發] {S['sym']} {S.get('back_d')} 觸發進場 成交價={fill_px}")
                         if fill_px:
                             S["back_px"] = fill_px
                         save_state()
@@ -996,6 +1000,7 @@ async def loop(app, chat, S):
                 cur_pos = await okx_pos(iid, pos_side)
                 if not cur_pos:
                     S["closing"] = True
+                    print(f"[前單出場] {S['sym']} {d} 偵測到倉位消失")
                     # 判斷出場原因（查最近成交）
                     reason = "SL"
                     fpx = Decimal(str(S["front_px"]))
