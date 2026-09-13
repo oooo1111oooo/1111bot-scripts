@@ -529,8 +529,25 @@ async def frame_mover(app):
             await asyncio.sleep(MOVE_TICK - (time.time() % MOVE_TICK))
             now_t = time.time()
 
-            active = [S for S in list(STRATS.values())
-                      if S.get("alive") and S.get("front_filled")]
+            candidates = [S for S in list(STRATS.values()) if S.get("alive")]
+            if not candidates:
+                continue
+
+            # 查 OKX 持倉，確認哪些策略真的有倉位
+            active = []
+            for S in candidates:
+                try:
+                    d = S["dir"]
+                    iid = S["spec"]["iid"]
+                    pos_side = "long" if d == "L" else "short"
+                    cur_pos = await okx_pos(iid, pos_side)
+                    if cur_pos:
+                        # OKX 有持倉，同步 front_filled
+                        if not S.get("front_filled"):
+                            S["front_filled"] = True
+                        active.append(S)
+                except Exception as e:
+                    print("frame_mover 查持倉錯誤", S.get("sym"), type(e).__name__, e)
             if not active:
                 continue
 
