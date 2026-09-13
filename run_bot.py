@@ -72,7 +72,7 @@ SAVE_FIELDS = ("sym","dir","lev","margin","offset","tp","sl","move_pct","interva
                "locked_dir",
                "front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
-               "back_oid","back_px","back_filled","back_sz",
+               "back_algo_id","back_px","back_filled","back_sz",
                "closing","state")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
@@ -364,8 +364,35 @@ async def _place_limit(iid, pos_side, d, amb, sz, prefix="n"):
     return None
 
 async def _cancel_order(iid, oid):
-    """撤銷單張掛單。"""
+    """撤銷單張限價掛單。"""
     await api("POST", "/api/v5/trade/cancel-order", {"instId": iid, "ordId": oid})
+
+
+async def _place_trigger(iid, pos_side, d, trigger_px, sz, prefix="b"):
+    """掛計劃委託（觸發後市價進場，taker），回傳 algoId 或 None。
+    後單專用：triggerPx = 前單靜態SL，觸發後以市價成交。
+    """
+    r = await api("POST", "/api/v5/trade/order-algo", {
+        "instId": iid, "tdMode": "isolated",
+        "side": "buy" if d == "L" else "sell",
+        "posSide": pos_side,
+        "ordType": "trigger",
+        "sz": str(sz),
+        "triggerPx": str(trigger_px),
+        "orderPx": "-1",           # -1 = 市價
+        "triggerPxType": "last",   # 以最新成交價觸發
+        "algoClOrdId": prefix + uuid.uuid4().hex[:14]
+    })
+    if r.get("code") == "0" and r.get("data"):
+        return r["data"][0]["algoId"]
+    print("_place_trigger fail", iid, d, r.get("msg"), (r.get("data") or [{}])[0].get("sMsg"))
+    return None
+
+async def _cancel_trigger(iid, algo_id):
+    """撤銷計劃委託。"""
+    await api("POST", "/api/v5/trade/cancel-algos",
+              [{"instId": iid, "algoId": algo_id}])
+
 
 async def _order_state(iid, oid):
     """查單張訂單狀態，回傳 (state, avgPx) 或 (None, None)。"""
@@ -431,9 +458,9 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} 前單掛單失敗，暫停 5 秒後重試")
         return False
 
-    # 掛後單
-    back_oid = await _place_limit(iid, back_pos, back_d, back_amb, sz_back)
-    if not back_oid:
+    # 掛後單（計劃委託 taker，觸發價 = 前單靜態SL）
+    back_algo_id = await _place_trigger(iid, back_pos, back_d, front_static_sl, sz_back)
+    if not back_algo_id:
         await _cancel_order(iid, front_oid)
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} 後單掛單失敗，暫停 5 秒後重試")
         return False
@@ -449,7 +476,7 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["front_sz"]        = str(sz_front)
     S["front_move_n"]    = 0
     S["front_move_hist"] = []
-    S["back_oid"]        = back_oid
+    S["back_algo_id"]    = back_algo_id
     S["back_px"]         = str(back_amb)
     S["back_static_sl"]  = str(back_static_sl)
     S["back_tp_px"]      = str(back_tp)
@@ -609,7 +636,7 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     sl_block = ("\n" + "\n".join(_sl_lines(mhist, mn))) if mn > 0 else ""
 
     # 查後單狀態
-    back_oid = S.get("back_oid")
+    back_algo_id = S.get("back_algo_id")
     back_filled = S.get("back_filled", False)
 
     if back_filled:
@@ -647,7 +674,7 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         S["front_sz"]        = str(back_sz)
         S["front_move_n"]    = 0
         S["front_move_hist"] = []
-        S["back_oid"]        = None
+        S["back_algo_id"]    = None
         S["back_filled"]     = False
         S["algo_id"]         = None
         S["state"]           = "升格持倉"
@@ -667,10 +694,10 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         new_back_sz = csize(Decimal(str(S["margin"])), Decimal(str(S["lev"])),
                             new_back_amb, spec["ctval"], spec["lot"])
         new_back_pos = "long" if new_back_d == "L" else "short"
-        new_back_oid = await _place_limit(iid, new_back_pos, new_back_d,
-                                          new_back_amb, new_back_sz)
-        if new_back_oid:
-            S["back_oid"]       = new_back_oid
+        new_back_algo_id = await _place_trigger(iid, new_back_pos, new_back_d,
+                                              new_back_amb, new_back_sz)
+        if new_back_algo_id:
+            S["back_algo_id"]   = new_back_algo_id
             S["back_px"]        = str(new_back_amb)
             S["back_static_sl"] = str(new_back_sl)
             S["back_tp_px"]     = str(new_back_tp)
@@ -695,8 +722,8 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
 
     else:
         # 後單未進場 → 取消後單，重新下新一輪
-        if back_oid:
-            await _cancel_order(iid, back_oid)
+        if back_algo_id:
+            await _cancel_trigger(iid, back_algo_id)
 
         await notify(app, chat,
             f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico} 前單出場 / 重新埋伏\n"
@@ -715,7 +742,7 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         # 清除持倉狀態
         for a in ("front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                   "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
-                  "back_oid","back_px","back_filled","back_sz","back_d",
+                  "back_algo_id","back_px","back_filled","back_sz","back_d",
                   "algo_id","closing"):
             S.pop(a, None)
         S["state"] = "重新埋伏"
@@ -745,8 +772,7 @@ async def loop(app, chat, S):
         while S["alive"]:
             await asyncio.sleep(2)
 
-            front_oid   = S.get("front_oid")
-            back_oid    = S.get("back_oid")
+            front_oid    = S.get("front_oid")
             front_filled = S.get("front_filled", False)
             back_filled  = S.get("back_filled", False)
 
@@ -785,14 +811,23 @@ async def loop(app, chat, S):
                         f"後單（{E.dir_word(back_d)}）埋伏中：{S.get('back_px')}\n"
                         f"時間：{hhmmss()}")
 
-            # 查後單狀態（若尚未成交）
-            if back_oid and not back_filled:
-                state, avgpx = await _order_state(iid, back_oid)
-                if state == "filled":
-                    S["back_filled"] = True
-                    S["back_px"]     = avgpx or S["back_px"]
-                    save_state()
-                    # 後單進場不通知（等前單出場時一起通知）
+            # 查後單狀態（計劃委託是否已觸發成交）
+            back_algo_id = S.get("back_algo_id")
+            if back_algo_id and not back_filled:
+                r_algo = await api("GET", f"/api/v5/trade/order-algo?algoId={back_algo_id}&ordType=trigger")
+                if r_algo.get("code") == "0" and r_algo.get("data"):
+                    algo_state = r_algo["data"][0].get("state", "")
+                    if algo_state == "order":  # 已觸發並掛出
+                        # 查實際成交
+                        fill_px = r_algo["data"][0].get("avgPx") or r_algo["data"][0].get("triggerPx")
+                        S["back_filled"] = True
+                        if fill_px:
+                            S["back_px"] = fill_px
+                        save_state()
+                    elif algo_state in ("canceled", "failed"):
+                        # 計劃委託被取消，視為後單失效
+                        S["back_algo_id"] = None
+                        save_state()
 
             # 偵測前單出場（已進場但倉位消失）
             if front_filled and not S.get("closing"):
@@ -852,7 +887,7 @@ async def rebuild_strat(d):
          "locked_dir": d.get("locked_dir", d["dir"])}
     for a in ("front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
               "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
-              "back_oid","back_px","back_filled","back_sz","closing"):
+              "back_algo_id","back_px","back_filled","back_sz","closing"):
         if a in d: S[a] = d[a]
     return S
 
