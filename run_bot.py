@@ -1159,14 +1159,14 @@ async def cmd_run(u, c):
     if not 0.1 <= interval <= 300:
         await reply(u, f"{E.BOT} 間隔秒須介於 0.1~300（支援小數一位，例如 0.5、1.5）"); return
 
-    # 方向鎖定檢查：帳戶已有任何活躍策略就擋
-    if STRATS:
-        alive = [S for S in STRATS.values() if S.get("alive")]
-        if alive:
-            locked = alive[0].get("locked_dir", alive[0].get("dir"))
-            if locked != dr:
-                await reply(u, f"{E.BOT} {E.LOSS} 帳戶已鎖定方向 {E.dir_word(locked)}，請先 /stop 再重新下單"); return
-            await reply(u, f"{E.BOT} {sym} {E.dir_word(dr)} 已在運行"); return
+    # 方向鎖定檢查：同幣種不能同時做 L 又做 S
+    k = skey(sym, dr)
+    if k in STRATS and STRATS[k].get("alive"):
+        await reply(u, f"{E.BOT} {sym} {E.dir_word(dr)} 已在運行"); return
+    # 同幣種反向也不允許
+    k_rev = skey(sym, "S" if dr == "L" else "L")
+    if k_rev in STRATS and STRATS[k_rev].get("alive"):
+        await reply(u, f"{E.BOT} {E.LOSS} {sym} 已有反向策略在運行，請先 /stop 再重新下單"); return
 
     try:
         spec = await get_spec(sym)
