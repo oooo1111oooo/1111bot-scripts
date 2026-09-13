@@ -514,13 +514,14 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["state"]           = "委託中"
     save_state()
 
-    E_front = E.dir_emoji(d)
-    await notify(app, chat,
-        f"{E.BOT} OKX原K｜{ACCT}\n事件：{label} 前後單已掛出\n"
-        f"━━━━━━━━━━\n商品：{E_front} {S['sym']} {E.dir_word(d)}\n"
-        f"前單（{E.dir_word(d)}）：埋伏{front_amb} TP{front_tp} SL{front_static_sl}\n"
-        f"後單（{E.dir_word(back_d)}）：埋伏{back_amb} TP{back_tp} SL{back_static_sl}\n"
-        f"━━━━━━━━━━\n時間：{hhmmss()}")
+    if label == "首次埋伏":
+        E_front = E.dir_emoji(d)
+        await notify(app, chat,
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：{label} 前後單已掛出\n"
+            f"━━━━━━━━━━\n商品：{E_front} {S['sym']} {E.dir_word(d)}\n"
+            f"前單（{E.dir_word(d)}）：埋伏{front_amb} TP{front_tp} SL{front_static_sl}\n"
+            f"後單（{E.dir_word(back_d)}）：觸發{back_amb}\n"
+            f"━━━━━━━━━━\n時間：{hhmmss()}")
     return True
 
 
