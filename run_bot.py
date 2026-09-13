@@ -582,17 +582,26 @@ async def frame_mover(app):
                 except Exception:
                     continue
 
-                # SL 以現價為基準，距離固定 move_pct
-                # 做多：SL = 現價 × (1 - move_pct)，保證 SL < 現價
-                # 做空：SL = 現價 × (1 + move_pct)，保證 SL > 現價
+                # SL 移動邏輯：
+                # shift = max(現價漲幅%, move_pct)
+                # nsl = 舊SL × (1 + shift)（做多往上移）
+                # 距離從初始0.2%慢慢縮小，直到觸碰現價出場
                 if d == "L":
-                    nsl = align(cur_px * (1 - move_pct), tick, "L")
+                    profit_pct = (cur_px - Decimal(str(S.get("front_px", cur_px)))) / Decimal(str(S.get("front_px", cur_px)))
+                    shift = max(profit_pct, move_pct)
+                    nsl = align(cur_sl * (1 + shift), tick, "L")
                     if nsl <= cur_sl:
                         continue  # 只能往上移
+                    if nsl >= cur_px:
+                        continue  # SL 不能超過現價
                 else:
-                    nsl = align(cur_px * (1 + move_pct), tick, "S")
+                    profit_pct = (Decimal(str(S.get("front_px", cur_px))) - cur_px) / Decimal(str(S.get("front_px", cur_px)))
+                    shift = max(profit_pct, move_pct)
+                    nsl = align(cur_sl * (1 - shift), tick, "S")
                     if nsl >= cur_sl:
                         continue  # 只能往下移
+                    if nsl <= cur_px:
+                        continue  # SL 不能低於現價
 
                 algo_id = S.get("algo_id")
                 if not algo_id:
@@ -631,39 +640,15 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     d    = S["dir"]
     back_d = S.get("back_d", "S" if d == "L" else "L")
     spec = S["spec"]
-    margin = Decimal(str(S["margin"]))
-    sz   = Decimal(str(S.get("front_sz", "1")))
-    ctval = spec["ctval"]
     tick  = spec["tick"]
 
     # 損益：查 OKX positions-history 真實數據
     after_ms = int(ee * 1000)
     pos_side = "long" if d == "L" else "short"
     rec = await close_record(iid, pos_side, after_ms, tries=20)
-    if rec:
-        xpx = Decimal(str(rec.get("closeAvgPx") or rec.get("last") or xpx))
-        g   = Decimal(str(rec.get("realizedPnl") or "0"))
-        fee = Decimal(str(rec.get("fee") or "0"))
-        net = g + fee  # OKX fee 已是負數
-        npv = float(net / margin * 100) if margin else 0
-        # 出場原因
-        pnl_type = rec.get("type", "")
-        if pnl_type == "close_long" or pnl_type == "close_short":
-            reason = "SL" if rec.get("closeAvgPx") else reason
-    else:
-        # OKX 查不到時用本地估算
-        if d == "L":
-            g = (xpx - fpx) * sz * ctval
-        else:
-            g = (fpx - xpx) * sz * ctval
-        fee = -abs(xpx * sz * ctval) * Decimal("0.0005") * 2
-        net = g + fee
-        npv = float(net / margin * 100) if margin else 0
 
     mn = S.get("front_move_n", 0)
     mhist = S.get("front_move_hist") or []
-
-    ico = E.WIN if net >= 0 else E.LOSS
     reason_label = "Take Profit" if reason == "TP" else "Stop Loss"
 
     # SL 移動明細
@@ -677,6 +662,54 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         return lines
 
     sl_block = ("\n" + "\n".join(_sl_lines(mhist, mn))) if mn > 0 else ""
+
+    next_note_label = ""
+    next_note = ""
+
+    async def _send_exit_notify(rec):
+        xpx_r = Decimal(str(rec.get("closeAvgPx") or xpx))
+        g_r    = Decimal(str(rec.get("realizedPnl") or "0"))
+        fee_r  = Decimal(str(rec.get("fee") or "0"))
+        net_r  = Decimal(str(rec.get("pnl") or "0"))
+        reason_r = reason_label
+        if rec.get("type") == "2":
+            reason_r = "Take Profit" if xpx_r >= Decimal(str(S.get("front_tp_px") or "0")) else "Stop Loss"
+        ico_r = E.WIN if net_r >= 0 else E.LOSS
+        await notify(app, chat,
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico_r} 前單出場{next_note_label}\n"
+            f"━━━━━━━━━━\n"
+            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
+            f"前單（{E.dir_word(d)}）：{reason_r}\n"
+            f"━━━━━━━━━━\n"
+            f"進場：{fpx}\n"
+            f"出場：{xpx_r}\n"
+            f"━━━━━━━━━━\n"
+            f"毛損益：{g_r:+.6f}\n"
+            f"手續費：{fee_r:.6f}\n"
+            f"淨損益：{net_r:+.6f} {ico_r}"
+            f"{sl_block}\n"
+            f"━━━━━━━━━━\n{next_note}\n時間：{hhmmss()}")
+
+    if rec:
+        await _send_exit_notify(rec)
+    else:
+        # 先發查詢中通知
+        await notify(app, chat,
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場{next_note_label}\n"
+            f"━━━━━━━━━━\n"
+            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
+            f"前單（{E.dir_word(d)}）：{reason_label}\n"
+            f"進場：{fpx}\n"
+            f"損益查詢中，請稍候...\n時間：{hhmmss()}")
+        # 背景繼續無限查，每5秒一次，查到就補發
+        async def _bg_query():
+            while True:
+                await asyncio.sleep(5)
+                r = await close_record(iid, pos_side, after_ms, tries=1)
+                if r:
+                    await _send_exit_notify(r)
+                    return
+        asyncio.create_task(_bg_query())
 
     # 查後單狀態
     back_algo_id = S.get("back_algo_id")
@@ -719,23 +752,27 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         back_tp  = Decimal(str(S.get("back_tp_px", "0")))
         back_static_sl = Decimal(str(S.get("back_static_sl", "0")))
 
-        # 通知：前單出場 + 後單升格
-        await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico} 前單出場 / 後單升格\n"
-            f"━━━━━━━━━━\n"
-            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
-            f"前單（{E.dir_word(d)}）：{reason_label}\n"
-            f"進場：{fpx}\n"
-            f"出場：{xpx}\n"
-            f"━━━━━━━━━━\n"
-            f"毛損益：{g:+.6f}\n"
-            f"手續費：{-fee:.6f}\n"
-            f"淨損益：{net:+.6f} ({npv:+.3f}%) {ico}"
-            f"{sl_block}\n"
-            f"━━━━━━━━━━\n"
-            f"後單（{E.dir_word(back_d)}）：升格為新前單\n"
-            f"進場：{back_fpx} | TP：{back_tp} | 靜態SL：{back_static_sl}\n"
-            f"時間：{hhmmss()}")
+        # 通知：損益部分由 _send_exit_notify 處理（OKX查詢）
+        next_note_label = " / 後單升格"
+        next_note = f"後單（{E.dir_word(back_d)}）：升格為新前單\n進場：{back_fpx} | TP：{back_tp} | 靜態SL：{back_static_sl}"
+        if rec:
+            await _send_exit_notify(rec)
+        else:
+            await notify(app, chat,
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場 / 後單升格\n"
+                f"━━━━━━━━━━\n"
+                f"商品：{E.dir_emoji(d)} {S['sym']}\n"
+                f"前單（{E.dir_word(d)}）：{reason_label}\n"
+                f"進場：{fpx}\n"
+                f"損益查詢中，請稍候...\n時間：{hhmmss()}")
+            async def _bg_query_up():
+                while True:
+                    await asyncio.sleep(5)
+                    r = await close_record(iid, pos_side, after_ms, tries=1)
+                    if r:
+                        await _send_exit_notify(r)
+                        return
+            asyncio.create_task(_bg_query_up())
 
         # 後單升格：更新 S 為新前單
         S["dir"]             = back_d
@@ -800,19 +837,26 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         if back_algo_id:
             await _cancel_trigger(iid, back_algo_id)
 
-        await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico} 前單出場 / 重新埋伏\n"
-            f"━━━━━━━━━━\n"
-            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
-            f"前單（{E.dir_word(d)}）：{reason_label}\n"
-            f"進場：{fpx}\n"
-            f"出場：{xpx}\n"
-            f"━━━━━━━━━━\n"
-            f"毛損益：{g:+.6f}\n"
-            f"手續費：{-fee:.6f}\n"
-            f"淨損益：{net:+.6f} ({npv:+.3f}%) {ico}"
-            f"{sl_block}\n"
-            f"━━━━━━━━━━\n後單已取消，重新下新一輪\n時間：{hhmmss()}")
+        next_note_label = " / 重新埋伏"
+        next_note = "後單已取消，重新下新一輪"
+        if rec:
+            await _send_exit_notify(rec)
+        else:
+            await notify(app, chat,
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場 / 重新埋伏\n"
+                f"━━━━━━━━━━\n"
+                f"商品：{E.dir_emoji(d)} {S['sym']}\n"
+                f"前單（{E.dir_word(d)}）：{reason_label}\n"
+                f"進場：{fpx}\n"
+                f"損益查詢中，請稍候...\n時間：{hhmmss()}")
+            async def _bg_query_re():
+                while True:
+                    await asyncio.sleep(5)
+                    r = await close_record(iid, pos_side, after_ms, tries=1)
+                    if r:
+                        await _send_exit_notify(r)
+                        return
+            asyncio.create_task(_bg_query_re())
 
         # 重置 S 方向為原始方向
         S["dir"] = S.get("locked_dir", d)
