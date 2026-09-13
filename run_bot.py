@@ -506,7 +506,7 @@ async def frame_mover(app):
     while True:
         try:
             await asyncio.sleep(MOVE_TICK - (time.time() % MOVE_TICK))
-            now_t = int(time.time())
+            now_t = time.time()
 
             active = [S for S in list(STRATS.values())
                       if S.get("alive") and S.get("front_filled")]
@@ -514,7 +514,7 @@ async def frame_mover(app):
                 continue
 
             due = [S for S in active
-                   if now_t % max(1, int(S.get("interval", 1))) == 0]
+                   if now_t - float(S.get("_last_move_t", 0)) >= float(S.get("interval", 1))]
             if not due:
                 continue
 
@@ -579,6 +579,7 @@ async def frame_mover(app):
                         nsl, npx, gain = S.pop("_pending_sl")
                         S["front_sl_px"] = nsl
                         S["front_move_n"] = int(S.get("front_move_n", 0)) + 1
+                        S["_last_move_t"] = now_t
                         mh = S.get("front_move_hist")
                         if not isinstance(mh, list):
                             mh = []; S["front_move_hist"] = mh
@@ -880,7 +881,7 @@ async def rebuild_strat(d):
          "offset": Decimal(str(d["offset"])), "tp": Decimal(str(d["tp"])),
          "sl": Decimal(str(d["sl"])),
          "move_pct": Decimal(str(d.get("move_pct", "0"))),
-         "interval": int(d.get("interval", 1)),
+         "interval": float(d.get("interval", 1)),
          "spec": spec,
          "alive": True, "state": d.get("state", "委託中"),
          "chat": d.get("chat", CHAT_ID),
@@ -1031,7 +1032,7 @@ async def cmd_run(u, c):
         sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
         margin = Decimal(a[3]); offset = Decimal(a[4])
         tp = Decimal(a[5].rstrip("%")); sl = Decimal(a[6].rstrip("%"))
-        move_pct = Decimal(a[7].rstrip("%")); interval = int(a[8])
+        move_pct = Decimal(a[7].rstrip("%")); interval = float(a[8])
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     if dr not in ("L", "S"):
@@ -1039,8 +1040,8 @@ async def cmd_run(u, c):
     for nm, v in (("移動門檻", move_pct), ("TP", tp), ("SL", sl)):
         if v < 0:
             await reply(u, f"{E.BOT} {nm} 不可為負數"); return
-    if not 1 <= interval <= 300:
-        await reply(u, f"{E.BOT} 間隔秒須介於 1~300"); return
+    if not 0.1 <= interval <= 300:
+        await reply(u, f"{E.BOT} 間隔秒須介於 0.1~300（支援小數一位，例如 0.5、1.5）"); return
 
     # 方向鎖定檢查：帳戶已有任何活躍策略就擋
     if STRATS:
