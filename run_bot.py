@@ -562,33 +562,26 @@ async def frame_mover(app):
                 try:
                     cur_sl = Decimal(str(S["front_sl_px"]))
                     cur_px = Decimal(str(px))
-                    fpx    = Decimal(str(S["front_px"]))
                 except Exception:
                     continue
 
-                # 計算浮動獲利%
+                # SL 以現價為基準，距離固定 move_pct
+                # 做多：SL = 現價 × (1 - move_pct)，保證 SL < 現價
+                # 做空：SL = 現價 × (1 + move_pct)，保證 SL > 現價
                 if d == "L":
-                    profit_pct = (cur_px - fpx) / fpx
-                else:
-                    profit_pct = (fpx - cur_px) / fpx
-
-                # SL 移動量：取獲利% 和 move_pct 的較大值，最小不低於 move_pct
-                shift = max(abs(profit_pct), move_pct)
-
-                if d == "L":
-                    nsl = align(cur_sl * (1 + shift), tick, "S")
+                    nsl = align(cur_px * (1 - move_pct), tick, "L")
                     if nsl <= cur_sl:
-                        continue  # 不能後退
+                        continue  # 只能往上移
                 else:
-                    nsl = align(cur_sl * (1 - shift), tick, "L")
+                    nsl = align(cur_px * (1 + move_pct), tick, "S")
                     if nsl >= cur_sl:
-                        continue
+                        continue  # 只能往下移
 
                 algo_id = S.get("algo_id")
                 if not algo_id:
                     continue
 
-                S["_pending_sl"] = (str(nsl), str(cur_px), float(profit_pct * 100))
+                S["_pending_sl"] = (str(nsl), str(cur_px))
                 amends.append((S["spec"]["iid"], algo_id, nsl, S))
 
             if amends:
@@ -596,7 +589,7 @@ async def frame_mover(app):
                 okn = await amend_frames(items)
                 for iid, aid, sl, S in amends:
                     if okn:
-                        nsl, npx, gain = S.pop("_pending_sl")
+                        nsl, npx = S.pop("_pending_sl")
                         S["front_sl_px"] = nsl
                         S["front_move_n"] = int(S.get("front_move_n", 0)) + 1
                         S["_last_move_t"] = now_t
@@ -626,17 +619,29 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     ctval = spec["ctval"]
     tick  = spec["tick"]
 
-    # 損益計算
-    if d == "L":
-        g = (xpx - fpx) * sz * ctval
-        _ = float((xpx - fpx) / fpx * 100)  # gp 保留計算但不使用
+    # 損益：查 OKX positions-history 真實數據
+    after_ms = int(ee * 1000)
+    pos_side = "long" if d == "L" else "short"
+    rec = await close_record(iid, pos_side, after_ms, tries=20)
+    if rec:
+        xpx = Decimal(str(rec.get("closeAvgPx") or rec.get("last") or xpx))
+        g   = Decimal(str(rec.get("realizedPnl") or "0"))
+        fee = Decimal(str(rec.get("fee") or "0"))
+        net = g + fee  # OKX fee 已是負數
+        npv = float(net / margin * 100) if margin else 0
+        # 出場原因
+        pnl_type = rec.get("type", "")
+        if pnl_type == "close_long" or pnl_type == "close_short":
+            reason = "SL" if rec.get("closeAvgPx") else reason
     else:
-        g = (fpx - xpx) * sz * ctval
-        _ = float((fpx - xpx) / fpx * 100)  # gp 保留計算但不使用
-
-    fee = abs(xpx * sz * ctval) * Decimal("0.0005") * 2
-    net = g - fee
-    npv = float(net / margin * 100) if margin else 0
+        # OKX 查不到時用本地估算
+        if d == "L":
+            g = (xpx - fpx) * sz * ctval
+        else:
+            g = (fpx - xpx) * sz * ctval
+        fee = -abs(xpx * sz * ctval) * Decimal("0.0005") * 2
+        net = g + fee
+        npv = float(net / margin * 100) if margin else 0
 
     mn = S.get("front_move_n", 0)
     mhist = S.get("front_move_hist") or []
@@ -658,11 +663,41 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
 
     # 查後單狀態
     back_algo_id = S.get("back_algo_id")
-    back_filled = S.get("back_filled", False)
+    back_d_local = S.get("back_d", "S" if d == "L" else "L")
+    back_pos_side = "long" if back_d_local == "L" else "short"
 
-    if back_filled:
-        # 後單已進場 → 後單升格為新前單
-        back_fpx = Decimal(str(S.get("back_px", "0")))
+    # 以 OKX 為主：每 0.5 秒查後單持倉，最多等 30 秒
+    max_wait = 30
+    waited = 0
+    cur_back_pos = None
+    while S.get("alive") and waited < max_wait:
+        try:
+            cur_back_pos = await okx_pos(iid, back_pos_side)
+            if cur_back_pos:
+                break  # 查到持倉，後單已進場
+            # 查計劃委託狀態
+            if back_algo_id:
+                r_algo = await api("GET", f"/api/v5/trade/order-algo?algoId={back_algo_id}&ordType=trigger")
+                if r_algo.get("code") == "0" and r_algo.get("data"):
+                    algo_state = r_algo["data"][0].get("state", "")
+                    if algo_state in ("live", "pause"):
+                        # 計劃委託還在等待，後單未觸發，跳出
+                        cur_back_pos = None
+                        break
+                    elif algo_state in ("canceled", "failed"):
+                        # 計劃委託失效，跳出
+                        cur_back_pos = None
+                        break
+                    # 其他狀態（已觸發但持倉未更新）繼續等
+        except Exception as e:
+            print("查後單持倉錯誤", type(e).__name__, e)
+        await asyncio.sleep(0.5)
+        waited += 0.5
+
+    if cur_back_pos:
+        # OKX 確認後單已進場 → 後單升格為新前單
+        back_fpx_str = cur_back_pos.get("avgPx") or cur_back_pos.get("last") or S.get("back_px", "0")
+        back_fpx = Decimal(str(back_fpx_str))
         back_sz  = Decimal(str(S.get("back_sz", "1")))
         back_tp  = Decimal(str(S.get("back_tp_px", "0")))
         back_static_sl = Decimal(str(S.get("back_static_sl", "0")))
@@ -744,7 +779,7 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             save_state()
 
     else:
-        # 後單未進場 → 取消後單，重新下新一輪
+        # OKX 確認後單未進場 → 取消後單計劃委託，等下一輪TF重掛
         if back_algo_id:
             await _cancel_trigger(iid, back_algo_id)
 
@@ -836,43 +871,45 @@ async def loop(app, chat, S):
                         await asyncio.sleep(3)
                     continue
 
-            # 查前單狀態（若尚未成交）
-            if front_oid and not front_filled:
+            # 查前單狀態：以 OKX 持倉為主
+            front_pos_side = "long" if d == "L" else "short"
+            cur_front_pos = await okx_pos(iid, front_pos_side)
+            if front_oid and not front_filled and cur_front_pos:
+                # OKX 有持倉，確認前單已進場
                 state, avgpx = await _order_state(iid, front_oid)
-                if state == "filled":
-                    fpx = Decimal(avgpx or S["front_px"])
-                    S["front_filled"] = True
-                    S["front_px"]     = str(fpx)
-                    S["front_sl_px"]  = str(fpx)   # 動態SL從進場價開始
-                    S["front_ee"]     = time.time()
-                    S["state"]        = "持倉中"
-                    # 進場次數 +1
-                    today = today8()
-                    if S.get("round_date") != today:
-                        S["round_today"] = 0; S["enter_today"] = 0; S["round_date"] = today
-                    S["enter_today"] = int(S.get("enter_today", 0)) + 1
-                    save_state()
-                    # 掛前單 algo OCO
-                    back_d = S.get("back_d", "S" if d == "L" else "L")
-                    front_tp = Decimal(str(S["front_tp_px"]))
-                    front_static_sl = Decimal(str(S["front_static_sl"]))
-                    algo_id = await place_algo(iid,
-                                               "long" if d == "L" else "short",
-                                               d, Decimal(str(S["front_sz"])),
-                                               front_tp, front_static_sl)
-                    if algo_id:
-                        S["algo_id"] = algo_id
-                    save_state()
-                    await notify(app, chat,
-                        f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} 前單進場成交\n"
-                        f"━━━━━━━━━━\n"
-                        f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                        f"進場：{fpx} | {hhmmss()}\n"
-                        f"TP：{front_tp}（+{S['tp']}%）\n"
-                        f"靜態SL：{front_static_sl}（-{S['sl']}%）\n"
-                        f"動態SL每{S['interval']}s移動，門檻{S['move_pct']}%\n"
-                        f"後單（{E.dir_word(back_d)}）埋伏中：{S.get('back_px')}\n"
-                        f"時間：{hhmmss()}")
+                fpx = Decimal(avgpx or S["front_px"])
+                S["front_filled"] = True
+                S["front_px"]     = str(fpx)
+                S["front_sl_px"]  = str(fpx)   # 動態SL從進場價開始
+                S["front_ee"]     = time.time()
+                S["state"]        = "持倉中"
+                # 進場次數 +1
+                today = today8()
+                if S.get("round_date") != today:
+                    S["round_today"] = 0; S["enter_today"] = 0; S["round_date"] = today
+                S["enter_today"] = int(S.get("enter_today", 0)) + 1
+                save_state()
+                # 掛前單 algo OCO
+                back_d = S.get("back_d", "S" if d == "L" else "L")
+                front_tp = Decimal(str(S["front_tp_px"]))
+                front_static_sl = Decimal(str(S["front_static_sl"]))
+                algo_id = await place_algo(iid,
+                                           "long" if d == "L" else "short",
+                                           d, Decimal(str(S["front_sz"])),
+                                           front_tp, front_static_sl)
+                if algo_id:
+                    S["algo_id"] = algo_id
+                save_state()
+                await notify(app, chat,
+                    f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} 前單進場成交\n"
+                    f"━━━━━━━━━━\n"
+                    f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+                    f"進場：{fpx} | {hhmmss()}\n"
+                    f"TP：{front_tp}（+{S['tp']}%）\n"
+                    f"靜態SL：{front_static_sl}（-{S['sl']}%）\n"
+                    f"動態SL每{S['interval']}s移動，門檻{S['move_pct']}%\n"
+                    f"後單（{E.dir_word(back_d)}）埋伏中：{S.get('back_px')}\n"
+                    f"時間：{hhmmss()}")
 
             # 查後單狀態（計劃委託是否已觸發成交）
             back_algo_id = S.get("back_algo_id")
