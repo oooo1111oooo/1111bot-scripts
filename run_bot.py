@@ -593,7 +593,7 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     mn = S.get("front_move_n", 0)
     mhist = S.get("front_move_hist") or []
 
-    ico = "🟢" if net >= 0 else "🔴"
+    ico = E.WIN if net >= 0 else E.LOSS
     reason_label = "Take Profit" if reason == "TP" else "Stop Loss"
 
     # SL 移動明細
@@ -775,7 +775,7 @@ async def loop(app, chat, S):
                         S["algo_id"] = algo_id
                     save_state()
                     await notify(app, chat,
-                        f"{E.BOT} OKX原K｜{ACCT}\n事件：🔔 前單進場成交\n"
+                        f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} 前單進場成交\n"
                         f"━━━━━━━━━━\n"
                         f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                         f"進場：{fpx} | {hhmmss()}\n"
@@ -888,12 +888,12 @@ async def startup_recover(app):
         print("重建失敗清單:", failed)
         if CHAT_ID:
             await notify(app, CHAT_ID, f"{E.BOT} {E.LOSS} 重啟時有 {len(failed)} 個策略重建失敗：\n" +
-                         "\n".join("・" + x for x in failed) + "\n⚠ 這些策略已消失，請確認 OKX 是否有殘留掛單")
+                         "\n".join("・" + x for x in failed) + "\n{E.WARN} 這些策略已消失，請確認 OKX 是否有殘留掛單")
     if CHAT_ID and rec and n_ord > len(rec):
         await notify(app, CHAT_ID, f"{E.BOT} {E.LOSS} OKX 掛單 {n_ord} 筆 > 策略 {len(rec)} 個，可能有孤兒單，請查 /status")
     if CHAT_ID and rec:
         await notify(app, CHAT_ID,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：🔄 重啟認領完成\n━━━━━━━━━━\n"
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.RELOAD} 重啟認領完成\n━━━━━━━━━━\n"
             f"已接管策略（{len(rec)}）：\n" + "\n".join("・" + x for x in rec) +
             f"\nOKX 現況：掛單{n_ord} 持倉{n_pos}\n循環已接管，繼續運作\n時間：{hhmmss()}")
 
@@ -1079,7 +1079,7 @@ async def cmd_run(u, c):
         f"  保證金：{margin} USDT｜{sz_back}張\n"
         f"━━━━━━━━━━\n"
         f"移動SL：每{interval}s｜門檻{move_pct}%\n"
-        f"⚠ 確認後立即開始埋伏\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
+        f"{E.WARN} 確認後立即開始埋伏\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def _to(app, chat, stamp):
@@ -1116,7 +1116,7 @@ async def cmd_confirm(u, c):
     TASKS[k] = asyncio.create_task(loop(c.application, u.effective_chat.id, S))
     save_state()
     cnt = sum(1 for s in STRATS.values() if s.get("alive"))
-    await reply(u, f"{E.BOT} ✅ 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
+    await reply(u, f"{E.BOT} {E.OK} 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
 
 async def cmd_stop(u, c):
     a = c.args
@@ -1145,7 +1145,7 @@ async def do_stop(u, key):
     S["alive"] = False
     n = await sweep(iid, ps)
     save_state()
-    tail = f"\n⚠ 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
+    tail = f"\n{E.WARN} 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
     await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜撤單 {n}{tail}")
 
 async def cmd_stopall(u, c):
@@ -1153,7 +1153,7 @@ async def cmd_stopall(u, c):
     if not alive:
         await reply(u, f"{E.BOT} 目前無運行中策略"); return
     PENDING[u.effective_chat.id] = {"kind": "stopall", "t": time.time()}
-    await reply(u, f"{E.BOT} ⚠ 將停止全部 {len(alive)} 個策略\n60秒內 /confirm 確認")
+    await reply(u, f"{E.BOT} {E.WARN} 將停止全部 {len(alive)} 個策略\n60秒內 /confirm 確認")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def do_stopall(u):
@@ -1172,7 +1172,7 @@ async def do_stopall(u):
         if cr.get("code") == "0": orphan += 1
     save_state()
     m = f"{E.BOT} 已停止 {len(done)} 個策略｜清殘單 {orphan}"
-    if held: m += "\n⚠ 持倉需手動平倉：" + "、".join(held)
+    if held: m += "\n{E.WARN} 持倉需手動平倉：" + "、".join(held)
     await reply(u, m)
 
 async def cmd_status(u, c):
@@ -1199,14 +1199,14 @@ async def cmd_status(u, c):
         key = (s["spec"]["iid"], "long" if s["dir"] == "L" else "short")
         live = "持倉中" if key in okxp else ("委託中" if key in okxo else "等下輪")
         martin = int(s.get("martin") or 1)
-        martin_label = f" 🎯馬丁x{martin}" if martin >= 2 else ""
+        martin_label = f" {E.HOLD}馬丁x{martin}" if martin >= 2 else ""
         L.append("━━━━━━━━━━")
         L.append(f"{E.dir_emoji(s['dir'])} {s['sym']}：{live}(掛{placed}/進{entered}){martin_label}")
         L.append(f"參數：{strat_params(s['sym'], s['dir'])}")
         # 馬丁模式：顯示各單狀態
         if martin >= 2 and s.get("martin_orders"):
             for i, p in enumerate(s["martin_orders"]):
-                tag = "✅已進場" if p.get("filled") else "⏳等待中"
+                tag = E.OK+"已進場" if p.get("filled") else E.WAIT+"等待中"
                 L.append(f"第{i+1}單({p.get('margin_x','')}份)：埋伏{p.get('amb','')} SL{p.get('sl','')} TP{p.get('tp','')}｜{tag}")
         if s.get("pos_open"):
             fpx_s = s.get("pos_px", "-")
@@ -1266,7 +1266,7 @@ def sum_lines(rs, placed, entered):
 async def cmd_summary(u, c):
     t = today8(); recs = load_trades(t)
     ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t)}
-    L = [f"{E.BOT} OKX原K｜{ACCT}", f"📊📊📊 Summary {t}"]
+    L = [f"{E.BOT} OKX原K｜{ACCT}", f"{E.CHART}{E.CHART}{E.CHART} Summary {t}"]
     for dr in ("L", "S"):
         rows = [r for r in recs if r["dir"] == dr]
         pa = sum(v["placed"] for k, v in ts.items() if k.endswith("_" + dr))
@@ -1421,7 +1421,7 @@ def build_amp_xlsx(results, tf, path):
             l2o = o - lo; l2o_pct = l2o / o if o else 0
             h2c = h - cl; h2c_pct = h2c / cl if cl else 0   # 收到高
             c2l = cl - lo; c2l_pct = c2l / cl if cl else 0  # 收到低
-            flag = "🟩" if cl >= o else "🟥"
+            flag = E.UP if cl >= o else E.DOWN
             vals = [sym, tf, dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S"),
                     flag, o, h, lo, cl, chg_pct, amp_pct, abs_diff,
                     round(h2o, dp), h2o_pct, round(l2o, dp), l2o_pct,
@@ -1585,7 +1585,7 @@ async def cmd_amp(u, c):
         await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
     if not ok:
         await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
-    await reply(u, f"{E.BOT} ✅ {sym} {year}全年振幅報表已寄出\n"
+    await reply(u, f"{E.BOT} {E.OK} {sym} {year}全年振幅報表已寄出\n"
                    f"TF：5m｜實際根數：{len(kl)}\n時間：{hhmmss()}")
 
 async def cmd_coins(u, c):
@@ -1608,7 +1608,7 @@ async def cmd_timeframe(u, c):
     tf = c.args[0]
     if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須為：" + "/".join(TF_SEC.keys())); return
     ACCOUNT_TF = tf; save_state()
-    await reply(u, f"{E.BOT} ✅ 帳戶週期已設為 {tf}\n（僅影響之後新建立的策略）")
+    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n（僅影響之後新建立的策略）")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT}\n使用說明\n━━━━━━━━━━\n"
@@ -1625,7 +1625,7 @@ async def cmd_menu(u, c):
         "每根收盤推 SL（移動門檻%）｜每 N 秒現價追蹤 SL\n"
         "獲利≥0.1%→緊貼現價0.1%\n"
         "出場只有 TP / SL，無 TF 強平\n"
-        "⚠ 真實下單，循環交易\n✅ 重啟接管持倉與掛單")
+        f"{E.WARN} 真實下單，循環交易\n{E.OK} 重啟接管持倉與掛單")
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
