@@ -73,7 +73,8 @@ SAVE_FIELDS = ("sym","dir","lev","margin","offset","tp","sl","move_pct","interva
                "front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
                "back_algo_id","back_px","back_filled","back_sz",
-               "closing","state")
+               "closing","state",
+               "round_today","enter_today","round_date")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
     # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
@@ -424,9 +425,14 @@ async def _order_state(iid, oid):
     return None, None
 
 async def _place_pair(S, iid, chat, app, label="新一輪"):
-    """掛出前後單一對，更新 S 的掛單欄位。
-    前單方向 = S["dir"]，後單方向相反。
-    """
+    """掛出前後單一對，更新 S 的掛單欄位。輪次 +1，日期歸零判斷。"""
+    # 輪次計數（日期歸零）
+    today = today8()
+    if S.get("round_date") != today:
+        S["round_today"] = 0
+        S["enter_today"] = 0
+        S["round_date"]  = today
+    S["round_today"] = int(S.get("round_today", 0)) + 1
     d    = S["dir"]
     back_d = "S" if d == "L" else "L"
     spec   = S["spec"]
@@ -768,12 +774,17 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
                   "back_algo_id","back_px","back_filled","back_sz","back_d",
                   "algo_id","closing"):
             S.pop(a, None)
-        S["state"] = "重新埋伏"
+        S["state"] = "等下輪TF"
         save_state()
 
-        # 重新下新一輪
-        await asyncio.sleep(2)
-        ok = await _place_pair(S, iid, chat, app, label="重新埋伏")
+        # 等下一 TF 開盤才重掛
+        tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
+        now_t  = time.time()
+        tf_end = (int(now_t // tf_sec) + 1) * tf_sec
+        wait   = tf_end - now_t
+        if wait > 0:
+            await asyncio.sleep(wait)
+        ok = await _place_pair(S, iid, chat, app, label="出場重掛")
         if not ok:
             await asyncio.sleep(5)
 
@@ -793,7 +804,7 @@ async def loop(app, chat, S):
 
         # 主監控迴圈
         while S["alive"]:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
             front_oid    = S.get("front_oid")
             front_filled = S.get("front_filled", False)
@@ -801,6 +812,33 @@ async def loop(app, chat, S):
 
             if S.get("closing"):
                 continue
+
+            # ── TF 計時：前單未成交時，TF 結束前 1 秒撤單重掛 ──
+            if not front_filled and not back_filled and front_oid:
+                tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
+                now_t  = time.time()
+                tf_end = (int(now_t // tf_sec) + 1) * tf_sec
+                secs_left = tf_end - now_t
+                if secs_left <= 1.5:   # TF 結束前 1.5 秒觸發
+                    # 撤前單
+                    await _cancel_order(iid, front_oid)
+                    # 撤後單計劃委託
+                    back_algo_id = S.get("back_algo_id")
+                    if back_algo_id:
+                        await _cancel_trigger(iid, back_algo_id)
+                    # 清除掛單狀態
+                    for a in ("front_oid","front_px","front_static_sl","front_tp_px",
+                              "front_sl_px","front_filled","front_ee","front_sz",
+                              "front_move_n","front_move_hist",
+                              "back_algo_id","back_px","back_filled","back_sz","back_d"):
+                        S.pop(a, None)
+                    # 等到新 TF 開盤（最多等 2 秒）
+                    await asyncio.sleep(min(secs_left + 0.2, 2))
+                    # 查現價，立刻重掛
+                    ok = await _place_pair(S, iid, chat, app, label="TF重掛")
+                    if not ok:
+                        await asyncio.sleep(3)
+                    continue
 
             # 查前單狀態（若尚未成交）
             if front_oid and not front_filled:
@@ -812,6 +850,12 @@ async def loop(app, chat, S):
                     S["front_sl_px"]  = str(fpx)   # 動態SL從進場價開始
                     S["front_ee"]     = time.time()
                     S["state"]        = "持倉中"
+                    # 進場次數 +1
+                    today = today8()
+                    if S.get("round_date") != today:
+                        S["round_today"] = 0; S["enter_today"] = 0; S["round_date"] = today
+                    S["enter_today"] = int(S.get("enter_today", 0)) + 1
+                    save_state()
                     # 掛前單 algo OCO
                     back_d = S.get("back_d", "S" if d == "L" else "L")
                     front_tp = Decimal(str(S["front_tp_px"]))
@@ -1282,6 +1326,9 @@ async def cmd_status(u, c):
         L.append(f"{live_emoji} {s['sym']}")
         L.append(f"{live_label}({state_str})")
         L.append(f"參數：{strat_params(s['sym'], s['dir'])}")
+        round_t = int(s.get("round_today", 0))
+        enter_t = int(s.get("enter_today", 0))
+        L.append(f"今日輪次：{round_t}｜今日進場：{enter_t}")
 
         # 前單資訊
         if front_waiting:
