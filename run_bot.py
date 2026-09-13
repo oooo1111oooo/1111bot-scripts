@@ -1279,20 +1279,22 @@ async def cmd_status(u, c):
             live_emoji = E.dir_emoji(d)
 
         L.append("━━━━━━━━━━")
-        L.append(f"{live_emoji} {s['sym']}：{live_label}({state_str})")
+        L.append(f"{live_emoji} {s['sym']}")
+        L.append(f"{live_label}({state_str})")
         L.append(f"參數：{strat_params(s['sym'], s['dir'])}")
 
         # 前單資訊
         if front_waiting:
-            L.append(f"前單（{E.dir_word(d)}）：埋伏{s.get('front_px','-')} TP{s.get('front_tp_px','-')} SL{s.get('front_static_sl','-')}")
+            L.append(f"前單（{E.dir_word(d)}）")
+            L.append(f"  埋伏：{s.get('front_px','-')}")
+            L.append(f"  TP：{s.get('front_tp_px','-')} | SL：{s.get('front_static_sl','-')}")
         elif front_in:
             fpx = s.get("front_px", "-")
             tp_s = s.get("front_tp_px", "-")
             sl_s = s.get("front_sl_px", "-")
             mn = s.get("front_move_n", 0)
-            L.append(f"前單（{E.dir_word(d)}）：進場{fpx}")
-            L.append(f"  TP：{tp_s}（固定）")
-            L.append(f"  動態SL：{sl_s}（目前）")
+            L.append(f"前單（{E.dir_word(d)}）進場：{fpx}")
+            L.append(f"  TP：{tp_s} | 動態SL：{sl_s}（目前）")
             L.append(f"  SL移動：{mn}次")
             mhist = s.get("front_move_hist") or []
             prev_px = None
@@ -1304,15 +1306,14 @@ async def cmd_status(u, c):
 
         # 後單資訊
         if back_waiting:
-            L.append(f"後單（{E.dir_word(back_d)}）：觸發{s.get('back_px','-')}（計劃委託等待中）")
+            L.append(f"後單（{E.dir_word(back_d)}）：觸發{s.get('back_px','-')}")
         elif back_in:
             fpx = s.get("back_px", "-")
             tp_s = s.get("back_tp_px", "-")
-            sl_s = s.get("front_sl_px", "-")   # 升格後動態SL
+            sl_s = s.get("front_sl_px", "-")
             mn = s.get("front_move_n", 0)
-            L.append(f"後單升格（{E.dir_word(back_d)}）：進場{fpx}")
-            L.append(f"  TP：{tp_s}（固定）")
-            L.append(f"  動態SL：{sl_s}（目前）")
+            L.append(f"後單升格（{E.dir_word(back_d)}）進場：{fpx}")
+            L.append(f"  TP：{tp_s} | 動態SL：{sl_s}（目前）")
             L.append(f"  SL移動：{mn}次")
             mhist = s.get("front_move_hist") or []
             prev_px = None
