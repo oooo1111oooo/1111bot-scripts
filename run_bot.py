@@ -607,7 +607,9 @@ async def frame_mover(app):
                 if not algo_id:
                     continue
 
-                S["_pending_sl"] = (str(nsl), str(cur_px))
+                # 判斷移動類型：跟=跟著漲幅，底=最小門檻
+                move_type = "跟" if abs(profit_pct) >= move_pct and profit_pct != move_pct else "底"
+                S["_pending_sl"] = (str(nsl), str(cur_px), move_type)
                 amends.append((S["spec"]["iid"], algo_id, nsl, S))
 
             if amends:
@@ -615,15 +617,15 @@ async def frame_mover(app):
                 okn = await amend_frames(items)
                 for iid, aid, sl, S in amends:
                     if okn:
-                        nsl, npx = S.pop("_pending_sl")
+                        nsl, npx, move_type = S.pop("_pending_sl")
                         S["front_sl_px"] = nsl
                         S["front_move_n"] = int(S.get("front_move_n", 0)) + 1
                         S["_last_move_t"] = now_t
-                        print(f"[SL移動] {S['sym']} {S['dir']} 現價={npx} 新SL={nsl} 第{S['front_move_n']}次")
+                        print(f"[SL移動] {S['sym']} {S['dir']} {move_type} 現價={npx} 新SL={nsl} 第{S['front_move_n']}次")
                         mh = S.get("front_move_hist")
                         if not isinstance(mh, list):
                             mh = []; S["front_move_hist"] = mh
-                        mh.append({"t": hhmmss(), "type": "現",
+                        mh.append({"t": hhmmss(), "type": move_type,
                                    "px": npx, "sl": nsl})
                         if len(mh) > 200:
                             S["front_move_hist"] = mh[-200:]
@@ -682,12 +684,12 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             f"商品：{E.dir_emoji(d)} {S['sym']}\n"
             f"前單（{E.dir_word(d)}）：{reason_r}\n"
             f"━━━━━━━━━━\n"
-            f"進場：{fpx}\n"
-            f"出場：{xpx_r}\n"
+            f"進場：{fpx} | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')}\n"
+            f"出場：{xpx_r} | {hhmmss()}\n"
             f"━━━━━━━━━━\n"
-            f"毛損益：{g_r:+.6f}\n"
-            f"手續費：{fee_r:.6f}\n"
-            f"淨損益：{net_r:+.6f} {ico_r}"
+            f"毛損益：{g_r:+.6f} ({float(g_r)/float(S.get('margin',1))*100:+.3f}%)\n"
+            f"手續費：{fee_r:.6f} ({float(fee_r)/float(S.get('margin',1))*100:+.3f}%)\n"
+            f"淨損益：{net_r:+.6f} ({float(rec.get('pnlRatio') or 0)*100:+.3f}%) {ico_r}"
             f"{sl_block}\n"
             f"━━━━━━━━━━\n{next_note}\n時間：{hhmmss()}")
 
