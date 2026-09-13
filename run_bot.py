@@ -239,13 +239,34 @@ async def cancel_verified(iid, oid, tries=4):
     return "fail"
 
 async def sweep(iid, pos, keep=None):
-    """清掉本 bot 在該幣種該方向的所有殘留掛單。"""
+    """清掉本 bot 在該幣種該方向的所有殘留限價掛單。"""
     n = 0
     for o in await okx_orders(iid, pos):
         if keep and o.get("ordId") == keep: continue
         await api("POST", "/api/v5/trade/cancel-order", {"instId": iid, "ordId": o["ordId"]})
         n += 1
     return n
+
+async def sweep_algos(iid, pos_side):
+    """清掉該幣種該方向所有未觸發的計劃委託（trigger algo）。"""
+    n = 0
+    try:
+        r = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
+        if r.get("code") == "0":
+            for o in (r.get("data") or []):
+                if o.get("posSide") != pos_side:
+                    continue
+                algo_id = o.get("algoId")
+                if not algo_id:
+                    continue
+                cr = await api("POST", "/api/v5/trade/cancel-algos",
+                               [{"instId": iid, "algoId": algo_id}])
+                if cr.get("code") == "0":
+                    n += 1
+    except Exception as e:
+        print("sweep_algos error", iid, pos_side, type(e).__name__, e)
+    return n
+
 
 async def close_record(iid, ps, after_ms, tries=10):
     """出場後取 OKX 真實平倉紀錄。"""
@@ -448,9 +469,10 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     front_pos = "long" if d == "L" else "short"
     back_pos  = "long" if back_d == "L" else "short"
 
-    # 清殘單
+    # 清殘單（限價單 + 計劃委託都清）
     await sweep(iid, front_pos)
     await sweep(iid, back_pos)
+    await sweep_algos(iid, back_pos)   # 清舊的後單計劃委託
 
     # 掛前單
     front_oid = await _place_limit(iid, front_pos, d, front_amb, sz_front)
@@ -1177,12 +1199,15 @@ async def do_stop(u, key):
         await reply(u, f"{E.BOT} 策略已不存在"); return
     d = S["dir"]; iid = S["spec"]["iid"]
     ps = "long" if d == "L" else "short"
+    back_d = S.get("back_d", "S" if d == "L" else "L")
+    back_ps = "long" if back_d == "L" else "short"
     p = await okx_pos(iid, ps)
     S["alive"] = False
     n = await sweep(iid, ps)
+    na = await sweep_algos(iid, back_ps)
     save_state()
     tail = f"\n{E.WARN} 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
-    await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜撤單 {n}{tail}")
+    await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜撤限價單 {n}｜撤計劃委託 {na}{tail}")
 
 async def cmd_stopall(u, c):
     alive = [k for k, s in STRATS.items() if s.get("alive")]
@@ -1198,9 +1223,12 @@ async def do_stopall(u):
     for k in list(alive):
         S = STRATS[k]; d = S["dir"]; iid = S["spec"]["iid"]
         ps = "long" if d == "L" else "short"
+        back_d = S.get("back_d", "S" if d == "L" else "L")
+        back_ps = "long" if back_d == "L" else "short"
         p = await okx_pos(iid, ps)
         S["alive"] = False
         await sweep(iid, ps)
+        await sweep_algos(iid, back_ps)   # 撤後單計劃委託
         (held if p else done).append(f"{S['sym']} {S['dir']}")
     orphan = 0
     for o in await okx_orders(prefix="n"):
