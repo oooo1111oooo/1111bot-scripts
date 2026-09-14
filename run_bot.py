@@ -1436,6 +1436,31 @@ async def cmd_status(u, c):
         L.append(f"{live_emoji} {s['sym']} {E.dir_word(d)} {lev}x {margin}（輪{round_t}｜進{enter_t}）")
         L.append(f"{live_label}({state_str})")
 
+        # 查現價和 TF K線開盤價，計算漲跌燈號
+        try:
+            iid_s = s["spec"]["iid"]
+            cur_px_s = await get_last(iid_s)
+            tf_s = s.get("tf", ACCOUNT_TF)
+            tf_sec_s = TF_SEC.get(tf_s, 300)
+            now_ts = time.time()
+            open_ts = int(now_ts // tf_sec_s) * tf_sec_s
+            kl_s = await klines_for_tf(iid_s, tf_s, 2)
+            kline_open = None
+            if kl_s:
+                for k in reversed(kl_s):
+                    if int(k["ts"]) // 1000 == open_ts:
+                        kline_open = float(k["o"])
+                        break
+            if kline_open is None and kl_s:
+                kline_open = float(kl_s[-1]["o"])
+            if kline_open:
+                px_emoji = E.UP if float(cur_px_s) > kline_open else (E.DOWN if float(cur_px_s) < kline_open else E.EVEN)
+            else:
+                px_emoji = "⚪"
+            L.append(f"現：{hhmmss()} | {px_emoji} {cur_px_s}")
+        except Exception:
+            L.append(f"現：{hhmmss()} | ⚪ -")
+
         # 前單資訊
         tp_f  = s.get("front_tp_px", "-")
         sl_f  = s.get("front_static_sl", "-")
