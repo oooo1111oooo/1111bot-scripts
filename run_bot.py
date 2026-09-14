@@ -913,6 +913,8 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         wait   = tf_end - now_t
         if wait > 0:
             await asyncio.sleep(wait)
+        if not S.get("alive"):   # stopall 在等待TF期間執行，直接放棄重掛
+            return
         ok = await _place_pair(S, iid, chat, app, label="出場重掛")
         if not ok:
             await asyncio.sleep(5)
@@ -964,6 +966,8 @@ async def loop(app, chat, S):
                     # 等到新 TF 開盤（最多等 2 秒）
                     await asyncio.sleep(min(secs_left + 0.2, 2))
                     # 查現價，立刻重掛
+                    if not S.get("alive"):   # stopall 在等待TF期間執行，直接放棄重掛
+                        continue
                     print(f"[TF重掛] {S['sym']} {d} TF到期重掛")
                     ok = await _place_pair(S, iid, chat, app, label="TF重掛")
                     if not ok:
