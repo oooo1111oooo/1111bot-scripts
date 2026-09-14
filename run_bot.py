@@ -658,6 +658,25 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     pos_side = "long" if d == "L" else "short"
     rec = await close_record(iid, pos_side, after_ms, tries=20)
 
+    # 查開倉手續費（fills API，找進場時間點附近的成交）
+    open_fee = Decimal("0")
+    try:
+        fills_r = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=10")
+        if fills_r.get("code") == "0":
+            for f in (fills_r.get("data") or []):
+                f_ts = int(f.get("ts") or 0)
+                f_side = f.get("side", "")
+                f_pos  = f.get("posSide", "")
+                # 找開倉那一筆（進場時間點前後5秒內，方向符合）
+                open_side = "buy" if d == "L" else "sell"
+                open_pos  = "long" if d == "L" else "short"
+                if (f_side == open_side and f_pos == open_pos and
+                        abs(f_ts - int(ee * 1000)) <= 5000):
+                    open_fee += Decimal(str(f.get("fee") or "0"))
+                    print(f"[開倉手續費] {f.get('fee')} ts={f_ts}")
+    except Exception as e:
+        print("查開倉手續費失敗", type(e).__name__, e)
+
     mn = S.get("front_move_n", 0)
     mhist = S.get("front_move_hist") or []
     reason_label = "Take Profit" if reason == "TP" else "Stop Loss"
@@ -680,9 +699,15 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     async def _send_exit_notify(rec):
         xpx_r = Decimal(str(rec.get("closeAvgPx") or xpx))
         print(f"[出場損益原始] realizedPnl={rec.get('realizedPnl')} pnl={rec.get('pnl')} fee={rec.get('fee')} pnlRatio={rec.get('pnlRatio')}")
-        g_r    = Decimal(str(rec.get("pnl") or "0"))           # 毛損益（OKX pnl，未扣手續費）
-        fee_r  = Decimal(str(rec.get("fee") or "0"))           # 手續費
-        net_r  = Decimal(str(rec.get("realizedPnl") or "0"))  # 淨損益（OKX realizedPnl = 收益額）
+        g_r    = Decimal(str(rec.get("pnl") or "0"))           # 毛損益
+        close_fee_r = Decimal(str(rec.get("fee") or "0"))      # 平倉手續費
+        fee_r  = close_fee_r + open_fee                        # 總手續費（開倉+平倉）
+        net_r  = Decimal(str(rec.get("realizedPnl") or "0")) + open_fee  # 淨損益（含開倉費）
+        pnl_ratio = float(rec.get("pnlRatio") or 0)
+        pos_val = float(Decimal(str(rec.get("realizedPnl") or "0"))) / pnl_ratio if pnl_ratio != 0 else 1
+        g_pct   = float(g_r) / pos_val * 100 if pos_val else 0
+        fee_pct = float(fee_r) / pos_val * 100 if pos_val else 0
+        net_pct = float(net_r) / pos_val * 100 if pos_val else 0
         reason_r = reason_label
         if rec.get("type") == "2":
             reason_r = "Take Profit" if xpx_r >= Decimal(str(S.get("front_tp_px") or "0")) else "Stop Loss"
@@ -696,9 +721,9 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             f"進場：{fpx} | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')}\n"
             f"出場：{xpx_r} | {hhmmss()}\n"
             f"━━━━━━━━━━\n"
-            f"毛損益：{g_r:+.6f} ({float(g_r)/float(S.get('margin',1))*100:+.3f}%)\n"
-            f"手續費：{fee_r:.6f} ({float(fee_r)/float(S.get('margin',1))*100:+.3f}%)\n"
-            f"淨損益：{net_r:+.6f} ({float(rec.get('pnlRatio') or 0)*100:+.3f}%) {ico_r}"
+            f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
+            f"手續費：{fee_r:.6f} ({fee_pct:+.3f}%)\n"
+            f"淨損益：{net_r:+.6f} ({net_pct:+.3f}%) {ico_r}"
             f"{sl_block}\n"
             f"━━━━━━━━━━\n{next_note}\n時間：{hhmmss()}")
 
