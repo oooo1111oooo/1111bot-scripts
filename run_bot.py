@@ -1403,55 +1403,42 @@ async def cmd_status(u, c):
     pl = [p for p in posr.get("data", []) if float(p.get("pos", "0")) != 0] if posr.get("code") == "0" else []
     pdl = pe.get("data", []) if pe.get("code") == "0" else []
     alive = [s for s in STRATS.values() if s.get("alive")]
-    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：現況（即時查OKX）", "━━━━━━━━━━",
+    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：現況（即時查OKX）",
          f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
          f"運行中策略：{len(alive)}個"]
     # 查計劃委託數（trigger algo）
     algo_r = await api("GET", "/api/v5/trade/orders-algo-pending?ordType=trigger")
     algo_list = algo_r.get("data", []) if algo_r.get("code") == "0" else []
-    total_pending = len(pdl) + len(algo_list)   # 限價單 + 計劃委託
+    total_pending = len(pdl) + len(algo_list)
 
-    for s in alive:
+    for i, s in enumerate(alive):
         d = s["dir"]
-        back_d = s.get("back_d", "S" if d == "L" else "L")
-        # 計算前後單狀態
         front_waiting  = 1 if s.get("front_oid") and not s.get("front_filled") else 0
         back_waiting   = 1 if s.get("back_algo_id") and not s.get("back_filled") else 0
         front_in       = 1 if s.get("front_filled") else 0
         back_in        = 1 if s.get("back_filled") else 0
-
         state_str = f"前{front_waiting}/後{back_waiting}/前進{front_in}/後進{back_in}"
-        if front_in or back_in:
-            live_label = "持倉中"
-            live_emoji = E.HOLD
-        else:
-            live_label = "委託中"
-            live_emoji = E.dir_emoji(d)
-
-        L.append("━━━━━━━━━━")
-        L.append(f"{live_emoji} {s['sym']}")
-        L.append(f"{live_label}({state_str})")
-        L.append(f"參數：{strat_params(s['sym'], s['dir'])}")
+        live_label = "持倉中" if (front_in or back_in) else "委託中"
+        live_emoji = E.HOLD if (front_in or back_in) else E.dir_emoji(d)
         round_t = int(s.get("round_today", 0))
         enter_t = int(s.get("enter_today", 0))
-        L.append(f"今日輪次：{round_t}｜今日進場：{enter_t}")
+        lev = s.get("lev", "?")
+        margin = s.get("margin", "?")
+
+        L.append("━━━━━━━━━━")
+        L.append(f"{live_emoji} {s['sym']} {E.dir_word(d)} {lev}x {margin}（輪{round_t}｜進{enter_t}）")
+        L.append(f"{live_label}({state_str})")
 
         # 前單資訊
+        tp_f  = s.get("front_tp_px", "-")
+        sl_f  = s.get("front_static_sl", "-")
+        amb_f = s.get("front_px", "-")
         if front_waiting:
-            L.append(f"前單（{E.dir_word(d)}）")
-            L.append(f"  埋伏：{s.get('front_px','-')}")
-            L.append(f"  TP：{s.get('front_tp_px','-')} | SL：{s.get('front_static_sl','-')}")
+            L.append(f"前：{tp_f}｜📍{amb_f}｜{sl_f}")
         elif front_in:
-            fpx = s.get("front_px", "-")
-            tp_s = s.get("front_tp_px", "-")
-            static_sl = s.get("front_static_sl", "-")
-            sl_s = s.get("front_sl_px", "-")
-            mn = s.get("front_move_n", 0)
-            L.append(f"前單（{E.dir_word(d)}）進場：{fpx}")
-            L.append(f"  TP：{tp_s}（固定）")
-            L.append(f"  靜態SL：{static_sl}")
-            L.append(f"  動態SL：{sl_s}（目前）")
-            L.append(f"  SL移動：{mn}次")
+            sl_d = s.get("front_sl_px", "-")
+            mn   = s.get("front_move_n", 0)
+            L.append(f"前：{tp_f}｜📍{amb_f}｜動態SL:{sl_d}（{mn}次）")
             mhist = s.get("front_move_hist") or []
             prev_px = None
             for mrec in mhist:
@@ -1461,33 +1448,23 @@ async def cmd_status(u, c):
                 prev_px = cur_px
 
         # 後單資訊
+        tp_b  = s.get("back_tp_px", "-")
+        sl_b  = s.get("back_static_sl", "-")
+        trig_b = s.get("back_px", "-")
         if back_waiting:
-            L.append(f"後單（{E.dir_word(back_d)}）：觸發{s.get('back_px','-')}")
+            L.append(f"後：{tp_b}｜📍{trig_b}｜{sl_b}")
         elif back_in:
-            fpx = s.get("back_px", "-")
-            tp_s = s.get("back_tp_px", "-")
-            static_sl = s.get("back_static_sl", "-")
-            sl_s = s.get("front_sl_px", "-")
-            mn = s.get("front_move_n", 0)
-            L.append(f"後單升格（{E.dir_word(back_d)}）進場：{fpx}")
-            L.append(f"  TP：{tp_s}（固定）")
-            L.append(f"  靜態SL：{static_sl}")
-            L.append(f"  動態SL：{sl_s}（目前）")
-            L.append(f"  SL移動：{mn}次")
-            mhist = s.get("front_move_hist") or []
-            prev_px = None
-            for mrec in mhist:
-                cur_px = mrec.get("px", "")
-                arrow = E.price_emoji(cur_px, prev_px) if prev_px else "🔸"
-                L.append(f"  {mrec.get('t','')} | {arrow} | {cur_px} | 止{mrec.get('sl','')}")
-                prev_px = cur_px
+            sl_d = s.get("front_sl_px", "-")
+            mn   = s.get("front_move_n", 0)
+            L.append(f"後升格：{tp_b}｜📍{trig_b}｜動態SL:{sl_d}（{mn}次）")
+
+        # 策略間空白行
+        if i < len(alive) - 1:
+            L.append("")
 
     L.append("━━━━━━━━━━")
     L.append(f"掛單數：{total_pending}｜持倉數：{len(pl)}")
-    for p in pl:
-        pd = "L" if p["posSide"] == "long" else "S"
-        L.append(f"{E.dir_emoji(pd)} {p['instId'].replace('-USDT-SWAP','USDT')} {pd}")
-    L += ["━━━━━━━━━━", f"時間：{hhmmss()} UTC+8"]
+    L.append(f"時間：{hhmmss()} UTC+8")
     await reply(u, "\n".join(L))
 
 # ---------- /summary ----------
