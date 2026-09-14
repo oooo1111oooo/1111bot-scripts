@@ -709,7 +709,11 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         net_pct = float(net_r) / margin_val * 100 if margin_val else 0
         reason_r = reason_label
         if rec.get("type") == "2":
-            reason_r = "Take Profit" if xpx_r >= Decimal(str(S.get("front_tp_px") or "0")) else "Stop Loss"
+            tp_px = Decimal(str(S.get("front_tp_px") or "0"))
+            if d == "L":
+                reason_r = "Take Profit" if xpx_r >= tp_px else "Stop Loss"
+            else:
+                reason_r = "Take Profit" if xpx_r <= tp_px else "Stop Loss"
         ico_r = E.WIN if net_r >= 0 else E.LOSS
         await notify(app, chat,
             f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico_r} 前單出場{next_note_label}\n"
