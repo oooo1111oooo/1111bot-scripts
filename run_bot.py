@@ -1457,9 +1457,9 @@ async def cmd_status(u, c):
                 px_emoji = E.UP if float(cur_px_s) > kline_open else (E.DOWN if float(cur_px_s) < kline_open else E.EVEN)
             else:
                 px_emoji = "⚪"
-            L.append(f"現：{hhmmss()} | {px_emoji} {cur_px_s}")
+            L.append(f"現：{hhmmss()}|{px_emoji} {cur_px_s}")
         except Exception:
-            L.append(f"現：{hhmmss()} | ⚪ -")
+            L.append(f"現：{hhmmss()}|⚪ -")
 
         # 前單資訊
         tp_f  = s.get("front_tp_px", "-")
