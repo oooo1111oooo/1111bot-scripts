@@ -970,11 +970,11 @@ async def loop(app, chat, S):
                     f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} 前單進場成交\n"
                     f"━━━━━━━━━━\n"
                     f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                    f"進場：{fpx} | {hhmmss()}\n"
-                    f"TP：{front_tp}（+{S['tp']}%）\n"
+                    f"進場：{fpx} | {datetime.fromtimestamp(S.get('front_ee', time.time()), TZ8).strftime('%H:%M:%S')}\n"
+                    f"靜態TP：{front_tp}（+{S['tp']}%）\n"
                     f"靜態SL：{front_static_sl}（-{S['sl']}%）\n"
-                    f"動態SL每{S['interval']}s移動，門檻{S['move_pct']}%\n"
-                    f"後單（{E.dir_word(back_d)}）埋伏中：{S.get('back_px')}\n"
+                    f"動態SL：{S['interval']}s | {S['move_pct']}%\n"
+                    f"後單：{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)} 埋伏價：{S.get('back_px')}\n"
                     f"時間：{hhmmss()}")
 
             # 查後單狀態（計劃委託是否已觸發成交）
