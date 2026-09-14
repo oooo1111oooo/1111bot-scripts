@@ -703,11 +703,10 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         close_fee_r = Decimal(str(rec.get("fee") or "0"))      # 平倉手續費
         fee_r  = close_fee_r + open_fee                        # 總手續費（開倉+平倉）
         net_r  = Decimal(str(rec.get("realizedPnl") or "0")) + open_fee  # 淨損益（含開倉費）
-        pnl_ratio = float(rec.get("pnlRatio") or 0)
-        pos_val = float(Decimal(str(rec.get("realizedPnl") or "0"))) / pnl_ratio if pnl_ratio != 0 else 1
-        g_pct   = float(g_r) / pos_val * 100 if pos_val else 0
-        fee_pct = float(fee_r) / pos_val * 100 if pos_val else 0
-        net_pct = float(net_r) / pos_val * 100 if pos_val else 0
+        margin_val = float(Decimal(str(S.get("margin", "1"))))
+        g_pct   = float(g_r) / margin_val * 100 if margin_val else 0
+        fee_pct = float(fee_r) / margin_val * 100 if margin_val else 0
+        net_pct = float(net_r) / margin_val * 100 if margin_val else 0
         reason_r = reason_label
         if rec.get("type") == "2":
             reason_r = "Take Profit" if xpx_r >= Decimal(str(S.get("front_tp_px") or "0")) else "Stop Loss"
@@ -727,26 +726,16 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             f"{sl_block}\n"
             f"━━━━━━━━━━\n{next_note}\n時間：{hhmmss()}")
 
-    if rec:
-        await _send_exit_notify(rec)
-    else:
-        # 先發查詢中通知
+    if not rec:
+        # 先發查詢中通知（等確認後單狀態後才補發完整通知）
         await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場{next_note_label}\n"
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場\n"
             f"━━━━━━━━━━\n"
             f"商品：{E.dir_emoji(d)} {S['sym']}\n"
             f"前單（{E.dir_word(d)}）：{reason_label}\n"
             f"進場：{fpx}\n"
             f"損益查詢中，請稍候...\n時間：{hhmmss()}")
-        # 背景繼續無限查，每5秒一次，查到就補發
-        async def _bg_query():
-            while True:
-                await asyncio.sleep(5)
-                r = await close_record(iid, pos_side, after_ms, tries=1)
-                if r:
-                    await _send_exit_notify(r)
-                    return
-        asyncio.create_task(_bg_query())
+    # rec 有資料時，等確認後單狀態後才一次發完整通知，避免重複
 
     # 查後單狀態
     back_algo_id = S.get("back_algo_id")
