@@ -783,7 +783,7 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         S["front_px"]        = str(back_fpx)
         S["front_static_sl"] = str(back_static_sl)
         S["front_tp_px"]     = str(back_tp)
-        S["front_sl_px"]     = str(back_fpx)   # 動態SL重置為進場價
+        S["front_sl_px"]     = str(back_static_sl)   # SL移動門檻初始值 = 後單靜態SL
         S["front_filled"]    = True
         S["front_ee"]        = time.time()
         S["front_sz"]        = str(back_sz)
@@ -945,7 +945,7 @@ async def loop(app, chat, S):
                 fpx = Decimal(avgpx or S["front_px"])
                 S["front_filled"] = True
                 S["front_px"]     = str(fpx)
-                S["front_sl_px"]  = str(fpx)   # 動態SL從進場價開始
+                S["front_sl_px"]  = str(S.get("front_static_sl", fpx))   # SL移動門檻初始值 = 靜態SL
                 S["front_ee"]     = time.time()
                 S["state"]        = "持倉中"
                 print(f"[前單進場] {S['sym']} {d} 進場價={fpx}")
