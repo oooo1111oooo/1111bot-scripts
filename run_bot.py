@@ -68,7 +68,7 @@ def pct(v):
     return str(d)
 
 # ---------- 狀態持久化（原子寫入） ----------
-SAVE_FIELDS = ("sym","dir","lev","margin","offset","tp","sl","move_pct","interval","chat",
+SAVE_FIELDS = ("sym","dir","lev","margin","offset","back_offset","tp","sl","move_pct","interval","chat",
                "locked_dir",
                "front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
@@ -461,8 +461,12 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         front_static_sl = align(front_amb * (1 + sl_pct), tick, "S")
         front_tp        = align(front_amb * (1 - tp_pct), tick, "L")
 
-    # 後單 TP/靜態SL（以後單埋伏價為基準）
-    back_amb = front_static_sl
+    # 後單埋伏價（由 back_offset 從現價計算，每輪重算）
+    back_offset_pct = Decimal(str(S.get("back_offset", S["offset"]))) / 100
+    if d == "S":
+        back_amb = align(op * (1 + back_offset_pct), tick, back_d)
+    else:
+        back_amb = align(op * (1 - back_offset_pct), tick, back_d)
     if back_d == "S":
         back_static_sl = align(back_amb * (1 + sl_pct), tick, "S")
         back_tp        = align(back_amb * (1 - tp_pct), tick, "L")
@@ -1073,7 +1077,8 @@ async def rebuild_strat(d):
     spec = await get_spec(d["sym"])
     S = {"sym": d["sym"], "dir": d["dir"],
          "lev": int(d["lev"]), "margin": Decimal(str(d["margin"])),
-         "offset": Decimal(str(d["offset"])), "tp": Decimal(str(d["tp"])),
+         "offset": Decimal(str(d["offset"])), "back_offset": Decimal(str(d.get("back_offset", d["offset"]))),
+         "tp": Decimal(str(d["tp"])),
          "sl": Decimal(str(d["sl"])),
          "move_pct": Decimal(str(d.get("move_pct", "0"))),
          "interval": float(d.get("interval", 1)),
@@ -1218,16 +1223,16 @@ def strat_params(sym, dr):
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 埋伏% TP% SL% 移動門檻% 間隔秒\n"
-           f"例：/run ETHUSDT L 1x 3 0.3 5 0.2 0.01 1\n"
-           f"共9個參數，方向只能 L 或 S")
-    if len(a) != 9:
-        await reply(u, f"{E.BOT} 參數數量錯誤（需9個）\n{fmt}"); return
+    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 前單埋伏% 後單埋伏% TP% SL% 移動門檻% 間隔秒\n"
+           f"例：/run ETHUSDT L 1x 3 0.3 0.5 5 0.2 0.01 1\n"
+           f"共10個參數，方向只能 L 或 S")
+    if len(a) != 10:
+        await reply(u, f"{E.BOT} 參數數量錯誤（需10個）\n{fmt}"); return
     try:
         sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
-        margin = Decimal(a[3]); offset = Decimal(a[4])
-        tp = Decimal(a[5].rstrip("%")); sl = Decimal(a[6].rstrip("%"))
-        move_pct = Decimal(a[7].rstrip("%")); interval = float(a[8])
+        margin = Decimal(a[3]); offset = Decimal(a[4]); back_offset = Decimal(a[5])
+        tp = Decimal(a[6].rstrip("%")); sl = Decimal(a[7].rstrip("%"))
+        move_pct = Decimal(a[8].rstrip("%")); interval = float(a[9])
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     if dr not in ("L", "S"):
@@ -1257,27 +1262,29 @@ async def cmd_run(u, c):
     # 前單埋伏價
     front_amb = align(op * (1 - offset / 100) if dr == "L"
                       else op * (1 + offset / 100), tick, dr)
-    # 前單靜態 SL（同時也是後單的埋伏限價）
+    # 前單靜態 SL / TP
     back_dr = "S" if dr == "L" else "L"
     if dr == "L":
         front_static_sl = align(front_amb * (1 - sl / 100), tick, "L")
-    else:
-        front_static_sl = align(front_amb * (1 + sl / 100), tick, "S")
-    # 前單 TP
-    if dr == "L":
         front_tp = align(front_amb * (1 + tp / 100), tick, "S")
     else:
+        front_static_sl = align(front_amb * (1 + sl / 100), tick, "S")
         front_tp = align(front_amb * (1 - tp / 100), tick, "L")
-    # 後單靜態 SL（以後單埋伏價為基準）
-    if back_dr == "S":
-        back_static_sl = align(front_static_sl * (1 + sl / 100), tick, "S")
-        back_tp = align(front_static_sl * (1 - tp / 100), tick, "L")
+    # 後單埋伏價（從現價 op 用 back_offset 算）
+    if dr == "S":
+        back_amb = align(op * (1 + back_offset / 100), tick, back_dr)
     else:
-        back_static_sl = align(front_static_sl * (1 - sl / 100), tick, "L")
-        back_tp = align(front_static_sl * (1 + tp / 100), tick, "S")
+        back_amb = align(op * (1 - back_offset / 100), tick, back_dr)
+    # 後單靜態 SL / TP（以後單埋伏價為基準）
+    if back_dr == "S":
+        back_static_sl = align(back_amb * (1 + sl / 100), tick, "S")
+        back_tp = align(back_amb * (1 - tp / 100), tick, "L")
+    else:
+        back_static_sl = align(back_amb * (1 - sl / 100), tick, "L")
+        back_tp = align(back_amb * (1 + tp / 100), tick, "S")
 
     sz_front = csize(margin, Decimal(lev), front_amb, spec["ctval"], spec["lot"])
-    sz_back  = csize(margin, Decimal(lev), front_static_sl, spec["ctval"], spec["lot"])
+    sz_back  = csize(margin, Decimal(lev), back_amb,  spec["ctval"], spec["lot"])
     if sz_front < spec["minsz"]:
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：前單算出 {sz_front} 張 < 最小 {spec['minsz']}\n至少需 {need:.4f} USDT"); return
@@ -1285,11 +1292,11 @@ async def cmd_run(u, c):
     PENDING[u.effective_chat.id] = {
         "kind": "run", "t": time.time(),
         "sym": sym, "dir": dr, "lev": lev, "margin": margin,
-        "offset": offset, "tp": tp, "sl": sl,
+        "offset": offset, "back_offset": back_offset, "tp": tp, "sl": sl,
         "move_pct": move_pct, "interval": interval, "spec": spec,
         "front_amb": front_amb, "front_static_sl": front_static_sl,
         "front_tp": front_tp, "front_sz": sz_front,
-        "back_dr": back_dr, "back_amb": front_static_sl,
+        "back_dr": back_dr, "back_amb": back_amb,
         "back_static_sl": back_static_sl, "back_tp": back_tp,
         "back_sz": sz_back, "locked_dir": dr,
     }
@@ -1303,7 +1310,7 @@ async def cmd_run(u, c):
         f"靜態SL：{front_static_sl}（-{sl}%）\n"
         f"\n"
         f"後單：{sym} {E.dir_word(back_dr)}（觸發進場）\n"
-        f"埋伏價 ：{front_static_sl}（前單靜態SL）\n"
+        f"埋伏價 ：{back_amb}（距現價{back_offset}%）\n"
         f"靜態TP：{back_tp}（+{tp}%）\n"
         f"靜態SL：{back_static_sl}（-{sl}%）\n"
         f"━━━━━━━━━━\n"
