@@ -644,6 +644,10 @@ async def frame_mover(app):
 
 async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     """前單出場共用處理：計算損益、發通知、決定後續動作。"""
+    # 防止雙重呼叫
+    if S.get("closing") == "done":
+        return
+    S["closing"] = "done"
     d    = S["dir"]
     back_d = S.get("back_d", "S" if d == "L" else "L")
     spec = S["spec"]
@@ -1425,7 +1429,10 @@ async def cmd_status(u, c):
         lev = s.get("lev", "?")
         margin = s.get("margin", "?")
 
-        L.append("━━━━━━━━━━")
+        if i == 0:
+            L.append("━━━━━━━━━━")
+        else:
+            L.append("")
         L.append(f"{live_emoji} {s['sym']} {E.dir_word(d)} {lev}x {margin}（輪{round_t}｜進{enter_t}）")
         L.append(f"{live_label}({state_str})")
 
@@ -1457,10 +1464,6 @@ async def cmd_status(u, c):
             sl_d = s.get("front_sl_px", "-")
             mn   = s.get("front_move_n", 0)
             L.append(f"後升格：{tp_b}｜📍{trig_b}｜動態SL:{sl_d}（{mn}次）")
-
-        # 策略間空白行
-        if i < len(alive) - 1:
-            L.append("")
 
     L.append("━━━━━━━━━━")
     L.append(f"掛單數：{total_pending}｜持倉數：{len(pl)}")
