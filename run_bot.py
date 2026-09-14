@@ -593,7 +593,9 @@ async def frame_mover(app):
                     if nsl <= cur_sl:
                         continue  # 只能往上移
                     if nsl >= cur_px:
-                        continue  # SL 不能超過現價
+                        nsl = align(cur_px - tick, tick, "L")  # 貼近現價一個tick
+                        if nsl <= cur_sl:
+                            continue  # 還是不能後退
                 else:
                     profit_pct = (Decimal(str(S.get("front_px", cur_px))) - cur_px) / Decimal(str(S.get("front_px", cur_px)))
                     shift = max(profit_pct, move_pct)
@@ -601,7 +603,9 @@ async def frame_mover(app):
                     if nsl >= cur_sl:
                         continue  # 只能往下移
                     if nsl <= cur_px:
-                        continue  # SL 不能低於現價
+                        nsl = align(cur_px + tick, tick, "S")  # 貼近現價一個tick
+                        if nsl >= cur_sl:
+                            continue  # 還是不能後退
 
                 algo_id = S.get("algo_id")
                 if not algo_id:
@@ -671,9 +675,10 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
 
     async def _send_exit_notify(rec):
         xpx_r = Decimal(str(rec.get("closeAvgPx") or xpx))
-        g_r    = Decimal(str(rec.get("realizedPnl") or "0"))
-        fee_r  = Decimal(str(rec.get("fee") or "0"))
-        net_r  = Decimal(str(rec.get("pnl") or "0"))
+        print(f"[出場損益原始] realizedPnl={rec.get('realizedPnl')} pnl={rec.get('pnl')} fee={rec.get('fee')} pnlRatio={rec.get('pnlRatio')}")
+        g_r    = Decimal(str(rec.get("pnl") or "0"))           # 毛損益（OKX pnl，未扣手續費）
+        fee_r  = Decimal(str(rec.get("fee") or "0"))           # 手續費
+        net_r  = Decimal(str(rec.get("realizedPnl") or "0"))  # 淨損益（OKX realizedPnl = 收益額）
         reason_r = reason_label
         if rec.get("type") == "2":
             reason_r = "Take Profit" if xpx_r >= Decimal(str(S.get("front_tp_px") or "0")) else "Stop Loss"
