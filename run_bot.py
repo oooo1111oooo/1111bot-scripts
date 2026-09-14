@@ -650,7 +650,6 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         return
     S["closing"] = "done"
     d    = S["dir"]
-    back_d = S.get("back_d", "S" if d == "L" else "L")
     spec = S["spec"]
     tick  = spec["tick"]
 
@@ -748,21 +747,37 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     if not rec:
         # 先發查詢中通知（等確認後單狀態後才補發完整通知）
         await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場\n"
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場 / 等待後單\n"
             f"━━━━━━━━━━\n"
             f"商品：{E.dir_emoji(d)} {S['sym']}\n"
             f"前單（{E.dir_word(d)}）：{reason_label}\n"
             f"進場：{fpx}\n"
-            f"損益查詢中，請稍候...\n時間：{hhmmss()}")
-    # rec 有資料時，等確認後單狀態後才一次發完整通知，避免重複
+            f"損益查詢中，請稍候...\n"
+            f"⏳ 後單持續埋伏3分鐘....\n時間：{hhmmss()}")
+        async def _bg_query_init():
+            while True:
+                await asyncio.sleep(5)
+                r = await close_record(iid, pos_side, after_ms, tries=1)
+                if r:
+                    next_note_label  # noqa: closure capture
+                    await _send_exit_notify(r)
+                    return
+        asyncio.create_task(_bg_query_init())
+    # rec 有資料時，立刻發出場通知（含⏳後單等待），不等後單結果
+
+    # 前單出場即時通知（rec 有資料才發）
+    next_note_label = " / 等待後單"
+    next_note = "⏳ 後單持續埋伏3分鐘...."
+    if rec:
+        await _send_exit_notify(rec)
 
     # 查後單狀態
     back_algo_id = S.get("back_algo_id")
     back_d_local = S.get("back_d", "S" if d == "L" else "L")
     back_pos_side = "long" if back_d_local == "L" else "short"
 
-    # 以 OKX 為主：每 0.5 秒查後單持倉，最多等 30 秒
-    max_wait = 30
+    # 以 OKX 為主：每 0.5 秒查後單持倉，最多等 180 秒（3分鐘）
+    max_wait = 180
     waited = 0
     cur_back_pos = None
     while S.get("alive") and waited < max_wait:
@@ -775,15 +790,9 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
                 r_algo = await api("GET", f"/api/v5/trade/order-algo?algoId={back_algo_id}&ordType=trigger")
                 if r_algo.get("code") == "0" and r_algo.get("data"):
                     algo_state = r_algo["data"][0].get("state", "")
-                    if algo_state in ("live", "pause"):
-                        # 計劃委託還在等待，後單未觸發，跳出
+                    if algo_state in ("canceled", "failed"):
                         cur_back_pos = None
                         break
-                    elif algo_state in ("canceled", "failed"):
-                        # 計劃委託失效，跳出
-                        cur_back_pos = None
-                        break
-                    # 其他狀態（已觸發但持倉未更新）繼續等
         except Exception as e:
             print("查後單持倉錯誤", type(e).__name__, e)
         await asyncio.sleep(0.5)
@@ -797,35 +806,21 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         back_tp  = Decimal(str(S.get("back_tp_px", "0")))
         back_static_sl = Decimal(str(S.get("back_static_sl", "0")))
 
-        # 通知：損益部分由 _send_exit_notify 處理（OKX查詢）
-        next_note_label = " / 後單升格"
-        next_note = f"後單（{E.dir_word(back_d)}）：升格為新前單\n進場：{back_fpx} | TP：{back_tp} | 靜態SL：{back_static_sl}"
-        if rec:
-            await _send_exit_notify(rec)
-        else:
-            await notify(app, chat,
-                f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場 / 後單升格\n"
-                f"━━━━━━━━━━\n"
-                f"商品：{E.dir_emoji(d)} {S['sym']}\n"
-                f"前單（{E.dir_word(d)}）：{reason_label}\n"
-                f"進場：{fpx}\n"
-                f"損益查詢中，請稍候...\n時間：{hhmmss()}")
-            async def _bg_query_up():
-                while True:
-                    await asyncio.sleep(5)
-                    r = await close_record(iid, pos_side, after_ms, tries=1)
-                    if r:
-                        await _send_exit_notify(r)
-                        return
-            asyncio.create_task(_bg_query_up())
+        # 升格跟進通知
+        await notify(app, chat,
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：🔔 後單升格\n"
+            f"━━━━━━━━━━\n"
+            f"商品：{E.dir_emoji(back_d_local)} {S['sym']} {E.dir_word(back_d_local)}\n"
+            f"進場：{back_fpx} | TP：{back_tp} | 靜態SL：{back_static_sl}\n"
+            f"時間：{hhmmss()}")
 
         # 後單升格：更新 S 為新前單
-        S["dir"]             = back_d
+        S["dir"]             = back_d_local
         S["front_oid"]       = None
         S["front_px"]        = str(back_fpx)
         S["front_static_sl"] = str(back_static_sl)
         S["front_tp_px"]     = str(back_tp)
-        S["front_sl_px"]     = str(back_static_sl)   # SL移動門檻初始值 = 後單靜態SL
+        S["front_sl_px"]     = str(back_static_sl)
         S["front_filled"]    = True
         S["front_ee"]        = time.time()
         S["front_sz"]        = str(back_sz)
@@ -838,7 +833,7 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         save_state()
 
         # 補掛新後單
-        new_back_d = "S" if back_d == "L" else "L"
+        new_back_d = "S" if back_d_local == "L" else "L"
         new_back_amb = back_static_sl
         sl_pct = Decimal(str(S["sl"])) / 100
         tp_pct = Decimal(str(S["tp"])) / 100
@@ -871,37 +866,23 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
                 f"{E.BOT} {E.LOSS} 新後單掛出失敗，請檢查\n時間：{hhmmss()}")
 
         # 掛新前單的 algo OCO（為新前單設 TP/SL）
-        algo_id = await place_algo(iid, "long" if back_d == "L" else "short",
-                                   back_d, back_sz, back_tp, back_static_sl)
+        algo_id = await place_algo(iid, "long" if back_d_local == "L" else "short",
+                                   back_d_local, back_sz, back_tp, back_static_sl)
         if algo_id:
             S["algo_id"] = algo_id
             save_state()
 
     else:
-        # OKX 確認後單未進場 → 取消後單計劃委託，等下一輪TF重掛
+        # 3分鐘後後單未進場 → 取消後單計劃委託，等下一輪TF重掛
         if back_algo_id:
             await _cancel_trigger(iid, back_algo_id)
 
-        next_note_label = " / 重新埋伏"
-        next_note = "後單已取消，重新下新一輪"
-        if rec:
-            await _send_exit_notify(rec)
-        else:
-            await notify(app, chat,
-                f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場 / 重新埋伏\n"
-                f"━━━━━━━━━━\n"
-                f"商品：{E.dir_emoji(d)} {S['sym']}\n"
-                f"前單（{E.dir_word(d)}）：{reason_label}\n"
-                f"進場：{fpx}\n"
-                f"損益查詢中，請稍候...\n時間：{hhmmss()}")
-            async def _bg_query_re():
-                while True:
-                    await asyncio.sleep(5)
-                    r = await close_record(iid, pos_side, after_ms, tries=1)
-                    if r:
-                        await _send_exit_notify(r)
-                        return
-            asyncio.create_task(_bg_query_re())
+        # 跟進通知
+        await notify(app, chat,
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：後單已取消，重新埋伏\n"
+            f"━━━━━━━━━━\n"
+            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
+            f"時間：{hhmmss()}")
 
         # 重置 S 方向為原始方向
         S["dir"] = S.get("locked_dir", d)
