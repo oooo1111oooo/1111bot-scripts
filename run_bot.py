@@ -72,9 +72,9 @@ SAVE_FIELDS = ("sym","dir","lev","margin","offset","back_offset","tp","sl","move
                "locked_dir",
                "front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
-               "back_algo_id","back_px","back_filled","back_sz",
-               "closing","state",
-               "round_today","enter_today","round_date")
+               "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
+               "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
+               "algo_id","round_date","round_today","enter_today")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
     # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
@@ -511,6 +511,7 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["front_move_hist"] = []
     S["back_algo_id"]    = back_algo_id
     S["back_px"]         = str(back_amb)
+    S["back_amb_px"]     = str(back_amb)   # 保存原始觸發埋伏價，後單SL後補回用
     S["back_static_sl"]  = str(back_static_sl)
     S["back_tp_px"]      = str(back_tp)
     S["back_filled"]     = False
@@ -538,32 +539,38 @@ async def frame_mover(app):
             if not candidates:
                 continue
 
-            # 查 OKX 持倉，確認哪些策略真的有倉位
+            # 查 OKX 持倉，確認哪些策略真的有倉位（前單或後單）
             active = []
             for S in candidates:
                 try:
                     d = S["dir"]
                     iid = S["spec"]["iid"]
-                    pos_side = "long" if d == "L" else "short"
-                    cur_pos = await okx_pos(iid, pos_side)
-                    if cur_pos:
-                        # OKX 有持倉，同步 front_filled
+                    front_ps = "long" if d == "L" else "short"
+                    cur_front = await okx_pos(iid, front_ps)
+                    back_d_v  = S.get("back_d", "S" if d == "L" else "L")
+                    back_ps   = "long" if back_d_v == "L" else "short"
+                    cur_back  = await okx_pos(iid, back_ps) if S.get("back_filled") else None
+                    if cur_front:
                         if not S.get("front_filled"):
                             S["front_filled"] = True
-                        active.append(S)
+                        active.append((S, "front", d, front_ps, "front_sl_px", "algo_id", cur_front))
+                    if cur_back:
+                        if not S.get("back_filled"):
+                            S["back_filled"] = True
+                        active.append((S, "back", back_d_v, back_ps, "back_sl_px", "back_algo2_id", cur_back))
                 except Exception as e:
                     print("frame_mover 查持倉錯誤", S.get("sym"), type(e).__name__, e)
             if not active:
                 continue
 
-            due = [S for S in active
-                   if now_t - float(S.get("_last_move_t", 0)) >= float(S.get("interval", 1))]
+            due = [(S, side, d, ps, sl_field, aid_field, cur_pos) for S, side, d, ps, sl_field, aid_field, cur_pos in active
+                   if now_t - float(S.get(f"_last_move_t_{side}", 0)) >= float(S.get("interval", 1))]
             if not due:
                 continue
 
-            # 批次查現價（每個 sym 查一次）
+            # 批次查現價
             px_map = {}
-            for S in due:
+            for S, side, d, ps, sl_field, aid_field, cur_pos in due:
                 sym = S["sym"]
                 if sym not in px_map:
                     try:
@@ -572,72 +579,69 @@ async def frame_mover(app):
                         px_map[sym] = None
 
             amends = []
-            for S in due:
+            for S, side, d, ps, sl_field, aid_field, cur_pos in due:
                 if S.get("closing"):
                     continue
                 px = px_map.get(S["sym"])
                 if not px:
                     continue
-                d = S["dir"]
                 tick = S["spec"]["tick"]
                 move_pct = Decimal(str(S["move_pct"])) / 100
+                entry_field = "front_px" if side == "front" else "back_px"
                 try:
-                    cur_sl = Decimal(str(S["front_sl_px"]))
+                    cur_sl = Decimal(str(S[sl_field]))
                     cur_px = Decimal(str(px))
                 except Exception:
                     continue
 
-                # SL 移動邏輯：
-                # shift = max(現價漲幅%, move_pct)
-                # nsl = 舊SL × (1 + shift)（做多往上移）
-                # 距離從初始0.2%慢慢縮小，直到觸碰現價出場
                 if d == "L":
-                    profit_pct = (cur_px - Decimal(str(S.get("front_px", cur_px)))) / Decimal(str(S.get("front_px", cur_px)))
+                    profit_pct = (cur_px - Decimal(str(S.get(entry_field, cur_px)))) / Decimal(str(S.get(entry_field, cur_px)))
                     shift = max(profit_pct, move_pct)
                     nsl = align(cur_sl * (1 + shift), tick, "L")
                     if nsl <= cur_sl:
-                        continue  # 只能往上移
+                        continue
                     if nsl >= cur_px:
-                        nsl = align(cur_px - tick, tick, "L")  # 貼近現價一個tick
+                        nsl = align(cur_px - tick, tick, "L")
                         if nsl <= cur_sl:
-                            continue  # 還是不能後退
+                            continue
                 else:
-                    profit_pct = (Decimal(str(S.get("front_px", cur_px))) - cur_px) / Decimal(str(S.get("front_px", cur_px)))
+                    profit_pct = (Decimal(str(S.get(entry_field, cur_px))) - cur_px) / Decimal(str(S.get(entry_field, cur_px)))
                     shift = max(profit_pct, move_pct)
                     nsl = align(cur_sl * (1 - shift), tick, "S")
                     if nsl >= cur_sl:
-                        continue  # 只能往下移
+                        continue
                     if nsl <= cur_px:
-                        nsl = align(cur_px + tick, tick, "S")  # 貼近現價一個tick
+                        nsl = align(cur_px + tick, tick, "S")
                         if nsl >= cur_sl:
-                            continue  # 還是不能後退
+                            continue
 
-                algo_id = S.get("algo_id")
+                algo_id = S.get(aid_field)
                 if not algo_id:
                     continue
 
-                # 判斷移動類型：跟=跟著漲幅，底=最小門檻
                 move_type = "跟" if abs(profit_pct) >= move_pct and profit_pct != move_pct else "底"
-                S["_pending_sl"] = (str(nsl), str(cur_px), move_type)
-                amends.append((S["spec"]["iid"], algo_id, nsl, S))
+                S[f"_pending_sl_{side}"] = (str(nsl), str(cur_px), move_type)
+                amends.append((S["spec"]["iid"], algo_id, nsl, S, side, sl_field, entry_field))
 
             if amends:
-                items = [(iid, aid, sl) for iid, aid, sl, _ in amends]
+                items = [(iid, aid, sl) for iid, aid, sl, _, _s, _sf, _ef in amends]
                 okn = await amend_frames(items)
-                for iid, aid, sl, S in amends:
+                for iid, aid, sl, S, side, sl_field, entry_field in amends:
                     if okn:
-                        nsl, npx, move_type = S.pop("_pending_sl")
-                        S["front_sl_px"] = nsl
-                        S["front_move_n"] = int(S.get("front_move_n", 0)) + 1
-                        S["_last_move_t"] = now_t
-                        print(f"[SL移動] {S['sym']} {S['dir']} {move_type} 現價={npx} 新SL={nsl} 第{S['front_move_n']}次")
-                        mh = S.get("front_move_hist")
-                        if not isinstance(mh, list):
-                            mh = []; S["front_move_hist"] = mh
-                        mh.append({"t": hhmmss(), "type": move_type,
-                                   "px": npx, "sl": nsl})
-                        if len(mh) > 200:
-                            S["front_move_hist"] = mh[-200:]
+                        nsl, npx, move_type = S.pop(f"_pending_sl_{side}")
+                        S[sl_field] = nsl
+                        move_n_key = f"{'front' if side == 'front' else 'back'}_move_n"
+                        S[move_n_key] = int(S.get(move_n_key, 0)) + 1
+                        S[f"_last_move_t_{side}"] = now_t
+                        label = f"{S['sym']} {S['dir'] if side == 'front' else S.get('back_d','?')}"
+                        print(f"[SL移動] {label} {side} {move_type} 現價={npx} 新SL={nsl} 第{S[move_n_key]}次")
+                        if side == "front":
+                            mh = S.get("front_move_hist")
+                            if not isinstance(mh, list):
+                                mh = []; S["front_move_hist"] = mh
+                            mh.append({"t": hhmmss(), "type": move_type, "px": npx, "sl": nsl})
+                            if len(mh) > 200:
+                                S["front_move_hist"] = mh[-200:]
                         save_state()
 
         except asyncio.CancelledError:
@@ -647,45 +651,65 @@ async def frame_mover(app):
             await asyncio.sleep(5)
 
 
+async def _re_enter_fresh(S, iid, chat, app, label="TP後重掛"):
+    """TP出場後，等下一TF重新取價掛前後單。"""
+    d = S.get("locked_dir", S["dir"])
+    for a in ("front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
+              "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
+              "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
+              "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
+              "algo_id","closing"):
+        S.pop(a, None)
+    S["dir"]   = d
+    S["state"] = "等下輪TF"
+    save_state()
+    tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
+    now_t  = time.time()
+    tf_end = (int(now_t // tf_sec) + 1) * tf_sec
+    wait   = tf_end - now_t
+    if wait > 0:
+        await asyncio.sleep(wait)
+    if not S.get("alive"):
+        return
+    ok = await _place_pair(S, iid, chat, app, label=label)
+    if not ok:
+        await asyncio.sleep(5)
+
+
 async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
-    """前單出場共用處理：計算損益、發通知、決定後續動作。"""
-    # 防止雙重呼叫
+    """前單出場：計算損益、發通知、決定後續動作。"""
     if S.get("closing") == "done":
         return
     S["closing"] = "done"
     d    = S["dir"]
     spec = S["spec"]
-    tick  = spec["tick"]
+    tick = spec["tick"]
 
-    # 損益：查 OKX positions-history 真實數據
+    # 查損益
     after_ms = int(ee * 1000)
     pos_side = "long" if d == "L" else "short"
     rec = await close_record(iid, pos_side, after_ms, tries=20)
 
-    # 查開倉手續費（fills API，找進場時間點附近的成交）
+    # 查開倉手續費
     open_fee = Decimal("0")
     try:
         fills_r = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=10")
         if fills_r.get("code") == "0":
             for f in (fills_r.get("data") or []):
                 f_ts = int(f.get("ts") or 0)
-                f_side = f.get("side", "")
-                f_pos  = f.get("posSide", "")
-                # 找開倉那一筆（進場時間點前後5秒內，方向符合）
                 open_side = "buy" if d == "L" else "sell"
                 open_pos  = "long" if d == "L" else "short"
-                if (f_side == open_side and f_pos == open_pos and
+                if (f.get("side") == open_side and f.get("posSide") == open_pos and
                         abs(f_ts - int(ee * 1000)) <= 5000):
                     open_fee += Decimal(str(f.get("fee") or "0"))
                     print(f"[開倉手續費] {f.get('fee')} ts={f_ts}")
     except Exception as e:
         print("查開倉手續費失敗", type(e).__name__, e)
 
-    mn = S.get("front_move_n", 0)
+    mn    = S.get("front_move_n", 0)
     mhist = S.get("front_move_hist") or []
     reason_label = "Take Profit" if reason == "TP" else "Stop Loss"
 
-    # SL 移動明細（mn=0 也顯示）
     def _sl_lines(mhist, mn):
         lines = ["━━━━━━━━━━", f"SL移動 {mn} 次"]
         if mn > 0 and mhist:
@@ -696,30 +720,25 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
 
     sl_block = "\n" + "\n".join(_sl_lines(mhist, mn))
 
-    next_note_label = ""
-    next_note = ""
-
-    async def _send_exit_notify(rec):
+    async def _send_exit_notify(rec, note_label="", note=""):
         xpx_r = Decimal(str(rec.get("closeAvgPx") or xpx))
         print(f"[出場損益原始] realizedPnl={rec.get('realizedPnl')} pnl={rec.get('pnl')} fee={rec.get('fee')} pnlRatio={rec.get('pnlRatio')}")
-        g_r    = Decimal(str(rec.get("pnl") or "0"))           # 毛損益
-        close_fee_r = Decimal(str(rec.get("fee") or "0"))      # 平倉手續費
-        fee_r  = close_fee_r + open_fee                        # 總手續費（開倉+平倉）
-        net_r  = Decimal(str(rec.get("realizedPnl") or "0")) + open_fee  # 淨損益（含開倉費）
-        margin_val = float(Decimal(str(S.get("margin", "1"))))
+        g_r         = Decimal(str(rec.get("pnl") or "0"))
+        close_fee_r = Decimal(str(rec.get("fee") or "0"))
+        fee_r       = close_fee_r + open_fee
+        net_r       = Decimal(str(rec.get("realizedPnl") or "0")) + open_fee
+        margin_val  = float(Decimal(str(S.get("margin", "1"))))
         g_pct   = float(g_r) / margin_val * 100 if margin_val else 0
         fee_pct = float(fee_r) / margin_val * 100 if margin_val else 0
         net_pct = float(net_r) / margin_val * 100 if margin_val else 0
         reason_r = reason_label
         if rec.get("type") == "2":
             tp_px = Decimal(str(S.get("front_tp_px") or "0"))
-            if d == "L":
-                reason_r = "Take Profit" if xpx_r >= tp_px else "Stop Loss"
-            else:
-                reason_r = "Take Profit" if xpx_r <= tp_px else "Stop Loss"
+            reason_r = ("Take Profit" if (d == "L" and xpx_r >= tp_px) or
+                        (d == "S" and xpx_r <= tp_px) else "Stop Loss")
         ico_r = E.WIN if net_r >= 0 else E.LOSS
         await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico_r} 前單出場{next_note_label}\n"
+            f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico_r} 前單出場{note_label}\n"
             f"━━━━━━━━━━\n"
             f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['lev']}x {S['margin']}\n"
             f"前單：{reason_r}\n"
@@ -734,126 +753,141 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             f"手續費：{fee_r:.6f} ({fee_pct:+.3f}%)\n"
             f"淨損益：{net_r:+.6f} ({net_pct:+.3f}%) {ico_r}"
             f"{sl_block}\n"
-            f"━━━━━━━━━━\n{next_note}\n時間：{hhmmss()}")
+            f"━━━━━━━━━━\n{note}\n時間：{hhmmss()}")
         log_trade({
-            "date":     today8(),
-            "sym":      S["sym"],
-            "dir":      d,
-            "reason":   reason_r.replace(" ", "_"),
-            "gross":    float(g_r),
-            "fee":      float(fee_r),
-            "net":      float(net_r),
-            "nv":       float(margin_val),
-            "hold_s":   int(time.time() - ee),
-            "ambush_s": 0,
+            "date": today8(), "sym": S["sym"], "dir": d,
+            "reason": reason_r.replace(" ", "_"),
+            "gross": float(g_r), "fee": float(fee_r), "net": float(net_r),
+            "nv": float(margin_val), "hold_s": int(time.time() - ee), "ambush_s": 0,
         })
 
-    if not rec:
-        # 先發查詢中通知（等確認後單狀態後才補發完整通知）
-        await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：前單出場 / 等待後單\n"
-            f"━━━━━━━━━━\n"
-            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
-            f"前單（{E.dir_word(d)}）：{reason_label}\n"
-            f"進場：{fpx}\n"
-            f"損益查詢中，請稍候...\n"
-            f"⏳ 後單持續埋伏3分鐘....\n時間：{hhmmss()}")
-        async def _bg_query_init():
-            while True:
-                await asyncio.sleep(5)
-                r = await close_record(iid, pos_side, after_ms, tries=1)
-                if r:
-                    next_note_label  # noqa: closure capture
-                    await _send_exit_notify(r)
-                    return
-        asyncio.create_task(_bg_query_init())
-    # rec 有資料時，立刻發出場通知（含⏳後單等待），不等後單結果
+    back_filled   = S.get("back_filled", False)
+    back_d_local  = S.get("back_d", "S" if d == "L" else "L")
+    back_algo_id  = S.get("back_algo_id")
+    back_algo2_id = S.get("back_algo2_id")
 
-    # 前單出場即時通知（rec 有資料才發）
-    next_note_label = " / 等待後單"
-    next_note = "⏳ 後單持續埋伏3分鐘...."
-    if rec:
-        await _send_exit_notify(rec)
+    if reason == "TP":
+        # ─── 前單 TP：取消/平倉另一方，重新開始 ───
+        if rec:
+            await _send_exit_notify(rec, note_label=" / 重新掛單", note="前單TP出場，取消後單重新掛")
+        else:
+            await notify(app, chat,
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：✅ 前單TP出場 / 重新掛單\n"
+                f"商品：{E.dir_emoji(d)} {S['sym']}\n損益查詢中...\n時間：{hhmmss()}")
+            async def _bg_tp():
+                while True:
+                    await asyncio.sleep(5)
+                    r = await close_record(iid, pos_side, after_ms, tries=1)
+                    if r:
+                        await _send_exit_notify(r, note_label=" / 重新掛單", note="前單TP出場，取消後單重新掛")
+                        return
+            asyncio.create_task(_bg_tp())
 
-    # 查後單狀態
-    back_algo_id = S.get("back_algo_id")
-    back_d_local = S.get("back_d", "S" if d == "L" else "L")
-    back_pos_side = "long" if back_d_local == "L" else "short"
+        # 取消後單掛單
+        if back_algo_id:
+            await _cancel_trigger(iid, back_algo_id)
+        # 若後單已進場（State C），平掉後單持倉
+        if back_filled:
+            back_pos_side = "long" if back_d_local == "L" else "short"
+            try:
+                await api("POST", "/api/v5/trade/close-position",
+                          {"instId": iid, "mgnMode": "cross", "posSide": back_pos_side})
+            except Exception as e:
+                print("平後單持倉失敗", type(e).__name__, e)
+            if back_algo2_id:
+                await _cancel_trigger(iid, back_algo2_id)
+        await _re_enter_fresh(S, iid, chat, app, label="前單TP後重掛")
 
-    # 以 OKX 為主：每 0.5 秒查後單持倉，最多等 180 秒（3分鐘）
-    max_wait = 180
-    waited = 0
-    cur_back_pos = None
-    while S.get("alive") and waited < max_wait:
-        try:
-            cur_back_pos = await okx_pos(iid, back_pos_side)
-            if cur_back_pos:
-                break  # 查到持倉，後單已進場
-            # 查計劃委託狀態
+    else:
+        # ─── 前單 SL：後單必已進場（升格） ───
+        back_pos_side = "long" if back_d_local == "L" else "short"
+        cur_back_pos  = await okx_pos(iid, back_pos_side)
+
+        if not cur_back_pos:
+            # 異常：後單未進場（參數設定錯誤），退守重新掛單
+            await notify(app, chat,
+                f"{E.BOT} {E.LOSS} {S['sym']} 前單SL但後單未進場（參數異常），重新掛單\n時間：{hhmmss()}")
             if back_algo_id:
-                r_algo = await api("GET", f"/api/v5/trade/order-algo?algoId={back_algo_id}&ordType=trigger")
-                if r_algo.get("code") == "0" and r_algo.get("data"):
-                    algo_state = r_algo["data"][0].get("state", "")
-                    if algo_state in ("canceled", "failed"):
-                        cur_back_pos = None
-                        break
-        except Exception as e:
-            print("查後單持倉錯誤", type(e).__name__, e)
-        await asyncio.sleep(0.5)
-        waited += 0.5
+                await _cancel_trigger(iid, back_algo_id)
+            await _re_enter_fresh(S, iid, chat, app, label="SL異常重掛")
+            return
 
-    if cur_back_pos:
-        # OKX 確認後單已進場 → 後單升格為新前單
         back_fpx_str = cur_back_pos.get("avgPx") or cur_back_pos.get("last") or S.get("back_px", "0")
-        back_fpx = Decimal(str(back_fpx_str))
-        back_sz  = Decimal(str(S.get("back_sz", "1")))
-        back_tp  = Decimal(str(S.get("back_tp_px", "0")))
-        back_static_sl = Decimal(str(S.get("back_static_sl", "0")))
+        back_fpx     = Decimal(str(back_fpx_str))
+        back_sz      = Decimal(str(S.get("back_sz", "1")))
+        back_tp      = Decimal(str(S.get("back_tp_px", "0")))
+        back_static_sl_dec = Decimal(str(S.get("back_static_sl", "0")))
 
-        # 升格跟進通知
-        await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：🔔 後單升格\n"
-            f"━━━━━━━━━━\n"
-            f"商品：{E.dir_emoji(back_d_local)} {S['sym']} {E.dir_word(back_d_local)}\n"
-            f"進場：{back_fpx} | TP：{back_tp} | 靜態SL：{back_static_sl}\n"
-            f"時間：{hhmmss()}")
+        # 送出前單出場通知（含升格資訊）
+        if rec:
+            await _send_exit_notify(rec, note_label=" / 後單升格", note=f"後單（{E.dir_word(back_d_local)}）升格為新前單\n進場：{back_fpx}")
+        else:
+            await notify(app, chat,
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：🔴 前單SL / 後單升格\n"
+                f"商品：{E.dir_emoji(d)} {S['sym']}\n損益查詢中...\n"
+                f"後單（{E.dir_word(back_d_local)}）升格 進場：{back_fpx}\n時間：{hhmmss()}")
+            async def _bg_sl():
+                while True:
+                    await asyncio.sleep(5)
+                    r = await close_record(iid, pos_side, after_ms, tries=1)
+                    if r:
+                        await _send_exit_notify(r, note_label=" / 後單升格", note=f"後單（{E.dir_word(back_d_local)}）升格為新前單\n進場：{back_fpx}")
+                        return
+            asyncio.create_task(_bg_sl())
 
-        # 後單升格：更新 S 為新前單
+        # 取消舊的後單OCO（若存在），改用新的
+        if back_algo2_id:
+            await _cancel_trigger(iid, back_algo2_id)
+
+        # 升格：後單成為新前單
         S["dir"]             = back_d_local
         S["front_oid"]       = None
         S["front_px"]        = str(back_fpx)
-        S["front_static_sl"] = str(back_static_sl)
+        S["front_static_sl"] = str(back_static_sl_dec)
         S["front_tp_px"]     = str(back_tp)
-        S["front_sl_px"]     = str(back_static_sl)
+        S["front_sl_px"]     = str(back_static_sl_dec)
         S["front_filled"]    = True
         S["front_ee"]        = time.time()
         S["front_sz"]        = str(back_sz)
         S["front_move_n"]    = 0
         S["front_move_hist"] = []
         S["back_algo_id"]    = None
+        S["back_algo2_id"]   = None
         S["back_filled"]     = False
-        S["algo_id"]         = None
+        S["back_ee"]         = None
+        S["back_sl_px"]      = None
         S["state"]           = "升格持倉"
+        S.pop("closing", None)   # ← 清除closing，loop繼續正常監控
         save_state()
 
-        # 補掛新後單
-        new_back_d = "S" if back_d_local == "L" else "L"
-        new_back_amb = back_static_sl
+        # 掛新前單的 OCO（TP/SL）
+        new_algo_id = await place_algo(iid, back_pos_side, back_d_local,
+                                       back_sz, back_tp, back_static_sl_dec)
+        if new_algo_id:
+            S["algo_id"] = new_algo_id
+            save_state()
+
+        # 補掛新後單：觸發點 = 新前單進場價 ± gap%
+        gap_pct     = (Decimal(str(S.get("back_offset", S["offset"]))) - Decimal(str(S["offset"]))) / 100
+        new_back_d  = "S" if back_d_local == "L" else "L"
         sl_pct = Decimal(str(S["sl"])) / 100
         tp_pct = Decimal(str(S["tp"])) / 100
-        if new_back_d == "S":
-            new_back_sl = align(new_back_amb * (1 + sl_pct), tick, "S")
-            new_back_tp = align(new_back_amb * (1 - tp_pct), tick, "L")
-        else:
-            new_back_sl = align(new_back_amb * (1 - sl_pct), tick, "L")
-            new_back_tp = align(new_back_amb * (1 + tp_pct), tick, "S")
-        new_back_sz = csize(Decimal(str(S["margin"])), Decimal(str(S["lev"])),
-                            new_back_amb, spec["ctval"], spec["lot"])
+        if back_d_local == "L":   # 新前單是LONG → 新後單是SHORT，觸發在下方
+            new_back_amb = align(back_fpx * (1 - gap_pct), tick, new_back_d)
+            new_back_sl  = align(new_back_amb * (1 + sl_pct), tick, "S")
+            new_back_tp  = align(new_back_amb * (1 - tp_pct), tick, "L")
+        else:                     # 新前單是SHORT → 新後單是LONG，觸發在上方
+            new_back_amb = align(back_fpx * (1 + gap_pct), tick, new_back_d)
+            new_back_sl  = align(new_back_amb * (1 - sl_pct), tick, "L")
+            new_back_tp  = align(new_back_amb * (1 + tp_pct), tick, "S")
+        new_back_sz  = csize(Decimal(str(S["margin"])), Decimal(str(S["lev"])),
+                             new_back_amb, spec["ctval"], spec["lot"])
         new_back_pos = "long" if new_back_d == "L" else "short"
         new_back_algo_id = await _place_trigger(iid, new_back_pos, new_back_d,
-                                              new_back_amb, new_back_sz)
+                                                new_back_amb, new_back_sz)
         if new_back_algo_id:
             S["back_algo_id"]   = new_back_algo_id
+            S["back_amb_px"]    = str(new_back_amb)
             S["back_px"]        = str(new_back_amb)
             S["back_static_sl"] = str(new_back_sl)
             S["back_tp_px"]     = str(new_back_tp)
@@ -863,62 +897,118 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             save_state()
             await notify(app, chat,
                 f"{E.BOT} 新後單（{E.dir_word(new_back_d)}）已掛出\n"
-                f"埋伏：{new_back_amb} | TP：{new_back_tp} | SL：{new_back_sl}\n"
+                f"觸發埋伏：{new_back_amb} | TP：{new_back_tp} | SL：{new_back_sl}\n"
                 f"時間：{hhmmss()}")
         else:
             await notify(app, chat,
                 f"{E.BOT} {E.LOSS} 新後單掛出失敗，請檢查\n時間：{hhmmss()}")
 
-        # 掛新前單的 algo OCO（為新前單設 TP/SL）
-        algo_id = await place_algo(iid, "long" if back_d_local == "L" else "short",
-                                   back_d_local, back_sz, back_tp, back_static_sl)
+
+async def _exit_back(app, S, chat, iid, reason, bpx, xpx, bee):
+    """後單出場：TP→取消/平前單重新開始；SL→補回原觸發點繼續保護前單。"""
+    if S.get("closing") == "done":
+        return
+    S["closing"] = "done"
+    d        = S["dir"]
+    back_d   = S.get("back_d", "S" if d == "L" else "L")
+    spec     = S["spec"]
+    tick     = spec["tick"]
+    back_pos_side = "long" if back_d == "L" else "short"
+
+    # 查後單損益
+    after_ms = int(bee * 1000)
+    rec = await close_record(iid, back_pos_side, after_ms, tries=10)
+    reason_label = "Take Profit" if reason == "TP" else "Stop Loss"
+
+    # 簡易損益通知
+    async def _notify_back_exit(note=""):
+        if rec:
+            g_r   = Decimal(str(rec.get("pnl") or "0"))
+            net_r = Decimal(str(rec.get("realizedPnl") or "0"))
+            mv    = float(Decimal(str(S.get("margin", "1"))))
+            g_pct = float(g_r) / mv * 100 if mv else 0
+            net_pct = float(net_r) / mv * 100 if mv else 0
+            ico_r = E.WIN if net_r >= 0 else E.LOSS
+            await notify(app, chat,
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico_r} 後單出場\n"
+                f"━━━━━━━━━━\n"
+                f"商品：{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)}\n"
+                f"後單：{reason_label}\n"
+                f"進場：{bpx} | 出場：{xpx}\n"
+                f"━━━━━━━━━━\n"
+                f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
+                f"淨損益：{net_r:+.6f} ({net_pct:+.3f}%) {ico_r}\n"
+                f"━━━━━━━━━━\n{note}\n時間：{hhmmss()}")
+        else:
+            await notify(app, chat,
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：後單出場（{reason_label}）\n"
+                f"商品：{E.dir_emoji(back_d)} {S['sym']}\n{note}\n時間：{hhmmss()}")
+
+    back_algo2_id = S.get("back_algo2_id")
+
+    if reason == "TP":
+        # 後單TP → 取消/平前單，重新開始
+        await _notify_back_exit(note="後單TP，取消前單重新掛單")
+        front_oid = S.get("front_oid")
+        if front_oid:
+            await _cancel_order(iid, front_oid)
+        algo_id = S.get("algo_id")
         if algo_id:
-            S["algo_id"] = algo_id
-            save_state()
+            await _cancel_trigger(iid, algo_id)
+        if S.get("front_filled"):
+            front_pos_side = "long" if d == "L" else "short"
+            try:
+                await api("POST", "/api/v5/trade/close-position",
+                          {"instId": iid, "mgnMode": "cross", "posSide": front_pos_side})
+            except Exception as e:
+                print("平前單持倉失敗", type(e).__name__, e)
+        if back_algo2_id:
+            await _cancel_trigger(iid, back_algo2_id)
+        await _re_enter_fresh(S, iid, chat, app, label="後單TP後重掛")
 
     else:
-        # 3分鐘後後單未進場 → 取消後單計劃委託，等下一輪TF重掛
-        if back_algo_id:
-            await _cancel_trigger(iid, back_algo_id)
+        # 後單SL → 價格回到前單保護範圍，補回原觸發點
+        back_amb_orig = Decimal(str(S.get("back_amb_px") or S.get("back_px") or "0"))
+        sl_pct = Decimal(str(S["sl"])) / 100
+        tp_pct = Decimal(str(S["tp"])) / 100
+        if back_d == "S":
+            new_back_sl = align(back_amb_orig * (1 + sl_pct), tick, "S")
+            new_back_tp = align(back_amb_orig * (1 - tp_pct), tick, "L")
+        else:
+            new_back_sl = align(back_amb_orig * (1 - sl_pct), tick, "L")
+            new_back_tp = align(back_amb_orig * (1 + tp_pct), tick, "S")
+        new_back_sz  = csize(Decimal(str(S["margin"])), Decimal(str(S["lev"])),
+                             back_amb_orig, spec["ctval"], spec["lot"])
+        new_back_pos = "long" if back_d == "L" else "short"
 
-        # 跟進通知
-        await notify(app, chat,
-            f"{E.BOT} OKX原K｜{ACCT}\n事件：後單已取消，重新埋伏\n"
-            f"━━━━━━━━━━\n"
-            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
-            f"時間：{hhmmss()}")
+        if back_algo2_id:
+            await _cancel_trigger(iid, back_algo2_id)
 
-        # 重置 S 方向為原始方向
-        S["dir"] = S.get("locked_dir", d)
-        # 清除持倉狀態
-        for a in ("front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
-                  "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
-                  "back_algo_id","back_px","back_filled","back_sz","back_d",
-                  "algo_id","closing"):
-            S.pop(a, None)
-        S["state"] = "等下輪TF"
-        save_state()
+        new_back_algo_id = await _place_trigger(iid, new_back_pos, back_d,
+                                                back_amb_orig, new_back_sz)
+        if new_back_algo_id:
+            S["back_algo_id"]   = new_back_algo_id
+            S["back_filled"]    = False
+            S["back_ee"]        = None
+            S["back_sl_px"]     = None
+            S["back_algo2_id"]  = None
+            S["back_static_sl"] = str(new_back_sl)
+            S["back_tp_px"]     = str(new_back_tp)
+            S["back_sz"]        = str(new_back_sz)
+            save_state()
+            await _notify_back_exit(note=f"後單SL，原觸發點{back_amb_orig}補回")
+        else:
+            await _notify_back_exit(note="後單SL，補回失敗請手動處理")
 
-        # 等下一 TF 開盤才重掛
-        tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
-        now_t  = time.time()
-        tf_end = (int(now_t // tf_sec) + 1) * tf_sec
-        wait   = tf_end - now_t
-        if wait > 0:
-            await asyncio.sleep(wait)
-        if not S.get("alive"):   # stopall 在等待TF期間執行，直接放棄重掛
-            return
-        ok = await _place_pair(S, iid, chat, app, label="出場重掛")
-        if not ok:
-            await asyncio.sleep(5)
+        S.pop("closing", None)   # 清除closing，loop繼續監控前單
 
+    # 損益：查 OKX positions-history 真實數據
 
 async def loop(app, chat, S):
     """前後單策略主迴圈。"""
     spec = S["spec"]
     iid  = spec["iid"]
-    d    = S["dir"]
-    k    = skey(S["sym"], d)
+    k    = skey(S["sym"], S["dir"])   # 初始key，用於TASKS/STRATS管理
     try:
         # 第一輪：掛前後單
         ok = await _place_pair(S, iid, chat, app, label="首次埋伏")
@@ -930,36 +1020,32 @@ async def loop(app, chat, S):
         while S["alive"]:
             await asyncio.sleep(1)
 
+            d            = S["dir"]   # ← 每輪動態讀取，升格後方向自動更新
             front_oid    = S.get("front_oid")
             front_filled = S.get("front_filled", False)
             back_filled  = S.get("back_filled", False)
+            back_algo_id = S.get("back_algo_id")
 
             if S.get("closing"):
                 continue
 
-            # ── TF 計時：前單未成交時，TF 結束前 1 秒撤單重掛 ──
+            # ── TF 計時：前後單都未進場時，TF結束前撤單重掛 ──
             if not front_filled and not back_filled and front_oid:
                 tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
                 now_t  = time.time()
                 tf_end = (int(now_t // tf_sec) + 1) * tf_sec
                 secs_left = tf_end - now_t
-                if secs_left <= 1.5:   # TF 結束前 1.5 秒觸發
-                    # 撤前單
+                if secs_left <= 1.5:
                     await _cancel_order(iid, front_oid)
-                    # 撤後單計劃委託
-                    back_algo_id = S.get("back_algo_id")
                     if back_algo_id:
                         await _cancel_trigger(iid, back_algo_id)
-                    # 清除掛單狀態
                     for a in ("front_oid","front_px","front_static_sl","front_tp_px",
                               "front_sl_px","front_filled","front_ee","front_sz",
                               "front_move_n","front_move_hist",
                               "back_algo_id","back_px","back_filled","back_sz","back_d"):
                         S.pop(a, None)
-                    # 等到新 TF 開盤（最多等 2 秒）
                     await asyncio.sleep(min(secs_left + 0.2, 2))
-                    # 查現價，立刻重掛
-                    if not S.get("alive"):   # stopall 在等待TF期間執行，直接放棄重掛
+                    if not S.get("alive"):
                         continue
                     print(f"[TF重掛] {S['sym']} {d} TF到期重掛")
                     ok = await _place_pair(S, iid, chat, app, label="TF重掛")
@@ -967,93 +1053,121 @@ async def loop(app, chat, S):
                         await asyncio.sleep(3)
                     continue
 
-            # 查前單狀態：以 OKX 持倉為主
+            # ── 查前單持倉（OKX為準） ──
             front_pos_side = "long" if d == "L" else "short"
-            cur_front_pos = await okx_pos(iid, front_pos_side)
+            cur_front_pos  = await okx_pos(iid, front_pos_side)
+
+            # ── 查後單持倉（有back_algo或已填入時才查） ──
+            back_d_val    = S.get("back_d", "S" if d == "L" else "L")
+            back_pos_side = "long" if back_d_val == "L" else "short"
+            cur_back_pos  = None
+            if back_algo_id or back_filled:
+                cur_back_pos = await okx_pos(iid, back_pos_side)
+
+            # ── 前單進場偵測 ──
             if front_oid and not front_filled and cur_front_pos:
-                # OKX 有持倉，確認前單已進場
                 state, avgpx = await _order_state(iid, front_oid)
                 fpx = Decimal(avgpx or S["front_px"])
                 S["front_filled"] = True
                 S["front_px"]     = str(fpx)
-                S["front_sl_px"]  = str(S.get("front_static_sl", fpx))   # SL移動門檻初始值 = 靜態SL
+                S["front_sl_px"]  = str(S.get("front_static_sl", fpx))
                 S["front_ee"]     = time.time()
                 S["state"]        = "持倉中"
                 bump(skey(S["sym"], d), "entered")
                 print(f"[前單進場] {S['sym']} {d} 進場價={fpx}")
-                # 進場次數 +1
                 today = today8()
                 if S.get("round_date") != today:
                     S["round_today"] = 0; S["enter_today"] = 0; S["round_date"] = today
                 S["enter_today"] = int(S.get("enter_today", 0)) + 1
                 save_state()
-                # 掛前單 algo OCO
-                back_d = S.get("back_d", "S" if d == "L" else "L")
-                front_tp = Decimal(str(S["front_tp_px"]))
-                front_static_sl = Decimal(str(S["front_static_sl"]))
-                algo_id = await place_algo(iid,
-                                           "long" if d == "L" else "short",
-                                           d, Decimal(str(S["front_sz"])),
-                                           front_tp, front_static_sl)
+                front_tp_dec      = Decimal(str(S["front_tp_px"]))
+                front_static_sl_d = Decimal(str(S["front_static_sl"]))
+                algo_id = await place_algo(iid, front_pos_side, d,
+                                           Decimal(str(S["front_sz"])),
+                                           front_tp_dec, front_static_sl_d)
                 if algo_id:
                     S["algo_id"] = algo_id
                 save_state()
+                back_d_n = S.get("back_d", "S" if d == "L" else "L")
                 await notify(app, chat,
                     f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} 前單進場成交\n"
                     f"━━━━━━━━━━\n"
                     f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                     f"進場：{fpx} | {datetime.fromtimestamp(S.get('front_ee', time.time()), TZ8).strftime('%H:%M:%S')}\n"
-                    f"靜態TP：{front_tp}（+{S['tp']}%）\n"
-                    f"靜態SL：{front_static_sl}（-{S['sl']}%）\n"
+                    f"靜態TP：{front_tp_dec}（+{S['tp']}%）\n"
+                    f"靜態SL：{front_static_sl_d}（-{S['sl']}%）\n"
                     f"動態SL：{S['interval']}s | {S['move_pct']}%\n"
-                    f"後單：{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)} 埋伏價：{S.get('back_px')}\n"
+                    f"後單：{E.dir_emoji(back_d_n)} {S['sym']} {E.dir_word(back_d_n)} 埋伏：{S.get('back_px')}\n"
                     f"時間：{hhmmss()}")
 
-            # 查後單狀態（計劃委託是否已觸發成交）
-            back_algo_id = S.get("back_algo_id")
-            if back_algo_id and not back_filled:
-                r_algo = await api("GET", f"/api/v5/trade/order-algo?algoId={back_algo_id}&ordType=trigger")
-                if r_algo.get("code") == "0" and r_algo.get("data"):
-                    algo_state = r_algo["data"][0].get("state", "")
-                    if algo_state == "order":  # 已觸發並掛出
-                        # 查實際成交
-                        fill_px = r_algo["data"][0].get("avgPx") or r_algo["data"][0].get("triggerPx")
-                        S["back_filled"] = True
-                        print(f"[後單觸發] {S['sym']} {S.get('back_d')} 觸發進場 成交價={fill_px}")
-                        if fill_px:
-                            S["back_px"] = fill_px
-                        save_state()
-                    elif algo_state in ("canceled", "failed"):
-                        # 計劃委託被取消，視為後單失效
-                        S["back_algo_id"] = None
-                        save_state()
+            # ── 後單進場偵測（觸發單已成交） ──
+            if back_algo_id and not back_filled and cur_back_pos:
+                back_fpx_str = cur_back_pos.get("avgPx") or cur_back_pos.get("last") or S.get("back_px", "0")
+                back_fpx     = Decimal(str(back_fpx_str))
+                S["back_filled"]  = True
+                S["back_px"]      = str(back_fpx)
+                S["back_ee"]      = time.time()
+                S["back_sl_px"]   = str(S.get("back_static_sl", back_fpx))
+                S["back_algo_id"] = None
+                print(f"[後單進場] {S['sym']} {back_d_val} 進場價={back_fpx}")
+                back_tp_dec      = Decimal(str(S["back_tp_px"]))
+                back_static_sl_d = Decimal(str(S["back_static_sl"]))
+                back_sz_dec      = Decimal(str(S["back_sz"]))
+                back_algo2_id = await place_algo(iid, back_pos_side, back_d_val,
+                                                  back_sz_dec, back_tp_dec, back_static_sl_d)
+                if back_algo2_id:
+                    S["back_algo2_id"] = back_algo2_id
+                save_state()
+                await notify(app, chat,
+                    f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} 後單進場成交\n"
+                    f"━━━━━━━━━━\n"
+                    f"商品：{E.dir_emoji(back_d_val)} {S['sym']} {E.dir_word(back_d_val)}\n"
+                    f"進場：{back_fpx} | {hhmmss()}\n"
+                    f"靜態TP：{back_tp_dec}（+{S['tp']}%）\n"
+                    f"靜態SL：{back_static_sl_d}（-{S['sl']}%）\n"
+                    f"時間：{hhmmss()}")
 
-            # 偵測前單出場（已進場但倉位消失）
-            if front_filled and not S.get("closing"):
-                pos_side = "long" if d == "L" else "short"
-                cur_pos = await okx_pos(iid, pos_side)
-                if not cur_pos:
-                    S["closing"] = True
-                    print(f"[前單出場] {S['sym']} {d} 偵測到倉位消失")
-                    # 判斷出場原因（查最近成交）
-                    reason = "SL"
-                    fpx = Decimal(str(S["front_px"]))
-                    front_tp_val = Decimal(str(S["front_tp_px"]))
-                    # 查最近成交價
-                    xpx = fpx  # 預設
-                    try:
-                        fills = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=5")
-                        if fills.get("code") == "0" and fills.get("data"):
-                            xpx = Decimal(fills["data"][0].get("fillPx") or str(fpx))
-                            # 判斷 TP 或 SL
-                            if d == "L" and xpx >= front_tp_val * Decimal("0.998"):
-                                reason = "TP"
-                            elif d == "S" and xpx <= front_tp_val * Decimal("1.002"):
-                                reason = "TP"
-                    except Exception:
-                        pass
-                    ee = S.get("front_ee") or time.time()
-                    await _exit_front(app, S, chat, iid, reason, fpx, xpx, ee)
+            # ── 前單出場偵測 ──
+            if front_filled and not S.get("closing") and not cur_front_pos:
+                S["closing"] = True
+                print(f"[前單出場] {S['sym']} {d} 偵測到倉位消失")
+                reason = "SL"
+                fpx_val      = Decimal(str(S["front_px"]))
+                front_tp_val = Decimal(str(S["front_tp_px"]))
+                xpx = fpx_val
+                try:
+                    fills = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=5")
+                    if fills.get("code") == "0" and fills.get("data"):
+                        xpx = Decimal(fills["data"][0].get("fillPx") or str(fpx_val))
+                        if d == "L" and xpx >= front_tp_val * Decimal("0.998"):
+                            reason = "TP"
+                        elif d == "S" and xpx <= front_tp_val * Decimal("1.002"):
+                            reason = "TP"
+                except Exception:
+                    pass
+                ee = S.get("front_ee") or time.time()
+                await _exit_front(app, S, chat, iid, reason, fpx_val, xpx, ee)
+
+            # ── 後單出場偵測 ──
+            if back_filled and not S.get("closing") and cur_back_pos is not None and not cur_back_pos:
+                S["closing"] = True
+                print(f"[後單出場] {S['sym']} {back_d_val} 偵測到倉位消失")
+                back_reason = "SL"
+                bpx_val     = Decimal(str(S.get("back_px", "0")))
+                back_tp_val = Decimal(str(S.get("back_tp_px", "0")))
+                xpx_b = bpx_val
+                try:
+                    fills = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=5")
+                    if fills.get("code") == "0" and fills.get("data"):
+                        xpx_b = Decimal(fills["data"][0].get("fillPx") or str(bpx_val))
+                        if back_d_val == "L" and xpx_b >= back_tp_val * Decimal("0.998"):
+                            back_reason = "TP"
+                        elif back_d_val == "S" and xpx_b <= back_tp_val * Decimal("1.002"):
+                            back_reason = "TP"
+                except Exception:
+                    pass
+                bee = S.get("back_ee") or time.time()
+                await _exit_back(app, S, chat, iid, back_reason, bpx_val, xpx_b, bee)
 
     except asyncio.CancelledError:
         raise
@@ -1071,6 +1185,19 @@ async def loop(app, chat, S):
             except Exception:
                 pass
             save_state()
+        # 第一輪：掛前後單
+        ok = await _place_pair(S, iid, chat, app, label="首次埋伏")
+        if not ok:
+            S["alive"] = False
+            return
+
+        # 主監控迴圈
+        while S["alive"]:
+            await asyncio.sleep(1)
+
+            front_oid    = S.get("front_oid")
+            front_filled = S.get("front_filled", False)
+            back_filled  = S.get("back_filled", False)
 
 
 async def rebuild_strat(d):
@@ -1285,6 +1412,12 @@ async def cmd_run(u, c):
 
     sz_front = csize(margin, Decimal(lev), front_amb, spec["ctval"], spec["lot"])
     sz_back  = csize(margin, Decimal(lev), back_amb,  spec["ctval"], spec["lot"])
+
+    # 參數檢測：後單觸發點必須在前單埋伏點和前單靜態SL之間
+    if dr == "S" and not (front_amb < back_amb < front_static_sl):
+        await reply(u, f"{E.BOT} {E.LOSS} 參數錯誤：後單觸發點({back_amb})必須在前單埋伏({front_amb})和前單SL({front_static_sl})之間\n確認 front_offset% < back_offset% < front_offset%+sl%"); return
+    if dr == "L" and not (front_static_sl < back_amb < front_amb):
+        await reply(u, f"{E.BOT} {E.LOSS} 參數錯誤：後單觸發點({back_amb})必須在前單SL({front_static_sl})和前單埋伏({front_amb})之間\n確認 front_offset% < back_offset% < front_offset%+sl%"); return
     if sz_front < spec["minsz"]:
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：前單算出 {sz_front} 張 < 最小 {spec['minsz']}\n至少需 {need:.4f} USDT"); return
