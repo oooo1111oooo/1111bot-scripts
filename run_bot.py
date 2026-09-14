@@ -513,6 +513,7 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["back_sz"]         = str(sz_back)
     S["back_d"]          = back_d
     S["state"]           = "委託中"
+    bump(skey(S["sym"], S["dir"]), "placed")
     save_state()
     return True
 
@@ -729,6 +730,18 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             f"淨損益：{net_r:+.6f} ({net_pct:+.3f}%) {ico_r}"
             f"{sl_block}\n"
             f"━━━━━━━━━━\n{next_note}\n時間：{hhmmss()}")
+        log_trade({
+            "date":     today8(),
+            "sym":      S["sym"],
+            "dir":      d,
+            "reason":   reason_r.replace(" ", "_"),
+            "gross":    float(g_r),
+            "fee":      float(fee_r),
+            "net":      float(net_r),
+            "nv":       float(margin_val),
+            "hold_s":   int(time.time() - ee),
+            "ambush_s": 0,
+        })
 
     if not rec:
         # 先發查詢中通知（等確認後單狀態後才補發完整通知）
@@ -979,6 +992,7 @@ async def loop(app, chat, S):
                 S["front_sl_px"]  = str(S.get("front_static_sl", fpx))   # SL移動門檻初始值 = 靜態SL
                 S["front_ee"]     = time.time()
                 S["state"]        = "持倉中"
+                bump(skey(S["sym"], d), "entered")
                 print(f"[前單進場] {S['sym']} {d} 進場價={fpx}")
                 # 進場次數 +1
                 today = today8()
@@ -1521,7 +1535,7 @@ def sum_lines(rs, placed, entered):
     m = len(rs)
     hit = (entered / placed * 100) if placed else 0
     amb = ("%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs) / m)) if m else "-"
-    L.append("次數:%d | %d(%s) | %.2f%%" % (placed, entered, amb, hit))
+    L.append("次數:%d|%d(%s)|%.2f%%" % (placed, entered, amb, hit))
     NAME = {"Take_Profit": "TP", "Stop_Loss": "SL", "Frame_Exit": "SL"}
     for lab, cats in (("獲利", ("Take_Profit",)), ("虧損", ("Stop_Loss", "Frame_Exit"))):
         if lab == "獲利":
@@ -1536,7 +1550,7 @@ def sum_lines(rs, placed, entered):
             else:
                 sec = "0秒"
             ps.append("%s:%d(%s)" % (NAME[cn], len(gg), sec))
-        L.append("%s數:%d | %s" % (lab, len(sub), " | ".join(ps)))
+        L.append("%s數:%d|%s" % (lab, len(sub), "|".join(ps)))
     tg = sum((Decimal(str(r.get("gross") or "0")) for r in rs), Decimal(0))
     tf = sum((Decimal(str(r.get("fee") or "0")) for r in rs), Decimal(0))
     tn = sum((Decimal(str(r.get("net") or "0")) for r in rs), Decimal(0))
