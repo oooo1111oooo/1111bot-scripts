@@ -682,17 +682,16 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
     mhist = S.get("front_move_hist") or []
     reason_label = "Take Profit" if reason == "TP" else "Stop Loss"
 
-    # SL 移動明細
+    # SL 移動明細（mn=0 也顯示）
     def _sl_lines(mhist, mn):
-        lines = []
+        lines = ["━━━━━━━━━━", f"SL移動 {mn} 次"]
         if mn > 0 and mhist:
-            lines.append(f"━━━━━━━━━━\nSL移動 {mn} 次")
             for mrec in mhist[-20:]:
                 tp_label = mrec.get("type", "現")
                 lines.append(f"{mrec.get('t','')} | {tp_label} | {mrec.get('px','')} | 止{mrec.get('sl','')}")
         return lines
 
-    sl_block = ("\n" + "\n".join(_sl_lines(mhist, mn))) if mn > 0 else ""
+    sl_block = "\n" + "\n".join(_sl_lines(mhist, mn))
 
     next_note_label = ""
     next_note = ""
@@ -719,10 +718,13 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
         await notify(app, chat,
             f"{E.BOT} OKX原K｜{ACCT}\n事件：{ico_r} 前單出場{next_note_label}\n"
             f"━━━━━━━━━━\n"
-            f"商品：{E.dir_emoji(d)} {S['sym']}\n"
-            f"前單（{E.dir_word(d)}）：{reason_r}\n"
+            f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S['lev']}x {S['margin']}\n"
+            f"前單：{reason_r}\n"
             f"━━━━━━━━━━\n"
             f"進場：{fpx} | {datetime.fromtimestamp(ee, TZ8).strftime('%H:%M:%S')}\n"
+            f"靜態TP：{S.get('front_tp_px', '-')}\n"
+            f"靜態SL：{S.get('front_static_sl', '-')}\n"
+            f"最後SL：{S.get('front_sl_px', '-')}\n"
             f"出場：{xpx_r} | {hhmmss()}\n"
             f"━━━━━━━━━━\n"
             f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
