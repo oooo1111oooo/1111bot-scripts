@@ -1545,7 +1545,7 @@ async def cmd_confirm(u, c):
     kind = p.get("kind", "run")
     if kind == "stop":
         del PENDING[u.effective_chat.id]
-        await do_stop(u, p["key"]); return
+        await do_stop(u, p["sym"], p["iid"]); return
     if kind == "stopall":
         del PENDING[u.effective_chat.id]
         await do_stopall(u); return
@@ -1567,36 +1567,61 @@ async def cmd_confirm(u, c):
 # 撤單部分 stopall / stop：一切以查詢交易所為主，DB 只是確認後的資料回補而已
 async def cmd_stop(u, c):
     a = c.args
-    alive = [k for k, s in STRATS.items() if s.get("alive")]
-    if not alive: await reply(u, f"{E.BOT} 目前無運行中策略"); return
     if not a:
-        lst = "\n".join(f"・/stop {STRATS[k]['sym']} {STRATS[k]['dir']}" for k in alive)
-        await reply(u, f"{E.BOT} 請指定：\n{lst}\n或 /stopall"); return
+        await reply(u, f"{E.BOT} 用法：/stop ETHUSDT"); return
     sym = a[0].upper()
-    tg = [skey(sym, a[1].upper())] if len(a) >= 2 and skey(sym, a[1].upper()) in alive else [k for k in alive if STRATS[k]["sym"] == sym]
-    if not tg: await reply(u, f"{E.BOT} 找不到運行中的 {sym}"); return
-    if len(tg) > 1: await reply(u, f"{E.BOT} {sym} 有多方向，請指定 /stop {sym} L 或 S"); return
-    S = STRATS[tg[0]]
-    PENDING[u.effective_chat.id] = {"kind": "stop", "t": time.time(), "key": tg[0]}
-    await reply(u, f"{E.BOT} 將停止 {E.dir_emoji(S['dir'])} {S['sym']} {E.dir_word(S['dir'])}\n"
-                   f"60秒內 /confirm 確認")
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        await reply(u, f"{E.BOT} 找不到商品 {sym}"); return
+    iid = spec["iid"]
+    PENDING[u.effective_chat.id] = {"kind": "stop", "t": time.time(), "sym": sym, "iid": iid}
+    await reply(u, f"{E.BOT} 將停止 {sym} 所有掛單\n60秒內 /confirm 確認")
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
-async def do_stop(u, key):
-    S = STRATS.get(key)
-    if not S or not S.get("alive"):
-        await reply(u, f"{E.BOT} 策略已不存在"); return
-    d = S["dir"]; iid = S["spec"]["iid"]
-    ps = "long" if d == "L" else "short"
-    p = await okx_pos(iid, ps)
-    S["alive"] = False
-    n = await sweep(iid, ps)
-    # 以OKX為主，兩個方向都掃，不依賴DB的back_d
-    na  = await sweep_algos(iid, "long")
-    na += await sweep_algos(iid, "short")
+async def do_stop(u, sym, iid):
+    # 步驟1：批次撤掉該幣種所有掛單，直到掛單數=0
+    for attempt in range(5):
+        r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
+        orders = r1.get("data") or []
+        r2 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
+        algos = r2.get("data") or []
+
+        if not orders and not algos:
+            break
+
+        if orders:
+            batch = [{"instId": o["instId"], "ordId": o["ordId"]} for o in orders]
+            for i in range(0, len(batch), 20):
+                await api("POST", "/api/v5/trade/cancel-batch-orders", batch[i:i+20])
+
+        if algos:
+            algo_batch = [{"instId": o["instId"], "algoId": o["algoId"]} for o in algos]
+            for i in range(0, len(algo_batch), 20):
+                await api("POST", "/api/v5/trade/cancel-algos", algo_batch[i:i+20])
+
+        await asyncio.sleep(0.5)
+
+    # 步驟2：查該幣種持倉
+    pr = await api("GET", f"/api/v5/account/positions?instId={iid}")
+    positions = [p for p in (pr.get("data") or []) if float(p.get("pos") or 0) != 0]
+
+    # 步驟3：回填 DB
+    for k, S in STRATS.items():
+        if S.get("sym") == sym:
+            S["alive"] = False
     save_state()
-    tail = f"\n{E.WARN} 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
-    await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜撤限價單 {n}｜撤計劃委託 {na}{tail}")
+
+    # 步驟4：TG 回報
+    r_chk = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
+    final_pending = len(r_chk.get("data") or [])
+    pos_count = len(positions)
+    msg = f"{E.BOT} 已停止 {sym}\n掛單數：{final_pending}｜持倉數：{pos_count}"
+    if positions:
+        msg += "\n━━━━━━━━━━\n持倉清單（請手動平倉）："
+        for i, p in enumerate(positions, 1):
+            msg += f"\n{i}. {p.get('instId','')} {p.get('posSide','')}"
+    await reply(u, msg)
 
 async def cmd_stopall(u, c):
     alive = [k for k, s in STRATS.items() if s.get("alive")]
