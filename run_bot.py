@@ -36,6 +36,7 @@ ENTRY_CUTOFF = 60    # TF 剩餘不足幾秒就放棄進場（撤掉未成交單
 MOVE_TICK = 1.0      # frame_mover 心跳（秒）
 FORCE_MV_INTERVAL = 60  # 每 N 秒固定推格一次（定時止損調整）
 FEE_RATE = Decimal("0.001")  # 手續費率 0.1%：獲利超過此值時 SL 緊貼現價（距離=FEE_RATE）
+NAKED_ALERT_SEC = 15  # 守門狗：有倉但未掛止盈止損超過 N 秒 → 只發一次 TG 告警（絕不自動平倉）
 
 def load_env(p):
     d = {}
@@ -567,6 +568,37 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     return True
 
 
+async def _naked_guard(app, S, side, now_t):
+    """守門狗：偵測『OKX 上有倉、但沒掛止盈止損』的裸倉。
+    超過 NAKED_ALERT_SEC 秒 → 只發一次 TG 告警，絕不自動平倉（平倉一律人工）。"""
+    if S.get("closing"):
+        return
+    aid_field   = "algo_id" if side == "front" else "back_algo2_id"
+    since_key   = f"_naked_since_{side}"
+    alerted_key = f"_naked_alerted_{side}"
+    if S.get(aid_field):
+        S.pop(since_key, None)
+        S.pop(alerted_key, None)
+        return
+    t0 = S.get(since_key)
+    if not t0:
+        S[since_key] = now_t
+        return
+    if now_t - float(t0) >= NAKED_ALERT_SEC and not S.get(alerted_key):
+        S[alerted_key] = True
+        if side == "front":
+            label = "A（前單）"; dw = E.dir_word(S["dir"])
+        else:
+            label = "B（後單）"; dw = E.dir_word(S.get("back_d", "S" if S["dir"] == "L" else "L"))
+        await notify(app, S.get("chat") or CHAT_ID,
+            f"{E.BOT} {E.LOSS} 守門狗警告：裸倉未掛止盈止損\n"
+            f"━━━━━━━━━━\n"
+            f"商品：{S['sym']} {dw}（{label}）\n"
+            f"已裸倉：{int(now_t - float(t0))} 秒\n"
+            f"這筆持倉在 OKX 上目前沒有止盈止損單，請至 OKX 手動處理。\n"
+            f"時間：{hhmmss()}")
+
+
 async def frame_mover(app):
     """前後單策略：每 interval 秒移動前單的動態SL。
     無論獲利或虧損，SL 每秒依 move_pct 往有利方向移動。
@@ -595,13 +627,17 @@ async def frame_mover(app):
                     back_ps   = "long" if back_d_v == "L" else "short"
                     cur_back  = await okx_pos(iid, back_ps) if S.get("back_filled") else None
                     if cur_front:
-                        if not S.get("front_filled"):
-                            S["front_filled"] = True
                         active.append((S, "front", d, front_ps, "front_sl_px", "algo_id", cur_front))
+                        await _naked_guard(app, S, "front", now_t)
+                    else:
+                        S.pop("_naked_since_front", None)
+                        S.pop("_naked_alerted_front", None)
                     if cur_back:
-                        if not S.get("back_filled"):
-                            S["back_filled"] = True
                         active.append((S, "back", back_d_v, back_ps, "back_sl_px", "back_algo2_id", cur_back))
+                        await _naked_guard(app, S, "back", now_t)
+                    else:
+                        S.pop("_naked_since_back", None)
+                        S.pop("_naked_alerted_back", None)
                 except Exception as e:
                     print("frame_mover 查持倉錯誤", S.get("sym"), type(e).__name__, e)
             if not active:
@@ -1015,7 +1051,7 @@ async def loop(app, chat, S):
                     else:
                         await _handle_lose_a(S, iid, chat, app, rec, pnl)
                     continue
-                if ps == "A_in" and cur_b and not S.get("back_filled"):
+                if ps in ("A_in", "A_in_B補") and cur_b and not S.get("back_filled"):
                     bpx = Decimal(str(cur_b.get("avgPx") or cur_b.get("last") or S.get("back_px","0")))
                     S["back_filled"]  = True
                     S["back_px"]      = str(bpx)
