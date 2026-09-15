@@ -1580,7 +1580,12 @@ async def cmd_stop(u, c):
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def do_stop(u, sym, iid):
-    # 步驟1：批次撤掉該幣種所有掛單，直到掛單數=0
+    # 步驟1：先關 flag，讓 loop 立刻停下來，防止誤判出場補新單
+    for k, S in STRATS.items():
+        if S.get("sym") == sym:
+            S["alive"] = False
+
+    # 步驟2：批次撤掉該幣種所有掛單，直到掛單數=0
     for attempt in range(5):
         r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
         orders = r1.get("data") or []
@@ -1602,17 +1607,14 @@ async def do_stop(u, sym, iid):
 
         await asyncio.sleep(0.5)
 
-    # 步驟2：查該幣種持倉
+    # 步驟3：查該幣種持倉
     pr = await api("GET", f"/api/v5/account/positions?instId={iid}")
     positions = [p for p in (pr.get("data") or []) if float(p.get("pos") or 0) != 0]
 
-    # 步驟3：回填 DB
-    for k, S in STRATS.items():
-        if S.get("sym") == sym:
-            S["alive"] = False
+    # 步驟4：回填 DB
     save_state()
 
-    # 步驟4：TG 回報
+    # 步驟5：TG 回報
     r_chk = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
     final_pending = len(r_chk.get("data") or [])
     pos_count = len(positions)
@@ -1632,7 +1634,11 @@ async def cmd_stopall(u, c):
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def do_stopall(u):
-    # 步驟1：批次撤掉 OKX 所有掛單，直到掛單數=0
+    # 步驟1：先關所有 flag，讓所有 loop 立刻停下來
+    for S in STRATS.values():
+        S["alive"] = False
+
+    # 步驟2：批次撤掉所有掛單，直到掛單數=0
     for attempt in range(5):
         # 查所有限價掛單
         r1 = await api("GET", "/api/v5/trade/orders-pending")
@@ -1658,13 +1664,11 @@ async def do_stopall(u):
 
         await asyncio.sleep(0.5)  # 等OKX確認後再查
 
-    # 步驟2：查 OKX 持倉
+    # 步驟3：查 OKX 持倉
     pr = await api("GET", "/api/v5/account/positions")
     positions = [p for p in (pr.get("data") or []) if float(p.get("pos") or 0) != 0]
 
-    # 步驟3：回填 DB
-    for S in STRATS.values():
-        S["alive"] = False
+    # 步驟4：回填 DB
     save_state()
 
     # 步驟4：TG 回報
