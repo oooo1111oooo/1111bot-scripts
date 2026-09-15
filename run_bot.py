@@ -504,12 +504,12 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         front_static_sl = align(front_amb * (1 + sl_pct), tick, "S")
         front_tp        = align(front_amb * (1 - tp_pct), tick, "L")
 
-    # 後單埋伏價（由 back_offset 從現價計算，每輪重算）
+    # 後單觸發價 = A單靜態SL ± back_offset%（距A的SL保持固定距離）
     back_offset_pct = Decimal(str(S.get("back_offset", S["offset"]))) / 100
-    if d == "S":
-        back_amb = align(op * (1 + back_offset_pct), tick, back_d)
-    else:
-        back_amb = align(op * (1 - back_offset_pct), tick, back_d)
+    if d == "S":   # A是SHORT，SL在上方；B是LONG，觸發在SL下方
+        back_amb = align(front_static_sl * (1 - back_offset_pct), tick, back_d)
+    else:          # A是LONG，SL在下方；B是SHORT，觸發在SL上方
+        back_amb = align(front_static_sl * (1 + back_offset_pct), tick, back_d)
     if back_d == "S":
         back_static_sl = align(back_amb * (1 + sl_pct), tick, "S")
         back_tp        = align(back_amb * (1 - tp_pct), tick, "L")
@@ -764,19 +764,22 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
 
 
 async def _handle_lose_a(S, iid, chat, app, rec, pnl):
-    """A虧損出場：補回A觸發委託（觸發價=原A進場價）。"""
-    d = S["dir"]
+    """A虧損出場：補A觸發（觸發價 = B靜態SL ± back_offset%）。"""
+    d      = S["dir"]
     a_side = "long" if d == "L" else "short"
-    orig_a_px = Decimal(str(S.get("front_px", "0")))
-    tick = S["spec"]["tick"]
+    b_static_sl     = Decimal(str(S.get("back_static_sl", "0")))
+    back_offset_pct = Decimal(str(S.get("back_offset", S.get("offset","0")))) / 100
+    tick   = S["spec"]["tick"]
     sl_pct = Decimal(str(S["sl"])) / 100
     tp_pct = Decimal(str(S["tp"])) / 100
-    if d == "L":
-        new_sl = align(orig_a_px * (1 - sl_pct), tick, "L")
-        new_tp = align(orig_a_px * (1 + tp_pct), tick, "S")
-    else:
-        new_sl = align(orig_a_px * (1 + sl_pct), tick, "S")
-        new_tp = align(orig_a_px * (1 - tp_pct), tick, "L")
+    if d == "L":   # A是LONG，B是SHORT；補A觸發在B靜態SL下方
+        orig_a_px = align(b_static_sl * (1 - back_offset_pct), tick, "L")
+        new_sl    = align(orig_a_px * (1 - sl_pct), tick, "L")
+        new_tp    = align(orig_a_px * (1 + tp_pct), tick, "S")
+    else:          # A是SHORT，B是LONG；補A觸發在B靜態SL上方
+        orig_a_px = align(b_static_sl * (1 + back_offset_pct), tick, "S")
+        new_sl    = align(orig_a_px * (1 + sl_pct), tick, "S")
+        new_tp    = align(orig_a_px * (1 - tp_pct), tick, "L")
     mv = float(Decimal(str(S.get("margin", "1"))))
     pnl_pct = float(pnl) / mv * 100 if mv else 0
     await notify(app, chat,
@@ -810,19 +813,23 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
 
 
 async def _handle_lose_b(S, iid, chat, app, rec, pnl):
-    """B虧損出場：補回B觸發委託（觸發價=原B觸發價）。"""
+    """B虧損出場：補B觸發（觸發價 = A靜態SL ± back_offset%）。"""
     back_d = S.get("back_d", "S" if S["dir"] == "L" else "L")
     b_side = "long" if back_d == "L" else "short"
-    orig_b_px = Decimal(str(S.get("back_amb_px") or S.get("back_px", "0")))
-    tick = S["spec"]["tick"]
+    d      = S["dir"]
+    a_static_sl     = Decimal(str(S.get("front_static_sl", "0")))
+    back_offset_pct = Decimal(str(S.get("back_offset", S.get("offset","0")))) / 100
+    tick   = S["spec"]["tick"]
     sl_pct = Decimal(str(S["sl"])) / 100
     tp_pct = Decimal(str(S["tp"])) / 100
-    if back_d == "S":
-        new_sl = align(orig_b_px * (1 + sl_pct), tick, "S")
-        new_tp = align(orig_b_px * (1 - tp_pct), tick, "L")
-    else:
-        new_sl = align(orig_b_px * (1 - sl_pct), tick, "L")
-        new_tp = align(orig_b_px * (1 + tp_pct), tick, "S")
+    if d == "L":   # A是LONG，SL在下方；補B（SHORT）觸發在A靜態SL上方
+        orig_b_px = align(a_static_sl * (1 + back_offset_pct), tick, "S")
+        new_sl    = align(orig_b_px * (1 + sl_pct), tick, "S")
+        new_tp    = align(orig_b_px * (1 - tp_pct), tick, "L")
+    else:          # A是SHORT，SL在上方；補B（LONG）觸發在A靜態SL下方
+        orig_b_px = align(a_static_sl * (1 - back_offset_pct), tick, "L")
+        new_sl    = align(orig_b_px * (1 - sl_pct), tick, "L")
+        new_tp    = align(orig_b_px * (1 + tp_pct), tick, "S")
     mv = float(Decimal(str(S.get("margin", "1"))))
     pnl_pct = float(pnl) / mv * 100 if mv else 0
     await notify(app, chat,
@@ -1166,8 +1173,9 @@ def strat_params(sym, dr):
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 前單埋伏% 後單埋伏% TP% SL% 移動門檻% 間隔秒\n"
-           f"例：/run ETHUSDT L 1x 3 0.3 0.5 5 0.2 0.01 1\n"
+    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 A單埋伏% B距A_SL% TP% SL% 移動門檻% 間隔秒\n"
+           f"例：/run ETHUSDT L 1x 3 0.5 0.1 1.5 0.2 0.002 1\n"
+           f"B距A_SL% = B觸發點距A靜態SL的距離\n"
            f"共10個參數，方向只能 L 或 S")
     if len(a) != 10:
         await reply(u, f"{E.BOT} 參數數量錯誤（需10個）\n{fmt}"); return
@@ -1213,11 +1221,11 @@ async def cmd_run(u, c):
     else:
         front_static_sl = align(front_amb * (1 + sl / 100), tick, "S")
         front_tp = align(front_amb * (1 - tp / 100), tick, "L")
-    # 後單埋伏價（從現價 op 用 back_offset 算）
-    if dr == "S":
-        back_amb = align(op * (1 + back_offset / 100), tick, back_dr)
-    else:
-        back_amb = align(op * (1 - back_offset / 100), tick, back_dr)
+    # B單觸發價 = A靜態SL ± back_offset%（距A的SL保持固定距離）
+    if dr == "S":   # A是SHORT，SL在上方；B是LONG，觸發在SL下方
+        back_amb = align(front_static_sl * (1 - back_offset / 100), tick, back_dr)
+    else:           # A是LONG，SL在下方；B是SHORT，觸發在SL上方
+        back_amb = align(front_static_sl * (1 + back_offset / 100), tick, back_dr)
     # 後單靜態 SL / TP（以後單埋伏價為基準）
     if back_dr == "S":
         back_static_sl = align(back_amb * (1 + sl / 100), tick, "S")
@@ -1229,11 +1237,9 @@ async def cmd_run(u, c):
     sz_front = csize(margin, Decimal(lev), front_amb, spec["ctval"], spec["lot"])
     sz_back  = csize(margin, Decimal(lev), back_amb,  spec["ctval"], spec["lot"])
 
-    # 參數檢測：後單觸發點必須在前單埋伏點和前單靜態SL之間
-    if dr == "S" and not (front_amb < back_amb < front_static_sl):
-        await reply(u, f"{E.BOT} {E.LOSS} 參數錯誤：後單觸發點({back_amb})必須在前單埋伏({front_amb})和前單SL({front_static_sl})之間\n確認 front_offset% < back_offset% < front_offset%+sl%"); return
-    if dr == "L" and not (front_static_sl < back_amb < front_amb):
-        await reply(u, f"{E.BOT} {E.LOSS} 參數錯誤：後單觸發點({back_amb})必須在前單SL({front_static_sl})和前單埋伏({front_amb})之間\n確認 front_offset% < back_offset% < front_offset%+sl%"); return
+    # 參數檢測：back_offset必須大於0
+    if back_offset <= 0:
+        await reply(u, f"{E.BOT} {E.LOSS} 參數錯誤：B單距離%必須大於0"); return
     if sz_front < spec["minsz"]:
         need = spec["minsz"] * spec["ctval"] * op / Decimal(lev)
         await reply(u, f"{E.BOT} {E.LOSS} 保證金不足：前單算出 {sz_front} 張 < 最小 {spec['minsz']}\n至少需 {need:.4f} USDT"); return
@@ -1259,7 +1265,7 @@ async def cmd_run(u, c):
         f"靜態SL：{front_static_sl}（-{sl}%）\n"
         f"\n"
         f"後單：{sym} {E.dir_word(back_dr)}（觸發進場）\n"
-        f"埋伏價 ：{back_amb}（距現價{back_offset}%）\n"
+        f"埋伏價 ：{back_amb}（距A靜態SL {back_offset}%）\n"
         f"靜態TP：{back_tp}（+{tp}%）\n"
         f"靜態SL：{back_static_sl}（-{sl}%）\n"
         f"━━━━━━━━━━\n"
