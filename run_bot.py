@@ -491,8 +491,8 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} 前單掛單失敗，暫停 5 秒後重試")
         return False
 
-    # 掛後單（計劃委託 taker，觸發價 = 前單靜態SL）
-    back_algo_id = await _place_trigger(iid, back_pos, back_d, front_static_sl, sz_back)
+    # 掛後單（計劃委託 taker，觸發價 = back_amb）
+    back_algo_id = await _place_trigger(iid, back_pos, back_d, back_amb, sz_back)
     if not back_algo_id:
         await _cancel_order(iid, front_oid)
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} 後單掛單失敗，暫停 5 秒後重試")
