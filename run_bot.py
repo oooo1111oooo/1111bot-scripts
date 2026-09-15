@@ -20,8 +20,8 @@ from app.core import emoji as E
 from app.strategy.normal import next_open_epoch as _noe_unused, TF_SEC as _TFS_unused
 
 # 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
-TF_SEC = {"3m": 180, "4m": 240, "5m": 300, "6m": 360, "10m": 600,
-          "12m": 720, "15m": 900, "20m": 1200, "30m": 1800, "60m": 3600}
+TF_SEC = {"5m": 300, "6m": 360, "8m": 480, "10m": 600,
+          "12m": 720, "15m": 900, "20m": 1200, "25m": 1500, "30m": 1800}
 
 def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
@@ -465,6 +465,16 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         S["round_date"]  = today
     S["round_today"] = int(S.get("round_today", 0)) + 1
     d    = S["dir"]
+
+    # ── 距下一根TF不足120秒，等到開盤再掛 ──
+    tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
+    while True:
+        secs_left = (int(time.time() // tf_sec) + 1) * tf_sec - time.time()
+        if secs_left >= 120:
+            break
+        if S.get("pair_state") == "idle":
+            return False   # 等待期間被/stop，放棄掛單
+        await asyncio.sleep(5)
 
     # ── 掛單前標準前置：清空該幣種所有掛單 ──
     await _pre_clear_orders(S["spec"]["iid"])
@@ -1454,25 +1464,17 @@ async def cmd_status(u, c):
         L.append(f"{live_emoji} {s['sym']} {E.dir_word(d)} {lev}x {margin}（輪{round_t}｜進{enter_t}）")
         L.append(f"{live_label}({state_str})")
 
-        # 查現價和 TF K線開盤價，計算漲跌燈號
+        # 燈號：現價 vs 前單埋伏價（和TF/K線完全無關）
         try:
             iid_s = s["spec"]["iid"]
             cur_px_s = await get_last(iid_s)
-            tf_s = s.get("tf", ACCOUNT_TF)
-            tf_sec_s = TF_SEC.get(tf_s, 300)
-            now_ts = time.time()
-            open_ts = int(now_ts // tf_sec_s) * tf_sec_s
-            kl_s = await klines_for_tf(iid_s, tf_s, 2)
-            kline_open = None
-            if kl_s:
-                for k in reversed(kl_s):
-                    if int(k["ts"]) // 1000 == open_ts:
-                        kline_open = float(k["o"])
-                        break
-            if kline_open is None and kl_s:
-                kline_open = float(kl_s[-1]["o"])
-            if kline_open:
-                px_emoji = E.UP if float(cur_px_s) > kline_open else (E.DOWN if float(cur_px_s) < kline_open else E.EVEN)
+            amb_px = s.get("front_px") or s.get("front_static_sl")
+            if amb_px and cur_px_s:
+                d_s = s.get("dir", "L")
+                if d_s == "S":
+                    px_emoji = E.DOWN if float(cur_px_s) < float(amb_px) else (E.UP if float(cur_px_s) > float(amb_px) else E.EVEN)
+                else:
+                    px_emoji = E.UP if float(cur_px_s) > float(amb_px) else (E.DOWN if float(cur_px_s) < float(amb_px) else E.EVEN)
             else:
                 px_emoji = "⚪"
             L.append(f"現：{hhmmss()}|{px_emoji} {cur_px_s}")
