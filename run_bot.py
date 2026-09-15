@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 設計此腳本的目的在於用bot取代我在交易所app上的一切手動行為，切記
 """B6-1 原K｜多帳戶 — 核心重寫版
 規格：
   1. 每根 K 線開盤即掛限價埋伏單；未成交於收線前 3 秒撤單。
@@ -1606,35 +1607,51 @@ async def cmd_stopall(u, c):
     asyncio.create_task(_to(c.application, u.effective_chat.id, PENDING[u.effective_chat.id]["t"]))
 
 async def do_stopall(u):
-    alive = [k for k, s in STRATS.items() if s.get("alive")]
-    held = []; done = []
-    for k in list(alive):
-        S = STRATS[k]; d = S["dir"]; iid = S["spec"]["iid"]
-        ps = "long" if d == "L" else "short"
-        p = await okx_pos(iid, ps)
+    # 步驟1：批次撤掉 OKX 所有掛單，直到掛單數=0
+    for attempt in range(5):
+        # 查所有限價掛單
+        r1 = await api("GET", "/api/v5/trade/orders-pending")
+        orders = r1.get("data") or []
+        # 查所有 trigger 計劃委託
+        r2 = await api("GET", "/api/v5/trade/orders-algo-pending?ordType=trigger")
+        algos = r2.get("data") or []
+
+        if not orders and not algos:
+            break  # 掛單全部清空，離開迴圈
+
+        # 批次撤限價掛單（每次最多20筆）
+        if orders:
+            batch = [{"instId": o["instId"], "ordId": o["ordId"]} for o in orders]
+            for i in range(0, len(batch), 20):
+                await api("POST", "/api/v5/trade/cancel-batch-orders", batch[i:i+20])
+
+        # 批次撤 trigger 計劃委託
+        if algos:
+            algo_batch = [{"instId": o["instId"], "algoId": o["algoId"]} for o in algos]
+            for i in range(0, len(algo_batch), 20):
+                await api("POST", "/api/v5/trade/cancel-algos", algo_batch[i:i+20])
+
+        await asyncio.sleep(0.5)  # 等OKX確認後再查
+
+    # 步驟2：查 OKX 持倉
+    pr = await api("GET", "/api/v5/account/positions")
+    positions = [p for p in (pr.get("data") or []) if float(p.get("pos") or 0) != 0]
+
+    # 步驟3：回填 DB
+    for S in STRATS.values():
         S["alive"] = False
-        await sweep(iid, ps)
-        # 以OKX為主，兩個方向都掃，不依賴DB的back_d
-        await sweep_algos(iid, "long")
-        await sweep_algos(iid, "short")
-        (held if p else done).append(f"{S['sym']} {S['dir']}")
-    # 孤兒補掃：全域清所有殘留 limit 掛單
-    orphan = 0
-    for o in await okx_orders(prefix="n"):
-        cr = await api("POST", "/api/v5/trade/cancel-order", {"instId": o["instId"], "ordId": o["ordId"]})
-        if cr.get("code") == "0": orphan += 1
-    # 全域清所有殘留 trigger 計劃委託（不限幣種）
-    r = await api("GET", "/api/v5/trade/orders-algo-pending?ordType=trigger")
-    for o in (r.get("data") or []):
-        algo_id = o.get("algoId")
-        iid_o = o.get("instId")
-        if not algo_id or not iid_o: continue
-        cr = await api("POST", "/api/v5/trade/cancel-algos", [{"instId": iid_o, "algoId": algo_id}])
-        if cr.get("code") == "0": orphan += 1
     save_state()
-    m = f"{E.BOT} 已停止 {len(done)} 個策略｜清殘單 {orphan}"
-    if held: m += f"\n{E.WARN} 持倉需手動平倉：" + "、".join(held)
-    await reply(u, m)
+
+    # 步驟4：TG 回報
+    pos_count = len(positions)
+    r_msg = await api("GET", "/api/v5/trade/orders-pending")
+    final_pending = len(r_msg.get("data") or [])
+    msg = f"{E.BOT} 已執行 /stopall\n掛單數：{final_pending}｜持倉數：{pos_count}"
+    if positions:
+        msg += "\n━━━━━━━━━━\n持倉清單（請手動平倉）："
+        for i, p in enumerate(positions, 1):
+            msg += f"\n{i}. {p.get('instId','')} {p.get('posSide','')}"
+    await reply(u, msg)
 
 async def cmd_status(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
