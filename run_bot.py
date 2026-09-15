@@ -723,6 +723,97 @@ async def _get_net_pnl(iid, pos_side, after_ms):
     return Decimal("0"), None
 
 
+async def _query_open_fee(iid, pos_side, entry_epoch):
+    """查開倉手續費（fills API）。"""
+    open_fee = Decimal("0")
+    try:
+        r = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=10")
+        if r.get("code") == "0":
+            for f in (r.get("data") or []):
+                if (f.get("posSide") == pos_side and
+                        abs(int(f.get("ts") or 0) - int(entry_epoch * 1000)) <= 5000):
+                    open_fee += Decimal(str(f.get("fee") or "0"))
+                    print(f"[開倉手續費] {f.get('fee')} ts={f.get('ts')}")
+    except Exception as e:
+        print("查開倉手續費失敗", type(e).__name__, e)
+    return open_fee
+
+
+def _sl_block(mn, mhist):
+    """建立 SL 移動明細區塊。"""
+    lines = ["━━━━━━━━━━", f"SL移動 {mn} 次"]
+    if mn > 0 and mhist:
+        for m in mhist[-20:]:
+            lines.append(f"{m.get('t','')} | {m.get('type','現')} | {m.get('px','')} | 止{m.get('sl','')}")
+    return "\n".join(lines)
+
+
+async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""):
+    """統一出場通知格式（與用戶核准的格式一致）。"""
+    d = S["dir"] if side == "A" else S.get("back_d", "S" if S["dir"] == "L" else "L")
+    sym = S["sym"]
+    mv = float(Decimal(str(S.get("margin", "1"))))
+
+    if side == "A":
+        entry_px  = S.get("front_px", "-")
+        entry_ee  = S.get("front_ee", 0)
+        static_tp = S.get("front_tp_px", "-")
+        static_sl = S.get("front_static_sl", "-")
+        last_sl   = S.get("front_sl_px", "-")
+        mn        = int(S.get("front_move_n", 0))
+        mhist     = S.get("front_move_hist") or []
+    else:
+        entry_px  = S.get("back_px", "-")
+        entry_ee  = S.get("back_ee", 0)
+        static_tp = S.get("back_tp_px", "-")
+        static_sl = S.get("back_static_sl", "-")
+        last_sl   = S.get("back_sl_px", "-")
+        mn        = 0
+        mhist     = []
+
+    entry_t = datetime.fromtimestamp(float(entry_ee), TZ8).strftime("%H:%M:%S") if entry_ee else "-"
+
+    if rec:
+        g_r   = Decimal(str(rec.get("pnl") or "0"))
+        fee_r = Decimal(str(rec.get("fee") or "0")) + open_fee
+        net_r = Decimal(str(rec.get("realizedPnl") or "0")) + open_fee
+        xpx   = str(rec.get("closeAvgPx") or "-")
+    else:
+        g_r = fee_r = net_r = Decimal("0")
+        xpx = "-"
+
+    g_pct   = float(g_r)   / mv * 100 if mv else 0
+    fee_pct = float(fee_r) / mv * 100 if mv else 0
+    net_pct = float(net_r) / mv * 100 if mv else 0
+    ico = E.WIN if net_r >= 0 else E.LOSS
+
+    sl_b = _sl_block(mn, mhist)
+
+    msg = (
+        f"{E.BOT} OKX原K｜{ACCT}\n"
+        f"事件：{ico} {side}單出場\n"
+        f"━━━━━━━━━━\n"
+        f"商品：{E.dir_emoji(d)} {sym} {E.dir_word(d)} {S.get('lev')}x {S.get('margin')}\n"
+        f"{side}單：{reason_label}\n"
+        f"━━━━━━━━━━\n"
+        f"進場：{entry_px} | {entry_t}\n"
+        f"靜態TP：{static_tp}\n"
+        f"靜態SL：{static_sl}\n"
+        f"最後SL：{last_sl}\n"
+        f"出場：{xpx} | {hhmmss()}\n"
+        f"━━━━━━━━━━\n"
+        f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
+        f"手續費：{fee_r:.6f} ({fee_pct:+.3f}%)\n"
+        f"淨損益：{net_r:+.6f} ({net_pct:+.3f}%) {ico}\n"
+        f"{sl_b}\n"
+        f"━━━━━━━━━━\n"
+        f"{extra}\n"
+        f"時間：{hhmmss()}"
+    )
+    await notify(app, chat, msg)
+    return g_r, fee_r, net_r
+
+
 async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_filled):
     """獲利出場：清另一方 → 等TF≥120s → 重新掛單。"""
     S["pair_state"] = "idle"
@@ -734,17 +825,17 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
                       {"instId": iid, "mgnMode": "cross", "posSide": other_side})
             await asyncio.sleep(0.5)
     await _pre_clear_orders(iid)
+    a_side = "long" if d == "L" else "short"
+    b_side = other_side
+    win_side_pos = a_side if winner == "A" else b_side
+    win_ee = S.get("front_ee", 0) if winner == "A" else S.get("back_ee", 0)
+    open_fee = await _query_open_fee(iid, win_side_pos, float(win_ee or 0))
+    reason_label = "Take Profit" if pnl > 0 else "Stop Loss"
+    g_r, fee_r, net_r = await _notify_exit(app, chat, S, winner, rec, open_fee, reason_label, extra="另一方已清除，重新掛單")
     mv = float(Decimal(str(S.get("margin", "1"))))
-    pnl_pct = float(pnl) / mv * 100 if mv else 0
-    await notify(app, chat,
-        f"{E.BOT} OKX原K\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.WIN} {winner}\u55ae\u7372\u5229\u51fa\u5834\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\u5546\u54c1\uff1a{S['sym']}\n"
-        f"\u6de8\u640d\u76ca\uff1a{pnl:+.6f} ({pnl_pct:+.3f}%)\n"
-        f"\u6642\u9593\uff1a{hhmmss()}")
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": "Win",
-               "gross": float(pnl), "fee": 0, "net": float(pnl),
-               "nv": mv, "hold_s": 0, "ambush_s": 0})
+               "gross": float(g_r), "fee": float(fee_r), "net": float(net_r),
+               "nv": mv, "hold_s": int(time.time() - float(win_ee or time.time())), "ambush_s": 0})
     for a in ("front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
               "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
               "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
@@ -780,13 +871,8 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
         orig_a_px = align(b_static_sl * (1 + back_offset_pct), tick, "S")
         new_sl    = align(orig_a_px * (1 + sl_pct), tick, "S")
         new_tp    = align(orig_a_px * (1 - tp_pct), tick, "L")
-    mv = float(Decimal(str(S.get("margin", "1"))))
-    pnl_pct = float(pnl) / mv * 100 if mv else 0
-    await notify(app, chat,
-        f"{E.BOT} OKX\u539f\u0041\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.LOSS} A\u55ae\u51fa\u5834\uff0c\u88dcA\u89f8\u767c\u59d4\u8098\n"
-        f"\u5546\u54c1\uff1a{S['sym']}\n"
-        f"\u6de8\u640d\u76ca\uff1a{pnl:+.6f} ({pnl_pct:+.3f}%)\n"
-        f"\u88dcA\u89f8\u767c\u50f9\uff1a{orig_a_px}\n\u6642\u9593\uff1a{hhmmss()}")
+    open_fee = await _query_open_fee(iid, a_side, float(S.get("front_ee") or 0))
+    await _notify_exit(app, chat, S, "A", rec, open_fee, "Stop Loss", extra=f"補A觸發委託，觸發價：{orig_a_px}")
     r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
     a_orders = [o for o in (r1.get("data") or []) if o.get("posSide") == a_side]
     if a_orders:
@@ -830,13 +916,8 @@ async def _handle_lose_b(S, iid, chat, app, rec, pnl):
         orig_b_px = align(a_static_sl * (1 - back_offset_pct), tick, "L")
         new_sl    = align(orig_b_px * (1 - sl_pct), tick, "L")
         new_tp    = align(orig_b_px * (1 + tp_pct), tick, "S")
-    mv = float(Decimal(str(S.get("margin", "1"))))
-    pnl_pct = float(pnl) / mv * 100 if mv else 0
-    await notify(app, chat,
-        f"{E.BOT} OKX\u539f\u0041\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.LOSS} B\u55ae\u51fa\u5834\uff0c\u88dcB\u89f8\u767c\u59d4\u8098\n"
-        f"\u5546\u54c1\uff1a{S['sym']}\n"
-        f"\u6de8\u640d\u76ca\uff1a{pnl:+.6f} ({pnl_pct:+.3f}%)\n"
-        f"\u88dcB\u89f8\u767c\u50f9\uff1a{orig_b_px}\n\u6642\u9593\uff1a{hhmmss()}")
+    open_fee = await _query_open_fee(iid, b_side, float(S.get("back_ee") or 0))
+    await _notify_exit(app, chat, S, "B", rec, open_fee, "Stop Loss", extra=f"補B觸發委託，觸發價：{orig_b_px}")
     r2 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
     b_algos = [o for o in (r2.get("data") or []) if o.get("posSide") == b_side]
     if b_algos:
