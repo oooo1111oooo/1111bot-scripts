@@ -1607,7 +1607,6 @@ async def cmd_stopall(u, c):
 async def do_stopall(u):
     alive = [k for k, s in STRATS.items() if s.get("alive")]
     held = []; done = []
-    iids = set()
     for k in list(alive):
         S = STRATS[k]; d = S["dir"]; iid = S["spec"]["iid"]
         ps = "long" if d == "L" else "short"
@@ -1617,24 +1616,24 @@ async def do_stopall(u):
         S["alive"] = False
         await sweep(iid, ps)
         await sweep_algos(iid, back_ps)
-        await sweep_algos(iid, ps)   # 也撤同方向的algo（防邊緣情況）
-        iids.add(iid)
+        await sweep_algos(iid, ps)
         (held if p else done).append(f"{S['sym']} {S['dir']}")
-    # 孤兒補掃：清所有殘留 limit 掛單 + trigger 計劃委託
+    # 孤兒補掃：全域清所有殘留 limit 掛單
     orphan = 0
     for o in await okx_orders(prefix="n"):
         cr = await api("POST", "/api/v5/trade/cancel-order", {"instId": o["instId"], "ordId": o["ordId"]})
         if cr.get("code") == "0": orphan += 1
-    for iid in iids:
-        r = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
-        for o in (r.get("data") or []):
-            algo_id = o.get("algoId")
-            if not algo_id: continue
-            cr = await api("POST", "/api/v5/trade/cancel-algos", [{"instId": iid, "algoId": algo_id}])
-            if cr.get("code") == "0": orphan += 1
+    # 全域清所有殘留 trigger 計劃委託（不限幣種）
+    r = await api("GET", "/api/v5/trade/orders-algo-pending?ordType=trigger")
+    for o in (r.get("data") or []):
+        algo_id = o.get("algoId")
+        iid_o = o.get("instId")
+        if not algo_id or not iid_o: continue
+        cr = await api("POST", "/api/v5/trade/cancel-algos", [{"instId": iid_o, "algoId": algo_id}])
+        if cr.get("code") == "0": orphan += 1
     save_state()
     m = f"{E.BOT} 已停止 {len(done)} 個策略｜清殘單 {orphan}"
-    if held: m += "\n{E.WARN} 持倉需手動平倉：" + "、".join(held)
+    if held: m += f"\n{E.WARN} 持倉需手動平倉：" + "、".join(held)
     await reply(u, m)
 
 async def cmd_status(u, c):
