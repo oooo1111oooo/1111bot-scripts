@@ -1563,6 +1563,7 @@ async def cmd_confirm(u, c):
     cnt = sum(1 for s in STRATS.values() if s.get("alive"))
     await reply(u, f"{E.BOT} {E.OK} 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
 
+# 撤單部分 stopall / stop：一切以查詢交易所為主，DB 只是確認後的資料回補而已
 async def cmd_stop(u, c):
     a = c.args
     alive = [k for k, s in STRATS.items() if s.get("alive")]
@@ -1586,12 +1587,12 @@ async def do_stop(u, key):
         await reply(u, f"{E.BOT} 策略已不存在"); return
     d = S["dir"]; iid = S["spec"]["iid"]
     ps = "long" if d == "L" else "short"
-    back_d = S.get("back_d", "S" if d == "L" else "L")
-    back_ps = "long" if back_d == "L" else "short"
     p = await okx_pos(iid, ps)
     S["alive"] = False
     n = await sweep(iid, ps)
-    na = await sweep_algos(iid, back_ps)
+    # 以OKX為主，兩個方向都掃，不依賴DB的back_d
+    na  = await sweep_algos(iid, "long")
+    na += await sweep_algos(iid, "short")
     save_state()
     tail = f"\n{E.WARN} 持倉 {p['pos']} 張，請至 OKX 平倉" if p else ""
     await reply(u, f"{E.BOT} 已停止 {E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}｜撤限價單 {n}｜撤計劃委託 {na}{tail}")
@@ -1610,13 +1611,12 @@ async def do_stopall(u):
     for k in list(alive):
         S = STRATS[k]; d = S["dir"]; iid = S["spec"]["iid"]
         ps = "long" if d == "L" else "short"
-        back_d = S.get("back_d", "S" if d == "L" else "L")
-        back_ps = "long" if back_d == "L" else "short"
         p = await okx_pos(iid, ps)
         S["alive"] = False
         await sweep(iid, ps)
-        await sweep_algos(iid, back_ps)
-        await sweep_algos(iid, ps)
+        # 以OKX為主，兩個方向都掃，不依賴DB的back_d
+        await sweep_algos(iid, "long")
+        await sweep_algos(iid, "short")
         (held if p else done).append(f"{S['sym']} {S['dir']}")
     # 孤兒補掃：全域清所有殘留 limit 掛單
     orphan = 0
