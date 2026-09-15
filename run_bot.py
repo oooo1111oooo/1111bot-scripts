@@ -425,6 +425,35 @@ async def _order_state(iid, oid):
         return d.get("state"), d.get("avgPx")
     return None, None
 
+async def _okx_slot_check(iid):
+    """查 OKX 三層：持倉 + 限價掛單 + trigger計劃委託，
+    回傳 (long_count, short_count)，各方向上限為1。"""
+    long_n = short_n = 0
+    try:
+        # 層1：持倉
+        r = await api("GET", f"/api/v5/account/positions?instId={iid}")
+        for p in (r.get("data") or []):
+            ps = p.get("posSide", "")
+            sz = Decimal(str(p.get("pos") or "0"))
+            if ps == "long"  and sz > 0: long_n  += 1
+            if ps == "short" and sz > 0: short_n += 1
+        # 層2：限價掛單
+        r2 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
+        for o in (r2.get("data") or []):
+            ps = o.get("posSide", "")
+            if ps == "long":  long_n  += 1
+            if ps == "short": short_n += 1
+        # 層3：計劃委託 trigger
+        r3 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
+        for o in (r3.get("data") or []):
+            ps = o.get("posSide", "")
+            if ps == "long":  long_n  += 1
+            if ps == "short": short_n += 1
+    except Exception as e:
+        print("_okx_slot_check error", type(e).__name__, e)
+    return long_n, short_n
+
+
 async def _place_pair(S, iid, chat, app, label="新一輪"):
     """掛出前後單一對，更新 S 的掛單欄位。輪次 +1，日期歸零判斷。"""
     # 輪次計數（日期歸零）
@@ -435,6 +464,16 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         S["round_date"]  = today
     S["round_today"] = int(S.get("round_today", 0)) + 1
     d    = S["dir"]
+
+    # ── OKX 槽位檢查：掛單前確認OKX實際狀態，防止超額掛單 ──
+    iid_check = S["spec"]["iid"]
+    long_n, short_n = await _okx_slot_check(iid_check)
+    if long_n >= 2 or short_n >= 2:
+        msg = (f"{E.BOT} {E.LOSS} {S['sym']} OKX槽位超額（L:{long_n} S:{short_n}），"
+               f"拒絕掛單，策略暫停，請手動檢查")
+        await notify(app, chat, msg)
+        print(f"[槽位拒絕] {S['sym']} L:{long_n} S:{short_n}")
+        return False
     back_d = "S" if d == "L" else "L"
     spec   = S["spec"]
     tick   = spec["tick"]
@@ -880,28 +919,56 @@ async def _exit_front(app, S, chat, iid, reason, fpx, xpx, ee):
             new_back_amb = align(back_fpx * (1 + gap_pct), tick, new_back_d)
             new_back_sl  = align(new_back_amb * (1 - sl_pct), tick, "L")
             new_back_tp  = align(new_back_amb * (1 + tp_pct), tick, "S")
-        new_back_sz  = csize(Decimal(str(S["margin"])), Decimal(str(S["lev"])),
-                             new_back_amb, spec["ctval"], spec["lot"])
-        new_back_pos = "long" if new_back_d == "L" else "short"
-        new_back_algo_id = await _place_trigger(iid, new_back_pos, new_back_d,
-                                                new_back_amb, new_back_sz)
-        if new_back_algo_id:
-            S["back_algo_id"]   = new_back_algo_id
-            S["back_amb_px"]    = str(new_back_amb)
-            S["back_px"]        = str(new_back_amb)
-            S["back_static_sl"] = str(new_back_sl)
-            S["back_tp_px"]     = str(new_back_tp)
-            S["back_filled"]    = False
-            S["back_sz"]        = str(new_back_sz)
-            S["back_d"]         = new_back_d
-            save_state()
+
+        # ── 觸發價有效性檢查：確認現價尚未穿越觸發點 ──
+        try:
+            cur_px = await get_last(iid)
+            if new_back_d == "L" and new_back_amb <= cur_px:
+                # LONG觸發點應高於現價，已被穿越，重新從現價計算
+                new_back_amb = align(cur_px * (1 + gap_pct), tick, new_back_d)
+                new_back_sl  = align(new_back_amb * (1 - sl_pct), tick, "L")
+                new_back_tp  = align(new_back_amb * (1 + tp_pct), tick, "S")
+                print(f"[觸發價修正] {S['sym']} 新後單LONG觸發點調整至 {new_back_amb}")
+            elif new_back_d == "S" and new_back_amb >= cur_px:
+                # SHORT觸發點應低於現價，已被穿越，重新從現價計算
+                new_back_amb = align(cur_px * (1 - gap_pct), tick, new_back_d)
+                new_back_sl  = align(new_back_amb * (1 + sl_pct), tick, "S")
+                new_back_tp  = align(new_back_amb * (1 - tp_pct), tick, "L")
+                print(f"[觸發價修正] {S['sym']} 新後單SHORT觸發點調整至 {new_back_amb}")
+        except Exception as e:
+            print("觸發價有效性檢查失敗", type(e).__name__, e)
+
+        # ── OKX 槽位檢查：防止超額掛單 ──
+        long_n, short_n = await _okx_slot_check(iid)
+        slot_count  = long_n if new_back_d == "L" else short_n
+        if slot_count >= 1:
             await notify(app, chat,
-                f"{E.BOT} 新後單（{E.dir_word(new_back_d)}）已掛出\n"
-                f"觸發埋伏：{new_back_amb} | TP：{new_back_tp} | SL：{new_back_sl}\n"
-                f"時間：{hhmmss()}")
+                f"{E.BOT} {E.WARN} {S['sym']} 新後單方向（{E.dir_word(new_back_d)}）OKX已有{slot_count}筆，"
+                f"跳過補後單，前單繼續監控\n時間：{hhmmss()}")
+            print(f"[槽位拒絕補後單] {S['sym']} {new_back_d} 已有 {slot_count} 筆")
         else:
-            await notify(app, chat,
-                f"{E.BOT} {E.LOSS} 新後單掛出失敗，請檢查\n時間：{hhmmss()}")
+            new_back_sz  = csize(Decimal(str(S["margin"])), Decimal(str(S["lev"])),
+                                 new_back_amb, spec["ctval"], spec["lot"])
+            new_back_pos = "long" if new_back_d == "L" else "short"
+            new_back_algo_id = await _place_trigger(iid, new_back_pos, new_back_d,
+                                                    new_back_amb, new_back_sz)
+            if new_back_algo_id:
+                S["back_algo_id"]   = new_back_algo_id
+                S["back_amb_px"]    = str(new_back_amb)
+                S["back_px"]        = str(new_back_amb)
+                S["back_static_sl"] = str(new_back_sl)
+                S["back_tp_px"]     = str(new_back_tp)
+                S["back_filled"]    = False
+                S["back_sz"]        = str(new_back_sz)
+                S["back_d"]         = new_back_d
+                save_state()
+                await notify(app, chat,
+                    f"{E.BOT} 新後單（{E.dir_word(new_back_d)}）已掛出\n"
+                    f"觸發埋伏：{new_back_amb} | TP：{new_back_tp} | SL：{new_back_sl}\n"
+                    f"時間：{hhmmss()}")
+            else:
+                await notify(app, chat,
+                    f"{E.BOT} {E.LOSS} 新後單掛出失敗，請檢查\n時間：{hhmmss()}")
 
 
 async def _exit_back(app, S, chat, iid, reason, bpx, xpx, bee):
@@ -983,6 +1050,15 @@ async def _exit_back(app, S, chat, iid, reason, bpx, xpx, bee):
 
         if back_algo2_id:
             await _cancel_trigger(iid, back_algo2_id)
+
+        # ── OKX 槽位檢查：防止超額補單 ──
+        long_n, short_n = await _okx_slot_check(iid)
+        slot_count = long_n if back_d == "L" else short_n
+        if slot_count >= 1:
+            await _notify_back_exit(note=f"後單SL，{E.dir_word(back_d)}方向OKX已有{slot_count}筆，跳過補後單")
+            print(f"[槽位拒絕補後單] {S['sym']} {back_d} 已有 {slot_count} 筆")
+            S.pop("closing", None)
+            return
 
         new_back_algo_id = await _place_trigger(iid, new_back_pos, back_d,
                                                 back_amb_orig, new_back_sz)
