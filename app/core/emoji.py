@@ -7,8 +7,8 @@ WIN      = "🟢"   # 🟢 出場獲利 / 淨損益正
 LOSS     = "🔴"   # 🔴 出場虧損 / 淨損益負
 EVEN     = "⚪"       # ⚪ 打平
 HOLD     = "📌"   # 📌 持倉中
-HA_RED   = "🟥"   # 🟥 HA 紅棒
-HA_GREEN = "🟩"   # 🟩 HA 綠棒
+KLINE_UP   = "🟩"   # 🟩 K棒上漲
+KLINE_DOWN = "🟥"   # 🟥 K棒下跌
 
 def dir_emoji(d): return LONG if d == "L" else SHORT
 def dir_word(d):  return "L" if d == "L" else "S"
@@ -16,4 +16,4 @@ def pnl_emoji(v):
     if v > 0: return WIN
     if v < 0: return LOSS
     return EVEN
-def ha_emoji(color): return HA_GREEN if color == "G" else HA_RED
+def kline_emoji(color): return KLINE_UP if color == "G" else KLINE_DOWN
