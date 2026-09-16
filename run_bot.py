@@ -1596,9 +1596,9 @@ async def cmd_status(u, c):
             open_px_s = Decimal(kr["data"][0][1]) if kr.get("code") == "0" and kr.get("data") else None
             if open_px_s and cur_px_s:
                 if cur_px_s > open_px_s:
-                    px_emoji = E.WIN
+                    px_emoji = E.KLINE_UP
                 elif cur_px_s < open_px_s:
-                    px_emoji = E.LOSS
+                    px_emoji = E.KLINE_DOWN
                 else:
                     px_emoji = E.EVEN
             else:
