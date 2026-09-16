@@ -1587,17 +1587,20 @@ async def cmd_status(u, c):
         L.append(f"{live_emoji} {s['sym']} {E.dir_word(d)} {lev}x {margin}（輪{round_t}｜進{enter_t}）")
         L.append(f"{live_label}({state_str})")
 
-        # 燈號：現價 vs 前單埋伏價（和TF/K線完全無關）
+        # 燈號：這根 TF K 棒的漲跌（現價 vs 當根開盤價，與策略方向無關）
         try:
             iid_s = s["spec"]["iid"]
             cur_px_s = await get_last(iid_s)
-            amb_px = s.get("front_px") or s.get("front_static_sl")
-            if amb_px and cur_px_s:
-                d_s = s.get("dir", "L")
-                if d_s == "S":
-                    px_emoji = E.DOWN if float(cur_px_s) < float(amb_px) else (E.UP if float(cur_px_s) > float(amb_px) else E.EVEN)
+            bar_s = NATIVE_BARS.get(ACCOUNT_TF, "5m")
+            kr = await pub(f"/api/v5/market/candles?instId={iid_s}&bar={bar_s}&limit=1")
+            open_px_s = Decimal(kr["data"][0][1]) if kr.get("code") == "0" and kr.get("data") else None
+            if open_px_s and cur_px_s:
+                if cur_px_s > open_px_s:
+                    px_emoji = E.WIN
+                elif cur_px_s < open_px_s:
+                    px_emoji = E.LOSS
                 else:
-                    px_emoji = E.UP if float(cur_px_s) > float(amb_px) else (E.DOWN if float(cur_px_s) < float(amb_px) else E.EVEN)
+                    px_emoji = E.EVEN
             else:
                 px_emoji = "⚪"
             L.append(f"現：{hhmmss()}|{px_emoji} {cur_px_s}")
