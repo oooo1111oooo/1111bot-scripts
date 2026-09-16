@@ -751,6 +751,27 @@ async def _pre_clear_orders(iid):
     return False
 
 
+async def _algo_actual_side(iid, algo_id, tries=6):
+    """查 OKX algo(OCO) 單真實觸發端：回傳 "tp" / "sl" / None。
+    以 OKX actualSide 為準，不用損益推論。"""
+    if not algo_id:
+        return None
+    for _ in range(tries):
+        try:
+            r = await api("GET", f"/api/v5/trade/orders-algo-history?ordType=oco&instId={iid}&state=effective&limit=20")
+            if r.get("code") == "0":
+                for o in (r.get("data") or []):
+                    if str(o.get("algoId")) == str(algo_id):
+                        a = (o.get("actualSide") or "").lower()
+                        if a in ("tp", "sl"):
+                            return a
+                        return None
+        except Exception as e:
+            print("查 algo actualSide 失敗", type(e).__name__, e)
+        await asyncio.sleep(1)
+    return None
+
+
 async def _get_net_pnl(iid, pos_side, after_ms):
     """查 OKX 出場淨損益（realizedPnl）。"""
     rec = await close_record(iid, pos_side, after_ms, tries=10)
@@ -866,10 +887,17 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
     win_side_pos = a_side if winner == "A" else b_side
     win_ee = S.get("front_ee", 0) if winner == "A" else S.get("back_ee", 0)
     open_fee = await _query_open_fee(iid, win_side_pos, float(win_ee or 0))
-    reason_label = "Take Profit" if pnl > 0 else "Stop Loss"
+    win_algo_id = S.get("algo_id") if winner == "A" else S.get("back_algo2_id")
+    _side = await _algo_actual_side(iid, win_algo_id)
+    if _side == "tp":
+        reason_label, reason_code = "Take Profit", "Take_Profit"
+    elif _side == "sl":
+        reason_label, reason_code = "Stop Loss", "Stop_Loss"
+    else:
+        reason_label, reason_code = "Manual/Unknown", "Manual"
     g_r, fee_r, net_r = await _notify_exit(app, chat, S, winner, rec, open_fee, reason_label, extra="另一方已清除，重新掛單")
     mv = float(Decimal(str(S.get("margin", "1"))))
-    log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": "Win",
+    log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason_code,
                "gross": float(g_r), "fee": float(fee_r), "net": float(net_r),
                "nv": mv, "hold_s": int(time.time() - float(win_ee or time.time())), "ambush_s": 0})
     for a in ("front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
@@ -1648,8 +1676,8 @@ def sum_lines(rs, placed, entered):
     hit = (entered / placed * 100) if placed else 0
     amb = ("%d秒" % (sum(int(r.get("ambush_s") or 0) for r in rs) / m)) if m else "-"
     L.append("次數:%d|%d(%s)|%.2f%%" % (placed, entered, amb, hit))
-    NAME = {"Take_Profit": "TP", "Stop_Loss": "SL", "Frame_Exit": "SL"}
-    for lab, cats in (("獲利", ("Take_Profit",)), ("虧損", ("Stop_Loss", "Frame_Exit"))):
+    NAME = {"Take_Profit": "TP", "Stop_Loss": "SL", "Frame_Exit": "SL", "Manual": "手動"}
+    for lab, cats in (("獲利", ("Take_Profit", "Stop_Loss", "Manual")), ("虧損", ("Stop_Loss", "Take_Profit", "Frame_Exit", "Manual"))):
         if lab == "獲利":
             sub = [r for r in rs if Decimal(str(r.get("net") or "0")) > 0]
         else:
