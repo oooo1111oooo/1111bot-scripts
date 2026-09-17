@@ -1484,7 +1484,7 @@ async def cmd_confirm(u, c):
     STRATS[k] = S
     TASKS[k] = asyncio.create_task(loop(c.application, u.effective_chat.id, S))
     save_state()
-    cnt = sum(1 for s in STRATS.values() if s.get("pair_state","idle") != "idle")
+    cnt = sum(1 for t in TASKS.values() if t and not t.done())
     await reply(u, f"{E.BOT} {E.OK} 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
 
 # 撤單部分 stopall / stop：一切以查詢交易所為主，DB 只是確認後的資料回補而已
