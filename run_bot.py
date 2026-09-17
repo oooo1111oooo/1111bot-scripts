@@ -2111,36 +2111,6 @@ async def amp_stream_build(sym, iid, tick, years, path, notify_cb=None):
             "want_days": want_days, "short": short}
 
 
-def send_amp_mail(path, name, subject, body):
-    """寄出振幅報表。回傳 (ok, 訊息)。"""
-    import smtplib
-    from email.message import EmailMessage
-    env = {}
-    try:
-        for line in open("/srv/1111bot/.env"):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"').strip("'")
-    except Exception as e:
-        return False, "讀 .env 失敗：%s" % e
-    user = env.get("GMAIL_USER")
-    pwd = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "")
-    to = env.get("REPORT_TO") or user
-    if not user or not pwd:
-        return False, "未設定 GMAIL_USER / GMAIL_APP_PASSWORD"
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = user; msg["To"] = to
-    msg.set_content(body)
-    msg.add_attachment(open(path, "rb").read(),
-                       maintype="application",
-                       subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       filename=name)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as sv:
-        sv.login(user, pwd); sv.send_message(msg)
-    return True, to
-
 async def cmd_amp(u, c):
     """原K 振幅分析報表（全程串流，記憶體友善）。
     用法：/amp <幣種> <往回年數 1~3>
@@ -2203,21 +2173,19 @@ async def cmd_amp(u, c):
         short_note = (f"\n{E.WARN} 資料不足：要求 {days} 天，實際 {got_days} 天\n"
                       f"OKX 最早只到 {odt}（多半是該幣上市日）")
 
-    subject = f"OKX 振幅分析 {sym} 5m 往回{years}年（{rows}根）"
-    body = (f"幣種：{sym}｜TF：5m\n"
-            f"範圍：{odt} ~ {ndt}（{got_days} 天）\n"
-            f"實際根數：{rows} 根\n"
-            f"產生時間：{now8().strftime('%Y/%m/%d %H:%M:%S')}\n")
     try:
-        ok, minfo = send_amp_mail(path, name, subject, body)
-    except Exception as e:
-        await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n"
-                       f"檔案已存於 VPS：{name}{short_note}"); return
-    if not ok:
-        await reply(u, f"{E.LOSS} 未寄送：{minfo}\n檔案已存於 VPS：{name}{short_note}"); return
-    await reply(u, f"{E.BOT} {E.OK} {sym} 振幅報表已寄出\n"
+        mb = os.path.getsize(path) / 1024 / 1024
+        size_s = f"{mb:.1f} MB"
+    except Exception:
+        size_s = "-"
+    await reply(u, f"{E.BOT} {E.OK} {sym} 振幅報表已產生\n"
                    f"範圍：{odt} ~ {ndt}（{got_days} 天）\n"
-                   f"根數：{rows}｜時間：{hhmmss()}{short_note}")
+                   f"根數：{rows}｜大小：{size_s}\n"
+                   f"檔名：{name}\n"
+                   f"時間：{hhmmss()}{short_note}\n"
+                   f"━━━━━━━━━━\n"
+                   f"下載（Mac 終端機執行）：\n"
+                   f"scp 1111bot:/srv/1111bot/data/{name} ~/Downloads/")
 
 async def cmd_coins(u, c):
     on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
