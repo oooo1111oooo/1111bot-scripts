@@ -375,14 +375,23 @@ def sl_shift(S, px, d):
         gain = float(abs(delta) / base * 100)
         return tp, nsl, cur, gain
 
-async def _place_limit(iid, pos_side, d, amb, sz, prefix="n"):
-    """掛限價單，回傳 ordId 或 None。"""
+async def _place_limit(iid, pos_side, d, amb, sz, tp, sl, prefix="n"):
+    """掛限價單（必帶 TP/SL），回傳 ordId 或 None。
+    【下單鐵則】tp/sl 為必填。委託單掛出時就帶止盈止損，成交當下即生效，
+    無裸倉空窗。這是下單的定義，不是選項 —— 寧可不下單，也不下沒有保護的單。"""
+    if tp is None or sl is None:
+        print("_place_limit 缺少 TP/SL，拒絕下單", iid, pos_side)
+        return None
     r = await api("POST", "/api/v5/trade/order", {
         "instId": iid, "tdMode": "isolated",
         "side": "buy" if d == "L" else "sell",
         "posSide": pos_side,
         "ordType": "limit", "px": str(amb), "sz": str(sz),
-        "clOrdId": prefix + uuid.uuid4().hex[:14]
+        "clOrdId": prefix + uuid.uuid4().hex[:14],
+        "attachAlgoOrds": [{
+            "tpTriggerPx": str(tp), "tpOrdPx": "-1", "tpTriggerPxType": "last",
+            "slTriggerPx": str(sl), "slOrdPx": "-1", "slTriggerPxType": "last",
+        }]
     })
     if r.get("code") == "0" and r.get("data"):
         return r["data"][0]["ordId"]
@@ -393,10 +402,13 @@ async def _cancel_order(iid, oid):
     await api("POST", "/api/v5/trade/cancel-order", {"instId": iid, "ordId": oid})
 
 
-async def _place_trigger(iid, pos_side, d, trigger_px, sz, prefix="b"):
-    """掛計劃委託（觸發後市價進場，taker），回傳 algoId 或 None。
-    後單專用：triggerPx = 前單靜態SL，觸發後以市價成交。
-    """
+async def _place_trigger(iid, pos_side, d, trigger_px, sz, tp, sl, prefix="b"):
+    """掛計劃委託（觸發後市價進場，taker，必帶 TP/SL），回傳 algoId 或 None。
+    【下單鐵則】tp/sl 為必填。委託單掛出時就帶止盈止損，觸發成交當下即生效，
+    無裸倉空窗。這是下單的定義，不是選項 —— 寧可不下單，也不下沒有保護的單。"""
+    if tp is None or sl is None:
+        print("_place_trigger 缺少 TP/SL，拒絕下單", iid, pos_side)
+        return None
     r = await api("POST", "/api/v5/trade/order-algo", {
         "instId": iid, "tdMode": "isolated",
         "side": "buy" if d == "L" else "sell",
@@ -406,7 +418,11 @@ async def _place_trigger(iid, pos_side, d, trigger_px, sz, prefix="b"):
         "triggerPx": str(trigger_px),
         "orderPx": "-1",           # -1 = 市價
         "triggerPxType": "last",   # 以最新成交價觸發
-        "algoClOrdId": prefix + uuid.uuid4().hex[:14]
+        "algoClOrdId": prefix + uuid.uuid4().hex[:14],
+        "attachAlgoOrds": [{
+            "tpTriggerPx": str(tp), "tpOrdPx": "-1", "tpTriggerPxType": "last",
+            "slTriggerPx": str(sl), "slOrdPx": "-1", "slTriggerPxType": "last",
+        }]
     })
     if r.get("code") == "0" and r.get("data"):
         return r["data"][0]["algoId"]
@@ -446,8 +462,8 @@ async def _okx_slot_check(iid):
             if ps == "long":  long_n  += 1
             if ps == "short": short_n += 1
         # 層3：計劃委託 trigger
-        r3 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
-        for o in (r3.get("data") or []):
+        _, _algos3 = await list_all_orders(iid)     # 涵蓋 trigger + oco
+        for o in _algos3:
             ps = o.get("posSide", "")
             if ps == "long":  long_n  += 1
             if ps == "short": short_n += 1
@@ -477,8 +493,21 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
             return False   # 等待期間被/stop，放棄掛單
         await asyncio.sleep(5)
 
-    # ── 掛單前標準前置：清空該幣種所有掛單 ──
-    await _pre_clear_orders(S["spec"]["iid"])
+    # ── 掛單前完整檢查：掛單 + 持倉 都必須為 0 才准部署新戰役 ──
+    # 有掛單→撤掉重檢；有持倉→等它自己出場（絕不平倉），重複同一SOP直到清空。
+    _iid0 = S["spec"]["iid"]
+    for _ in range(60):
+        await cancel_all_orders(_iid0)
+        clear, n_ord, n_pos = await _field_is_clear(_iid0)
+        if clear:
+            break
+        if not S.get("alive", True):
+            return False
+        print(f"[部署前未清空] {S['sym']} 掛單={n_ord} 持倉={n_pos}，等待中")
+        await asyncio.sleep(2)
+    else:
+        print(f"[部署前檢查逾時] {S['sym']} 放棄本次部署")
+        return False
     back_d = "S" if d == "L" else "L"
     spec   = S["spec"]
     tick   = spec["tick"]
@@ -530,13 +559,15 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     await sweep_algos(iid, back_pos)   # 清舊的後單計劃委託
 
     # 掛前單
-    front_oid = await _place_limit(iid, front_pos, d, front_amb, sz_front)
+    front_oid = await _place_limit(iid, front_pos, d, front_amb, sz_front,
+                                   front_tp, front_static_sl)
     if not front_oid:
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} 前單掛單失敗，暫停 5 秒後重試")
         return False
 
     # 掛後單（計劃委託 taker，觸發價 = back_amb）
-    back_algo_id = await _place_trigger(iid, back_pos, back_d, back_amb, sz_back)
+    back_algo_id = await _place_trigger(iid, back_pos, back_d, back_amb, sz_back,
+                                        back_tp, back_static_sl)
     if not back_algo_id:
         await _cancel_order(iid, front_oid)
         await notify(app, chat, f"{E.BOT} {E.LOSS} {S['sym']} 後單掛單失敗，暫停 5 秒後重試")
@@ -725,22 +756,32 @@ async def frame_mover(app):
                 items = [(iid, aid, sl) for iid, aid, sl, _, _s, _sf, _ef in amends]
                 okn = await amend_frames(items)
                 for iid, aid, sl, S, side, sl_field, entry_field in amends:
+                    pend = S.pop(f"_pending_sl_{side}", None)
+                    if not pend:
+                        continue
+                    nsl, npx, move_type = pend
+                    hist_key = "front_move_hist" if side == "front" else "back_move_hist"
+                    mh = S.get(hist_key)
+                    if not isinstance(mh, list):
+                        mh = []; S[hist_key] = mh
+                    label = f"{S['sym']} {S['dir'] if side == 'front' else S.get('back_d','?')}"
                     if okn:
-                        nsl, npx, move_type = S.pop(f"_pending_sl_{side}")
+                        # 成功：更新 SL、計次
                         S[sl_field] = nsl
                         move_n_key = f"{'front' if side == 'front' else 'back'}_move_n"
                         S[move_n_key] = int(S.get(move_n_key, 0)) + 1
                         S[f"_last_move_t_{side}"] = now_t
-                        label = f"{S['sym']} {S['dir'] if side == 'front' else S.get('back_d','?')}"
                         print(f"[SL移動] {label} {side} {move_type} 現價={npx} 新SL={nsl} 第{S[move_n_key]}次")
-                        if side == "front":
-                            mh = S.get("front_move_hist")
-                            if not isinstance(mh, list):
-                                mh = []; S["front_move_hist"] = mh
-                            mh.append({"t": hhmmss(), "type": move_type, "px": npx, "sl": nsl})
-                            if len(mh) > 200:
-                                S["front_move_hist"] = mh[-200:]
-                        save_state()
+                        mh.append({"t": hhmmss(), "type": move_type, "px": npx, "sl": nsl})
+                    else:
+                        # 失敗：SL 不變（上一次的 SL 仍守著），但一樣留下痕跡
+                        fail_key = f"{'front' if side == 'front' else 'back'}_move_fail_n"
+                        S[fail_key] = int(S.get(fail_key, 0)) + 1
+                        print(f"[SL移動失敗] {label} {side} 現價={npx} 欲改SL={nsl} 累計失敗{S[fail_key]}次")
+                        mh.append({"t": hhmmss(), "type": "失", "px": npx, "sl": nsl})
+                    if len(mh) > 200:
+                        S[hist_key] = mh[-200:]
+                    save_state()
 
         except asyncio.CancelledError:
             raise
@@ -750,23 +791,48 @@ async def frame_mover(app):
 
 
 
-async def _pre_clear_orders(iid):
-    """掛單前標準前置步驟：清空該幣種所有掛單，確認OKX=0才返回。"""
-    for _ in range(5):
-        r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
-        orders = r1.get("data") or []
-        r2 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
-        algos = r2.get("data") or []
+ALGO_TYPES = ("trigger", "oco")   # 本腳本用到的兩種 algo 單：觸發進場、OCO止盈止損
+
+
+async def list_all_orders(iid=None, pos_side=None):
+    """查該幣種所有掛單。回傳 (普通單list, algo單list)。
+    【統一入口】algo 單一律涵蓋 trigger + oco 兩類 ——
+    只查 trigger 會漏掉 OCO，撤不乾淨、數量也不準。全檔查掛單都走這裡。"""
+    q = f"?instId={iid}" if iid else ""
+    r1 = await api("GET", f"/api/v5/trade/orders-pending{q}")
+    orders = [o for o in (r1.get("data") or [])
+              if (not pos_side or o.get("posSide") == pos_side)]
+    algos = []
+    for ot in ALGO_TYPES:
+        sep = "&" if q else "?"
+        r2 = await api("GET", f"/api/v5/trade/orders-algo-pending{q}{sep}ordType={ot}")
+        algos += [o for o in (r2.get("data") or [])
+                  if (not pos_side or o.get("posSide") == pos_side)]
+    return orders, algos
+
+
+async def cancel_all_orders(iid=None, pos_side=None, tries=5):
+    """撤光該幣種（或該方向）所有掛單：普通單 + trigger + oco。
+    確認 OKX 回報 0 張才返回 True。絕不碰持倉。"""
+    for _ in range(tries):
+        orders, algos = await list_all_orders(iid, pos_side)
         if not orders and not algos:
             return True
         if orders:
-            await api("POST", "/api/v5/trade/cancel-batch-orders",
-                      [{"instId": o["instId"], "ordId": o["ordId"]} for o in orders])
+            for i in range(0, len(orders), 20):
+                await api("POST", "/api/v5/trade/cancel-batch-orders",
+                          [{"instId": o["instId"], "ordId": o["ordId"]} for o in orders[i:i+20]])
         if algos:
-            await api("POST", "/api/v5/trade/cancel-algos",
-                      [{"instId": o["instId"], "algoId": o["algoId"]} for o in algos])
+            for i in range(0, len(algos), 20):
+                await api("POST", "/api/v5/trade/cancel-algos",
+                          [{"instId": o["instId"], "algoId": o["algoId"]} for o in algos[i:i+20]])
         await asyncio.sleep(0.5)
     return False
+
+
+async def _pre_clear_orders(iid):
+    """掛單前標準前置步驟：清空該幣種所有掛單，確認OKX=0才返回。"""
+    return await cancel_all_orders(iid)
 
 
 async def _algo_actual_side(iid, algo_id, tries=6):
@@ -814,10 +880,12 @@ async def _query_open_fee(iid, pos_side, entry_epoch):
     return open_fee
 
 
-def _sl_block(mn, mhist):
-    """建立 SL 移動明細區塊。"""
-    lines = ["━━━━━━━━━━", f"SL移動 {mn} 次"]
-    if mn > 0 and mhist:
+def _sl_block(mn, mhist, fn=0):
+    """建立 SL 移動明細區塊。fn=失敗次數。
+    凡走過必留痕跡：成功(跟/底)與失敗(失)都列入明細，時間順序不打散。"""
+    head = f"SL移動 {mn} 次" + (f"（失敗 {fn} 次）" if fn else "")
+    lines = ["━━━━━━━━━━", head]
+    if mhist:
         for m in mhist[-20:]:
             lines.append(f"{m.get('t','')} | {m.get('type','現')} | {m.get('px','')} | 止{m.get('sl','')}")
     return "\n".join(lines)
@@ -825,11 +893,12 @@ def _sl_block(mn, mhist):
 
 async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""):
     """統一出場通知格式（與用戶核准的格式一致）。"""
-    d = S["dir"] if side == "A" else S.get("back_d", "S" if S["dir"] == "L" else "L")
+    _is_a = side.startswith("A")   # side 為 A單/B單/A補單/B補單
+    d = S["dir"] if _is_a else S.get("back_d", "S" if S["dir"] == "L" else "L")
     sym = S["sym"]
     mv = float(Decimal(str(S.get("margin", "1"))))
 
-    if side == "A":
+    if _is_a:
         entry_px  = S.get("front_px", "-")
         entry_ee  = S.get("front_ee", 0)
         static_tp = S.get("front_tp_px", "-")
@@ -843,8 +912,8 @@ async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""
         static_tp = S.get("back_tp_px", "-")
         static_sl = S.get("back_static_sl", "-")
         last_sl   = S.get("back_sl_px", "-")
-        mn        = 0
-        mhist     = []
+        mn        = int(S.get("back_move_n", 0))
+        mhist     = S.get("back_move_hist") or []
 
     entry_t = datetime.fromtimestamp(float(entry_ee), TZ8).strftime("%H:%M:%S") if entry_ee else "-"
 
@@ -862,7 +931,8 @@ async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""
     net_pct = float(net_r) / mv * 100 if mv else 0
     ico = E.WIN if net_r >= 0 else E.LOSS
 
-    sl_b = _sl_block(mn, mhist)
+    _fn = int((S.get("front_move_fail_n", 0) if _is_a else S.get("back_move_fail_n", 0)))
+    sl_b = _sl_block(mn, mhist, _fn)
 
     msg = (
         f"{E.BOT} OKX原K｜{ACCT}\n"
@@ -889,17 +959,53 @@ async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""
     return g_r, fee_r, net_r
 
 
+async def _field_is_clear(iid):
+    """戰場是否完全清空：無任何掛單(普通+trigger+oco) 且 無任何持倉。
+    回傳 (是否清空, 掛單數, 持倉數)。"""
+    orders, algos = await list_all_orders(iid)
+    n_ord = len(orders) + len(algos)
+    n_pos = 0
+    r = await api("GET", "/api/v5/account/positions?instType=SWAP")
+    if r.get("code") == "0":
+        for p in (r.get("data") or []):
+            if p.get("instId") == iid:
+                try:
+                    if float(p.get("pos") or 0) != 0:
+                        n_pos += 1
+                except Exception:
+                    pass
+    return (n_ord == 0 and n_pos == 0), n_ord, n_pos
+
+
+async def _wait_field_clear(S, iid, max_wait=3600):
+    """【SOP二 步驟3+4】等戰場完全清空。
+    絕不平倉：剩餘持倉靠自己的 TP/SL 與移動SL 出場（移動SL 是獨立任務，照常運作）。
+    仍有掛單則再撤一次（撤單可重複，持倉不動）。
+    回傳 True=已清空可繼續；False=策略已停止，放棄。"""
+    t0 = time.time()
+    while True:
+        if not S.get("alive", True):
+            return False   # /stop 或 /stopall 已停止此策略
+        clear, n_ord, n_pos = await _field_is_clear(iid)
+        if clear:
+            return True
+        if n_ord and not n_pos:
+            # 沒持倉卻還有掛單 —— 再撤一次（重複執行同一 SOP）
+            await cancel_all_orders(iid)
+        if time.time() - t0 > max_wait:
+            print(f"[等待清空逾時] {iid} 掛單={n_ord} 持倉={n_pos}")
+            return False
+        await asyncio.sleep(2)
+
+
 async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_filled):
-    """獲利出場：清另一方 → 等TF≥120s → 重新掛單。"""
+    """【SOP二】戰役結束（任一單淨損益>0）：
+    撤光所有掛單 → 剩餘持倉等它自己出場（移動SL照推，絕不平倉）
+    → 確認戰場清空 → 等TF≥120s → 用當下現價重新部署。"""
     S["pair_state"] = "idle"
     d = S["dir"]
-    if other_filled:
-        other_pos = await okx_pos(iid, other_side)
-        if other_pos:
-            await api("POST", "/api/v5/trade/close-position",
-                      {"instId": iid, "mgnMode": "cross", "posSide": other_side})
-            await asyncio.sleep(0.5)
-    await _pre_clear_orders(iid)
+    # 偵測到結束就直接撤單，不做前置檢查；涵蓋普通單+trigger+oco。絕不平倉。
+    await cancel_all_orders(iid)
     a_side = "long" if d == "L" else "short"
     b_side = other_side
     win_side_pos = a_side if winner == "A" else b_side
@@ -915,10 +1021,10 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
         reason_label, reason_code = "Manual/Unknown", "Manual"
     _ps_now = S.get("pair_state", "")
     if winner == "A":
-        _wname = "A\u88dc\u55ae" if _ps_now == "A\u88dc_B_in" else "A\u55ae"
+        _wname = "A\u88dc\u55ae" if _ps_now == "A_REFILL_B_IN" else "A\u55ae"
     else:
-        _wname = "B\u88dc\u55ae" if _ps_now == "A_in_B\u88dc" else "B\u55ae"
-    g_r, fee_r, net_r = await _notify_exit(app, chat, S, _wname, rec, open_fee, reason_label, extra="另一方已清除，重新掛單")
+        _wname = "B\u88dc\u55ae" if _ps_now == "A_IN_B_REFILL" else "B\u55ae"
+    g_r, fee_r, net_r = await _notify_exit(app, chat, S, _wname, rec, open_fee, reason_label, extra="戰役結束：已撤光掛單，等待剩餘持倉出場")
     mv = float(Decimal(str(S.get("margin", "1"))))
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason_code,
                "gross": float(g_r), "fee": float(fee_r), "net": float(net_r),
@@ -927,18 +1033,26 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
               "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
               "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
               "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
+              "back_move_n","back_move_hist",
+              "front_move_fail_n","back_move_fail_n",
               "algo_id"):
         S.pop(a, None)
     S["dir"] = S.get("locked_dir", d)
+    # 【SOP二 步驟3】等剩餘持倉自己出場 —— 絕不平倉。移動SL 是獨立任務，期間照常推。
+    if not await _wait_field_clear(S, iid):
+        return
+    # 【SOP二 步驟4】戰場確認清空後，才等TF，再用當下現價重新部署
     tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
     while True:
+        if not S.get("alive", True):
+            return
         secs_left = (int(time.time() // tf_sec) + 1) * tf_sec - time.time()
         if secs_left >= 120:
             break
         await asyncio.sleep(5)
     S["pair_state"] = "waiting"
     save_state()
-    await _place_pair(S, iid, chat, app, label="\u7372\u5229\u5f8c\u91cd\u639b")
+    await _place_pair(S, iid, chat, app, label="\u65b0\u6230\u5f79")
 
 
 async def _handle_lose_a(S, iid, chat, app, rec, pnl):
@@ -959,7 +1073,7 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
         new_sl    = align(orig_a_px * (1 + sl_pct), tick, "S")
         new_tp    = align(orig_a_px * (1 - tp_pct), tick, "L")
     open_fee = await _query_open_fee(iid, a_side, float(S.get("front_ee") or 0))
-    _aname = "A\u88dc\u55ae" if S.get("pair_state") == "A\u88dc_B_in" else "A\u55ae"
+    _aname = "A\u88dc\u55ae" if S.get("pair_state") == "A_REFILL_B_IN" else "A\u55ae"
     await _notify_exit(app, chat, S, _aname, rec, open_fee, "Stop Loss", extra=f"補A觸發委託，觸發價：{orig_a_px}")
     r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
     a_orders = [o for o in (r1.get("data") or []) if o.get("posSide") == a_side]
@@ -968,7 +1082,7 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
                   [{"instId": iid, "ordId": o["ordId"]} for o in a_orders])
         await asyncio.sleep(0.3)
     sz = Decimal(str(S.get("front_sz", "1")))
-    new_algo = await _place_trigger(iid, a_side, d, orig_a_px, sz)
+    new_algo = await _place_trigger(iid, a_side, d, orig_a_px, sz, new_tp, new_sl)
     if new_algo:
         S["front_oid"] = None
         S["front_filled"] = False
@@ -978,7 +1092,7 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
         S["front_move_n"] = 0
         S["front_move_hist"] = []
         S["algo_id"] = None
-        S["pair_state"] = "A\u88dc_B_in"
+        S["pair_state"] = "A_REFILL_B_IN"
         save_state()
         print(f"[\u88dcA] {S['sym']} {d} \u89f8\u767c\u50f9={orig_a_px}")
     else:
@@ -1005,16 +1119,16 @@ async def _handle_lose_b(S, iid, chat, app, rec, pnl):
         new_sl    = align(orig_b_px * (1 - sl_pct), tick, "L")
         new_tp    = align(orig_b_px * (1 + tp_pct), tick, "S")
     open_fee = await _query_open_fee(iid, b_side, float(S.get("back_ee") or 0))
-    _bnm = "B\u88dc\u55ae" if S.get("pair_state") == "A_in_B\u88dc" else "B\u55ae"
+    _bnm = "B\u88dc\u55ae" if S.get("pair_state") == "A_IN_B_REFILL" else "B\u55ae"
     await _notify_exit(app, chat, S, _bnm, rec, open_fee, "Stop Loss", extra=f"補B觸發委託，觸發價：{orig_b_px}")
-    r2 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
-    b_algos = [o for o in (r2.get("data") or []) if o.get("posSide") == b_side]
+    _, _algos_b = await list_all_orders(iid)       # 涵蓋 trigger + oco
+    b_algos = [o for o in _algos_b if o.get("posSide") == b_side]
     if b_algos:
         await api("POST", "/api/v5/trade/cancel-algos",
                   [{"instId": iid, "algoId": o["algoId"]} for o in b_algos])
         await asyncio.sleep(0.3)
     sz = Decimal(str(S.get("back_sz", "1")))
-    new_algo = await _place_trigger(iid, b_side, back_d, orig_b_px, sz)
+    new_algo = await _place_trigger(iid, b_side, back_d, orig_b_px, sz, new_tp, new_sl)
     if new_algo:
         S["back_algo_id"] = new_algo
         S["back_filled"] = False
@@ -1025,7 +1139,7 @@ async def _handle_lose_b(S, iid, chat, app, rec, pnl):
         S["back_tp_px"] = str(new_tp)
         cur_ps = S.get("pair_state")
         if cur_ps == "AB_in":
-            S["pair_state"] = "A_in_B\u88dc"
+            S["pair_state"] = "A_IN_B_REFILL"
         save_state()
         print(f"[\u88dcB] {S['sym']} {back_d} \u89f8\u767c\u50f9={orig_b_px}")
     else:
@@ -1094,8 +1208,8 @@ async def loop(app, chat, S):
                         f"\u52d5\u614bSL\uff1a{S['interval']}s\uff5c{S['move_pct']}%\n"
                         f"B\u55ae\u89f8\u767c\uff1a{S.get('back_px')}\n\u6642\u9593\uff1a{hhmmss()}")
 
-            elif ps in ("A_in", "A_in_B\u88dc"):
-                if ps in ("A_in", "A_in_B補") and cur_b and not S.get("back_filled"):
+            elif ps in ("A_in", "A_IN_B_REFILL"):
+                if ps in ("A_in", "A_IN_B_REFILL") and cur_b and not S.get("back_filled"):
                     bpx = Decimal(str(cur_b.get("avgPx") or cur_b.get("last") or S.get("back_px","0")))
                     S["back_filled"]  = True
                     S["back_px"]      = str(bpx)
@@ -1111,7 +1225,7 @@ async def loop(app, chat, S):
                         S["back_algo2_id"] = ba2
                     save_state()
                     print(f"[B\u9032\u5834] {S['sym']} {back_d} {bpx}")
-                    _bname = "B\u88dc\u55ae" if ps == "A_in_B\u88dc" else "B\u55ae"
+                    _bname = "B\u88dc\u55ae" if ps == "A_IN_B_REFILL" else "B\u55ae"
                     await notify(app, chat,
                         f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} {_bname}\u89f8\u767c\u9032\u5834\u6210\u4ea4\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -1130,25 +1244,31 @@ async def loop(app, chat, S):
                     continue
 
             elif ps == "AB_in":
+                # 【SOP一】兩個位置各自獨立判斷：空了就查該單損益。
+                # 只對真的出場的位置查損益 —— 沒出場的位置不參與任何判斷（不塞假的0）。
                 a_gone = not cur_a and S.get("front_filled")
                 b_gone = not cur_b and S.get("back_filled")
                 if a_gone or b_gone:
-                    after_a = int(float(S.get("front_ee", time.time())) * 1000)
-                    after_b = int(float(S.get("back_ee",  time.time())) * 1000)
-                    a_pnl, a_rec = (await _get_net_pnl(iid, a_side, after_a)) if a_gone else (Decimal("0"), None)
-                    b_pnl, b_rec = (await _get_net_pnl(iid, b_side, after_b)) if b_gone else (Decimal("0"), None)
-                    if a_pnl > 0 or b_pnl > 0:
-                        if a_pnl >= b_pnl:
-                            await _handle_win(S, iid, chat, app, "A", a_pnl, a_rec, b_side, not b_gone)
-                        else:
-                            await _handle_win(S, iid, chat, app, "B", b_pnl, b_rec, a_side, not a_gone)
+                    a_pnl = a_rec = b_pnl = b_rec = None
+                    if a_gone:
+                        after_a = int(float(S.get("front_ee", time.time())) * 1000)
+                        a_pnl, a_rec = await _get_net_pnl(iid, a_side, after_a)
+                    if b_gone:
+                        after_b = int(float(S.get("back_ee", time.time())) * 1000)
+                        b_pnl, b_rec = await _get_net_pnl(iid, b_side, after_b)
+                    # 【SOP二 步驟1】結束條件只有一個：任一單淨損益>0。不比較誰賺得多。
+                    if a_pnl is not None and a_pnl > 0:
+                        await _handle_win(S, iid, chat, app, "A", a_pnl, a_rec, b_side, not b_gone)
+                    elif b_pnl is not None and b_pnl > 0:
+                        await _handle_win(S, iid, chat, app, "B", b_pnl, b_rec, a_side, not a_gone)
                     else:
+                        # 戰役繼續：哪個位置空了就補回該位置（A空補A、B空補B）
                         if a_gone:
                             await _handle_lose_a(S, iid, chat, app, a_rec, a_pnl)
-                        if b_gone and S.get("pair_state") != "idle":
+                        if b_gone and S.get("alive", True):
                             await _handle_lose_b(S, iid, chat, app, b_rec, b_pnl)
 
-            elif ps == "A\u88dc_B_in":
+            elif ps == "A_REFILL_B_IN":
                 if cur_a and not S.get("front_filled"):
                     fpx = Decimal(str(cur_a.get("avgPx") or cur_a.get("last") or S.get("front_px","0")))
                     S["front_filled"] = True
@@ -1507,13 +1627,13 @@ async def do_stop(u, sym, iid):
     for k, S in STRATS.items():
         if S.get("sym") == sym:
             S["pair_state"] = "idle"
+            S["alive"] = False       # 讓等待清空/等TF 的迴圈立刻退出
 
     # 步驟2：批次撤掉該幣種所有掛單，直到掛單數=0
     for attempt in range(5):
         r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
         orders = r1.get("data") or []
-        r2 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
-        algos = r2.get("data") or []
+        _, algos = await list_all_orders(iid)      # 涵蓋 trigger + oco
 
         if not orders and not algos:
             break
@@ -1560,6 +1680,7 @@ async def do_stopall(u):
     # 步驟1：先設所有策略 pair_state=idle，讓所有 loop 立刻停下來
     for S in STRATS.values():
         S["pair_state"] = "idle"
+        S["alive"] = False           # 讓等待清空/等TF 的迴圈立刻退出
 
     # 步驟2：批次撤掉所有掛單，直到掛單數=0
     for attempt in range(5):
@@ -1567,8 +1688,7 @@ async def do_stopall(u):
         r1 = await api("GET", "/api/v5/trade/orders-pending")
         orders = r1.get("data") or []
         # 查所有 trigger 計劃委託
-        r2 = await api("GET", "/api/v5/trade/orders-algo-pending?ordType=trigger")
-        algos = r2.get("data") or []
+        _, algos = await list_all_orders()         # 涵蓋 trigger + oco
 
         if not orders and not algos:
             break  # 掛單全部清空，離開迴圈
@@ -1623,8 +1743,7 @@ async def cmd_status(u, c):
          f"USDT權益：{eq}", f"可用餘額：{av}", f"帳戶週期：{ACCOUNT_TF}",
          f"運行中策略：{len(alive)}個"]
     # 查計劃委託數（trigger algo）
-    algo_r = await api("GET", "/api/v5/trade/orders-algo-pending?ordType=trigger")
-    algo_list = algo_r.get("data", []) if algo_r.get("code") == "0" else []
+    _, algo_list = await list_all_orders()         # 涵蓋 trigger + oco，否則數字不準
     total_pending = len(pdl) + len(algo_list)
 
     for i, s in enumerate(alive):
