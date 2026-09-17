@@ -848,10 +848,10 @@ async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""
 
     msg = (
         f"{E.BOT} OKX原K｜{ACCT}\n"
-        f"事件：{ico} {side}單出場\n"
+        f"事件：{ico} {side}出場成交\n"
         f"━━━━━━━━━━\n"
         f"商品：{E.dir_emoji(d)} {sym} {E.dir_word(d)} {S.get('lev')}x {S.get('margin')}\n"
-        f"{side}單：{reason_label}\n"
+        f"{side}：{reason_label}\n"
         f"━━━━━━━━━━\n"
         f"進場：{entry_px} | {entry_t}\n"
         f"靜態TP：{static_tp}\n"
@@ -895,7 +895,12 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
         reason_label, reason_code = "Stop Loss", "Stop_Loss"
     else:
         reason_label, reason_code = "Manual/Unknown", "Manual"
-    g_r, fee_r, net_r = await _notify_exit(app, chat, S, winner, rec, open_fee, reason_label, extra="另一方已清除，重新掛單")
+    _ps_now = S.get("pair_state", "")
+    if winner == "A":
+        _wname = "A\u88dc\u55ae" if _ps_now == "A\u88dc_B_in" else "A\u55ae"
+    else:
+        _wname = "B\u88dc\u55ae" if _ps_now == "A_in_B\u88dc" else "B\u55ae"
+    g_r, fee_r, net_r = await _notify_exit(app, chat, S, _wname, rec, open_fee, reason_label, extra="另一方已清除，重新掛單")
     mv = float(Decimal(str(S.get("margin", "1"))))
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason_code,
                "gross": float(g_r), "fee": float(fee_r), "net": float(net_r),
@@ -936,7 +941,8 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
         new_sl    = align(orig_a_px * (1 + sl_pct), tick, "S")
         new_tp    = align(orig_a_px * (1 - tp_pct), tick, "L")
     open_fee = await _query_open_fee(iid, a_side, float(S.get("front_ee") or 0))
-    await _notify_exit(app, chat, S, "A", rec, open_fee, "Stop Loss", extra=f"補A觸發委託，觸發價：{orig_a_px}")
+    _aname = "A\u88dc\u55ae" if S.get("pair_state") == "A\u88dc_B_in" else "A\u55ae"
+    await _notify_exit(app, chat, S, _aname, rec, open_fee, "Stop Loss", extra=f"補A觸發委託，觸發價：{orig_a_px}")
     r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
     a_orders = [o for o in (r1.get("data") or []) if o.get("posSide") == a_side]
     if a_orders:
@@ -981,7 +987,8 @@ async def _handle_lose_b(S, iid, chat, app, rec, pnl):
         new_sl    = align(orig_b_px * (1 - sl_pct), tick, "L")
         new_tp    = align(orig_b_px * (1 + tp_pct), tick, "S")
     open_fee = await _query_open_fee(iid, b_side, float(S.get("back_ee") or 0))
-    await _notify_exit(app, chat, S, "B", rec, open_fee, "Stop Loss", extra=f"補B觸發委託，觸發價：{orig_b_px}")
+    _bnm = "B\u88dc\u55ae" if S.get("pair_state") == "A_in_B\u88dc" else "B\u55ae"
+    await _notify_exit(app, chat, S, _bnm, rec, open_fee, "Stop Loss", extra=f"補B觸發委託，觸發價：{orig_b_px}")
     r2 = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=trigger&instId={iid}")
     b_algos = [o for o in (r2.get("data") or []) if o.get("posSide") == b_side]
     if b_algos:
@@ -1060,7 +1067,7 @@ async def loop(app, chat, S):
                     save_state()
                     print(f"[A\u9032\u5834] {S['sym']} {d} {fpx}")
                     await notify(app, chat,
-                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} A\u55ae\u9032\u5834\u6210\u4ea4\n"
+                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} A\u55ae\u9650\u50f9\u9032\u5834\u6210\u4ea4\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         f"\u5546\u54c1\uff1a{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                         f"\u9032\u5834\uff1a{fpx} | {hhmmss()}\n"
@@ -1070,15 +1077,6 @@ async def loop(app, chat, S):
                         f"B\u55ae\u89f8\u767c\uff1a{S.get('back_px')}\n\u6642\u9593\uff1a{hhmmss()}")
 
             elif ps in ("A_in", "A_in_B\u88dc"):
-                if not cur_a:
-                    after_ms = int(float(S.get("front_ee", time.time())) * 1000)
-                    pnl, rec = await _get_net_pnl(iid, a_side, after_ms)
-                    print(f"[A\u51fa\u5834] {S['sym']} \u6de8\u640d\u76ca={pnl}")
-                    if pnl > 0:
-                        await _handle_win(S, iid, chat, app, "A", pnl, rec, b_side, S.get("back_filled", False))
-                    else:
-                        await _handle_lose_a(S, iid, chat, app, rec, pnl)
-                    continue
                 if ps in ("A_in", "A_in_B補") and cur_b and not S.get("back_filled"):
                     bpx = Decimal(str(cur_b.get("avgPx") or cur_b.get("last") or S.get("back_px","0")))
                     S["back_filled"]  = True
@@ -1095,13 +1093,23 @@ async def loop(app, chat, S):
                         S["back_algo2_id"] = ba2
                     save_state()
                     print(f"[B\u9032\u5834] {S['sym']} {back_d} {bpx}")
+                    _bname = "B\u88dc\u55ae" if ps == "A_in_B\u88dc" else "B\u55ae"
                     await notify(app, chat,
-                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} B\u55ae\u9032\u5834\u6210\u4ea4\n"
+                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} {_bname}\u89f8\u767c\u9032\u5834\u6210\u4ea4\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         f"\u5546\u54c1\uff1a{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)}\n"
                         f"\u9032\u5834\uff1a{bpx} | {hhmmss()}\n"
                         f"\u975c\u614bTP\uff1a{S['back_tp_px']}\uff08+{S['tp']}%\uff09\n"
                         f"\u975c\u614bSL\uff1a{S['back_static_sl']}\uff08-{S['sl']}%\uff09\n\u6642\u9593\uff1a{hhmmss()}")
+                if not cur_a:
+                    after_ms = int(float(S.get("front_ee", time.time())) * 1000)
+                    pnl, rec = await _get_net_pnl(iid, a_side, after_ms)
+                    print(f"[A\u51fa\u5834] {S['sym']} \u6de8\u640d\u76ca={pnl}")
+                    if pnl > 0:
+                        await _handle_win(S, iid, chat, app, "A", pnl, rec, b_side, S.get("back_filled", False))
+                    else:
+                        await _handle_lose_a(S, iid, chat, app, rec, pnl)
+                    continue
 
             elif ps == "AB_in":
                 a_gone = not cur_a and S.get("front_filled")
@@ -1139,7 +1147,14 @@ async def loop(app, chat, S):
                     save_state()
                     print(f"[A\u88dc\u9032\u5834] {S['sym']} {d} {fpx}")
                     await notify(app, chat,
-                        f"{E.BOT} A\u88dc\u55ae\u89f8\u767c\u9032\u5834\n\u5546\u54c1\uff1a{S['sym']} {E.dir_word(d)}\n\u9032\u5834\uff1a{fpx}\n\u6642\u9593\uff1a{hhmmss()}")
+                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} A\u88dc\u55ae\u89f8\u767c\u9032\u5834\u6210\u4ea4\n"
+                        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                        f"\u5546\u54c1\uff1a{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+                        f"\u9032\u5834\uff1a{fpx} | {hhmmss()}\n"
+                        f"\u975c\u614bTP\uff1a{S['front_tp_px']}\uff08+{S['tp']}%\uff09\n"
+                        f"\u975c\u614bSL\uff1a{S['front_static_sl']}\uff08-{S['sl']}%\uff09\n"
+                        f"\u52d5\u614bSL\uff1a{S['interval']}s\uff5c{S['move_pct']}%\n"
+                        f"\u6642\u9593\uff1a{hhmmss()}")
                     continue
                 if not cur_b and S.get("back_filled"):
                     after_b = int(float(S.get("back_ee", time.time())) * 1000)
