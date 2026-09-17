@@ -1927,203 +1927,189 @@ AMP_BINS = [Decimal(str(x)) for x in
             ("0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9","1.0","1.2","1.5",
              "2.0","2.5","3.0","3.5","4.0","5.0")]
 
-async def get_klines_paged(iid, bar, want):
-    """分頁往前抓 K 線（OKX 單次上限 300），回傳舊->新、只含已收線。"""
+AMP_THRESHOLDS = [
+    ("≥ 0.1%", 0.001), ("≥ 0.2%", 0.002), ("≥ 0.3%", 0.003),
+    ("≥ 0.4%", 0.004), ("≥ 0.5%", 0.005), ("≥ 0.6%", 0.006),
+    ("≥ 0.7%", 0.007), ("≥ 0.8%", 0.008), ("≥ 0.9%", 0.009),
+    ("≥ 1.0%", 0.01),  ("≥ 1.2%", 0.012), ("≥ 1.5%", 0.015),
+    ("≥ 2.0%", 0.02),  ("≥ 2.5%", 0.025), ("≥ 3.0%", 0.03),
+    ("≥ 3.5%", 0.035), ("≥ 4.0%", 0.04),  ("≥ 5.0%", 0.05),
+]
+
+
+async def amp_fetch_page(iid, after, ep):
+    """抓一頁 K 線（新->舊，只含已收線）。回傳 (list, 下一個ep, 是否到盡頭)。"""
+    q = f"/api/v5/market/{ep}?instId={iid}&bar=5m&limit=300"
+    if after:
+        q += f"&after={after}"
+    r = await pub(q)
+    batch = r.get("data") or []
+    if r.get("code") != "0" or not batch:
+        if ep == "candles" and after:
+            return [], "history-candles", False      # candles 僅近期，改歷史端點續抓
+        return [], ep, True                          # OKX 沒有更早資料（多半是該幣上市日）
     out = []
-    after = ""
-    ep = "candles"          # 近期用 candles，翻不動時自動切 history-candles
-    for _ in range(400):    # 最多 400 頁（支援整年 5m ≈ 351 頁）
-        q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit=300"
-        if after:
-            q += f"&after={after}"
-        r = await pub(q)
-        if r.get("code") != "0":
-            break
-        batch = r.get("data") or []
-        if not batch:
-            if ep == "candles" and after:
-                ep = "history-candles"      # candles 只保留近 ~1440 根，改用歷史端點續抓
+    for c in batch:
+        try:
+            if len(c) >= 9 and str(c[8]) != "1":
                 continue
-            break
-        got = []
-        for c in batch:
-            try:
-                if len(c) >= 9 and str(c[8]) != "1":
-                    continue
-                got.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
-                            "l": Decimal(c[3]), "c": Decimal(c[4])})
-            except Exception:
-                continue
-        if not got:
-            break
-        out.extend(got)                      # OKX 回傳為新->舊
-        after = str(min(int(x["ts"]) for x in got))
-        if len(out) >= want + 10:
-            break
-        await asyncio.sleep(0.15)
-    out.sort(key=lambda x: x["ts"])          # 轉成舊->新
-    seen = set(); uniq = []
-    for k in out:
-        if k["ts"] in seen:
+            out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
+                        "l": Decimal(c[3]), "c": Decimal(c[4])})
+        except Exception:
             continue
-        seen.add(k["ts"]); uniq.append(k)
-    return uniq[-want:] if want else uniq
+    if not out:
+        return [], ep, True
+    out.sort(key=lambda x: x["ts"], reverse=True)
+    return out, ep, False
 
-async def klines_paged_for_tf(iid, tf, want):
-    """依 TF 分頁取 K 線。10m 由兩根 5m 合成。"""
-    if tf == "10m":
-        return _merge2(await get_klines_paged(iid, "5m", want * 2 + 4))
-    bar = NATIVE_BARS.get(tf)
-    if not bar:
-        return None
-    return await get_klines_paged(iid, bar, want)
 
-def build_amp_xlsx(results, tf, path):
-    """振幅分析報表（多幣種，每幣一個 sheet，sheet name = 幣種）。
-    results = [(sym, kl, amps, tick), ...]  tick = OKX tickSz（Decimal）
-    欄位：幣種/週期/日期/時間/漲跌/開/高/低/收/漲跌幅%/振幅%/ABS(振幅%-漲跌幅%)/開到高/開到高%/開到低/開到低%/收到高/收到高%/收到低/收到低%
-    右側分析表：開到高% / 開到低% / 收到高% / 收到低% 門檻統計（≥0.1% ~ ≥5.0%）
+async def amp_stream_build(sym, iid, tick, years, path, notify_cb=None):
+    """【全程串流】邊抓邊算邊寫：記憶體只留當前一頁(300根)+一個跨頁接縫值。
+    OKX 回傳新->舊，直接照此序寫 Excel（最新在上），省去暫存檔與二次讀寫。
+    振幅/漲跌幅需要「前一根收盤」=同頁的下一根；跨頁時以 pending 暫存一根等下頁補算。
+    回傳 dict: rows / newest_ts / oldest_ts / want_days / short（資料不足）。
     """
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font, Alignment, PatternFill, Color
     from openpyxl.utils import get_column_letter
 
     FONT = "蘋方-繁 標準體"
-    THRESHOLDS = [
-        ("≥ 0.1%", 0.001), ("≥ 0.2%", 0.002), ("≥ 0.3%", 0.003),
-        ("≥ 0.4%", 0.004), ("≥ 0.5%", 0.005), ("≥ 0.6%", 0.006),
-        ("≥ 0.7%", 0.007), ("≥ 0.8%", 0.008), ("≥ 0.9%", 0.009),
-        ("≥ 1.0%", 0.01),  ("≥ 1.2%", 0.012), ("≥ 1.5%", 0.015),
-        ("≥ 2.0%", 0.02),  ("≥ 2.5%", 0.025), ("≥ 3.0%", 0.03),
-        ("≥ 3.5%", 0.035), ("≥ 4.0%", 0.04),  ("≥ 5.0%", 0.05),
-    ]
     TINT = 0.7999816888943144
-    fill_blue = PatternFill("solid", fgColor=Color(theme=6, tint=TINT, type="theme"))
-    fill_orng = PatternFill("solid", fgColor=Color(theme=9, tint=TINT, type="theme"))
-    fill_grn  = PatternFill("solid", fgColor=Color(theme=6, tint=0.6, type="theme"))   # 收到高群組
-    fill_red  = PatternFill("solid", fgColor=Color(theme=9, tint=0.6, type="theme"))   # 收到低群組
+    f_blue = PatternFill("solid", fgColor=Color(theme=6, tint=TINT, type="theme"))
+    f_orng = PatternFill("solid", fgColor=Color(theme=9, tint=TINT, type="theme"))
+    f_grn  = PatternFill("solid", fgColor=Color(theme=6, tint=0.6, type="theme"))
+    f_red  = PatternFill("solid", fgColor=Color(theme=9, tint=0.6, type="theme"))
+    hdr = Font(name=FONT, bold=True, size=11)
+    dat = Font(name=FONT, size=11)
+    lft = Alignment(horizontal="left")
+    cen = Alignment(horizontal="center")
 
-    wb = Workbook()
-    wb.remove(wb.active)
+    dp = max(0, -tick.as_tuple().exponent)
+    pfmt = "0" if dp == 0 else "0." + "0" * dp
+    P4, P4N, P2 = "0.0000%", "0.0000%;[Red]\\-0.0000%", "0.00%"
 
-    for sym, kl, amps, tick in results:
-        dp = max(0, -tick.as_tuple().exponent)
-        price_fmt = "0" if dp == 0 else "0." + "0" * dp
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(title=sym)
+    for ci, w in {1: 4.4, 2: 12.8, 3: 6.8, 4: 16.8, 5: 11.4, 6: 6.8, 7: 11.2,
+                  11: 13.6, 12: 12.2, 13: 13.0, 14: 9.4, 15: 12.2, 16: 9.0,
+                  17: 12.2, 18: 3.0, 19: 9.4, 20: 12.2, 21: 9.0, 22: 12.2,
+                  23: 3.0, 24: 16.0, 25: 6.8, 26: 13.0, 27: 3.0, 28: 16.0,
+                  29: 6.8, 30: 13.0, 31: 3.0, 32: 16.0, 33: 6.8, 34: 13.0,
+                  35: 3.0, 36: 16.0, 37: 6.8, 38: 13.0}.items():
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "B3"
 
-        ws = wb.create_sheet(title=sym)
-        hdr = Font(name=FONT, bold=True, size=11)
-        dat = Font(name=FONT, size=11)
-        lft = Alignment(horizontal="left")
-        cen = Alignment(horizontal="center")
+    def C(v, font=dat, fmt=None, align=None, fill=None):
+        c = WriteOnlyCell(ws, value=v)
+        c.font = font
+        if fmt:   c.number_format = fmt
+        if align: c.alignment = align
+        if fill:  c.fill = fill
+        return c
 
-        # 主欄標頭（row 2，col B~U）
-        # B=幣種 C=週期 D=日期 E=時間 F=漲跌
-        # G=開 H=高 I=低 J=收
-        # K=漲跌幅% L=振幅% M=ABS(振幅%-漲跌幅%)
-        # N=開到高 O=開到高% P=開到低 Q=開到低%
-        # R=收到高 S=收到高% T=收到低 U=收到低%
-        main_heads = ["幣種", "週期", "日期", "時間", "漲跌",
-                      "開", "高", "低", "收", "漲跌幅%", "振幅%", "ABS(振幅%-漲跌幅%)",
-                      "開到高", "開到高%", "開到低", "開到低%",
-                      "收到高", "收到高%", "收到低", "收到低%"]
-        fills_main = [fill_blue] * 12 + [fill_blue] * 4 + [fill_grn] * 4
-        for ci, (h, f) in enumerate(zip(main_heads, fills_main), start=2):
-            c = ws.cell(row=2, column=ci, value=h)
-            c.font = hdr; c.alignment = cen; c.fill = f
+    def blank_row():
+        return [None] * 37
 
-        # 分析表標頭（row 2）：W/X/Y 淡藍（開到高%），AA/AB/AC 淡橘（開到低%）
-        #                       AE/AF/AG 收到高%，AI/AJ/AK 收到低%
-        # col: 23=W 24=X 25=Y  27=AA 28=AB 29=AC  31=AE 32=AF 33=AG  35=AI 36=AJ 37=AK
-        for col, label, fill in [
-            (23, "開到高%門檻", fill_blue), (24, "根數", fill_blue), (25, "佔比", fill_blue),
-            (27, "開到低%門檻", fill_orng), (28, "根數", fill_orng), (29, "佔比", fill_orng),
-            (31, "收到高%門檻", fill_grn),  (32, "根數", fill_grn),  (33, "佔比", fill_grn),
-            (35, "收到低%門檻", fill_red),  (36, "根數", fill_red),  (37, "佔比", fill_red),
-        ]:
-            c = ws.cell(row=2, column=col, value=label)
-            c.font = hdr; c.alignment = lft; c.fill = fill
+    # row1：分析表總數（串流無法回頭改，故用整欄 COUNT）
+    r1 = blank_row()
+    for col, f in ((24, "=COUNT($O:$O)"), (28, "=COUNT($Q:$Q)"),
+                   (32, "=COUNT($S:$S)"), (36, "=COUNT($U:$U)")):
+        r1[col - 1] = C(f, font=hdr)
+    ws.append(r1)
 
-        # 資料行（row 3 起）
-        for i, (k, (amp, chg)) in enumerate(zip(kl, amps)):
-            r = i + 3
-            dt = datetime.fromtimestamp(int(k["ts"]) / 1000, TZ8)
-            o = float(k["o"]); h = float(k["h"])
-            lo = float(k["l"]); cl = float(k["c"])
-            chg_pct = (cl - o) / o if o else 0
-            amp_pct = (h - lo) / o if o else 0
-            abs_diff = abs(amp_pct - chg_pct)
-            h2o = h - o;  h2o_pct = h2o / o if o else 0
-            l2o = o - lo; l2o_pct = l2o / o if o else 0
-            h2c = h - cl; h2c_pct = h2c / cl if cl else 0   # 收到高
-            c2l = cl - lo; c2l_pct = c2l / cl if cl else 0  # 收到低
-            flag = E.UP if cl >= o else E.DOWN
-            vals = [sym, tf, dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S"),
-                    flag, o, h, lo, cl, chg_pct, amp_pct, abs_diff,
-                    round(h2o, dp), h2o_pct, round(l2o, dp), l2o_pct,
-                    round(h2c, dp), h2c_pct, round(c2l, dp), c2l_pct]
-            for ci, v in enumerate(vals, start=2):
-                ws.cell(row=r, column=ci, value=v).font = dat
-            # 價格欄（開/高/低/收/開到高/開到低/收到高/收到低）
-            for ci in [7, 8, 9, 10, 14, 16, 18, 20]:
-                ws.cell(r, ci).number_format = price_fmt
-            # 漲跌幅%
-            ws.cell(r, 11).number_format = "0.0000%;[Red]\\-0.0000%"
-            # 振幅%、ABS差、開到高%、開到低%、收到高%、收到低%
-            for ci in [12, 13, 15, 17, 19, 21]:
-                ws.cell(r, ci).number_format = "0.0000%"
+    # row2：主欄標頭 + 分析表標頭
+    heads = ["幣種", "週期", "日期", "時間", "漲跌", "開", "高", "低", "收",
+             "漲跌幅%", "振幅%", "ABS(振幅%-漲跌幅%)", "開到高", "開到高%",
+             "開到低", "開到低%", "收到高", "收到高%", "收到低", "收到低%"]
+    fills = [f_blue] * 16 + [f_grn] * 4
+    r2 = blank_row()
+    for ci, (h, fl) in enumerate(zip(heads, fills), start=2):
+        r2[ci - 1] = C(h, font=hdr, align=cen, fill=fl)
+    for col, lb, fl in ((23, "開到高%門檻", f_blue), (24, "根數", f_blue), (25, "佔比", f_blue),
+                        (27, "開到低%門檻", f_orng), (28, "根數", f_orng), (29, "佔比", f_orng),
+                        (31, "收到高%門檻", f_grn),  (32, "根數", f_grn),  (33, "佔比", f_grn),
+                        (35, "收到低%門檻", f_red),  (36, "根數", f_red),  (37, "佔比", f_red)):
+        r2[col - 1] = C(lb, font=hdr, align=lft, fill=fl)
+    ws.append(r2)
 
-        # 分析表（row 1 SUM，row 3+ 門檻）
-        last_r = len(kl) + 2
-        # 開到高% → 欄 O(15)，根數欄 X(24)
-        ws.cell(1, 24, f"=COUNT($O3:$O{last_r})").font = Font(name=FONT, bold=True, size=11)
-        # 開到低% → 欄 Q(17)，根數欄 AB(28)
-        ws.cell(1, 28, f"=COUNT($Q3:$Q{last_r})").font = Font(name=FONT, bold=True, size=11)
-        # 收到高% → 欄 S(19)，根數欄 AF(32)
-        ws.cell(1, 32, f"=COUNT($S3:$S{last_r})").font = Font(name=FONT, bold=True, size=11)
-        # 收到低% → 欄 U(21)，根數欄 AJ(36)
-        ws.cell(1, 36, f"=COUNT($U3:$U{last_r})").font = Font(name=FONT, bold=True, size=11)
+    want_days  = 365 * years
+    horizon_ms = want_days * 86400 * 1000
+    newest_ts = oldest_ts = None
+    rows = 0
+    pending = None
+    after, ep = "", "candles"
+    short = False
 
-        for ti, (label, dec) in enumerate(THRESHOLDS):
-            tr = ti + 3
-            ps = f">={dec}"
-            # 開到高%
-            ws.cell(tr, 23, label).font = dat; ws.cell(tr, 23).alignment = lft
-            ws.cell(tr, 24, f'=COUNTIF({sym}!$O3:$O{last_r},"{ps}")').font = dat
-            c = ws.cell(tr, 25, f"=X{tr}/X$1"); c.font = dat; c.number_format = "0.00%"
-            # 開到低%
-            ws.cell(tr, 27, label).font = dat; ws.cell(tr, 27).alignment = lft
-            ws.cell(tr, 28, f'=COUNTIF({sym}!$Q3:$Q{last_r},"{ps}")').font = dat
-            c = ws.cell(tr, 29, f"=AB{tr}/AB$1"); c.font = dat; c.number_format = "0.00%"
-            # 收到高%
-            ws.cell(tr, 31, label).font = dat; ws.cell(tr, 31).alignment = lft
-            ws.cell(tr, 32, f'=COUNTIF({sym}!$S3:$S{last_r},"{ps}")').font = dat
-            c = ws.cell(tr, 33, f"=AF{tr}/AF$1"); c.font = dat; c.number_format = "0.00%"
-            # 收到低%
-            ws.cell(tr, 35, label).font = dat; ws.cell(tr, 35).alignment = lft
-            ws.cell(tr, 36, f'=COUNTIF({sym}!$U3:$U{last_r},"{ps}")').font = dat
-            c = ws.cell(tr, 37, f"=AJ{tr}/AJ$1"); c.font = dat; c.number_format = "0.00%"
+    for page in range(years * 500 + 100):
+        page_k, ep, done = await amp_fetch_page(iid, after, ep)
+        if done:
+            short = True              # OKX 已無更早資料
+            break
+        if not page_k:
+            continue
 
-        # Row/Col 字體
-        for rd in ws.row_dimensions.values():
-            rd.font = Font(name=FONT, size=11)
-        for cd in ws.column_dimensions.values():
-            cd.font = Font(name=FONT, size=11)
+        if newest_ts is None:
+            newest_ts = page_k[0]["ts"]
 
-        # 欄寬
-        col_widths = {
-            1: 4.4,   2: 12.8,  3: 6.8,   4: 16.8,  5: 11.4,
-            6: 6.8,   7: 11.2,  11: 13.6, 12: 12.2, 13: 13.0,
-            14: 9.4,  15: 12.2, 16: 9.0,  17: 12.2, 18: 3.0,
-            19: 9.4,  20: 12.2, 21: 9.0,  22: 12.2, 23: 3.0,
-            24: 16.0, 25: 6.8,  26: 13.0, 27: 3.0,  28: 16.0,
-            29: 6.8,  30: 13.0, 31: 3.0,  32: 16.0, 33: 6.8,
-            34: 13.0, 35: 3.0,  36: 16.0, 37: 6.8,  38: 13.0,
-        }
-        for ci, w in col_widths.items():
-            ws.column_dimensions[get_column_letter(ci)].width = w
-        ws.freeze_panes = "B3"
+        work = ([pending] if pending else []) + page_k
+        pending = work[-1]            # 本頁最舊一根，留待下一頁當它的前收
+        stop = False
+
+        for i in range(len(work) - 1):
+            k = work[i]
+            if (newest_ts - k["ts"]) > horizon_ms:
+                stop = True           # 已達要求年限
+                break
+            prev_c = work[i + 1]["c"]
+            ts_i = k["ts"]
+            dt = datetime.fromtimestamp(ts_i / 1000, TZ8)
+            o, h, lo, cl = float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"])
+            pc = float(prev_c) or o
+            chg = (cl - pc) / pc if pc else 0
+            amp = (h - lo) / pc if pc else 0
+            h2o, l2o = h - o, o - lo
+            h2c, c2l = h - cl, cl - lo
+            row = blank_row()
+            vals = [sym, "5m", dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S"),
+                    (E.KLINE_UP if cl >= o else E.KLINE_DOWN),
+                    o, h, lo, cl, chg, amp, abs(amp - chg),
+                    round(h2o, dp), (h2o / o if o else 0),
+                    round(l2o, dp), (l2o / o if o else 0),
+                    round(h2c, dp), (h2c / cl if cl else 0),
+                    round(c2l, dp), (c2l / cl if cl else 0)]
+            fmts = [None, None, None, None, None,
+                    pfmt, pfmt, pfmt, pfmt, P4N, P4, P4,
+                    pfmt, P4, pfmt, P4, pfmt, P4, pfmt, P4]
+            for ci, (v, fm) in enumerate(zip(vals, fmts), start=2):
+                row[ci - 1] = C(v, fmt=fm)
+
+            # 前 18 列資料同時帶出右側門檻分析表（串流只能一次寫完一列）
+            if rows < len(AMP_THRESHOLDS):
+                lb, dv = AMP_THRESHOLDS[rows]
+                tr = rows + 3
+                for lab_c, cnt_c, pct_c, src in ((23, 24, 25, "O"), (27, 28, 29, "Q"),
+                                                 (31, 32, 33, "S"), (35, 36, 37, "U")):
+                    row[lab_c - 1] = C(lb, align=lft)
+                    row[cnt_c - 1] = C(f'=COUNTIF(${src}:${src},">={dv}")')
+                    ltr = get_column_letter(cnt_c)
+                    row[pct_c - 1] = C(f"={ltr}{tr}/{ltr}$1", fmt=P2)
+
+            ws.append(row)
+            oldest_ts = ts_i
+            rows += 1
+
+        if stop:
+            break
+        after = str(min(x["ts"] for x in page_k))
+        if notify_cb and page and page % 60 == 0:
+            await notify_cb(rows, oldest_ts)
+        await asyncio.sleep(0.05)     # 同時讓出控制權，移動SL不受影響
 
     wb.save(path)
+    return {"rows": rows, "newest_ts": newest_ts, "oldest_ts": oldest_ts,
+            "want_days": want_days, "short": short}
+
 
 def send_amp_mail(path, name, subject, body):
     """寄出振幅報表。回傳 (ok, 訊息)。"""
@@ -2156,72 +2142,82 @@ def send_amp_mail(path, name, subject, body):
     return True, to
 
 async def cmd_amp(u, c):
-    """原K 振幅分析報表（單幣種整年 Excel 寄信）。
-    用法：/amp <幣種> <年份>
-    例：/amp ETHUSDT 2025
-    TF 固定 5m，抓整年資料，產生 Excel 寄到信箱。
+    """原K 振幅分析報表（全程串流，記憶體友善）。
+    用法：/amp <幣種> <往回年數 1~3>
+    例：/amp BTCUSDT 1  → 從OKX最新一根往回抓 365 天
+    以「往回 N 年」取代指定年份：各幣上市日不同，往回抓永遠從有資料處開始，
+    抓不滿會明確回報實際天數與最早日期，不會卡住。TF 固定 5m。
     """
-    fmt = f"{E.BOT} 用法：/amp <幣種> <年份>\n例：/amp ETHUSDT 2025\nTF 固定 5m，產生整年 Excel 寄到信箱"
+    fmt = (f"{E.BOT} 用法：/amp <幣種> <往回年數>\n"
+           f"例：/amp BTCUSDT 1\n"
+           f"年數只接受 1~3（1=365天, 2=730天, 3=1095天）\n"
+           f"TF 固定 5m，產生 Excel 寄到信箱")
     if not c.args or len(c.args) != 2:
         await reply(u, fmt); return
     sym = c.args[0].upper()
     try:
-        year = int(c.args[1])
-        if not 2020 <= year <= 2030:
+        years = int(c.args[1])
+        if years not in (1, 2, 3):
             raise ValueError
     except (ValueError, TypeError):
-        await reply(u, f"{E.LOSS} 年份格式錯誤，例：2025"); return
+        await reply(u, f"{E.LOSS} 年數只接受 1、2、3\n{fmt}"); return
 
-    tf = "5m"
-    # 計算該年的起訖 timestamp（ms）
-    from calendar import isleap
-    days = 366 if isleap(year) else 365
-    n = 12 * 24 * days  # 整年 5m 根數
-    ts_start = int(datetime(year, 1, 1, 0, 0, 0, tzinfo=TZ8).timestamp() * 1000)
-    ts_end   = int(datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=TZ8).timestamp() * 1000)
-
+    days = 365 * years
+    est  = 288 * days
     await reply(u, f"{E.BOT} 振幅分析報表中…\n"
-                   f"幣種：{sym}\nTF：{tf}｜{year}全年（{days}天，約{n}根）\n"
-                   f"預計需要 5~10 分鐘，請稍候…")
+                   f"幣種：{sym}｜TF：5m\n"
+                   f"範圍：從OKX最新一根往回 {days} 天（約{est}根）\n"
+                   f"全程串流寫入，不影響進行中的策略\n"
+                   f"時間：{hhmmss()}")
     try:
         spec = await get_spec(sym)
     except Exception:
         await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
 
-    # 抓整年 K 線（帶起訖時間過濾）
-    try:
-        kl_raw = await get_klines_paged(spec["iid"], "5m", n)
-    except Exception as e:
-        await reply(u, f"{E.LOSS} K 線抓取失敗：{type(e).__name__}: {e}"); return
-
-    # 只保留該年度的 K 線
-    kl = [k for k in kl_raw if ts_start <= k["ts"] < ts_end]
-    if not kl:
-        await reply(u, f"{E.LOSS} {sym} {year} 年無資料"); return
-
-    amps = calc_amp(kl)
-    results = [(sym, kl, amps, spec["tick"])]
-
-    day = now8().strftime("%Y%m%d")
-    name = f"OKX.{sym}.5m.{year}.{day}.xlsx"
+    day  = now8().strftime("%Y%m%d")
+    name = f"OKX.{sym}.5m.{years}Y.{day}.xlsx"
     path = f"/srv/1111bot/data/{name}"
-    try:
-        build_amp_xlsx(results, tf, path)
-    except Exception as e:
-        await reply(u, f"{E.LOSS} 產生 Excel 失敗：{type(e).__name__}: {e}"); return
 
-    subject = f"OKX 振幅分析 {sym} 5m {year}全年（{len(kl)}根）"
-    body = (f"幣種：{sym}｜TF：5m｜{year}全年\n"
-            f"實際根數：{len(kl)} 根（{days}天）\n"
+    async def _progress(rows, oldest_ts):
+        if oldest_ts:
+            od = datetime.fromtimestamp(oldest_ts / 1000, TZ8).strftime("%Y-%m-%d")
+            print(f"[amp] {sym} 已寫 {rows} 根，最舊 {od}")
+
+    try:
+        info = await amp_stream_build(sym, spec["iid"], spec["tick"], years, path,
+                                      notify_cb=_progress)
+    except Exception as e:
+        await reply(u, f"{E.LOSS} 產生失敗：{type(e).__name__}: {e}"); return
+
+    rows = info["rows"]
+    if not rows:
+        await reply(u, f"{E.LOSS} {sym} 查無資料"); return
+
+    nts, ots = info["newest_ts"], info["oldest_ts"]
+    ndt = datetime.fromtimestamp(nts / 1000, TZ8).strftime("%Y-%m-%d") if nts else "-"
+    odt = datetime.fromtimestamp(ots / 1000, TZ8).strftime("%Y-%m-%d") if ots else "-"
+    got_days = int((nts - ots) / 86400000) + 1 if (nts and ots) else 0
+
+    short_note = ""
+    if info["short"] or got_days < days - 2:
+        short_note = (f"\n{E.WARN} 資料不足：要求 {days} 天，實際 {got_days} 天\n"
+                      f"OKX 最早只到 {odt}（多半是該幣上市日）")
+
+    subject = f"OKX 振幅分析 {sym} 5m 往回{years}年（{rows}根）"
+    body = (f"幣種：{sym}｜TF：5m\n"
+            f"範圍：{odt} ~ {ndt}（{got_days} 天）\n"
+            f"實際根數：{rows} 根\n"
             f"產生時間：{now8().strftime('%Y/%m/%d %H:%M:%S')}\n")
     try:
-        ok, info = send_amp_mail(path, name, subject, body)
+        ok, minfo = send_amp_mail(path, name, subject, body)
     except Exception as e:
-        await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n檔案已存於 VPS：{name}"); return
+        await reply(u, f"{E.LOSS} 寄送失敗：{type(e).__name__}: {e}\n"
+                       f"檔案已存於 VPS：{name}{short_note}"); return
     if not ok:
-        await reply(u, f"{E.LOSS} 未寄送：{info}\n檔案已存於 VPS：{name}"); return
-    await reply(u, f"{E.BOT} {E.OK} {sym} {year}全年振幅報表已寄出\n"
-                   f"TF：5m｜實際根數：{len(kl)}\n時間：{hhmmss()}")
+        await reply(u, f"{E.LOSS} 未寄送：{minfo}\n檔案已存於 VPS：{name}{short_note}"); return
+    await reply(u, f"{E.BOT} {E.OK} {sym} 振幅報表已寄出\n"
+                   f"範圍：{odt} ~ {ndt}（{got_days} 天）\n"
+                   f"根數：{rows}｜時間：{hhmmss()}{short_note}")
 
 async def cmd_coins(u, c):
     on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
