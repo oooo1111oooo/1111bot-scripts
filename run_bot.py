@@ -568,15 +568,34 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     return True
 
 
-async def _naked_guard(app, S, side, now_t):
-    """守門狗：偵測『OKX 上有倉、但沒掛止盈止損』的裸倉。
+async def _okx_has_oco(iid, ps):
+    """直接問 OKX：這個持倉方向上有沒有活著的 OCO(止盈止損)單。
+    完全不看程式內部旗標 —— 守門狗要抓的正是『程式記錯』的情況。"""
+    try:
+        r = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=oco&instId={iid}")
+        if r.get("code") != "0":
+            return None  # 查不到就不判定，避免誤報
+        for o in (r.get("data") or []):
+            if o.get("posSide") == ps:
+                return True
+        return False
+    except Exception as e:
+        print("查 OCO 失敗", type(e).__name__, e)
+        return None
+
+
+async def _naked_guard(app, S, iid, ps, tag, now_t):
+    """守門狗：OKX 上有倉、但 OKX 上沒有對應 OCO → 裸倉。
+    判定一律以 OKX 為準，不看 back_filled / algo_id 等內部旗標。
     超過 NAKED_ALERT_SEC 秒 → 只發一次 TG 告警，絕不自動平倉（平倉一律人工）。"""
     if S.get("closing"):
         return
-    aid_field   = "algo_id" if side == "front" else "back_algo2_id"
-    since_key   = f"_naked_since_{side}"
-    alerted_key = f"_naked_alerted_{side}"
-    if S.get(aid_field):
+    since_key   = f"_naked_since_{ps}"
+    alerted_key = f"_naked_alerted_{ps}"
+    has_oco = await _okx_has_oco(iid, ps)
+    if has_oco is None:
+        return
+    if has_oco:
         S.pop(since_key, None)
         S.pop(alerted_key, None)
         return
@@ -586,17 +605,14 @@ async def _naked_guard(app, S, side, now_t):
         return
     if now_t - float(t0) >= NAKED_ALERT_SEC and not S.get(alerted_key):
         S[alerted_key] = True
-        if side == "front":
-            label = "A（前單）"; dw = E.dir_word(S["dir"])
-        else:
-            label = "B（後單）"; dw = E.dir_word(S.get("back_d", "S" if S["dir"] == "L" else "L"))
         await notify(app, S.get("chat") or CHAT_ID,
-            f"{E.BOT} {E.LOSS} 守門狗警告：裸倉未掛止盈止損\n"
-            f"━━━━━━━━━━\n"
-            f"商品：{S['sym']} {dw}（{label}）\n"
-            f"已裸倉：{int(now_t - float(t0))} 秒\n"
-            f"這筆持倉在 OKX 上目前沒有止盈止損單，請至 OKX 手動處理。\n"
-            f"時間：{hhmmss()}")
+            f"{E.BOT} {E.WARN} \u5b88\u9580\u72d7\u8b66\u544a\uff1a\u88f8\u5009\u672a\u639b\u6b62\u76c8\u6b62\u640d\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\u5546\u54c1\uff1a{S['sym']} {tag}\n"
+            f"\u65b9\u5411\uff1a{ps}\n"
+            f"\u5df2\u88f8\u5009\uff1a{int(now_t - float(t0))} \u79d2\n"
+            f"OKX \u4e0a\u67e5\u4e0d\u5230\u6b64\u6301\u5009\u7684\u6b62\u76c8\u6b62\u640d\u55ae\uff0c\u8acb\u81f3 OKX \u624b\u52d5\u8655\u7406\u3002\n"
+            f"\u6642\u9593\uff1a{hhmmss()}")
 
 
 async def frame_mover(app):
@@ -625,19 +641,21 @@ async def frame_mover(app):
                     cur_front = await okx_pos(iid, front_ps)
                     back_d_v  = S.get("back_d", "S" if d == "L" else "L")
                     back_ps   = "long" if back_d_v == "L" else "short"
-                    cur_back  = await okx_pos(iid, back_ps) if S.get("back_filled") else None
+                    # 守門狗：B 邊一律查 OKX，不看 back_filled —— 孤兒倉正是旗標為 False 的那種
+                    cur_back  = await okx_pos(iid, back_ps)
                     if cur_front:
                         active.append((S, "front", d, front_ps, "front_sl_px", "algo_id", cur_front))
-                        await _naked_guard(app, S, "front", now_t)
+                        await _naked_guard(app, S, iid, front_ps, "A/\u524d\u55ae", now_t)
                     else:
-                        S.pop("_naked_since_front", None)
-                        S.pop("_naked_alerted_front", None)
+                        S.pop(f"_naked_since_{front_ps}", None)
+                        S.pop(f"_naked_alerted_{front_ps}", None)
                     if cur_back:
-                        active.append((S, "back", back_d_v, back_ps, "back_sl_px", "back_algo2_id", cur_back))
-                        await _naked_guard(app, S, "back", now_t)
+                        await _naked_guard(app, S, iid, back_ps, "B/\u5f8c\u55ae", now_t)
+                        if S.get("back_filled"):
+                            active.append((S, "back", back_d_v, back_ps, "back_sl_px", "back_algo2_id", cur_back))
                     else:
-                        S.pop("_naked_since_back", None)
-                        S.pop("_naked_alerted_back", None)
+                        S.pop(f"_naked_since_{back_ps}", None)
+                        S.pop(f"_naked_alerted_{back_ps}", None)
                 except Exception as e:
                     print("frame_mover 查持倉錯誤", S.get("sym"), type(e).__name__, e)
             if not active:
