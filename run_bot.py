@@ -748,7 +748,9 @@ async def frame_mover(app):
                 if not algo_id:
                     continue
 
-                move_type = "跟" if abs(profit_pct) >= move_pct and profit_pct != move_pct else "底"
+                # ✅=實際獲利推進（profit>move_pct）；⏱️=時間到的固定小移動（依move_pct）
+                # 不取abs：虧損時 profit_pct 為負，必須歸類為 ⏱️，不可誤判為獲利推進
+                move_type = E.MOVE_PROFIT if profit_pct > move_pct else E.MOVE_TIME
                 S[f"_pending_sl_{side}"] = (str(nsl), str(cur_px), move_type)
                 amends.append((S["spec"]["iid"], algo_id, nsl, S, side, sl_field, entry_field))
 
@@ -778,7 +780,7 @@ async def frame_mover(app):
                         fail_key = f"{'front' if side == 'front' else 'back'}_move_fail_n"
                         S[fail_key] = int(S.get(fail_key, 0)) + 1
                         print(f"[SL移動失敗] {label} {side} 現價={npx} 欲改SL={nsl} 累計失敗{S[fail_key]}次")
-                        mh.append({"t": hhmmss(), "type": "失", "px": npx, "sl": nsl})
+                        mh.append({"t": hhmmss(), "type": E.MOVE_FAIL, "px": npx, "sl": nsl})
                     if len(mh) > 200:
                         S[hist_key] = mh[-200:]
                     save_state()
@@ -880,15 +882,30 @@ async def _query_open_fee(iid, pos_side, entry_epoch):
     return open_fee
 
 
+def _move_stat(mhist):
+    """統計三類移動次數：✅獲利推進 / ⏱️時間小移動 / 🚫API失敗。"""
+    p = t = f = 0
+    for m in (mhist or []):
+        ty = m.get("type", "")
+        if ty == E.MOVE_PROFIT:  p += 1
+        elif ty == E.MOVE_TIME:  t += 1
+        elif ty == E.MOVE_FAIL:  f += 1
+    return p, t, f
+
+
 def _sl_block(mn, mhist, fn=0):
-    """建立 SL 移動明細區塊。fn=失敗次數。
-    凡走過必留痕跡：成功(跟/底)與失敗(失)都列入明細，時間順序不打散。"""
-    head = f"SL移動 {mn} 次" + (f"（失敗 {fn} 次）" if fn else "")
+    """建立 SL 移動明細區塊。
+    凡走過必留痕跡：✅獲利推進、⏱️時間小移動、🚫API失敗 全部列入，時間序不打散。"""
+    p, t, f = _move_stat(mhist)
+    head = f"SL移動 {mn} 次"
+    if p or t or f:
+        head += f"（{E.MOVE_PROFIT}{p} {E.MOVE_TIME}{t} {E.MOVE_FAIL}{f}）"
     lines = ["━━━━━━━━━━", head]
     if mhist:
         for m in mhist[-20:]:
-            lines.append(f"{m.get('t','')} | {m.get('type','現')} | {m.get('px','')} | 止{m.get('sl','')}")
+            lines.append(f"{m.get('t','')} | {m.get('type','')} | {m.get('px','')} | 止{m.get('sl','')}")
     return "\n".join(lines)
+
 
 
 async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""):
@@ -1838,14 +1855,13 @@ async def cmd_status(u, c):
         elif front_in:
             sl_d = s.get("front_sl_px", "-")
             mn   = s.get("front_move_n", 0)
-            L.append(f"前：{tp_f}｜📍{amb_f}｜動態SL:{sl_d}（{mn}次）")
             mhist = s.get("front_move_hist") or []
-            prev_px = None
-            for mrec in mhist:
-                cur_px = mrec.get("px", "")
-                arrow = E.price_emoji(cur_px, prev_px) if prev_px else "🔸"
-                L.append(f"  {mrec.get('t','')} | {arrow} | {cur_px} | 止{mrec.get('sl','')}")
-                prev_px = cur_px
+            _p, _t, _f = _move_stat(mhist)
+            _stat = f"｜{E.MOVE_PROFIT}{_p} {E.MOVE_TIME}{_t} {E.MOVE_FAIL}{_f}" if (_p or _t or _f) else ""
+            L.append(f"前：{tp_f}｜📍{amb_f}｜動態SL:{sl_d}（{mn}次{_stat}）")
+            for mrec in mhist[-20:]:
+                L.append(f"  {mrec.get('t','')} | {mrec.get('type','')} | "
+                         f"{mrec.get('px','')} | 止{mrec.get('sl','')}")
 
         # 後單資訊（TP/SL 以OKX實際掛單為主）
         _tp_ob, _sl_ob = await okx_tpsl(iid_s, _bps)
