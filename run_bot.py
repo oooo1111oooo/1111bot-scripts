@@ -898,19 +898,22 @@ async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""
     sym = S["sym"]
     mv = float(Decimal(str(S.get("margin", "1"))))
 
+    _pos_side = ("long" if d == "L" else "short")
+    _iid_x = S["spec"]["iid"]
+    _otp, _osl = await okx_tpsl(_iid_x, _pos_side)   # 以OKX為主：出場當下查實際掛的TP/SL
     if _is_a:
         entry_px  = S.get("front_px", "-")
         entry_ee  = S.get("front_ee", 0)
-        static_tp = S.get("front_tp_px", "-")
-        static_sl = S.get("front_static_sl", "-")
+        static_tp = _otp or S.get("front_tp_px", "-")
+        static_sl = _osl or S.get("front_static_sl", "-")
         last_sl   = S.get("front_sl_px", "-")
         mn        = int(S.get("front_move_n", 0))
         mhist     = S.get("front_move_hist") or []
     else:
         entry_px  = S.get("back_px", "-")
         entry_ee  = S.get("back_ee", 0)
-        static_tp = S.get("back_tp_px", "-")
-        static_sl = S.get("back_static_sl", "-")
+        static_tp = _otp or S.get("back_tp_px", "-")
+        static_sl = _osl or S.get("back_static_sl", "-")
         last_sl   = S.get("back_sl_px", "-")
         mn        = int(S.get("back_move_n", 0))
         mhist     = S.get("back_move_hist") or []
@@ -957,6 +960,37 @@ async def _notify_exit(app, chat, S, side, rec, open_fee, reason_label, extra=""
     )
     await notify(app, chat, msg)
     return g_r, fee_r, net_r
+
+
+async def okx_tpsl(iid, pos_side):
+    """查 OKX 上該方向【實際掛著】的 TP/SL，回傳 (tp, sl)；查不到回 (None, None)。
+    【以OKX為主】畫面顯示一律走這裡 —— 記憶體存的是「程式打算用的值」，
+    不等於 OKX 上真的掛著的值。兩者一旦不符，畫面必須說實話。
+    來源優先序：持倉上的 OCO 掛單 > 未成交委託單附帶的 attachAlgoOrds。"""
+    try:
+        # 1) 已進場：查該方向活著的 OCO 單
+        r = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=oco&instId={iid}")
+        if r.get("code") == "0":
+            for o in (r.get("data") or []):
+                if o.get("posSide") == pos_side:
+                    return (o.get("tpTriggerPx") or None), (o.get("slTriggerPx") or None)
+        # 2) 未成交：查委託單上附帶的 TP/SL
+        for ot in ("trigger",):
+            r = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType={ot}&instId={iid}")
+            if r.get("code") == "0":
+                for o in (r.get("data") or []):
+                    if o.get("posSide") == pos_side:
+                        att = (o.get("attachAlgoOrds") or [{}])[0]
+                        return (att.get("tpTriggerPx") or None), (att.get("slTriggerPx") or None)
+        r = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
+        if r.get("code") == "0":
+            for o in (r.get("data") or []):
+                if o.get("posSide") == pos_side:
+                    att = (o.get("attachAlgoOrds") or [{}])[0]
+                    return (att.get("tpTriggerPx") or None), (att.get("slTriggerPx") or None)
+    except Exception as e:
+        print("查 OKX TP/SL 失敗", type(e).__name__, e)
+    return None, None
 
 
 async def _field_is_clear(iid):
@@ -1198,15 +1232,18 @@ async def loop(app, chat, S):
                         S["algo_id"] = algo_id
                     save_state()
                     print(f"[A\u9032\u5834] {S['sym']} {d} {fpx}")
+                    _otp, _osl = await okx_tpsl(iid, a_side)          # 以OKX為主
+                    _btrig_o, _ = await okx_tpsl(iid, b_side)
+                    _btrig = S.get("back_px")
                     await notify(app, chat,
                         f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} A\u55ae\u9650\u50f9\u9032\u5834\u6210\u4ea4\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         f"\u5546\u54c1\uff1a{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                         f"\u9032\u5834\uff1a{fpx} | {hhmmss()}\n"
-                        f"\u975c\u614bTP\uff1a{S['front_tp_px']}\uff08+{S['tp']}%\uff09\n"
-                        f"\u975c\u614bSL\uff1a{S['front_static_sl']}\uff08-{S['sl']}%\uff09\n"
+                        f"\u975c\u614bTP\uff1a{_otp or '-'}\uff08+{S['tp']}%\uff09\n"
+                        f"\u975c\u614bSL\uff1a{_osl or '-'}\uff08-{S['sl']}%\uff09\n"
                         f"\u52d5\u614bSL\uff1a{S['interval']}s\uff5c{S['move_pct']}%\n"
-                        f"B\u55ae\u89f8\u767c\uff1a{S.get('back_px')}\n\u6642\u9593\uff1a{hhmmss()}")
+                        f"B\u55ae\u89f8\u767c\uff1a{_btrig or '-'}\n\u6642\u9593\uff1a{hhmmss()}")
 
             elif ps in ("A_in", "A_IN_B_REFILL"):
                 if ps in ("A_in", "A_IN_B_REFILL") and cur_b and not S.get("back_filled"):
@@ -1226,13 +1263,14 @@ async def loop(app, chat, S):
                     save_state()
                     print(f"[B\u9032\u5834] {S['sym']} {back_d} {bpx}")
                     _bname = "B\u88dc\u55ae" if ps == "A_IN_B_REFILL" else "B\u55ae"
+                    _otp, _osl = await okx_tpsl(iid, b_side)          # 以OKX為主
                     await notify(app, chat,
                         f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} {_bname}\u89f8\u767c\u9032\u5834\u6210\u4ea4\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         f"\u5546\u54c1\uff1a{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)}\n"
                         f"\u9032\u5834\uff1a{bpx} | {hhmmss()}\n"
-                        f"\u975c\u614bTP\uff1a{S['back_tp_px']}\uff08+{S['tp']}%\uff09\n"
-                        f"\u975c\u614bSL\uff1a{S['back_static_sl']}\uff08-{S['sl']}%\uff09\n\u6642\u9593\uff1a{hhmmss()}")
+                        f"\u975c\u614bTP\uff1a{_otp or '-'}\uff08+{S['tp']}%\uff09\n"
+                        f"\u975c\u614bSL\uff1a{_osl or '-'}\uff08-{S['sl']}%\uff09\n\u6642\u9593\uff1a{hhmmss()}")
                 if not cur_a:
                     after_ms = int(float(S.get("front_ee", time.time())) * 1000)
                     pnl, rec = await _get_net_pnl(iid, a_side, after_ms)
@@ -1284,13 +1322,14 @@ async def loop(app, chat, S):
                         S["algo_id"] = algo_id
                     save_state()
                     print(f"[A\u88dc\u9032\u5834] {S['sym']} {d} {fpx}")
+                    _otp, _osl = await okx_tpsl(iid, a_side)          # 以OKX為主
                     await notify(app, chat,
                         f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} A\u88dc\u55ae\u89f8\u767c\u9032\u5834\u6210\u4ea4\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         f"\u5546\u54c1\uff1a{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
                         f"\u9032\u5834\uff1a{fpx} | {hhmmss()}\n"
-                        f"\u975c\u614bTP\uff1a{S['front_tp_px']}\uff08+{S['tp']}%\uff09\n"
-                        f"\u975c\u614bSL\uff1a{S['front_static_sl']}\uff08-{S['sl']}%\uff09\n"
+                        f"\u975c\u614bTP\uff1a{_otp or '-'}\uff08+{S['tp']}%\uff09\n"
+                        f"\u975c\u614bSL\uff1a{_osl or '-'}\uff08-{S['sl']}%\uff09\n"
                         f"\u52d5\u614bSL\uff1a{S['interval']}s\uff5c{S['move_pct']}%\n"
                         f"\u6642\u9593\uff1a{hhmmss()}")
                     continue
@@ -1767,9 +1806,9 @@ async def cmd_status(u, c):
         L.append(f"{live_emoji} {s['sym']} {E.dir_word(d)} {lev}x {margin}（輪{round_t}｜進{enter_t}）")
         L.append(f"{live_label}({state_str})")
 
+        iid_s = s["spec"]["iid"]
         # 燈號：這根 TF K 棒的漲跌（現價 vs 當根開盤價，與策略方向無關）
         try:
-            iid_s = s["spec"]["iid"]
             cur_px_s = await get_last(iid_s)
             bar_s = NATIVE_BARS.get(ACCOUNT_TF, "5m")
             kr = await pub(f"/api/v5/market/candles?instId={iid_s}&bar={bar_s}&limit=1")
@@ -1787,9 +1826,12 @@ async def cmd_status(u, c):
         except Exception:
             L.append(f"現：{hhmmss()}|⚪ -")
 
-        # 前單資訊
-        tp_f  = s.get("front_tp_px", "-")
-        sl_f  = s.get("front_static_sl", "-")
+        # 前單資訊（TP/SL 以OKX實際掛單為主）
+        _fps = "long" if d == "L" else "short"
+        _bps = "short" if d == "L" else "long"
+        _tp_o, _sl_o = await okx_tpsl(iid_s, _fps)
+        tp_f  = _tp_o or s.get("front_tp_px", "-")
+        sl_f  = _sl_o or s.get("front_static_sl", "-")
         amb_f = s.get("front_px", "-")
         if front_waiting:
             L.append(f"前：{tp_f}｜📍{amb_f}｜{sl_f}")
@@ -1805,15 +1847,16 @@ async def cmd_status(u, c):
                 L.append(f"  {mrec.get('t','')} | {arrow} | {cur_px} | 止{mrec.get('sl','')}")
                 prev_px = cur_px
 
-        # 後單資訊
-        tp_b  = s.get("back_tp_px", "-")
-        sl_b  = s.get("back_static_sl", "-")
+        # 後單資訊（TP/SL 以OKX實際掛單為主）
+        _tp_ob, _sl_ob = await okx_tpsl(iid_s, _bps)
+        tp_b  = _tp_ob or s.get("back_tp_px", "-")
+        sl_b  = _sl_ob or s.get("back_static_sl", "-")
         trig_b = s.get("back_px", "-")
         if back_waiting:
             L.append(f"後：{tp_b}｜📍{trig_b}｜{sl_b}")
         elif back_in:
-            sl_d = s.get("front_sl_px", "-")
-            mn   = s.get("front_move_n", 0)
+            sl_d = s.get("back_sl_px", "-")      # 修正：後單應讀 back 欄位
+            mn   = s.get("back_move_n", 0)
             L.append(f"後升格：{tp_b}｜📍{trig_b}｜動態SL:{sl_d}（{mn}次）")
 
     L.append("━━━━━━━━━━")
