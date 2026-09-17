@@ -15,6 +15,9 @@ CHART    = "📊"   # 📊 報表／統計
 RELOAD   = "🔄"   # 🔄 重啟／重新載入
 UP       = "🟩"   # 🟩 K棒漲（同 KLINE_UP）
 DOWN     = "🟥"   # 🟥 K棒跌（同 KLINE_DOWN）
+MOVE_PROFIT = "✅"   # ✅ 動態SL：往獲利方向移動（實際獲利 > move_pct）
+MOVE_TIME   = "⏱️"   # ⏱️ 動態SL：時間到的小移動（依 move_pct 固定幅度）
+MOVE_FAIL   = "🚫"   # 🚫 動態SL：OKX API 調整失敗（上次SL仍守著）
 
 def dir_emoji(d): return LONG if d == "L" else SHORT
 def dir_word(d):  return "L" if d == "L" else "S"
