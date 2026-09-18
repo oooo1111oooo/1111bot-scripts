@@ -494,19 +494,14 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         await asyncio.sleep(5)
 
     # ── 掛單前完整檢查：掛單 + 持倉 都必須為 0 才准部署新戰役 ──
-    # 有掛單→撤掉重檢；有持倉→等它自己出場（絕不平倉），重複同一SOP直到清空。
+    # 【不阻塞】只檢查一次就返回，絕不在此等待 —— loop 是主迴圈，
+    # 讓它替 _place_pair 站崗會使進場/出場偵測全部停擺（曾造成 100 秒失明）。
+    # 未清空就回 False，由 loop 下一輪（1秒後）自然重試。
     _iid0 = S["spec"]["iid"]
-    for _ in range(60):
-        await cancel_all_orders(_iid0)
-        clear, n_ord, n_pos = await _field_is_clear(_iid0)
-        if clear:
-            break
-        if not S.get("alive", True):
-            return False
-        print(f"[部署前未清空] {S['sym']} 掛單={n_ord} 持倉={n_pos}，等待中")
-        await asyncio.sleep(2)
-    else:
-        print(f"[部署前檢查逾時] {S['sym']} 放棄本次部署")
+    await cancel_all_orders(_iid0)          # 只撤進場委託，保留持倉保護傘
+    clear, n_ord, n_pos = await _field_is_clear(_iid0)
+    if not clear:
+        print(f"[部署前未清空] {S['sym']} 掛單={n_ord} 持倉={n_pos} → 本輪不部署，稍後重試")
         return False
     back_d = "S" if d == "L" else "L"
     spec   = S["spec"]
@@ -813,11 +808,26 @@ async def list_all_orders(iid=None, pos_side=None):
     return orders, algos
 
 
-async def cancel_all_orders(iid=None, pos_side=None, tries=5):
-    """撤光該幣種（或該方向）所有掛單：普通單 + trigger + oco。
-    確認 OKX 回報 0 張才返回 True。絕不碰持倉。"""
+def _is_position_guard(o):
+    """這張 algo 單是不是『正在守護持倉』的止盈止損？
+    reduceOnly=true 代表平倉單 —— 它是持倉的保護傘，撤掉就變裸倉。
+    【鐵則】清場只撤『尚未成交的進場委託』，絕不撤持倉的保護傘。"""
+    if str(o.get("reduceOnly")).lower() == "true":
+        return True
+    # OCO 一定帶 tp/sl 觸發價；trigger 進場單不帶
+    if o.get("tpTriggerPx") or o.get("slTriggerPx"):
+        return True
+    return False
+
+
+async def cancel_all_orders(iid=None, pos_side=None, tries=5, keep_guards=True):
+    """撤光該幣種（或該方向）的『進場委託單』：普通單 + trigger。
+    keep_guards=True（預設）時，保留守護持倉的 OCO/止盈止損 —— 絕不製造裸倉。
+    確認 OKX 回報 0 張（不含保護傘）才返回 True。絕不碰持倉本身。"""
     for _ in range(tries):
         orders, algos = await list_all_orders(iid, pos_side)
+        if keep_guards:
+            algos = [o for o in algos if not _is_position_guard(o)]
         if not orders and not algos:
             return True
         if orders:
@@ -1207,8 +1217,10 @@ async def loop(app, chat, S):
     try:
         ok = await _place_pair(S, iid, chat, app, label="\u9996\u6b21\u57cb\u4f0f")
         if not ok:
-            S["pair_state"] = "idle"
-            return
+            # 未清空只是「本輪不部署」，不是失敗 —— 保持 waiting 由主迴圈重試。
+            # 直接設 idle 會誤殺策略（_place_pair 現在也會因未清空而回 False）。
+            S["pair_state"] = "waiting"
+            save_state()
 
         while True:
             await asyncio.sleep(1)
@@ -1221,17 +1233,13 @@ async def loop(app, chat, S):
             back_d = S.get("back_d", "S" if d == "L" else "L")
             b_side = "long" if back_d == "L" else "short"
             cur_a  = await okx_pos(iid, a_side)
-            cur_b  = await okx_pos(iid, b_side) if ps != "waiting" else None
+            cur_b  = await okx_pos(iid, b_side)      # 兩邊一律查，不看狀態
+            # 【診斷】每5秒印一次狀態，供事後比對 loop 是否活著、是否看到持倉
+            if int(time.time()) % 5 == 0:
+                print(f"[loop] {S['sym']} ps={ps} A={'有' if cur_a else '無'} "
+                      f"B={'有' if cur_b else '無'} algo={bool(S.get('algo_id'))}")
 
             if ps == "waiting":
-                tf_sec    = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
-                secs_left = (int(time.time() // tf_sec) + 1) * tf_sec - time.time()
-                if secs_left <= 1.5:
-                    await _pre_clear_orders(iid)
-                    if S.get("pair_state") != "idle":
-                        print(f"[TF\u91cd\u639b] {S['sym']} {d}")
-                        await _place_pair(S, iid, chat, app, label="TF\u91cd\u639b")
-                    continue
                 if cur_a:
                     fpx = Decimal(str(cur_a.get("avgPx") or cur_a.get("last") or S.get("front_px","0")))
                     S["front_filled"] = True
@@ -1298,6 +1306,17 @@ async def loop(app, chat, S):
                         await _handle_lose_a(S, iid, chat, app, rec, pnl)
                     continue
 
+                # 【順序鐵則】TF重掛必須排在進出場偵測「之後」。
+                # 反過來會讓 TF 快結束時剛成交的單永遠偵測不到
+                # （無進場通知、無出場通知、無損益）—— continue 會跳過整段偵測。
+                tf_sec    = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
+                secs_left = (int(time.time() // tf_sec) + 1) * tf_sec - time.time()
+                if secs_left <= 1.5 and not cur_a and not cur_b:
+                    await _pre_clear_orders(iid)
+                    if S.get("pair_state") != "idle":
+                        print(f"[TF重掛] {S['sym']} {d}")
+                        await _place_pair(S, iid, chat, app, label="TF重掛")
+                    continue
             elif ps == "AB_in":
                 # 【SOP一】兩個位置各自獨立判斷：空了就查該單損益。
                 # 只對真的出場的位置查損益 —— 沒出場的位置不參與任何判斷（不塞假的0）。
