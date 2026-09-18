@@ -27,6 +27,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
+VERSION = "v2.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -76,7 +77,8 @@ SAVE_FIELDS = ("sym","dir","lev","margin","offset","back_offset","tp","sl","move
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
                "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
                "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
-               "algo_id","round_date","round_today","enter_today")
+               "algo_id","front_algo_id","a_refill","b_refill",
+               "round_date","round_today","enter_today")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
     # 關閉流程中絕不寫檔：此時 loop() 的 finally 會逐一 pop 掉 STRATS，
@@ -305,14 +307,19 @@ async def cancel_frame(iid, algo_id):
               [{"instId": iid, "algoId": algo_id}])
 
 async def amend_frames(items):
-    """批次修改 algo 單止損價。items: [(instId, algoId, sl)]
-    只修改 SL，TP 固定不動。
+    """批次修改 algo 單觸發價。
+    items 元素可為 3 元組 (instId, algoId, sl) → 只改 SL（移動SL 用，TP 不動）；
+    或 4 元組 (instId, algoId, sl, tp) → SL/TP 一起改（補單成交後依實際成交價校正用）。
     OKX 一次最多 10 筆，超過自動分批。回傳成功筆數。"""
     ok = 0
     for i in range(0, len(items), 10):
         batch = items[i:i+10]
-        body = [{"instId": iid, "algoId": aid, "newSlTriggerPx": str(sl)}
-                for iid, aid, sl in batch]
+        body = []
+        for it in batch:
+            e = {"instId": it[0], "algoId": it[1], "newSlTriggerPx": str(it[2])}
+            if len(it) >= 4 and it[3] is not None:
+                e["newTpTriggerPx"] = str(it[3])
+            body.append(e)
         r = await api("POST", "/api/v5/trade/amend-algos", body)
         if r.get("code") == "0":
             ok += len(batch)
@@ -608,6 +615,36 @@ async def _okx_has_oco(iid, ps):
     except Exception as e:
         print("查 OCO 失敗", type(e).__name__, e)
         return None
+
+
+async def _okx_oco_id(iid, ps, tries=6):
+    """【問題4 配套】向 OKX 索取守護該持倉方向的 OCO(止盈止損) algoId。
+    下單時 attachAlgoOrds 已帶 TP/SL，成交當下由 OKX「自動」生成這張 OCO ——
+    程式不再自己補掛第二張（那會變成 2 張），改成回頭跟 OKX 要它的 algoId。
+    移動SL(amend-algos) 與贏家方向判定(_algo_actual_side) 都要靠這個 ID。"""
+    for _ in range(tries):
+        try:
+            r = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=oco&instId={iid}")
+            if r.get("code") == "0":
+                for o in (r.get("data") or []):
+                    if o.get("posSide") == ps and o.get("algoId"):
+                        return o.get("algoId")
+        except Exception as e:
+            print("查 OCO algoId 失敗", iid, ps, type(e).__name__, e)
+        await asyncio.sleep(0.5)
+    print(f"[警告] 查不到 OCO algoId {iid} {ps} —— 移動SL 將由守門狗監控")
+    return None
+
+
+def _calc_tp_sl(S, px, side_d):
+    """依「實際成交價」px 與該單方向 side_d 重算 TP/SL。
+    【問題6】補單是觸發後市價成交，會滑價；用預估觸發價算出的 SL 距離會失真。"""
+    tick   = S["spec"]["tick"]
+    sl_pct = Decimal(str(S["sl"])) / 100
+    tp_pct = Decimal(str(S["tp"])) / 100
+    if side_d == "L":
+        return (align(px * (1 + tp_pct), tick, "S"), align(px * (1 - sl_pct), tick, "L"))
+    return (align(px * (1 - tp_pct), tick, "L"), align(px * (1 + sl_pct), tick, "S"))
 
 
 async def _naked_guard(app, S, iid, ps, tag, now_t):
@@ -1080,11 +1117,10 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
         reason_label, reason_code = "Stop Loss", "Stop_Loss"
     else:
         reason_label, reason_code = "Manual/Unknown", "Manual"
-    _ps_now = S.get("pair_state", "")
     if winner == "A":
-        _wname = "A\u88dc\u55ae" if _ps_now == "A_REFILL_B_IN" else "A\u55ae"
+        _wname = "A\u88dc\u55ae" if S.get("a_refill") else "A\u55ae"
     else:
-        _wname = "B\u88dc\u55ae" if _ps_now == "A_IN_B_REFILL" else "B\u55ae"
+        _wname = "B\u88dc\u55ae" if S.get("b_refill") else "B\u55ae"
     g_r, fee_r, net_r = await _notify_exit(app, chat, S, _wname, rec, open_fee, reason_label, extra="戰役結束：已撤光掛單，等待剩餘持倉出場")
     mv = float(Decimal(str(S.get("margin", "1"))))
     log_trade({"date": today8(), "sym": S["sym"], "dir": d, "reason": reason_code,
@@ -1096,7 +1132,7 @@ async def _handle_win(S, iid, chat, app, winner, pnl, rec, other_side, other_fil
               "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
               "back_move_n","back_move_hist",
               "front_move_fail_n","back_move_fail_n",
-              "algo_id"):
+              "algo_id","front_algo_id","a_refill","b_refill"):
         S.pop(a, None)
     S["dir"] = S.get("locked_dir", d)
     # 【SOP二 步驟3】等剩餘持倉自己出場 —— 絕不平倉。移動SL 是獨立任務，期間照常推。
@@ -1134,14 +1170,12 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
         new_sl    = align(orig_a_px * (1 + sl_pct), tick, "S")
         new_tp    = align(orig_a_px * (1 - tp_pct), tick, "L")
     open_fee = await _query_open_fee(iid, a_side, float(S.get("front_ee") or 0))
-    _aname = "A\u88dc\u55ae" if S.get("pair_state") == "A_REFILL_B_IN" else "A\u55ae"
+    _aname = "A\u88dc\u55ae" if S.get("a_refill") else "A\u55ae"
     await _notify_exit(app, chat, S, _aname, rec, open_fee, "Stop Loss", extra=f"補A觸發委託，觸發價：{orig_a_px}")
-    r1 = await api("GET", f"/api/v5/trade/orders-pending?instId={iid}")
-    a_orders = [o for o in (r1.get("data") or []) if o.get("posSide") == a_side]
-    if a_orders:
-        await api("POST", "/api/v5/trade/cancel-batch-orders",
-                  [{"instId": iid, "ordId": o["ordId"]} for o in a_orders])
-        await asyncio.sleep(0.3)
+    # 【問題5】舊版只查 orders-pending（普通單），漏掉 algo 單 —— 與 B 邊不一致。
+    # 改用統一入口 cancel_all_orders：涵蓋 普通單 + trigger，且保留持倉保護傘。
+    if not await cancel_all_orders(iid, pos_side=a_side):
+        print(f"[補A] {S['sym']} A方向掛單未確認清空，仍續掛（由下一輪 SOP 重試）")
     sz = Decimal(str(S.get("front_sz", "1")))
     new_algo = await _place_trigger(iid, a_side, d, orig_a_px, sz, new_tp, new_sl)
     if new_algo:
@@ -1153,7 +1187,8 @@ async def _handle_lose_a(S, iid, chat, app, rec, pnl):
         S["front_move_n"] = 0
         S["front_move_hist"] = []
         S["algo_id"] = None
-        S["pair_state"] = "A_REFILL_B_IN"
+        S["front_algo_id"] = new_algo     # 補A的觸發委託ID（/status 與撤單用）
+        S["a_refill"] = True              # 【問題1】A位置狀態獨立，不再寫入共用字串
         save_state()
         print(f"[\u88dcA] {S['sym']} {d} \u89f8\u767c\u50f9={orig_a_px}")
     else:
@@ -1180,7 +1215,7 @@ async def _handle_lose_b(S, iid, chat, app, rec, pnl):
         new_sl    = align(orig_b_px * (1 - sl_pct), tick, "L")
         new_tp    = align(orig_b_px * (1 + tp_pct), tick, "S")
     open_fee = await _query_open_fee(iid, b_side, float(S.get("back_ee") or 0))
-    _bnm = "B\u88dc\u55ae" if S.get("pair_state") == "A_IN_B_REFILL" else "B\u55ae"
+    _bnm = "B\u88dc\u55ae" if S.get("b_refill") else "B\u55ae"
     await _notify_exit(app, chat, S, _bnm, rec, open_fee, "Stop Loss", extra=f"補B觸發委託，觸發價：{orig_b_px}")
     _, _algos_b = await list_all_orders(iid)       # 涵蓋 trigger + oco
     b_algos = [o for o in _algos_b if o.get("posSide") == b_side]
@@ -1198,9 +1233,7 @@ async def _handle_lose_b(S, iid, chat, app, rec, pnl):
         S["back_algo2_id"] = None
         S["back_static_sl"] = str(new_sl)
         S["back_tp_px"] = str(new_tp)
-        cur_ps = S.get("pair_state")
-        if cur_ps == "AB_in":
-            S["pair_state"] = "A_IN_B_REFILL"
+        S["b_refill"] = True              # 【問題1】B位置狀態獨立，不再寫入共用字串
         save_state()
         print(f"[\u88dcB] {S['sym']} {back_d} \u89f8\u767c\u50f9={orig_b_px}")
     else:
@@ -1222,10 +1255,11 @@ async def loop(app, chat, S):
             S["pair_state"] = "waiting"
             save_state()
 
+        loop_tick = 0
         while True:
             await asyncio.sleep(1)
-            ps = S.get("pair_state", "idle")
-            if ps == "idle":
+            loop_tick += 1
+            if S.get("pair_state", "idle") == "idle":
                 break
 
             d      = S["dir"]
@@ -1234,148 +1268,148 @@ async def loop(app, chat, S):
             b_side = "long" if back_d == "L" else "short"
             cur_a  = await okx_pos(iid, a_side)
             cur_b  = await okx_pos(iid, b_side)      # 兩邊一律查，不看狀態
-            # 【診斷】每5秒印一次狀態，供事後比對 loop 是否活著、是否看到持倉
-            if int(time.time()) % 5 == 0:
-                print(f"[loop] {S['sym']} ps={ps} A={'有' if cur_a else '無'} "
-                      f"B={'有' if cur_b else '無'} algo={bool(S.get('algo_id'))}")
+            # 【問題1/2/3 核心】A、B 兩個位置各用一個獨立旗標，不再用單一字串
+            # 描述兩個位置的組合狀態 —— 那會讓後執行的補單覆蓋前一個，
+            # 也會漏掉「補B成交」的偵測分支，連帶害移動SL 對該倉失效。
+            a_open = bool(S.get("front_filled"))
+            b_open = bool(S.get("back_filled"))
 
-            if ps == "waiting":
-                if cur_a:
-                    fpx = Decimal(str(cur_a.get("avgPx") or cur_a.get("last") or S.get("front_px","0")))
-                    S["front_filled"] = True
-                    S["front_px"]     = str(fpx)
-                    S["front_ee"]     = time.time()
-                    S["front_sl_px"]  = str(S.get("front_static_sl", fpx))
-                    S["pair_state"]   = "A_in"
-                    bump(skey(S["sym"], d), "entered")
-                    save_state()
-                    algo_id = await place_algo(iid, a_side, d,
-                                               Decimal(str(S["front_sz"])),
-                                               Decimal(str(S["front_tp_px"])),
-                                               Decimal(str(S["front_static_sl"])))
-                    if algo_id:
-                        S["algo_id"] = algo_id
-                    save_state()
-                    print(f"[A\u9032\u5834] {S['sym']} {d} {fpx}")
-                    _otp, _osl = await okx_tpsl(iid, a_side)          # 以OKX為主
-                    _btrig_o, _ = await okx_tpsl(iid, b_side)
-                    _btrig = S.get("back_px")
-                    await notify(app, chat,
-                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} A\u55ae\u9650\u50f9\u9032\u5834\u6210\u4ea4\n"
-                        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                        f"\u5546\u54c1\uff1a{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                        f"\u9032\u5834\uff1a{fpx} | {hhmmss()}\n"
-                        f"\u975c\u614bTP\uff1a{_otp or '-'}\uff08+{S['tp']}%\uff09\n"
-                        f"\u975c\u614bSL\uff1a{_osl or '-'}\uff08-{S['sl']}%\uff09\n"
-                        f"\u52d5\u614bSL\uff1a{S['interval']}s\uff5c{S['move_pct']}%\n"
-                        f"B\u55ae\u89f8\u767c\uff1a{_btrig or '-'}\n\u6642\u9593\uff1a{hhmmss()}")
+            # 【問題8】診斷 log 改用輪數計數器：loop 每輪 1 秒 + API 往返會讓節拍漂移，
+            # 用 int(time.time()) % 5 會整秒跳過（有時 10 秒沒 log）。計數器不受漂移影響。
+            if loop_tick % 5 == 0:
+                print(f"[loop] {S['sym']} {VERSION} "
+                      f"A={'倉' if cur_a else '空'}/{'開' if a_open else '待'} "
+                      f"B={'倉' if cur_b else '空'}/{'開' if b_open else '待'} "
+                      f"ocoA={bool(S.get('algo_id'))} ocoB={bool(S.get('back_algo2_id'))}")
 
-            elif ps in ("A_in", "A_IN_B_REFILL"):
-                if ps in ("A_in", "A_IN_B_REFILL") and cur_b and not S.get("back_filled"):
-                    bpx = Decimal(str(cur_b.get("avgPx") or cur_b.get("last") or S.get("back_px","0")))
-                    S["back_filled"]  = True
-                    S["back_px"]      = str(bpx)
-                    S["back_ee"]      = time.time()
-                    S["back_sl_px"]   = str(S.get("back_static_sl", bpx))
-                    S["back_algo_id"] = None
-                    S["pair_state"]   = "AB_in"
-                    ba2 = await place_algo(iid, b_side, back_d,
-                                           Decimal(str(S["back_sz"])),
-                                           Decimal(str(S["back_tp_px"])),
-                                           Decimal(str(S["back_static_sl"])))
-                    if ba2:
-                        S["back_algo2_id"] = ba2
-                    save_state()
-                    print(f"[B\u9032\u5834] {S['sym']} {back_d} {bpx}")
-                    _bname = "B\u88dc\u55ae" if ps == "A_IN_B_REFILL" else "B\u55ae"
-                    _otp, _osl = await okx_tpsl(iid, b_side)          # 以OKX為主
-                    await notify(app, chat,
-                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} {_bname}\u89f8\u767c\u9032\u5834\u6210\u4ea4\n"
-                        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                        f"\u5546\u54c1\uff1a{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)}\n"
-                        f"\u9032\u5834\uff1a{bpx} | {hhmmss()}\n"
-                        f"\u975c\u614bTP\uff1a{_otp or '-'}\uff08+{S['tp']}%\uff09\n"
-                        f"\u975c\u614bSL\uff1a{_osl or '-'}\uff08-{S['sl']}%\uff09\n\u6642\u9593\uff1a{hhmmss()}")
-                if not cur_a:
-                    after_ms = int(float(S.get("front_ee", time.time())) * 1000)
-                    pnl, rec = await _get_net_pnl(iid, a_side, after_ms)
-                    print(f"[A\u51fa\u5834] {S['sym']} \u6de8\u640d\u76ca={pnl}")
-                    if pnl > 0:
-                        await _handle_win(S, iid, chat, app, "A", pnl, rec, b_side, S.get("back_filled", False))
-                    else:
-                        await _handle_lose_a(S, iid, chat, app, rec, pnl)
+            # ========== A 位置：進場偵測（首次進場與補單進場共用同一段） ==========
+            if cur_a and not a_open:
+                fpx = Decimal(str(cur_a.get("avgPx") or cur_a.get("last") or S.get("front_px", "0")))
+                a_is_refill = bool(S.get("a_refill"))
+                S["front_filled"] = True
+                S["front_px"]     = str(fpx)
+                S["front_ee"]     = time.time()
+                # 【問題6】補單是觸發後「市價」成交，必有滑價；用預估觸發價算出的
+                # TP/SL 距離會失真 —— 改用 OKX 回報的實際成交價重算。
+                if a_is_refill:
+                    n_tp, n_sl = _calc_tp_sl(S, fpx, d)
+                    S["front_tp_px"]     = str(n_tp)
+                    S["front_static_sl"] = str(n_sl)
+                S["front_sl_px"]   = str(S.get("front_static_sl", fpx))
+                S["front_algo_id"] = None
+                # 【問題4】不再呼叫 place_algo 補掛第二張 OCO（那會變成 2 張，且危險）。
+                # 掛單時 attachAlgoOrds 已帶 TP/SL，成交當下 OKX 自動生成 1 張 OCO，
+                # 這裡只是回頭跟 OKX 要那張單的 algoId —— 移動SL amend 要靠它。
+                S["algo_id"] = await _okx_oco_id(iid, a_side)
+                if a_is_refill and S.get("algo_id"):
+                    _ok = await amend_frames([(iid, S["algo_id"],
+                                               S["front_static_sl"], S["front_tp_px"])])
+                    print(f"[補A校正] {S['sym']} 成交={fpx} TP={S['front_tp_px']} "
+                          f"SL={S['front_static_sl']} ok={_ok}")
+                if S.get("pair_state") == "waiting":
+                    S["pair_state"] = "running"
+                bump(skey(S["sym"], d), "entered")
+                save_state()
+                a_open = True
+                print(f"[A進場] {S['sym']} {d} {fpx} refill={a_is_refill}")
+                _an = "A補單" if a_is_refill else "A單"
+                _otp, _osl = await okx_tpsl(iid, a_side)          # 以OKX為主
+                _btrig = S.get("back_px")
+                _bline = f"B單觸發：{_btrig or '-'}\n" if not b_open else ""
+                await notify(app, chat,
+                    f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} {_an}進場成交\n"
+                    f"━━━━━━━━━━\n"
+                    f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
+                    f"進場：{fpx} | {hhmmss()}\n"
+                    f"靜態TP：{_otp or '-'}（+{S['tp']}%）\n"
+                    f"靜態SL：{_osl or '-'}（-{S['sl']}%）\n"
+                    f"動態SL：{S['interval']}s｜{S['move_pct']}%\n"
+                    f"{_bline}時間：{hhmmss()}")
+
+            # ========== B 位置：進場偵測（與 A 完全對稱、完全獨立） ==========
+            if cur_b and not b_open:
+                bpx = Decimal(str(cur_b.get("avgPx") or cur_b.get("last") or S.get("back_px", "0")))
+                b_is_refill = bool(S.get("b_refill"))
+                S["back_filled"]  = True
+                S["back_px"]      = str(bpx)
+                S["back_ee"]      = time.time()
+                if b_is_refill:
+                    n_tp, n_sl = _calc_tp_sl(S, bpx, back_d)
+                    S["back_tp_px"]     = str(n_tp)
+                    S["back_static_sl"] = str(n_sl)
+                S["back_sl_px"]    = str(S.get("back_static_sl", bpx))
+                S["back_algo_id"]  = None
+                S["back_algo2_id"] = await _okx_oco_id(iid, b_side)
+                if b_is_refill and S.get("back_algo2_id"):
+                    _ok = await amend_frames([(iid, S["back_algo2_id"],
+                                               S["back_static_sl"], S["back_tp_px"])])
+                    print(f"[補B校正] {S['sym']} 成交={bpx} TP={S['back_tp_px']} "
+                          f"SL={S['back_static_sl']} ok={_ok}")
+                if S.get("pair_state") == "waiting":
+                    S["pair_state"] = "running"
+                save_state()
+                b_open = True
+                print(f"[B進場] {S['sym']} {back_d} {bpx} refill={b_is_refill}")
+                _bn = "B補單" if b_is_refill else "B單"
+                _otp, _osl = await okx_tpsl(iid, b_side)          # 以OKX為主
+                await notify(app, chat,
+                    f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} {_bn}觸發進場成交\n"
+                    f"━━━━━━━━━━\n"
+                    f"商品：{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)}\n"
+                    f"進場：{bpx} | {hhmmss()}\n"
+                    f"靜態TP：{_otp or '-'}（+{S['tp']}%）\n"
+                    f"靜態SL：{_osl or '-'}（-{S['sl']}%）\n"
+                    f"動態SL：{S['interval']}s｜{S['move_pct']}%\n"
+                    f"時間：{hhmmss()}")
+
+            # ========== 出場偵測：A、B 各自獨立，同一輪可同時處理 ==========
+            a_gone = a_open and not cur_a
+            b_gone = b_open and not cur_b
+            if a_gone or b_gone:
+                a_pnl = a_rec = b_pnl = b_rec = None
+                if a_gone:
+                    after_a = int(float(S.get("front_ee") or time.time()) * 1000)
+                    a_pnl, a_rec = await _get_net_pnl(iid, a_side, after_a)
+                    print(f"[A出場] {S['sym']} 淨損益={a_pnl}")
+                if b_gone:
+                    after_b = int(float(S.get("back_ee") or time.time()) * 1000)
+                    b_pnl, b_rec = await _get_net_pnl(iid, b_side, after_b)
+                    print(f"[B出場] {S['sym']} 淨損益={b_pnl}")
+
+                # 【SOP二 步驟1】戰役結束條件只有一個：任一單「單筆」淨損益>0。
+                # 不是兩單合計，也不比較誰賺得多。沒出場的位置不參與判斷。
+                if a_pnl is not None and a_pnl > 0:
+                    await _handle_win(S, iid, chat, app, "A", a_pnl, a_rec,
+                                      b_side, b_open and not b_gone)
+                    continue
+                if b_pnl is not None and b_pnl > 0:
+                    await _handle_win(S, iid, chat, app, "B", b_pnl, b_rec,
+                                      a_side, a_open and not a_gone)
                     continue
 
-                # 【順序鐵則】TF重掛必須排在進出場偵測「之後」。
-                # 反過來會讓 TF 快結束時剛成交的單永遠偵測不到
-                # （無進場通知、無出場通知、無損益）—— continue 會跳過整段偵測。
+                # 【SOP一】戰役持續：哪個位置空了就補回該位置同方向。
+                # 兩個位置完全獨立，同一輪同時空掉也各自補各自的，不互相覆蓋。
+                if a_gone:
+                    await _handle_lose_a(S, iid, chat, app, a_rec, a_pnl)
+                if b_gone and S.get("pair_state", "idle") != "idle":
+                    await _handle_lose_b(S, iid, chat, app, b_rec, b_pnl)
+                continue
+
+            # ========== TF 重掛（僅限「戰場完全空白」的重試路徑） ==========
+            # 【順序鐵則】必須排在進出場偵測「之後」。排在前面會讓 TF 快結束時
+            # 剛成交的單永遠偵測不到（無進場通知、無出場通知、無損益）。
+            if not cur_a and not cur_b and not a_open and not b_open:
                 tf_sec    = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
                 secs_left = (int(time.time() // tf_sec) + 1) * tf_sec - time.time()
-                if secs_left <= 1.5 and not cur_a and not cur_b:
-                    await _pre_clear_orders(iid)
-                    if S.get("pair_state") != "idle":
-                        print(f"[TF重掛] {S['sym']} {d}")
-                        await _place_pair(S, iid, chat, app, label="TF重掛")
+                if secs_left <= 1.5:
+                    # 再跟 OKX 確認一次「連掛單都沒有」才重新部署 ——
+                    # 只要還有掛單，代表埋伏單或補單委託還活著、戰役持續中，絕不撤掉重來。
+                    _ords, _algos = await list_all_orders(iid)
+                    if not _ords and not _algos:
+                        if S.get("pair_state", "idle") != "idle":
+                            print(f"[TF重掛] {S['sym']} {d}")
+                            await _place_pair(S, iid, chat, app, label="TF重掛")
                     continue
-            elif ps == "AB_in":
-                # 【SOP一】兩個位置各自獨立判斷：空了就查該單損益。
-                # 只對真的出場的位置查損益 —— 沒出場的位置不參與任何判斷（不塞假的0）。
-                a_gone = not cur_a and S.get("front_filled")
-                b_gone = not cur_b and S.get("back_filled")
-                if a_gone or b_gone:
-                    a_pnl = a_rec = b_pnl = b_rec = None
-                    if a_gone:
-                        after_a = int(float(S.get("front_ee", time.time())) * 1000)
-                        a_pnl, a_rec = await _get_net_pnl(iid, a_side, after_a)
-                    if b_gone:
-                        after_b = int(float(S.get("back_ee", time.time())) * 1000)
-                        b_pnl, b_rec = await _get_net_pnl(iid, b_side, after_b)
-                    # 【SOP二 步驟1】結束條件只有一個：任一單淨損益>0。不比較誰賺得多。
-                    if a_pnl is not None and a_pnl > 0:
-                        await _handle_win(S, iid, chat, app, "A", a_pnl, a_rec, b_side, not b_gone)
-                    elif b_pnl is not None and b_pnl > 0:
-                        await _handle_win(S, iid, chat, app, "B", b_pnl, b_rec, a_side, not a_gone)
-                    else:
-                        # 戰役繼續：哪個位置空了就補回該位置（A空補A、B空補B）
-                        if a_gone:
-                            await _handle_lose_a(S, iid, chat, app, a_rec, a_pnl)
-                        if b_gone and S.get("alive", True):
-                            await _handle_lose_b(S, iid, chat, app, b_rec, b_pnl)
-
-            elif ps == "A_REFILL_B_IN":
-                if cur_a and not S.get("front_filled"):
-                    fpx = Decimal(str(cur_a.get("avgPx") or cur_a.get("last") or S.get("front_px","0")))
-                    S["front_filled"] = True
-                    S["front_px"]     = str(fpx)
-                    S["front_ee"]     = time.time()
-                    S["front_sl_px"]  = str(S.get("front_static_sl", fpx))
-                    S["pair_state"]   = "AB_in"
-                    algo_id = await place_algo(iid, a_side, d,
-                                               Decimal(str(S["front_sz"])),
-                                               Decimal(str(S["front_tp_px"])),
-                                               Decimal(str(S["front_static_sl"])))
-                    if algo_id:
-                        S["algo_id"] = algo_id
-                    save_state()
-                    print(f"[A\u88dc\u9032\u5834] {S['sym']} {d} {fpx}")
-                    _otp, _osl = await okx_tpsl(iid, a_side)          # 以OKX為主
-                    await notify(app, chat,
-                        f"{E.BOT} OKX\u539f\u004b\uff5c{ACCT}\n\u4e8b\u4ef6\uff1a{E.ENTRY} A\u88dc\u55ae\u89f8\u767c\u9032\u5834\u6210\u4ea4\n"
-                        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                        f"\u5546\u54c1\uff1a{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)}\n"
-                        f"\u9032\u5834\uff1a{fpx} | {hhmmss()}\n"
-                        f"\u975c\u614bTP\uff1a{_otp or '-'}\uff08+{S['tp']}%\uff09\n"
-                        f"\u975c\u614bSL\uff1a{_osl or '-'}\uff08-{S['sl']}%\uff09\n"
-                        f"\u52d5\u614bSL\uff1a{S['interval']}s\uff5c{S['move_pct']}%\n"
-                        f"\u6642\u9593\uff1a{hhmmss()}")
-                    continue
-                if not cur_b and S.get("back_filled"):
-                    after_b = int(float(S.get("back_ee", time.time())) * 1000)
-                    b_pnl, b_rec = await _get_net_pnl(iid, b_side, after_b)
-                    if b_pnl > 0:
-                        await _handle_win(S, iid, chat, app, "B", b_pnl, b_rec, a_side, False)
-                    else:
-                        await _handle_lose_b(S, iid, chat, app, b_rec, b_pnl)
 
     except asyncio.CancelledError:
         raise
@@ -1395,6 +1429,17 @@ async def loop(app, chat, S):
                 pass
             save_state()
 
+def _norm_pair_state(v, d):
+    """把舊版存檔裡的組合字串（A_in / AB_in / A_IN_B_REFILL / A_REFILL_B_IN）
+    正規化成新的三態：idle / waiting / running。
+    位置狀態現在由 front_filled / back_filled 兩個獨立旗標負責，不看這個值。"""
+    if v == "idle":
+        return "idle"
+    if d.get("front_filled") or d.get("back_filled"):
+        return "running"
+    return "waiting" if v == "waiting" else "running"
+
+
 async def rebuild_strat(d):
     spec = await get_spec(d["sym"])
     S = {"sym": d["sym"], "dir": d["dir"],
@@ -1406,12 +1451,17 @@ async def rebuild_strat(d):
          "interval": float(d.get("interval", 1)),
          "spec": spec,
          "alive": True, "state": d.get("state", "委託中"),
-         "pair_state": d.get("pair_state", "waiting"),
+         "pair_state": _norm_pair_state(d.get("pair_state", "waiting"), d),
          "chat": d.get("chat", CHAT_ID),
          "locked_dir": d.get("locked_dir", d["dir"])}
+    # 重啟接管：把存檔裡所有位置欄位一併還原。
+    # （舊版漏還原 back_static_sl / back_d / back_algo2_id / algo_id 等，
+    #  導致重啟後 B 邊靜態SL 與 OCO ID 消失、移動SL 推不動。一併補齊。）
     for a in ("front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
               "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
-              "back_algo_id","back_px","back_filled","back_sz","closing"):
+              "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
+              "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
+              "algo_id","front_algo_id","a_refill","b_refill","closing"):
         if a in d: S[a] = d[a]
     return S
 
@@ -1823,8 +1873,17 @@ async def cmd_status(u, c):
 
     for i, s in enumerate(alive):
         d = s["dir"]
-        front_waiting  = 1 if s.get("front_oid") and not s.get("front_filled") else 0
-        back_waiting   = 1 if s.get("back_algo_id") and not s.get("back_filled") else 0
+        # 【問題7】掛單數一律查 OKX，不看 front_oid / back_algo_id 等內部旗標 ——
+        # 手動在 OKX 撤單後旗標不會更新，會顯示成「後1」但實際上早已無掛單。
+        _d_ps  = "long" if d == "L" else "short"
+        _d_bps = "short" if d == "L" else "long"
+        try:
+            _o_all, _a_all = await list_all_orders(s["spec"]["iid"])
+            _pend = [o for o in (_o_all + _a_all) if not _is_position_guard(o)]
+            front_waiting = sum(1 for o in _pend if o.get("posSide") == _d_ps)
+            back_waiting  = sum(1 for o in _pend if o.get("posSide") == _d_bps)
+        except Exception:
+            front_waiting = back_waiting = 0
         front_in       = 1 if s.get("front_filled") else 0
         back_in        = 1 if s.get("back_filled") else 0
         state_str = f"前{front_waiting}/後{back_waiting}/前進{front_in}/後進{back_in}"
@@ -1897,6 +1956,7 @@ async def cmd_status(u, c):
     L.append("━━━━━━━━━━")
     L.append(f"掛單數：{total_pending}｜持倉數：{len(pl)}")
     L.append(f"時間：{hhmmss()} UTC+8")
+    L.append(f"版本：{VERSION}")
     await reply(u, "\n".join(L))
 
 # ---------- /summary ----------
