@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -407,19 +407,65 @@ async def reply(u, t):
     return False
 
 # ---------- OKX 事實查詢 ----------
-async def okx_pos(iid, ps):
-    """查單一方向持倉。回 None 有兩種含意：真的沒倉、或查詢出問題 ——
-    呼叫端若要據此判定「已平倉」，一律先經過 _confirm_gone 多次確認。"""
-    r = await api("GET", "/api/v5/account/positions")
-    if r.get("code") != "0":
-        print(f"[持倉查詢異常] {iid} {ps} code={r.get('code')} msg={r.get('msg')}")
-        return None
-    for p in (r.get("data") or []):
+# ---------- 持倉查詢：全域共用快取（#27 速率控管） ----------
+# 【為什麼需要】OKX 對 /api/v5/account/positions 的限制是 10 次 / 2 秒。
+# 舊版 loop 與 frame_mover 各自為 long/short 各查一次 → 8 次/秒 = 16 次/2秒，
+# 超限 60%，實測噴滿 50011 Too Many Requests。
+# 而這個端點【一次就回傳所有持倉】，分兩次查 long/short 是純粹浪費。
+# 改成一次查詢、快取 POS_TTL 秒，兩個方向、兩個任務、所有幣種共用同一份。
+POS_TTL   = 0.4
+POS_CACHE = {"t": 0.0, "data": None, "cool": 0.0}
+_POS_LOCK = None
+POS_COOL  = 2.0     # 撞到 50011 後的冷卻秒數：期間不再 force，避免超限自我延續
+
+async def _positions_fetch(force=False):
+    """回 (ok, data)。ok=False 代表【查不到答案】（速率限制或網路錯誤），
+    絕對不可以解讀成『沒有倉位』—— 這正是昨晚假出場災情的根源。"""
+    global _POS_LOCK
+    if _POS_LOCK is None:
+        _POS_LOCK = asyncio.Lock()
+    now = time.time()
+    # 冷卻期間一律不強制刷新：撞到速率限制後還猛打，只會讓限制一直續命
+    if now < POS_CACHE["cool"]:
+        force = False
+    if not force and POS_CACHE["data"] is not None and (now - POS_CACHE["t"]) < POS_TTL:
+        return True, POS_CACHE["data"]
+    async with _POS_LOCK:
+        now = time.time()
+        # 等鎖期間別人剛更新過就直接用，避免同一瞬間重複打 API
+        if POS_CACHE["data"] is not None and (now - POS_CACHE["t"]) < POS_TTL:
+            return True, POS_CACHE["data"]
+        r = await api("GET", "/api/v5/account/positions")
+        if r.get("code") != "0":
+            if str(r.get("code")) == "50011":
+                POS_CACHE["cool"] = time.time() + POS_COOL
+            print(f"[持倉查詢異常] code={r.get('code')} msg={r.get('msg')} → 本輪判定為「未知」，不做任何出場認定")
+            return False, None
+        data = r.get("data") or []
+        POS_CACHE["t"] = time.time()
+        POS_CACHE["data"] = data
+        return True, data
+
+
+async def okx_pos_ex(iid, ps, force=False):
+    """回 (ok, pos)。ok=False = 查詢失敗（未知），pos=None 且 ok=True = 確實沒倉。"""
+    ok, data = await _positions_fetch(force)
+    if not ok:
+        return False, None
+    for p in data:
         if p.get("instId") == iid and p.get("posSide") == ps:
             try:
-                if float(p.get("pos") or 0) != 0: return p
-            except Exception: pass
-    return None
+                if float(p.get("pos") or 0) != 0:
+                    return True, p
+            except Exception:
+                pass
+    return True, None
+
+
+async def okx_pos(iid, ps, force=False):
+    """相容介面：只回持倉本身。需要分辨「沒倉」與「查不到」時請用 okx_pos_ex。"""
+    ok, p = await okx_pos_ex(iid, ps, force)
+    return p if ok else None
 
 async def okx_orders(iid=None, ps=None, prefix="n"):
     r = await api("GET", "/api/v5/trade/orders-pending")
@@ -975,16 +1021,25 @@ async def frame_mover(app):
                     fps = "long" if d  == "L" else "short"
                     bps = "long" if bd == "L" else "short"
 
-                    cur_f = await okx_pos(iid, fps)
-                    cur_b = await okx_pos(iid, bps)
+                    ok_f, cur_f = await okx_pos_ex(iid, fps)
+                    ok_b, cur_b = await okx_pos_ex(iid, bps)
+                    if not (ok_f and ok_b):
+                        continue        # 【#27】查詢未回應，本輪不動任何 SL
 
                     # 守門狗：一律查 OKX，不看內部旗標（孤兒倉正是旗標為 False 的那種）
+                    # 【#27】守門狗節流：裸倉告警門檻是 15 秒，不需要每 0.5 秒查一次
+                    # algo 單（那會多吃 8 次/秒的 orders-algo-pending 額度）。每 3 秒一次足夠。
+                    _ng_due = (now_t - float(S.get("_naked_chk_t", 0)) >= 3.0)
+                    if _ng_due:
+                        S["_naked_chk_t"] = now_t
                     if cur_f:
-                        await _naked_guard(app, S, iid, fps, "A/前單", now_t)
+                        if _ng_due:
+                            await _naked_guard(app, S, iid, fps, "A/前單", now_t)
                     else:
                         S.pop(f"_naked_since_{fps}", None); S.pop(f"_naked_alerted_{fps}", None)
                     if cur_b:
-                        await _naked_guard(app, S, iid, bps, "B/後單", now_t)
+                        if _ng_due:
+                            await _naked_guard(app, S, iid, bps, "B/後單", now_t)
                     else:
                         S.pop(f"_naked_since_{bps}", None); S.pop(f"_naked_alerted_{bps}", None)
 
@@ -1358,9 +1413,17 @@ async def _confirm_gone(iid, ps, tries=3, gap=0.3):
     實測 2026-09-19：A、B 兩個倉在 0.5 秒內「同時消失」，21 秒後又「回來」，
     期間程式已經宣告戰役結束、撤光掛單、把旗標清空 —— 一次空讀滾成全面災情。
 
-    連續 tries 次都查不到才算數。回傳 True = 確實已平倉。"""
+    連續 tries 次都查不到才算數。回傳 True = 確實已平倉。
+
+    【#27】查詢失敗（50011 速率限制等）一律視為「沒出場」——
+    持續性超限會讓三次查詢一致失敗，若把失敗當成空倉，三重確認反而會
+    「一致同意」倉位不見了，比單次誤判更危險。寧可漏判，不可誤判。"""
     for i in range(tries):
-        if await okx_pos(iid, ps):
+        ok, p = await okx_pos_ex(iid, ps, force=True)
+        if not ok:
+            print(f"[出場判定中止] {iid} {ps} 查詢未回應，不認定為出場")
+            return False
+        if p:
             return False
         if i < tries - 1:
             await asyncio.sleep(gap)
@@ -1553,8 +1616,12 @@ async def loop(app, chat, S):
             a_side = "long" if d == "L" else "short"
             back_d = S.get("back_d", "S" if d == "L" else "L")
             b_side = "long" if back_d == "L" else "short"
-            cur_a  = await okx_pos(iid, a_side)
-            cur_b  = await okx_pos(iid, b_side)
+            ok_a, cur_a = await okx_pos_ex(iid, a_side)
+            ok_b, cur_b = await okx_pos_ex(iid, b_side)
+            if not (ok_a and ok_b):
+                # 【#27】查不到答案就整輪跳過。寧可晚 0.5 秒偵測，
+                # 也不能拿「未知」去判定進場或出場。
+                continue
             a_open = bool(S.get("front_filled"))
             b_open = bool(S.get("back_filled"))
 
