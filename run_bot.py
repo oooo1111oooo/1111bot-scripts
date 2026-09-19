@@ -330,12 +330,14 @@ async def ws_private_task():
         try:
             async with wsl.connect(WS_PRI_URL, ping_interval=20, ping_timeout=10) as ws:
                 ts = str(int(time.time()))
+                # 欄位名必須與 api() 用的同一組（accounts.env 的實際鍵名）
                 sgn = base64.b64encode(hmac.new(
-                    ACC[f"{ACCT}_SECRET"].encode(),
+                    ACC[f"OKX_{ACCT}_SECRET"].encode(),
                     (ts + "GET" + "/users/self/verify").encode(),
                     hashlib.sha256).digest()).decode()
                 await ws.send(json.dumps({"op": "login", "args": [{
-                    "apiKey": ACC[f"{ACCT}_KEY"], "passphrase": ACC[f"{ACCT}_PASS"],
+                    "apiKey": ACC[f"OKX_{ACCT}_API_KEY"],
+                    "passphrase": ACC[f"OKX_{ACCT}_PASSPHRASE"],
                     "timestamp": ts, "sign": sgn}]}))
                 raw = await asyncio.wait_for(ws.recv(), timeout=10)
                 if json.loads(raw).get("event") != "login":
