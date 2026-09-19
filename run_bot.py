@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -408,8 +408,12 @@ async def reply(u, t):
 
 # ---------- OKX 事實查詢 ----------
 async def okx_pos(iid, ps):
+    """查單一方向持倉。回 None 有兩種含意：真的沒倉、或查詢出問題 ——
+    呼叫端若要據此判定「已平倉」，一律先經過 _confirm_gone 多次確認。"""
     r = await api("GET", "/api/v5/account/positions")
-    if r.get("code") != "0": return None
+    if r.get("code") != "0":
+        print(f"[持倉查詢異常] {iid} {ps} code={r.get('code')} msg={r.get('msg')}")
+        return None
     for p in (r.get("data") or []):
         if p.get("instId") == iid and p.get("posSide") == ps:
             try:
@@ -470,15 +474,18 @@ async def sweep_algos(iid, pos_side):
     return n
 
 
-async def close_record(iid, ps, after_ms, tries=10):
-    """出場後取 OKX 真實平倉紀錄。"""
+async def close_record(iid, ps, after_ms, tries=8, gap=0.5):
+    """出場後取 OKX 真實平倉紀錄。
+    【#25】這個查詢一律在【背景】執行，絕不可擋住 loop —— 實測 2026-09-19，
+    兩次假出場讓它在主迴圈裡連續阻塞 21 秒，期間監控完全失明，
+    B 單真正的出場就掉在那個空窗裡，沒有任何通知。"""
     for i in range(tries):
         r = await api("GET", f"/api/v5/account/positions-history?instType=SWAP&instId={iid}&limit=10")
         if r.get("code") == "0":
             for p in (r.get("data") or []):
                 if p.get("posSide") == ps and int(p.get("uTime") or 0) >= after_ms:
                     return p
-        await asyncio.sleep(1)
+        await asyncio.sleep(gap)
     return None
 
 # ---------- OKX algo 單（OCO 止盈止損） ----------
@@ -1030,6 +1037,13 @@ async def frame_mover(app):
                                 print(f"[TF逼倉] {S['sym']} {side} 現價={px} SL→{nsl}")
                         if nsl is None:
                             continue
+                        # 【#23】送單前先跟現價比對。峰值算出的 SL 在價格快速回落時
+                        # 可能已越過現價；OKX 對做多要求 SL<最新價、做空要求 SL>最新價，
+                        # 硬送會被 51280 拒絕、計入失敗、觸發退避。
+                        # 越界就跳過這一輪 —— 既有 SL 仍守著，不是保護空窗。
+                        cpx = Decimal(str(px))
+                        if (sd == "L" and nsl >= cpx) or (sd == "S" and nsl <= cpx):
+                            continue
                         S[f"_pending_{side}"] = (str(nsl), str(pk), mtype)
                         amends.append((iid, algo_id, nsl, S, side, sl_f))
                 except Exception as e:
@@ -1163,16 +1177,24 @@ async def _get_net_pnl(iid, pos_side, after_ms):
 
 
 async def _query_open_fee(iid, pos_side, entry_epoch):
-    """查開倉手續費（fills API）。"""
+    """查開倉手續費（fills API）。
+
+    【#26】舊版只用「±5秒時間窗口」比對，會把【平倉】那筆成交也算進開倉手續費。
+    實測 2026-09-19：假出場讓進場時間戳錯亂，開倉費被算成 -0.0004479（其實是平倉費），
+    整筆手續費從 0.072% 被灌成 0.108%，帳目失真。
+    改成同時比對「開倉方向」：做多的開倉一定是 buy、做空的開倉一定是 sell，
+    平倉方向相反，從根本上不可能混淆。"""
     open_fee = Decimal("0")
+    open_side = "buy" if pos_side == "long" else "sell"
     try:
-        r = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=10")
+        r = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=20")
         if r.get("code") == "0":
             for f in (r.get("data") or []):
-                if (f.get("posSide") == pos_side and
-                        abs(int(f.get("ts") or 0) - int(entry_epoch * 1000)) <= 5000):
+                if f.get("posSide") != pos_side or f.get("side") != open_side:
+                    continue
+                if abs(int(f.get("ts") or 0) - int(entry_epoch * 1000)) <= 8000:
                     open_fee += Decimal(str(f.get("fee") or "0"))
-                    print(f"[開倉手續費] {f.get('fee')} ts={f.get('ts')}")
+                    print(f"[開倉手續費] {f.get('fee')} side={f.get('side')} ts={f.get('ts')}")
     except Exception as e:
         print("查開倉手續費失敗", type(e).__name__, e)
     return open_fee
@@ -1208,78 +1230,73 @@ def _sl_block(mn, mhist, fn=0):
     return "\n".join(lines)
 
 
-def _exit_reason(S, side, close_px):
-    """判定出場原因：TP / 靜態SL / 緊貼SL / TF逼倉 / 手動。
-    舊版一律顯示 Stop Loss，分不出是靜態SL、緊貼SL 還是 TF 逼出去的。"""
+def _exit_snapshot(S, side, seq):
+    """把出場當下需要的所有欄位【複製】一份。
+    【#25】記帳改到背景執行後，主迴圈可能已經重新部署並重置 S 的欄位；
+    不先快照就會用到新戰役的資料去算舊戰役的損益。"""
+    pre = "front" if side == "front" else "back"
+    d = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
+    return {
+        "side": side, "pre": pre, "name": "A單" if side == "front" else "B單",
+        "dir": d, "sym": S["sym"], "iid": S["spec"]["iid"], "tick": S["spec"]["tick"],
+        "pos_side": "long" if d == "L" else "short",
+        "lev": S.get("lev"), "margin": S.get("margin"), "seq": seq,
+        "entry_px": S.get(f"{pre}_px"), "entry_ee": S.get(f"{pre}_ee"),
+        "tp_px": S.get(f"{pre}_tp_px"), "static_sl": S.get(f"{pre}_static_sl"),
+        "last_sl": S.get(f"{pre}_sl_px"), "peak": S.get(f"{pre}_peak"),
+        "move_n": int(S.get(f"{pre}_move_n", 0)),
+        "move_hist": list(S.get(f"{pre}_move_hist") or []),
+        "round": S.get("round_today", "-"),
+    }
+
+
+def _exit_reason(snap, close_px):
+    """判定出場原因：TP / 靜態SL / 緊貼SL / TF逼倉 / 手動。"""
     try:
         cp = Decimal(str(close_px))
-    except Exception:
-        return "手動/其他"
-    pre = "front" if side == "front" else "back"
-    tick = S["spec"]["tick"]
-    tol = tick * 3
-    try:
-        tp  = Decimal(str(S.get(f"{pre}_tp_px") or 0))
-        ssl = Decimal(str(S.get(f"{pre}_static_sl") or 0))
-        lsl = Decimal(str(S.get(f"{pre}_sl_px") or ssl))
+        tol = snap["tick"] * 3
+        tp  = Decimal(str(snap.get("tp_px") or 0))
+        ssl = Decimal(str(snap.get("static_sl") or 0))
+        lsl = Decimal(str(snap.get("last_sl") or ssl))
     except Exception:
         return "手動/其他"
     if tp and abs(cp - tp) <= tol:
         return "TP"
-    mh = S.get(f"{pre}_move_hist") or []
-    last_ok = None
-    for m in reversed(mh):
-        if m.get("type") != E.MOVE_FAIL:
-            last_ok = m; break
     if abs(cp - ssl) <= tol and abs(lsl - ssl) <= tol:
         return "靜態SL"
     if abs(cp - lsl) <= tol:
+        last_ok = None
+        for m in reversed(snap.get("move_hist") or []):
+            if m.get("type") != E.MOVE_FAIL:
+                last_ok = m; break
         if last_ok and last_ok.get("type") == E.MOVE_TIME:
             return "TF逼倉"
         return "緊貼SL"
     return "手動/其他"
 
 
-def _peak_line(S, side):
+def _peak_line(snap):
     """峰值顯示行（獨立一行，避免訊息過寬）。"""
-    pre = "front" if side == "front" else "back"
-    ent = S.get(f"{pre}_px")
-    pk  = S.get(f"{pre}_peak") or ent
+    ent = snap.get("entry_px"); pk = snap.get("peak") or ent
     if not ent or not pk:
         return "峰值：-"
     try:
         e = Decimal(str(ent)); p = Decimal(str(pk))
-        d = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
-        gain = (p - e) / e * 100 if d == "L" else (e - p) / e * 100
+        gain = (p - e) / e * 100 if snap["dir"] == "L" else (e - p) / e * 100
         return f"峰值：{p}（{gain:+.3f}%）"
     except Exception:
         return f"峰值：{pk}"
 
 
-async def _build_exit_msg(S, side, rec, open_fee, seq):
-    """組出場通知全文（不送出，由呼叫端決定何時送）。
-    分成 build / send 兩步的原因：戰役結束時要先重新部署、拿到新的埋伏價，
-    才能把『重新部署』那幾行寫進同一則訊息 —— 但 _place_pair 會重置 S 欄位，
-    所以必須在重置前先把文字組好。
-    回傳 (訊息字串, 毛損益, 手續費, 淨損益, 出場原因)。"""
-    _is_a = (side == "front")
-    name = "A單" if _is_a else "B單"
-    d = S["dir"] if _is_a else S.get("back_d", "S" if S["dir"] == "L" else "L")
-    sym = S["sym"]
-    mv = float(Decimal(str(S.get("margin", "1"))))
-    pre = "front" if _is_a else "back"
-
-    _pos_side = "long" if d == "L" else "short"
-    _otp, _osl = await okx_tpsl(S["spec"]["iid"], _pos_side)
-    entry_px  = S.get(f"{pre}_px", "-")
-    entry_ee  = S.get(f"{pre}_ee", 0)
-    static_tp = _otp or S.get(f"{pre}_tp_px", "-")
-    static_sl = _osl or S.get(f"{pre}_static_sl", "-")
-    last_sl   = S.get(f"{pre}_sl_px", "-")
-    mn        = int(S.get(f"{pre}_move_n", 0))
-    mhist     = S.get(f"{pre}_move_hist") or []
-
-    entry_t = datetime.fromtimestamp(float(entry_ee), TZ8).strftime("%H:%M:%S") if entry_ee else "-"
+async def _build_exit_msg(snap, rec, open_fee):
+    """組出場通知全文（從快照，不碰 S）。回傳 (訊息, 毛, 費, 淨, 原因)。"""
+    d = snap["dir"]
+    mv = float(Decimal(str(snap.get("margin", "1"))))
+    _otp, _osl = await okx_tpsl(snap["iid"], snap["pos_side"])
+    static_tp = _otp or snap.get("tp_px", "-")
+    static_sl = _osl or snap.get("static_sl", "-")
+    ee = snap.get("entry_ee")
+    entry_t = datetime.fromtimestamp(float(ee), TZ8).strftime("%H:%M:%S") if ee else "-"
 
     if rec:
         g_r   = Decimal(str(rec.get("pnl") or "0"))
@@ -1290,7 +1307,7 @@ async def _build_exit_msg(S, side, rec, open_fee, seq):
         g_r = fee_r = net_r = Decimal("0")
         xpx = "-"
 
-    reason = _exit_reason(S, pre, xpx) if xpx != "-" else "手動/其他"
+    reason = _exit_reason(snap, xpx) if xpx != "-" else "查無平倉紀錄"
     g_pct   = float(g_r)   / mv * 100 if mv else 0
     fee_pct = float(fee_r) / mv * 100 if mv else 0
     net_pct = float(net_r) / mv * 100 if mv else 0
@@ -1298,22 +1315,22 @@ async def _build_exit_msg(S, side, rec, open_fee, seq):
 
     msg = (
         f"{E.BOT} OKX原K｜{ACCT}\n"
-        f"事件：{ico} {name}出場成交（本場第{seq}個出場）\n"
+        f"事件：{ico} {snap['name']}出場成交（本場第{snap['seq']}個出場）\n"
         f"━━━━━━━━━━\n"
-        f"商品：{E.dir_emoji(d)} {sym} {E.dir_word(d)} {S.get('lev')}x {S.get('margin')}\n"
+        f"商品：{E.dir_emoji(d)} {snap['sym']} {E.dir_word(d)} {snap.get('lev')}x {snap.get('margin')}\n"
         f"出場原因：{reason}\n"
         f"━━━━━━━━━━\n"
-        f"進場：{entry_px} | {entry_t}\n"
-        f"{_peak_line(S, pre)}\n"
+        f"進場：{snap.get('entry_px','-')} | {entry_t}\n"
+        f"{_peak_line(snap)}\n"
         f"靜態TP：{static_tp}\n"
         f"靜態SL：{static_sl}\n"
-        f"最後SL：{last_sl}\n"
+        f"最後SL：{snap.get('last_sl','-')}\n"
         f"出場：{xpx} | {hhmmss()}\n"
         f"━━━━━━━━━━\n"
         f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
         f"手續費：{fee_r:.6f} ({fee_pct:+.3f}%)\n"
         f"淨損益：{net_r:+.6f} ({net_pct:+.3f}%) {ico}\n"
-        f"{_sl_block(mn, mhist)}"
+        f"{_sl_block(snap['move_n'], snap['move_hist'])}"
     )
     return msg, g_r, fee_r, net_r, reason
 
@@ -1331,6 +1348,50 @@ def _battle_form(S):
     if b:
         return "B單獨成交"
     return "未成交"
+
+
+async def _confirm_gone(iid, ps, tries=3, gap=0.3):
+    """【#20/#21】確認持倉是真的不見了，不是查詢雜訊。
+
+    OKX /api/v5/account/positions 有讀取一致性延遲：剛成交的倉位可能短暫查不到，
+    而且回的是 code=0 的正常回應（沒有任何錯誤碼），okx_pos 無從分辨。
+    實測 2026-09-19：A、B 兩個倉在 0.5 秒內「同時消失」，21 秒後又「回來」，
+    期間程式已經宣告戰役結束、撤光掛單、把旗標清空 —— 一次空讀滾成全面災情。
+
+    連續 tries 次都查不到才算數。回傳 True = 確實已平倉。"""
+    for i in range(tries):
+        if await okx_pos(iid, ps):
+            return False
+        if i < tries - 1:
+            await asyncio.sleep(gap)
+    return True
+
+
+async def _exit_report(app, chat, S, snaps, tail_fn):
+    """【#25】背景記帳：查平倉損益、組訊息、發 TG、寫交易紀錄。
+    主迴圈只負責偵測與狀態機，絕不為記帳停下來。"""
+    try:
+        results = []
+        for snap in snaps:
+            ee = float(snap.get("entry_ee") or time.time())
+            rec  = await close_record(snap["iid"], snap["pos_side"], int(ee * 1000))
+            ofee = await _query_open_fee(snap["iid"], snap["pos_side"], ee)
+            msg, g_r, fee_r, net_r, reason = await _build_exit_msg(snap, rec, ofee)
+            S[f"{snap['pre']}_exit_reason"] = reason
+            S[f"{snap['pre']}_exit_pnl"]    = f"{float(net_r):+.6f}"
+            print(f"[{snap['name']}出場] {snap['sym']} {reason} 淨損益={net_r}")
+            log_trade({"date": today8(), "sym": snap["sym"], "dir": snap["dir"],
+                       "reason": reason, "gross": float(g_r), "fee": float(fee_r),
+                       "net": float(net_r),
+                       "nv": float(Decimal(str(snap.get("margin", "1")))),
+                       "hold_s": int(time.time() - ee), "ambush_s": 0})
+            results.append(msg)
+        save_state()
+        tail = tail_fn()
+        for m in results:
+            await notify(app, chat, f"{m}\n{tail}")
+    except Exception as e:
+        print("背景記帳錯誤", type(e).__name__, e)
 
 
 async def okx_tpsl(iid, pos_side):
@@ -1563,68 +1624,86 @@ async def loop(app, chat, S):
             a_gone = a_open and not cur_a
             b_gone = b_open and not cur_b
             if a_gone or b_gone:
-                pend_msgs = []
-                for gone, side, ps in ((a_gone, "front", a_side), (b_gone, "back", b_side)):
+                # 【#20/#21/#22】三重確認：一次空讀絕不當成出場。
+                # OKX 持倉端點有讀取一致性延遲，會回 code=0 但內容缺漏，
+                # 舊版一次空讀就宣告戰役結束＋撤光掛單，不可逆。
+                if a_gone and not await _confirm_gone(iid, a_side):
+                    print(f"[空讀忽略] {S['sym']} A 持倉仍在，判定為查詢雜訊")
+                    a_gone = False
+                if b_gone and not await _confirm_gone(iid, b_side):
+                    print(f"[空讀忽略] {S['sym']} B 持倉仍在，判定為查詢雜訊")
+                    b_gone = False
+                if not (a_gone or b_gone):
+                    continue
+
+                # 先快照、先清旗標，狀態機立刻往前走；記帳丟背景。
+                snaps = []
+                for gone, side in ((a_gone, "front"), (b_gone, "back")):
                     if not gone:
                         continue
                     seq = int(S.get("exit_seq", 0)) + 1
                     S["exit_seq"] = seq
-                    ee = float(S.get(f"{side}_ee") or time.time())
-                    _, rec = await _get_net_pnl(iid, ps, int(ee * 1000))
-                    ofee = await _query_open_fee(iid, ps, ee)
-                    msg, g_r, fee_r, net_r, reason = await _build_exit_msg(S, side, rec, ofee, seq)
-                    S[f"{side}_exit_reason"] = reason
-                    S[f"{side}_exit_pnl"]    = f"{float(net_r):+.6f}"
-                    S[f"{side}_filled"]      = False
-                    print(f"[{'A' if side=='front' else 'B'}出場] {S['sym']} {reason} 淨損益={net_r}")
-                    log_trade({"date": today8(), "sym": S["sym"],
-                               "dir": d if side == "front" else back_d,
-                               "reason": reason, "gross": float(g_r), "fee": float(fee_r),
-                               "net": float(net_r), "nv": float(Decimal(str(S.get("margin","1")))),
-                               "hold_s": int(time.time() - ee), "ambush_s": 0})
-                    pend_msgs.append(msg)
+                    snaps.append(_exit_snapshot(S, side, seq))
+                    S[f"{side}_filled"] = False
+                    print(f"[出場確認] {S['sym']} {'A' if side=='front' else 'B'}單 "
+                          f"第{seq}個出場（記帳轉背景）")
                 save_state()
 
-                # 戰場狀態：對手還在？還是戰役結束？
-                other = "back" if a_gone and not b_gone else ("front" if b_gone and not a_gone else None)
+                other = "back" if (a_gone and not b_gone) else ("front" if (b_gone and not a_gone) else None)
                 note = await _pending_side_note(S, iid, other) if other else None
                 if note:
-                    tail = f"━━━━━━━━━━\n{note}\n時間：{hhmmss()}"
-                    for m in pend_msgs:
-                        await notify(app, chat, f"{m}\n{tail}")
+                    # 對手還在場：戰役未結束，只附戰場狀態
+                    asyncio.create_task(_exit_report(app, chat, S, snaps,
+                        lambda n=note: f"━━━━━━━━━━\n{n}\n時間：{hhmmss()}"))
                     continue
 
                 # ---- 戰役結束：零持倉、零掛單 ----
                 await cancel_all_orders(iid)
-                form = _battle_form(S)
-                a_r  = S.get("front_exit_reason"); a_p = S.get("front_exit_pnl")
-                b_r  = S.get("back_exit_reason");  b_p = S.get("back_exit_pnl")
-                try:
-                    tot = float(a_p or 0) + float(b_p or 0)
-                except Exception:
-                    tot = 0.0
+                # 先留存「先前已出場那一邊」的結果 —— _place_pair 會把這些欄位清掉
+                prev = {"front": (S.get("front_exit_reason"), S.get("front_exit_pnl")),
+                        "back":  (S.get("back_exit_reason"),  S.get("back_exit_pnl"))}
+                rnd = S.get("round_today", "-")
                 mvv = float(Decimal(str(S.get("margin", "1")))) or 1.0
-                settle = (f"━━━━━━━━━━\n"
-                          f"🏁 戰役結束 第{S.get('round_today','-')}輪\n"
-                          f"A單：{a_r or '未成交'}  {a_p or '-'}\n"
-                          f"B單：{b_r or '未成交'}  {b_p or '-'}\n"
-                          f"戰役淨損益：{tot:+.6f}（{tot/mvv*100:+.3f}%）\n"
-                          f"形態：{form}")
-                bump(skey(S["sym"], S["dir"]), f"form_{form}")
-                S["battle_form"] = form
+                skey_now = skey(S["sym"], S.get("locked_dir", d))
                 S["dir"] = S.get("locked_dir", d)
-                # 立刻重新取價部署（不等 120 秒、不看 K 線節奏）
                 S["pair_state"] = "waiting"
                 redeploy = await _place_pair(S, iid, chat, app, label="新戰役")
-                if redeploy:
-                    settle += (f"\n━━━━━━━━━━\n"
-                               f"重新部署：A埋伏 {S['front_px']}\n"
-                               f"B觸發 {S['back_px']}")
-                else:
-                    settle += "\n━━━━━━━━━━\n重新部署：稍後重試（戰場尚未清空）"
-                settle += f"\n時間：{hhmmss()}"
-                for m in pend_msgs:
-                    await notify(app, chat, f"{m}\n{settle}")
+                new_a = S.get("front_px") if redeploy else None
+                new_b = S.get("back_px")  if redeploy else None
+
+                def _settle_tail(S=S, prev=prev, rnd=rnd, mvv=mvv,
+                                 new_a=new_a, new_b=new_b, kk=skey_now):
+                    # 在背景記帳寫完 exit_reason 之後才計算，所以拿得到真實結果
+                    a_r = S.get("front_exit_reason") or prev["front"][0]
+                    a_p = S.get("front_exit_pnl")    or prev["front"][1]
+                    b_r = S.get("back_exit_reason")  or prev["back"][0]
+                    b_p = S.get("back_exit_pnl")     or prev["back"][1]
+                    if a_r and b_r:
+                        form = "雙殺" if (a_r == "靜態SL" and b_r == "靜態SL") else "雙邊成交"
+                    elif a_r:
+                        form = "A單獨成交"
+                    elif b_r:
+                        form = "B單獨成交"
+                    else:
+                        form = "未成交"
+                    try:
+                        tot = float(a_p or 0) + float(b_p or 0)
+                    except Exception:
+                        tot = 0.0
+                    bump(kk, f"form_{form}")
+                    t = (f"━━━━━━━━━━\n"
+                         f"🏁 戰役結束 第{rnd}輪\n"
+                         f"A單：{a_r or '未成交'}  {a_p or '-'}\n"
+                         f"B單：{b_r or '未成交'}  {b_p or '-'}\n"
+                         f"戰役淨損益：{tot:+.6f}（{tot/mvv*100:+.3f}%）\n"
+                         f"形態：{form}")
+                    if new_a and new_b:
+                        t += f"\n━━━━━━━━━━\n重新部署：A埋伏 {new_a}\nB觸發 {new_b}"
+                    else:
+                        t += "\n━━━━━━━━━━\n重新部署：稍後重試（戰場尚未清空）"
+                    return t + f"\n時間：{hhmmss()}"
+
+                asyncio.create_task(_exit_report(app, chat, S, snaps, _settle_tail))
                 continue
 
             # ========== TF 零持倉重新部署 ==========
