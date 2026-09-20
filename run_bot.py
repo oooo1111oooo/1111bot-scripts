@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -97,7 +97,7 @@ def pct(v):
     return str(d)
 
 # ---------- 狀態持久化（原子寫入） ----------
-SAVE_FIELDS = ("sym","dir","lev","margin","offset","gap","tp","sl","chat",
+SAVE_FIELDS = ("sym","dir","lev","margin","offset","gap","tp","sl","hug","chat",
                "locked_dir","pair_state",
                "front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
@@ -105,7 +105,7 @@ SAVE_FIELDS = ("sym","dir","lev","margin","offset","gap","tp","sl","chat",
                "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
                "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
                "back_peak","back_exit_reason","back_exit_pnl",
-               "algo_id","exit_seq","battle_form",
+               "algo_id","exit_seq","battle_form","battle_t0","_reported_closes",
                "round_date","round_today","enter_today")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
@@ -641,6 +641,14 @@ def hug_pct(S, side):
     """該單的緊貼距離（= 其來回手續費率）。A=FEE_A、B=FEE_B。
     再套 tick 地板：低於 MIN_HUG_TICKS 檔會被買賣價差直接掃掉，自動提升。"""
     F = FEE_A if side == "front" else FEE_B
+    # 使用者設的緊貼距離：只能比手續費率【鬆】，不能更緊 ——
+    # 貼得比手續費還近，出場必定淨虧，那是穩賠的設定。
+    try:
+        user = Decimal(str(S.get("hug", 0) or 0)) / 100
+        if user > F:
+            F = user
+    except Exception:
+        pass
     try:
         # 參考價各用各的：A 用 front_px、B 用 back_px，不可互相借用
         ref = Decimal(str(S.get("front_px" if side == "front" else "back_px") or 0))
@@ -780,6 +788,14 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     # ── 掛單前完整檢查：掛單 + 持倉 都必須為 0 才准部署新戰役 ──
     # 【不阻塞】只檢查一次就返回，絕不在此等待 —— loop 是主迴圈，
     # 讓它替 _place_pair 站崗會使進場/出場偵測全部停擺。
+    # 【#33 保險絲】任一邊仍標記為「已成交」→ 代表還有單沒結清，絕不准部署。
+    # 舊版 _place_pair 無條件重置旗標，把「已平倉但還沒回報出場」的單直接抹掉，
+    # 那一單的損益就此消失（實測第69輪 A 單）。這道保險絲讓它不可能再發生。
+    if S.get("front_filled") or S.get("back_filled"):
+        print(f"[拒絕部署] {S['sym']} 仍有未結清的單 "
+              f"(A={bool(S.get('front_filled'))} B={bool(S.get('back_filled'))})")
+        return False
+
     _iid0 = S["spec"]["iid"]
     await cancel_all_orders(_iid0)          # 只撤進場委託，保留持倉保護傘
     clear, n_ord, n_pos = await _field_is_clear(_iid0)
@@ -875,6 +891,7 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
         S.pop(k, None)
     S["state"]           = "委託中"
     S["pair_state"]      = "waiting"
+    S["battle_t0"]       = time.time()      # 對帳的時間起點
     WS_WANT.add(iid)
     bump(skey(S["sym"], S["dir"]), "placed")
     save_state()
@@ -897,7 +914,7 @@ async def _okx_has_oco(iid, ps):
         return None
 
 
-async def _okx_oco_id(iid, ps, tries=6):
+async def _okx_oco_id(iid, ps, tries=4, gap=0.2):
     """【問題4 配套】向 OKX 索取守護該持倉方向的 OCO(止盈止損) algoId。
     下單時 attachAlgoOrds 已帶 TP/SL，成交當下由 OKX「自動」生成這張 OCO ——
     程式不再自己補掛第二張（那會變成 2 張），改成回頭跟 OKX 要它的 algoId。
@@ -911,7 +928,7 @@ async def _okx_oco_id(iid, ps, tries=6):
                         return o.get("algoId")
         except Exception as e:
             print("查 OCO algoId 失敗", iid, ps, type(e).__name__, e)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(gap)
     print(f"[警告] 查不到 OCO algoId {iid} {ps} —— 移動SL 將由守門狗監控")
     return None
 
@@ -1223,37 +1240,12 @@ async def _algo_actual_side(iid, algo_id, tries=6):
     return None
 
 
-async def _get_net_pnl(iid, pos_side, after_ms):
-    """查 OKX 出場淨損益（realizedPnl）。"""
-    rec = await close_record(iid, pos_side, after_ms, tries=10)
-    if rec:
-        return Decimal(str(rec.get("realizedPnl") or "0")), rec
-    return Decimal("0"), None
-
-
-async def _query_open_fee(iid, pos_side, entry_epoch):
-    """查開倉手續費（fills API）。
-
-    【#26】舊版只用「±5秒時間窗口」比對，會把【平倉】那筆成交也算進開倉手續費。
-    實測 2026-09-19：假出場讓進場時間戳錯亂，開倉費被算成 -0.0004479（其實是平倉費），
-    整筆手續費從 0.072% 被灌成 0.108%，帳目失真。
-    改成同時比對「開倉方向」：做多的開倉一定是 buy、做空的開倉一定是 sell，
-    平倉方向相反，從根本上不可能混淆。"""
-    open_fee = Decimal("0")
-    open_side = "buy" if pos_side == "long" else "sell"
-    try:
-        r = await api("GET", f"/api/v5/trade/fills?instId={iid}&limit=20")
-        if r.get("code") == "0":
-            for f in (r.get("data") or []):
-                if f.get("posSide") != pos_side or f.get("side") != open_side:
-                    continue
-                if abs(int(f.get("ts") or 0) - int(entry_epoch * 1000)) <= 8000:
-                    open_fee += Decimal(str(f.get("fee") or "0"))
-                    print(f"[開倉手續費] {f.get('fee')} side={f.get('side')} ts={f.get('ts')}")
-    except Exception as e:
-        print("查開倉手續費失敗", type(e).__name__, e)
-    return open_fee
-
+# 【設計原則】損益一律直接讀 OKX，程式絕不自己加減。
+# 舊版有 _get_net_pnl / _query_open_fee 兩個輔助函式，會把「開倉手續費」
+# 再加到 OKX 給的 fee / realizedPnl 上 —— 但 positions-history 的 fee 欄位
+# 本來就已經是【開倉+平倉】的累計值，補加就變成重複計算
+# （實測 2026-09-20：真實 -0.00061584，被算成 -0.000791）。
+# 兩個函式已全數移除，避免日後又被誤用。程式只做一件事：把金額換算成百分比。
 
 def _move_stat(mhist):
     """統計三類移動次數：✅獲利推進 / ⏱️時間小移動 / 🚫API失敗。"""
@@ -1343,20 +1335,26 @@ def _peak_line(snap):
         return f"峰值：{pk}"
 
 
-async def _build_exit_msg(snap, rec, open_fee):
+async def _build_exit_msg(snap, rec):
     """組出場通知全文（從快照，不碰 S）。回傳 (訊息, 毛, 費, 淨, 原因)。"""
     d = snap["dir"]
     mv = float(Decimal(str(snap.get("margin", "1"))))
-    _otp, _osl = await okx_tpsl(snap["iid"], snap["pos_side"])
-    static_tp = _otp or snap.get("tp_px", "-")
-    static_sl = _osl or snap.get("static_sl", "-")
+    # 【#30】不再查 OKX 即時掛單。記帳是背景執行的，那時新戰役的掛單早就掛上去了，
+    # live 查詢會抓到【下一場】的 TP/SL（實測第63輪顯示 0.09086/0.08701，
+    # 那是新 A 埋伏價 0.08736 算出來的，不是這一單的）。一律用進場當下的快照。
+    static_tp = snap.get("tp_px", "-")
+    static_sl = snap.get("static_sl", "-")
     ee = snap.get("entry_ee")
     entry_t = datetime.fromtimestamp(float(ee), TZ8).strftime("%H:%M:%S") if ee else "-"
 
     if rec:
+        # 【#39】OKX positions-history 的 fee 欄位【已經是整個持倉的累計手續費】
+        # （開倉 + 平倉），realizedPnl 同樣已扣除。舊版又把開倉費加一次 → 重複計算。
+        # 實測 2026-09-20 第63輪：開倉費 -0.00017544、平倉費 -0.00044040，
+        # 真實總費 -0.00061584，TG 卻顯示 -0.000791，正好多算一次開倉費。
         g_r   = Decimal(str(rec.get("pnl") or "0"))
-        fee_r = Decimal(str(rec.get("fee") or "0")) + open_fee
-        net_r = Decimal(str(rec.get("realizedPnl") or "0")) + open_fee
+        fee_r = Decimal(str(rec.get("fee") or "0"))
+        net_r = Decimal(str(rec.get("realizedPnl") or "0"))
         xpx   = str(rec.get("closeAvgPx") or "-")
     else:
         g_r = fee_r = net_r = Decimal("0")
@@ -1430,6 +1428,53 @@ async def _confirm_gone(iid, ps, tries=3, gap=0.3):
     return True
 
 
+async def _reconcile(app, chat, S, iid):
+    """【#37】出場對帳：拿 OKX 的平倉紀錄跟程式回報過的比對，把漏掉的補登。
+
+    程式以輪詢偵測進出場，一筆單的完整生老病死可能只有 1 秒（實測第63輪），
+    loop 正在處理別的事就會整段錯過 —— 那筆真實損益就永遠不會進帳。
+    這是最後一道防線：就算程式漏看，帳也不會錯。"""
+    try:
+        t0 = float(S.get("battle_t0") or 0)
+        if not t0:
+            return
+        r = await api("GET", f"/api/v5/account/positions-history?instId={iid}&limit=20")
+        if r.get("code") != "0":
+            return
+        done = set(S.get("_reported_closes") or [])
+        miss = [p for p in (r.get("data") or [])
+                if int(p.get("uTime") or 0) >= int(t0 * 1000)
+                and p.get("posId") and p.get("posId") not in done]
+        if not miss:
+            return
+        mv = float(Decimal(str(S.get("margin", "1")))) or 1.0
+        for p in miss:
+            net = Decimal(str(p.get("realizedPnl") or "0"))
+            fee = Decimal(str(p.get("fee") or "0"))
+            g   = Decimal(str(p.get("pnl") or "0"))
+            ps  = p.get("posSide")
+            dd  = "L" if ps == "long" else "S"
+            done.add(p.get("posId"))
+            print(f"[對帳補登] {S['sym']} {ps} 淨損益={net} posId={p.get('posId')}")
+            log_trade({"date": today8(), "sym": S["sym"], "dir": dd, "reason": "補登",
+                       "gross": float(g), "fee": float(fee), "net": float(net),
+                       "nv": mv, "hold_s": 0, "ambush_s": 0})
+            await notify(app, chat,
+                f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.WARN} 對帳補登出場\n"
+                f"━━━━━━━━━━\n"
+                f"商品：{E.dir_emoji(dd)} {S['sym']} {E.dir_word(dd)}\n"
+                f"這筆成交程式當時沒偵測到，依 OKX 紀錄補登\n"
+                f"━━━━━━━━━━\n"
+                f"進場：{p.get('openAvgPx','-')}\n出場：{p.get('closeAvgPx','-')}\n"
+                f"毛損益：{g:+.6f}\n手續費：{fee:.6f}\n"
+                f"淨損益：{net:+.6f}（{float(net)/mv*100:+.3f}%）{E.pnl_emoji(net)}\n"
+                f"時間：{hhmmss()}")
+        S["_reported_closes"] = list(done)[-40:]
+        save_state()
+    except Exception as e:
+        print("對帳失敗", type(e).__name__, e)
+
+
 async def _exit_report(app, chat, S, snaps, tail_fn):
     """【#25】背景記帳：查平倉損益、組訊息、發 TG、寫交易紀錄。
     主迴圈只負責偵測與狀態機，絕不為記帳停下來。"""
@@ -1438,8 +1483,10 @@ async def _exit_report(app, chat, S, snaps, tail_fn):
         for snap in snaps:
             ee = float(snap.get("entry_ee") or time.time())
             rec  = await close_record(snap["iid"], snap["pos_side"], int(ee * 1000))
-            ofee = await _query_open_fee(snap["iid"], snap["pos_side"], ee)
-            msg, g_r, fee_r, net_r, reason = await _build_exit_msg(snap, rec, ofee)
+            if rec and rec.get("posId"):
+                _rc = list(S.get("_reported_closes") or [])
+                _rc.append(rec["posId"]); S["_reported_closes"] = _rc[-40:]
+            msg, g_r, fee_r, net_r, reason = await _build_exit_msg(snap, rec)
             S[f"{snap['pre']}_exit_reason"] = reason
             S[f"{snap['pre']}_exit_pnl"]    = f"{float(net_r):+.6f}"
             print(f"[{snap['name']}出場] {snap['sym']} {reason} 淨損益={net_r}")
@@ -1494,15 +1541,19 @@ async def _field_is_clear(iid):
     orders, algos = await list_all_orders(iid)
     n_ord = len(orders) + len(algos)
     n_pos = 0
-    r = await api("GET", "/api/v5/account/positions?instType=SWAP")
-    if r.get("code") == "0":
-        for p in (r.get("data") or []):
-            if p.get("instId") == iid:
-                try:
-                    if float(p.get("pos") or 0) != 0:
-                        n_pos += 1
-                except Exception:
-                    pass
+    # 【#29】改走共用快取，且查詢失敗一律回「未清空」。
+    # 舊版查詢失敗時 n_pos 維持 0 → 謊報已清空 → 帶著活倉重新部署。
+    # 另外舊版自己打 API，完全繞過速率快取，3 幣種在 TF 邊界會同時各打一次。
+    ok, data = await _positions_fetch(force=True)
+    if not ok:
+        return False, n_ord, -1
+    for p in data:
+        if p.get("instId") == iid:
+            try:
+                if float(p.get("pos") or 0) != 0:
+                    n_pos += 1
+            except Exception:
+                pass
     return (n_ord == 0 and n_pos == 0), n_ord, n_pos
 
 
@@ -1571,7 +1622,10 @@ async def _pending_side_note(S, iid, side):
     nm  = "A單" if side == "front" else "B單"
     d = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
     ps = "long" if d == "L" else "short"
-    if await okx_pos(iid, ps):
+    # 【#28】查不到答案時保守視為「對手還在」—— 寧可晚一輪結束戰役，
+    # 也不能因為一次查詢異常就宣告結束、撤光掛單。
+    ok_p, pos_p = await okx_pos_ex(iid, ps)
+    if (not ok_p) or pos_p:
         pk = S.get(f"{pre}_peak") or S.get(f"{pre}_px") or "-"
         sl = S.get(f"{pre}_sl_px") or S.get(f"{pre}_static_sl") or "-"
         return f"戰場狀態：{nm} 持倉中\n峰值 {pk}｜SL {sl}"
@@ -1692,14 +1746,26 @@ async def loop(app, chat, S):
             b_gone = b_open and not cur_b
             if a_gone or b_gone:
                 # 【#20/#21/#22】三重確認：一次空讀絕不當成出場。
-                # OKX 持倉端點有讀取一致性延遲，會回 code=0 但內容缺漏，
-                # 舊版一次空讀就宣告戰役結束＋撤光掛單，不可逆。
+                # OKX 持倉端點有讀取一致性延遲，會回 code=0 但內容缺漏。
                 if a_gone and not await _confirm_gone(iid, a_side):
                     print(f"[空讀忽略] {S['sym']} A 持倉仍在，判定為查詢雜訊")
                     a_gone = False
                 if b_gone and not await _confirm_gone(iid, b_side):
                     print(f"[空讀忽略] {S['sym']} B 持倉仍在，判定為查詢雜訊")
                     b_gone = False
+
+                # 【#32/#33 核心】任一邊出場時，順便確認【對手】是不是也已經平掉了。
+                # 兩次持倉讀取之間對手可能剛好被掃掉：實測第69輪，loop 讀到 A 還在、
+                # B 已平，處理完 B 之後再查對手時 A 已經沒了，於是判定戰役結束、
+                # 重新部署，而 _place_pair 把 A 的旗標抹掉 —— A 的出場永遠沒被回報，
+                # +0.25% 的損益整筆消失。在這裡一併結清就不會有那個縫隙。
+                if a_gone or b_gone:
+                    if (not a_gone) and S.get("front_filled") and await _confirm_gone(iid, a_side):
+                        a_gone = True
+                        print(f"[補抓出場] {S['sym']} A單 同一輪也已平倉")
+                    if (not b_gone) and S.get("back_filled") and await _confirm_gone(iid, b_side):
+                        b_gone = True
+                        print(f"[補抓出場] {S['sym']} B單 同一輪也已平倉")
                 if not (a_gone or b_gone):
                     continue
 
@@ -1719,16 +1785,23 @@ async def loop(app, chat, S):
                 other = "back" if (a_gone and not b_gone) else ("front" if (b_gone and not a_gone) else None)
                 note = await _pending_side_note(S, iid, other) if other else None
                 if note:
-                    # 對手還在場：戰役未結束，只附戰場狀態
                     asyncio.create_task(_exit_report(app, chat, S, snaps,
                         lambda n=note: f"━━━━━━━━━━\n{n}\n時間：{hhmmss()}"))
                     continue
 
+                # 【#32 硬性檢查】仍有未結清的單就絕不宣告戰役結束
+                if S.get("front_filled") or S.get("back_filled"):
+                    print(f"[戰役續行] {S['sym']} 仍有未結清的單，不重新部署")
+                    asyncio.create_task(_exit_report(app, chat, S, snaps,
+                        lambda: f"━━━━━━━━━━\n戰場狀態：另一單尚未結清\n時間：{hhmmss()}"))
+                    continue
+
                 # ---- 戰役結束：零持倉、零掛單 ----
                 await cancel_all_orders(iid)
-                # 先留存「先前已出場那一邊」的結果 —— _place_pair 會把這些欄位清掉
+                await _reconcile(app, chat, S, iid)     # 【#37】補登程式漏看的成交
                 prev = {"front": (S.get("front_exit_reason"), S.get("front_exit_pnl")),
                         "back":  (S.get("back_exit_reason"),  S.get("back_exit_pnl"))}
+                had = {"front": bool(S.get("front_ee")), "back": bool(S.get("back_ee"))}
                 rnd = S.get("round_today", "-")
                 mvv = float(Decimal(str(S.get("margin", "1")))) or 1.0
                 skey_now = skey(S["sym"], S.get("locked_dir", d))
@@ -1738,13 +1811,15 @@ async def loop(app, chat, S):
                 new_a = S.get("front_px") if redeploy else None
                 new_b = S.get("back_px")  if redeploy else None
 
-                def _settle_tail(S=S, prev=prev, rnd=rnd, mvv=mvv,
+                def _settle_tail(S=S, prev=prev, had=had, rnd=rnd, mvv=mvv,
                                  new_a=new_a, new_b=new_b, kk=skey_now):
-                    # 在背景記帳寫完 exit_reason 之後才計算，所以拿得到真實結果
                     a_r = S.get("front_exit_reason") or prev["front"][0]
                     a_p = S.get("front_exit_pnl")    or prev["front"][1]
                     b_r = S.get("back_exit_reason")  or prev["back"][0]
                     b_p = S.get("back_exit_pnl")     or prev["back"][1]
+                    # 【#31】區分「從未進場」與「進場過但沒拿到出場結果」
+                    a_txt = a_r or ("結果未取得" if had["front"] else "未成交")
+                    b_txt = b_r or ("結果未取得" if had["back"]  else "未成交")
                     if a_r and b_r:
                         form = "雙殺" if (a_r == "靜態SL" and b_r == "靜態SL") else "雙邊成交"
                     elif a_r:
@@ -1760,8 +1835,8 @@ async def loop(app, chat, S):
                     bump(kk, f"form_{form}")
                     t = (f"━━━━━━━━━━\n"
                          f"🏁 戰役結束 第{rnd}輪\n"
-                         f"A單：{a_r or '未成交'}  {a_p or '-'}\n"
-                         f"B單：{b_r or '未成交'}  {b_p or '-'}\n"
+                         f"A單：{a_txt}  {a_p or '-'}\n"
+                         f"B單：{b_txt}  {b_p or '-'}\n"
                          f"戰役淨損益：{tot:+.6f}（{tot/mvv*100:+.3f}%）\n"
                          f"形態：{form}")
                     if new_a and new_b:
@@ -1778,8 +1853,14 @@ async def loop(app, chat, S):
             # 永遠偵測不到（無進場通知、無出場通知、無損益）。
             if not cur_a and not cur_b and not a_open and not b_open:
                 if tf_expired(S, "_tf_idx_loop"):
-                    print(f"[TF重錨定] {S['sym']} {d} 零持倉 → 撤單依現價重新部署")
+                    # 多幣種錯開：3 個幣種的 TF 邊界是同一秒，若同時撤單重掛會在
+                    # 一瞬間擠出一堆下單請求。依幣種名給 0~1.4 秒的固定偏移分散掉。
+                    _stg = (sum(ord(ch) for ch in S["sym"]) % 15) / 10.0
+                    if _stg:
+                        await asyncio.sleep(_stg)
+                    print(f"[TF重錨定] {S['sym']} {d} 零持倉 → 撤單依現價重新部署（錯開{_stg}s）")
                     await cancel_all_orders(iid)
+                    await _reconcile(app, chat, S, iid)
                     await _place_pair(S, iid, chat, app, label="TF重錨定")
                 continue
 
@@ -1821,6 +1902,7 @@ async def rebuild_strat(d):
          "gap": Decimal(str(d.get("gap", d.get("back_offset", 0)))),
          "tp": Decimal(str(d["tp"])),
          "sl": Decimal(str(d["sl"])),
+         "hug": Decimal(str(d.get("hug", 0))),
          "spec": spec,
          "alive": True, "state": d.get("state", "委託中"),
          "pair_state": _norm_pair_state(d.get("pair_state", "waiting"), d),
@@ -1966,28 +2048,29 @@ def strat_params(sym, dr):
     if not S or S.get("pair_state","idle") == "idle":
         return f"{dr}（已停止）"
     return (f"{dr} {S['lev']}x {pct(S['margin'])} {pct(S['offset'])} "
-            f"{pct(S.get('gap',0))} {pct(S['tp'])} {pct(S['sl'])}")
+            f"{pct(S.get('gap',0))} {pct(S['tp'])} {pct(S['sl'])} {pct(S.get('hug',0))}")
 
 
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL%\n"
-           f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4\n"
+    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL% 緊貼距離%\n"
+           f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4 0.15\n"
            f"兩單間距% = B進場價比A進場價低(做L)/高(做S)多少；0 = 同價完全對沖\n"
-           f"共8個參數，方向只能 L 或 S\n"
-           f"（緊貼距離=手續費率、查價{PRICE_TICK_SEC}秒，皆為腳本內建常數）")
-    if len(a) != 8:
-        await reply(u, f"{E.BOT} 參數數量錯誤（需8個）\n{fmt}"); return
+           f"緊貼距離% = SL 跟著峰值的距離；設 0 = 用手續費率"
+           f"（A {float(FEE_A*100):.3f}%／B {float(FEE_B*100):.3f}%）\n"
+           f"共9個參數，方向只能 L 或 S｜查價 {PRICE_TICK_SEC} 秒（內建）")
+    if len(a) != 9:
+        await reply(u, f"{E.BOT} 參數數量錯誤（需9個）\n{fmt}"); return
     try:
         sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
         margin = Decimal(a[3]); offset = Decimal(a[4].rstrip("%")); gap = Decimal(a[5].rstrip("%"))
-        tp = Decimal(a[6].rstrip("%")); sl = Decimal(a[7].rstrip("%"))
+        tp = Decimal(a[6].rstrip("%")); sl = Decimal(a[7].rstrip("%")); hug = Decimal(a[8].rstrip("%"))
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     if dr not in ("L", "S"):
         await reply(u, f"{E.BOT} 方向須 L 或 S"); return
-    for nm, v in (("A單埋伏", offset), ("兩單間距", gap), ("TP", tp), ("SL", sl)):
+    for nm, v in (("A單埋伏", offset), ("兩單間距", gap), ("TP", tp), ("SL", sl), ("緊貼距離", hug)):
         if v < 0:
             await reply(u, f"{E.BOT} {nm} 不可為負數"); return
 
@@ -2048,15 +2131,20 @@ async def cmd_run(u, c):
                        f"至少需 {need:.4f} USDT"); return
 
     # ── 護欄③ 緊貼距離 tick 地板（自動修正，不擋下單） ──
-    hug_a, hug_b = FEE_A, FEE_B
+    hug_u = hug / 100
+    hug_a = max(FEE_A, hug_u)
+    hug_b = max(FEE_B, hug_u)
+    warn0 = ""
+    if 0 < hug_u <= FEE_B:
+        warn0 = f"\n{E.WARN} 緊貼 {pct(hug)}% 未高於 B 的手續費率 → B 自動用 {float(FEE_B*100):.3f}%"
     floor_a = (tick * MIN_HUG_TICKS) / front_amb
     floor_b = (tick * MIN_HUG_TICKS) / back_amb
-    warn = ""
+    warn = warn0
     if floor_a > hug_a:
-        warn += f"\n{E.WARN} A緊貼 {float(FEE_A*100):.3f}% 不足{MIN_HUG_TICKS}檔 → 自動調整為 {float(floor_a*100):.4f}%"
+        warn += f"\n{E.WARN} A緊貼 {float(hug_a*100):.3f}% 不足{MIN_HUG_TICKS}檔 → 自動調整為 {float(floor_a*100):.4f}%"
         hug_a = floor_a
     if floor_b > hug_b:
-        warn += f"\n{E.WARN} B緊貼 {float(FEE_B*100):.3f}% 不足{MIN_HUG_TICKS}檔 → 自動調整為 {float(floor_b*100):.4f}%"
+        warn += f"\n{E.WARN} B緊貼 {float(hug_b*100):.3f}% 不足{MIN_HUG_TICKS}檔 → 自動調整為 {float(floor_b*100):.4f}%"
         hug_b = floor_b
 
     # ── 風險結構（這場戰役的完整輪廓，下單前先看清楚） ──
@@ -2070,7 +2158,7 @@ async def cmd_run(u, c):
     PENDING[u.effective_chat.id] = {
         "kind": "run", "t": time.time(),
         "sym": sym, "dir": dr, "lev": lev, "margin": margin,
-        "offset": offset, "gap": gap, "tp": tp, "sl": sl, "spec": spec,
+        "offset": offset, "gap": gap, "tp": tp, "sl": sl, "hug": hug, "spec": spec,
         "front_amb": front_amb, "front_static_sl": front_static_sl,
         "front_tp": front_tp, "front_sz": sz_front,
         "back_dr": back_dr, "back_amb": back_amb,
@@ -2441,29 +2529,43 @@ def battle_lines(recs, ts):
 
 
 async def cmd_summary(u, c):
+    """總表一頁 → 每個「幣種＋方向」各一頁。多幣種時才分得清誰賺誰賠。"""
     t = today8(); recs = load_trades(t)
     ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t)}
-    L = [f"{E.BOT} OKX原K｜{ACCT} {VERSION}", f"{E.CHART}{E.CHART}{E.CHART} Summary {t}"]
-    for dr in ("L", "S"):
-        rows = [r for r in recs if r["dir"] == dr]
-        pa = sum(v.get("placed", 0) for k, v in ts.items() if k.endswith("_" + dr))
-        en = sum(v.get("entered", 0) for k, v in ts.items() if k.endswith("_" + dr))
-        if not (rows or pa or en):
-            continue
-        L.append(f"{E.dir_emoji(dr)} {E.dir_word(dr)}")
-        L += sum_lines(rows, pa, en)
+
+    # ---------- 第一頁：全帳戶總表 ----------
+    L = [f"{E.BOT} OKX原K｜{ACCT} {VERSION}", f"{E.CHART}{E.CHART}{E.CHART} 總表 {t}"]
+    pa_all = sum(v.get("placed", 0) for v in ts.values())
+    en_all = sum(v.get("entered", 0) for v in ts.values())
+    L += sum_lines(recs, pa_all, en_all)
+    pairs = sorted({(r["sym"], r["dir"]) for r in recs})
+    if pairs:
+        L.append("━━━━━━━━━━")
+        L.append("分項：")
+        for sy, dr in pairs:
+            rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
+            n = sum((Decimal(str(r.get("net") or "0")) for r in rows), Decimal(0))
+            nv = sum((Decimal(str(r.get("nv") or "0")) for r in rows), Decimal(0))
+            L.append(f"{E.dir_emoji(dr)} {sy} {E.dir_word(dr)}：{len(rows)}筆 "
+                     f"{n:+.6f}（{(n/nv*100) if nv else 0:+.3f}%）{E.pnl_emoji(n)}")
     L += battle_lines(recs, ts)
     L.append(f"時間:{hhmmss()}")
     await reply(u, "\n".join(L))
-    for sy in sorted({r["sym"] for r in recs}):
-        D = [f"\U0001f49a\U0001f499\U0001fa75\U0001f49c {sy} {t}"]
-        for dr in ("L", "S"):
-            rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
-            if not rows:
-                continue
-            st_ = ts.get(skey(sy, dr)) or {"placed": 0, "entered": 0}
-            D.append(f"策略:{E.dir_emoji(dr)} {strat_params(sy, dr)}")
-            D += sum_lines(rows, st_.get("placed", 0), st_.get("entered", 0))
+
+    # ---------- 之後每頁：一個幣種＋一個方向 ----------
+    for sy, dr in pairs:
+        rows = [r for r in recs if r["sym"] == sy and r["dir"] == dr]
+        st_ = ts.get(skey(sy, dr)) or {"placed": 0, "entered": 0}
+        D = [f"{E.dir_emoji(dr)} {sy} {E.dir_word(dr)}　{t}",
+             f"策略：{strat_params(sy, dr)}"]
+        D += sum_lines(rows, st_.get("placed", 0), st_.get("entered", 0))
+        D += battle_lines(rows, {skey(sy, dr): st_})
+        best = max(rows, key=lambda r: float(r.get("net") or 0), default=None)
+        worst = min(rows, key=lambda r: float(r.get("net") or 0), default=None)
+        if best:
+            D.append("━━━━━━━━━━")
+            D.append(f"最佳：{best.get('reason')} {float(best.get('net') or 0):+.6f}")
+            D.append(f"最差：{worst.get('reason')} {float(worst.get('net') or 0):+.6f}")
         D.append(f"時間:{hhmmss()}")
         await reply(u, "\n".join(D))
 
@@ -2759,10 +2861,10 @@ async def cmd_timeframe(u, c):
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
-        "/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL%\n"
-        f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4\n週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
+        "/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL% 緊貼距離%\n"
+        f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4 0.15\n週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
-        "/status 所有策略現況\n/summary 當日戰報＋形態統計\n"
+        "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
@@ -2771,7 +2873,7 @@ async def cmd_menu(u, c):
         "價格衝出箱子時一邊被SL掃、一邊獨活順勢起飛。\n"
         "━━━━━━━━━━\n"
         "【SL】峰值緊貼，棘輪不後退\n"
-        f"A緊貼 {float(FEE_A*100):.3f}%｜B緊貼 {float(FEE_B*100):.3f}%（=各自手續費率）\n"
+        f"緊貼距離取 max(參數, 手續費率)｜A下限 {float(FEE_A*100):.3f}%、B下限 {float(FEE_B*100):.3f}%\n"
         "峰值達 進場價±緊貼 才啟動，之前靜態SL緩衝區完整保留\n"
         "━━━━━━━━━━\n"
         "【TF】兩單都持倉→不動｜單邊有獲利→不動\n"
