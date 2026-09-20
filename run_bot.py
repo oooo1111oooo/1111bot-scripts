@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.6.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -2861,18 +2861,40 @@ def _avg(xs):
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def _tune_block(sym, rows):
-    """單一幣種的調參診斷。每條建議都附依據，樣本不足會標示。"""
-    L = [f"🔧 {sym}　{len(rows)} 筆出場"]
-    if not rows:
+def _tune_block(sym, all_rows):
+    """單一幣種的調參診斷。每條建議都附依據，樣本不足會標示。
+
+    【相容】v3.6 之前的紀錄沒有 amp/mfe/mae/moves 等欄位，
+    直接混在一起算會得到一整排 0.000%，看起來像「完全沒移動」——
+    那不是真的沒移動，是當時根本沒存。所以分開統計並明確標示。"""
+    L = [f"🔧 {sym}　{len(all_rows)} 筆出場"]
+    if not all_rows:
         return L + ["（尚無資料）"]
+    # 舊紀錄相容：v3.5 的 peak_pct 等同 mfe，救回來
+    for r in all_rows:
+        if r.get("mfe") is None and r.get("peak_pct") is not None:
+            r["mfe"] = r["peak_pct"]
+    rows = [r for r in all_rows if float(r.get("amp") or 0) > 0]   # 欄位完整的
+    oldn = len(all_rows) - len(rows)
+    L.append("━━━━━━━━━━")
+    if oldn:
+        L.append(f"{E.WARN} 其中 {oldn} 筆是 v3.6 前的紀錄，缺均幅/峰值/SL移動等欄位")
+        L.append("　（只列入損益統計，不參與診斷）")
+    if not rows:
+        nets = [float(r.get("net") or 0) for r in all_rows]
+        nvs  = sum(float(r.get("nv") or 0) for r in all_rows) or 1
+        L.append("")
+        L.append("【診斷】尚無 v3.6 完整紀錄，等新資料累積")
+        L.append(f"【損益】淨 {sum(nets):+.6f}（{sum(nets)/nvs*100:+.3f}%）"
+                 f"｜勝率 {len([x for x in nets if x>0])/len(nets)*100:.0f}%")
+        return L
     last = rows[-1]
     amp = float(last.get("amp") or 0)
     sl  = float(last.get("sl") or 0)
     hug = float(last.get("hug") or 0)
     slx = (sl / amp) if amp else 0
     hgx = (hug / amp) if amp else 0
-    L.append("━━━━━━━━━━")
+    L.append(f"完整紀錄 {len(rows)} 筆")
     L.append(f"目前：均幅 {amp:.3f}%｜SL {sl:.2f}%（{slx:.1f}×）｜緊貼 {hug:.3f}%（{hgx:.2f}×）")
     if hgx and hgx < 1.0:
         L.append(f"{E.WARN} 緊貼 {hgx:.2f}× 均幅 — 比一根平均K還窄，必被雜訊掃掉")
@@ -2931,15 +2953,15 @@ def _tune_block(sym, rows):
     nomove = len([x for x in mv if x == 0])
     L.append(f"  完全沒移動 {nomove}/{len(rows)} 筆（{nomove/len(rows)*100:.0f}%）← 緊貼從未啟動")
 
-    # 【綜合】
-    nets = [float(r.get("net") or 0) for r in rows]
-    nvs  = sum(float(r.get("nv") or 0) for r in rows) or 1
+    # 【綜合】損益用全部紀錄（舊版也有記損益，是有效的）
+    nets = [float(r.get("net") or 0) for r in all_rows]
+    nvs  = sum(float(r.get("nv") or 0) for r in all_rows) or 1
     win  = len([x for x in nets if x > 0])
     L.append("")
-    L.append(f"【綜合】淨 {sum(nets):+.6f}（{sum(nets)/nvs*100:+.3f}%）"
-             f"｜勝率 {win/len(rows)*100:.0f}%")
+    L.append(f"【綜合】{len(all_rows)} 筆　淨 {sum(nets):+.6f}（{sum(nets)/nvs*100:+.3f}%）"
+             f"｜勝率 {win/len(all_rows)*100:.0f}%")
     L.append(f"　最佳 {max(nets):+.6f}｜最差 {min(nets):+.6f}"
-             f"｜平均持倉 {_avg([int(r.get('hold_s') or 0) for r in rows]):.0f}s")
+             f"｜平均持倉 {_avg([int(r.get('hold_s') or 0) for r in all_rows]):.0f}s")
     return L
 
 
@@ -2961,8 +2983,10 @@ async def cmd_tune(u, c):
         await reply(u, f"{E.BOT} 近 {days} 天沒有可分析的紀錄"
                        f"{('（' + sym + '）') if sym else ''}"); return
     syms = sorted({r.get("sym") for r in rows})
+    nfull = len([r for r in rows if float(r.get("amp") or 0) > 0])
     head = [f"{E.BOT} OKX原K｜{ACCT} {VERSION}",
             f"🔧 調參報告　近 {days} 天　{len(rows)} 筆",
+            f"　完整紀錄 {nfull} 筆｜舊版 {len(rows)-nfull} 筆（欄位不全）",
             f"幣種：{'、'.join(syms)}"]
     await reply(u, "\n".join(head))
     for sy in syms:
