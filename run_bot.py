@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.7.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -2999,6 +2999,227 @@ async def cmd_tune(u, c):
             await reply(u, "\n".join(block))
 
 
+# ---------- /apitest API 探測（純診斷，完全不碰交易邏輯） ----------
+def _brief(r, keys=None):
+    """把 OKX 回應壓成一行：code / msg / data[0] 的重點欄位。"""
+    try:
+        c = r.get("code"); m = (r.get("msg") or "").strip()
+        d = (r.get("data") or [{}])
+        d0 = d[0] if d else {}
+        sc = d0.get("sCode"); sm = (d0.get("sMsg") or "").strip()
+        out = f"code={c}"
+        if m: out += f" msg={m[:70]}"
+        if sc not in (None, ""): out += f" sCode={sc}"
+        if sm: out += f" sMsg={sm[:70]}"
+        if keys:
+            for k in keys:
+                if d0.get(k) not in (None, ""):
+                    out += f" {k}={d0.get(k)}"
+        return out
+    except Exception as e:
+        return f"<解析失敗 {type(e).__name__}>"
+
+
+async def _apitest_run(u, sym):
+    """實際跑探測。回傳要顯示的行。每一步都印 OKX 原始回應的重點。"""
+    L = []
+    def say(s): L.append(s); print("[apitest]", s)
+
+    spec = await get_spec(sym)
+    iid  = spec["iid"]; tick = spec["tick"]
+    px   = await get_last(iid)
+    sz   = spec["minsz"]
+    notional = sz * spec["ctval"] * px
+    say(f"幣種 {sym}｜{iid}")
+    say(f"現價 {px}｜tick {tick}｜最小張數 {sz}｜名目 ≈{notional:.4f} USDT")
+    say("")
+
+    if notional > 5:
+        say(f"{E.LOSS} 最小名目 {notional:.2f} USDT > 5，本指令拒絕執行（避免成本過高）")
+        return L
+
+    created = {"ord": None, "algos": [], "pos": False}
+    try:
+        # ── 步驟1：唯讀 —— 各 ordType 查得到什麼 ──
+        say("【1】orders-algo-pending 各 ordType 是否受理（唯讀）")
+        for ot in ("trigger", "oco", "conditional", "move_order_stop", "twap"):
+            r = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
+            say(f"  {ot:16} {_brief(r)}｜筆數={len(r.get('data') or [])}")
+        say("")
+
+        # ── 步驟2：開一個最小倉（限價單帶 attachAlgoOrds，模擬 A單）──
+        say("【2】掛限價單 + attachAlgoOrds（貼近現價，求立即成交）")
+        buy_px = align(px * Decimal("1.002"), tick, "S")     # 買單掛高一點 → 立刻成交
+        tp_px  = align(px * Decimal("1.05"), tick, "S")
+        sl_px  = align(px * Decimal("0.95"), tick, "L")
+        r = await api("POST", "/api/v5/trade/order", {
+            "instId": iid, "tdMode": "isolated", "side": "buy", "posSide": "long",
+            "ordType": "limit", "px": str(buy_px), "sz": str(sz),
+            "clOrdId": "t" + uuid.uuid4().hex[:14],
+            "attachAlgoOrds": [{"tpTriggerPx": str(tp_px), "tpOrdPx": "-1",
+                                "slTriggerPx": str(sl_px), "slOrdPx": "-1"}]})
+        say(f"  下單價 {buy_px}｜TP {tp_px}｜SL {sl_px}")
+        say(f"  {_brief(r, ['ordId'])}")
+        if r.get("code") != "0":
+            say(f"  {E.LOSS} 開倉失敗，後續步驟略過")
+            return L
+        created["ord"] = (r.get("data") or [{}])[0].get("ordId")
+        await asyncio.sleep(2)
+        ok, pos = await okx_pos_ex(iid, "long", force=True)
+        created["pos"] = bool(pos)
+        say(f"  持倉確認：{'有倉 avgPx=' + str(pos.get('avgPx')) if pos else '無倉（可能未成交）'}")
+        if not pos:
+            say(f"  {E.LOSS} 沒吃到倉，後續步驟略過")
+            return L
+        say("")
+
+        # ── 步驟3：成交後自動生成的 OCO 長什麼樣 ──
+        say("【3】成交後自動生成的 algo 單（完整欄位）")
+        oco_id = None
+        for ot in ("oco", "conditional", "move_order_stop"):
+            r = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
+            for o in (r.get("data") or []):
+                if o.get("posSide") != "long":
+                    continue
+                oco_id = oco_id or o.get("algoId")
+                say(f"  [{ot}] algoId={o.get('algoId')} ordType={o.get('ordType')}")
+                say(f"       reduceOnly={o.get('reduceOnly')} closeFraction={o.get('closeFraction')}")
+                say(f"       sz={o.get('sz')} tpTrig={o.get('tpTriggerPx')} slTrig={o.get('slTriggerPx')}")
+                if o.get("algoId"): created["algos"].append(o["algoId"])
+        if not oco_id:
+            say("  （查不到任何自動生成的 algo 單）")
+        say("")
+
+        # ── 步驟4：amend 邊界 —— 51280 到底卡在哪（最重要）──
+        say("【4】amend-algos SL 邊界測試（做多：SL 必須低於現價？）")
+        if oco_id:
+            cur = await get_last(iid)
+            say(f"  當下現價 {cur}")
+            for off, label in ((-5, "現價-5檔"), (-1, "現價-1檔"), (0, "現價"),
+                               (1, "現價+1檔")):
+                test_sl = cur + tick * off
+                r = await api("POST", "/api/v5/trade/amend-algos",
+                              [{"instId": iid, "algoId": oco_id,
+                                "newSlTriggerPx": str(test_sl)}])
+                say(f"  {label:9} SL={test_sl}　{_brief(r)}")
+                await asyncio.sleep(0.4)
+        else:
+            say("  （無 OCO 可測）")
+        say("")
+
+        # ── 步驟5：原生移動止損 —— 能不能掛、最小回調多少 ──
+        say("【5】move_order_stop 原生移動止損")
+        got_trail = None
+        for ratio in ("0.001", "0.002", "0.005", "0.01"):
+            body = {"instId": iid, "tdMode": "isolated", "side": "sell", "posSide": "long",
+                    "ordType": "move_order_stop", "sz": str(sz),
+                    "callbackRatio": ratio,
+                    "algoClOrdId": "m" + uuid.uuid4().hex[:14]}
+            r = await api("POST", "/api/v5/trade/order-algo", body)
+            say(f"  callbackRatio={ratio:6} {_brief(r, ['algoId'])}")
+            if r.get("code") == "0":
+                aid = (r.get("data") or [{}])[0].get("algoId")
+                if aid:
+                    created["algos"].append(aid); got_trail = (ratio, aid)
+                break
+            await asyncio.sleep(0.4)
+        if not got_trail:
+            say("  → 四種回調幅度全被拒，改試 callbackSpread（絕對價差）")
+            r = await api("POST", "/api/v5/trade/order-algo", {
+                "instId": iid, "tdMode": "isolated", "side": "sell", "posSide": "long",
+                "ordType": "move_order_stop", "sz": str(sz),
+                "callbackSpread": str(tick * 10),
+                "algoClOrdId": "m" + uuid.uuid4().hex[:14]})
+            say(f"  callbackSpread={tick*10}　{_brief(r, ['algoId'])}")
+            if r.get("code") == "0":
+                aid = (r.get("data") or [{}])[0].get("algoId")
+                if aid: created["algos"].append(aid); got_trail = ("spread", aid)
+        say("")
+
+        # ── 步驟6：共存 —— OCO 和移動止損能不能同時在場 ──
+        say("【6】共存檢查（OCO + 移動止損同倉位）")
+        tot = 0
+        for ot in ("oco", "conditional", "move_order_stop", "trigger"):
+            r = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
+            n = len([o for o in (r.get("data") or []) if o.get("posSide") == "long"])
+            tot += n
+            if n: say(f"  {ot}: {n} 張")
+        say(f"  合計 {tot} 張　→ {'✅ 可共存' if tot >= 2 else '❌ 無法共存或移動止損未掛上'}")
+        say("")
+
+        # ── 步驟7：list_all_orders 看不看得到移動止損 ──
+        say("【7】程式現用的 list_all_orders 涵蓋範圍")
+        _o, _a = await list_all_orders(iid)
+        say(f"  普通單 {len(_o)} 張｜algo {len(_a)} 張")
+        say(f"  ALGO_TYPES = {ALGO_TYPES}")
+        if got_trail and tot > len(_a):
+            say(f"  {E.WARN} 有 algo 單不在涵蓋範圍內 → cancel_all_orders 會漏撤")
+        say("")
+
+    except Exception as e:
+        say(f"{E.LOSS} 探測中斷：{type(e).__name__}: {e}")
+    finally:
+        # ── 清場：撤掉本指令建立的一切，平掉測試倉 ──
+        say("【8】清場")
+        try:
+            if created["ord"]:
+                await api("POST", "/api/v5/trade/cancel-order",
+                          {"instId": iid, "ordId": created["ord"]})
+            for ot in ("oco", "conditional", "move_order_stop", "trigger"):
+                r = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
+                ids = [{"instId": iid, "algoId": o["algoId"]}
+                       for o in (r.get("data") or []) if o.get("algoId")]
+                if ids:
+                    rr = await api("POST", "/api/v5/trade/cancel-algos", ids)
+                    say(f"  撤 {ot} {len(ids)} 張　{_brief(rr)}")
+            ok, pos = await okx_pos_ex(iid, "long", force=True)
+            if pos:
+                psz = pos.get("pos")
+                rr = await api("POST", "/api/v5/trade/order", {
+                    "instId": iid, "tdMode": "isolated", "side": "sell", "posSide": "long",
+                    "ordType": "market", "sz": str(psz),
+                    "clOrdId": "z" + uuid.uuid4().hex[:14]})
+                say(f"  平測試倉 {psz} 張　{_brief(rr)}")
+                await asyncio.sleep(2)
+            ok, pos2 = await okx_pos_ex(iid, "long", force=True)
+            _o2, _a2 = await list_all_orders(iid)
+            clean = (not pos2) and not _o2 and not _a2
+            say(f"  結果：持倉{'無' if not pos2 else '【仍有！】'}"
+                f"｜掛單 {len(_o2) + len(_a2)} 張　{'✅ 已清空' if clean else '⚠️ 未清空，請手動檢查 OKX'}")
+        except Exception as e:
+            say(f"  {E.LOSS} 清場失敗：{type(e).__name__}: {e} ← 請立刻手動到 OKX 檢查")
+    return L
+
+
+async def cmd_apitest(u, c):
+    """/apitest 幣種 —— 用最小單位實測 OKX API，把原始回應印出來。
+    純診斷：不碰 loop、不碰 frame_mover、不碰任何出場邏輯。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    a = c.args or []
+    if not a:
+        await reply(u, f"{E.BOT} 用法：/apitest 幣種\n例：/apitest WIFUSDT\n"
+                       f"用最小張數實測 OKX API，測完自動清場。"); return
+    sym = a[0].upper()
+    k1, k2 = skey(sym, "L"), skey(sym, "S")
+    for k in (k1, k2):
+        if k in STRATS and STRATS[k].get("pair_state", "idle") != "idle":
+            await reply(u, f"{E.BOT} {E.LOSS} {sym} 有策略在運行中，"
+                           f"請先 /stop {sym} 再測，避免互相干擾"); return
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
+    ok, p1 = await okx_pos_ex(spec["iid"], "long", force=True)
+    ok2, p2 = await okx_pos_ex(spec["iid"], "short", force=True)
+    if p1 or p2:
+        await reply(u, f"{E.BOT} {E.LOSS} {sym} 目前有持倉，拒絕執行（避免誤動你的倉）"); return
+
+    await reply(u, f"{E.BOT} 🔬 開始探測 {sym}…\n最小張數實測，測完自動清場，約 30 秒")
+    lines = await _apitest_run(u, sym)
+    await _reply_long(u, [f"{E.BOT} 🔬 API 探測 {sym}　{VERSION}"], lines,
+                      [f"時間：{hhmmss()}"])
+
+
 # ---------- /amp 振幅報表（Excel + Email） ----------
 AMP_MAX = 110000     # 單次最多抓幾根（支援整年 5m ≈ 105,120 根）
 AMP_YEAR_BARS = 12 * 24 * 365  # 整年 5m 根數 = 105,120
@@ -3295,6 +3516,7 @@ async def cmd_menu(u, c):
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
+        "/apitest 幣種　API 探測（診斷用，最小張數，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
@@ -3336,6 +3558,7 @@ async def _post_init(app):
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "當日戰報"),
             BotCommand("tune", "調參報告"),
+            BotCommand("apitest", "API探測"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
             BotCommand("stopall", "停全部"),
@@ -3393,7 +3616,8 @@ def main():
            .get_updates_connect_timeout(30.0).build())
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
-                    ("summary", cmd_summary), ("tune", cmd_tune), ("amp", cmd_amp),
+                    ("summary", cmd_summary), ("tune", cmd_tune),
+                    ("apitest", cmd_apitest), ("amp", cmd_amp),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
