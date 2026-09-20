@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.6.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -649,7 +649,12 @@ def tf_hug_sl(cur_px, d, F, tick, static_sl):
         return nsl if nsl < old else None
 
 
-HUG_K       = Decimal("1.5")   # 自動緊貼 = 近N根1分K平均振幅 × K（看實測數據再調）
+# 【v3.7】緊貼距離改回【固定值】。
+# 自動版（均幅×1.5）算出 DOGE 0.134%／SUI 0.347%／WIF 0.242%，實測鎖利太少：
+# WIF 峰值 +0.6% 只鎖到 +0.358%，回吐 0.242%；固定 0.1% 可鎖到 +0.500%。
+# 均幅仍照算並寫進交易紀錄（/tune 分析要用），只是不再決定緊貼距離。
+HUG_FIXED   = Decimal("0.001")  # 緊貼距離 0.1%（A/B 共用）← 要調就改這一行
+HUG_K       = Decimal("1.5")   # 均幅係數（目前僅供 /tune 參考，不影響交易）
 HUG_BARS    = 60               # 取樣根數
 HUG_TTL     = 300              # 算完快取幾秒（每次部署會重算，行情變了自己跟上）
 _HUG_CACHE  = {}               # iid -> (振幅Decimal, 計算時間)
@@ -715,16 +720,12 @@ async def auto_hug(iid, spec, sl_pct, ref_px):
 
 
 def hug_pct(S, side):
-    """該單實際使用的緊貼距離。
-    取 max(自動算出的值, 該單手續費率)，再套 tick 地板。
-    手續費率是硬下限：貼得比手續費還近，出場必定淨虧，那是穩賠的設定。"""
-    F = FEE_A if side == "front" else FEE_B
-    try:
-        auto = Decimal(str(S.get("hug_auto", 0) or 0))
-        if auto > F:
-            F = auto
-    except Exception:
-        pass
+    """該單實際使用的緊貼距離 —— v3.7 起為固定值 HUG_FIXED，A/B 共用。
+
+    只保留一道 tick 地板：低於 MIN_HUG_TICKS 檔會被買賣價差直接掃掉。
+    【取捨】0.1% 低於 B 單的來回手續費 0.120%，B 若剛好在啟動門檻附近被掃
+    會小虧約 0.02%。這是為了多鎖利刻意接受的代價。"""
+    F = HUG_FIXED
     try:
         # 參考價各用各的：A 用 front_px、B 用 back_px，不可互相借用
         ref = Decimal(str(S.get("front_px" if side == "front" else "back_px") or 0))
@@ -921,7 +922,7 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["hug_note"] = _hn
     _c = _HUG_CACHE.get(iid)
     S["amp"] = str(_c[0]) if _c else ""     # 進場當下的1分K均幅，事後分析的基準
-    print(f"[自動緊貼] {S['sym']} {float((_ha or 0)*100):.4f}%  {_hn}")
+    print(f"[緊貼] {S['sym']} 固定{float(HUG_FIXED*100):.3f}%｜{_hn}")
 
     front_pos = "long" if d == "L" else "short"
     back_pos  = "long" if back_d == "L" else "short"
@@ -1487,7 +1488,7 @@ async def _build_exit_msg(snap, rec):
         f"靜態TP：{static_tp}\n"
         f"靜態SL：{static_sl}\n"
         f"最後SL：{snap.get('last_sl','-')}\n"
-        f"自動緊貼：{hug_display(snap['spec'], snap.get('entry_px') or 0, snap.get('hug') or Decimal('0'))}\n"
+        f"緊貼：{hug_display(snap['spec'], snap.get('entry_px') or 0, snap.get('hug') or Decimal('0'))}（固定）\n"
         f"出場：{xpx} | {hhmmss()}\n"
         f"━━━━━━━━━━\n"
         f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
@@ -1942,7 +1943,7 @@ async def loop(app, chat, S):
                     f"進場：{fpx} | {hhmmss()}\n"
                     f"靜態TP：{S['front_tp_px']}（{'+' if d=='L' else '-'}{S['tp']}%）\n"
                     f"靜態SL：{S['front_static_sl']}（{'-' if d=='L' else '+'}{S['sl']}%）\n"
-                    f"自動緊貼：{hug_display(spec, fpx, hug_pct(S,'front'))}\n"
+                    f"緊貼：{hug_display(spec, fpx, hug_pct(S,'front'))}（固定）\n"
                     f"　{S.get('hug_note','')}\n"
                     f"啟動門檻：{_trigger_line(S,'front')}\n"
                     f"━━━━━━━━━━\n"
@@ -1970,7 +1971,7 @@ async def loop(app, chat, S):
                     f"進場：{bpx} | {hhmmss()}\n"
                     f"靜態TP：{S['back_tp_px']}（{'+' if back_d=='L' else '-'}{S['tp']}%）\n"
                     f"靜態SL：{S['back_static_sl']}（{'-' if back_d=='L' else '+'}{S['sl']}%）\n"
-                    f"自動緊貼：{hug_display(spec, bpx, hug_pct(S,'back'))}\n"
+                    f"緊貼：{hug_display(spec, bpx, hug_pct(S,'back'))}（固定）\n"
                     f"　{S.get('hug_note','')}\n"
                     f"啟動門檻：{_trigger_line(S,'back')}\n"
                     f"━━━━━━━━━━\n"
@@ -2372,8 +2373,9 @@ async def cmd_run(u, c):
     # ── 護欄③ 緊貼距離 tick 地板（自動修正，不擋下單） ──
     hug_auto, hug_note = await auto_hug(spec["iid"], spec, sl / 100, front_amb)
     hug_u = hug_auto or Decimal("0")
-    hug_a = max(FEE_A, hug_u)
-    hug_b = max(FEE_B, hug_u)
+    hug_a = hug_b = HUG_FIXED          # v3.7：固定值，A/B 共用
+    hug_note = (f"固定 {float(HUG_FIXED*100):.3f}%"
+                + (f"｜參考均幅 {float(hug_u/HUG_K*100):.4f}%" if hug_u else ""))
     warn0 = ""
     if hug_auto is None:
         warn0 = f"\n{E.WARN} {hug_note}"
@@ -2439,7 +2441,7 @@ async def cmd_run(u, c):
         f"較好情境：{worst_ok:+.3f}%（生還方撐到最後）\n"
         f"打平需續走：{breakev:.3f}%\n"
         f"最大獲利：{best:+.3f}%（TP觸發）\n"
-        f"自動緊貼：A {hug_display(spec, front_amb, hug_a)}｜B {hug_display(spec, back_amb, hug_b)}\n"
+        f"緊貼距離：A {hug_display(spec, front_amb, hug_a)}｜B {hug_display(spec, back_amb, hug_b)}（固定）\n"
         f"　{hug_note}\n"
         f"查價間隔：{PRICE_TICK_SEC}s｜WS：{ws_status()}{warn}\n"
         f"━━━━━━━━━━\n"
@@ -2619,7 +2621,7 @@ def _side_block(S, side, waiting, holding):
             out.append(f"  峰值 {pk}")
         stage = "緊貼中" if hug_started(S, pre) else "緩衝中（未啟動）"
         try:
-            out.append(f"  自動緊貼 {hug_display(S['spec'], S.get(f'{pre}_px') or 0, hug_pct(S, pre))}")
+            out.append(f"  緊貼 {hug_display(S['spec'], S.get(f'{pre}_px') or 0, hug_pct(S, pre))}（固定）")
         except Exception:
             pass
         mn = int(S.get(f"{pre}_move_n", 0))
@@ -2634,7 +2636,7 @@ def _side_block(S, side, waiting, holding):
         out.append(f"{nm} 埋伏 @{amb}")
         out.append(f"  TP {S.get(f'{pre}_tp_px','-')}｜SL {S.get(f'{pre}_static_sl','-')}")
         try:
-            out.append(f"  自動緊貼 {hug_display(S['spec'], amb, hug_pct(S, pre))}")
+            out.append(f"  緊貼 {hug_display(S['spec'], amb, hug_pct(S, pre))}（固定）")
         except Exception:
             pass
     else:
@@ -3301,8 +3303,8 @@ async def cmd_menu(u, c):
         "價格衝出箱子時一邊被SL掃、一邊獨活順勢起飛。\n"
         "━━━━━━━━━━\n"
         "【SL】峰值緊貼，棘輪不後退\n"
-        f"緊貼距離【自動】：該幣種近{HUG_BARS}根1分K均幅×{HUG_K}\n"
-        f"上限 SL½｜下限 A {float(FEE_A*100):.3f}%／B {float(FEE_B*100):.3f}%（手續費率）\n"
+        f"緊貼距離【固定 {float(HUG_FIXED*100):.3f}%】A/B 共用（下限 {MIN_HUG_TICKS} 檔）\n"
+        f"手續費 A {float(FEE_A*100):.3f}%／B {float(FEE_B*100):.3f}%（只用於損益，不決定緊貼）\n"
         "峰值達 進場價±緊貼 才啟動，之前靜態SL緩衝區完整保留\n"
         "━━━━━━━━━━\n"
         "【TF】兩單都持倉→不動｜單邊有獲利→不動\n"
