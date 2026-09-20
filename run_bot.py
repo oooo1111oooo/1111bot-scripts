@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.7.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.7.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -3008,9 +3008,9 @@ def _brief(r, keys=None):
         d0 = d[0] if d else {}
         sc = d0.get("sCode"); sm = (d0.get("sMsg") or "").strip()
         out = f"code={c}"
-        if m: out += f" msg={m[:70]}"
+        if m: out += f" msg={m[:140]}"
         if sc not in (None, ""): out += f" sCode={sc}"
-        if sm: out += f" sMsg={sm[:70]}"
+        if sm: out += f" sMsg={sm[:140]}"
         if keys:
             for k in keys:
                 if d0.get(k) not in (None, ""):
@@ -3056,10 +3056,14 @@ async def _apitest_probe(say, sym, spec, d, path):
         say(f"  {_brief(r, ['ordId'])}")
         created["ord"] = (r.get("data") or [{}])[0].get("ordId")
     else:
-        # 觸發價設在「已經越過」的一側 → 立刻觸發
-        trg = align(px * (Decimal("0.999") if d == "L" else Decimal("1.001")), tick,
-                    "L" if d == "L" else "S")
-        say(f"  掛觸發 {open_side} 觸發@{trg}（現價 {px}，已越過→應立即觸發）TP {tp_px} SL {sl_px}")
+        # 【v3.7.3 修正】OKX 觸發單是「等價格走到觸發價」才觸發，不是「已越過就立刻觸發」。
+        # 舊版把 buy 掛在現價下方、sell 掛在現價上方 → 等於等一個反方向的移動，
+        # 兩次測試都沒吃到倉。正確做法：掛在「會被立刻走到」的那一側，只差 1 檔。
+        #   buy  觸發 → 價格「漲」到觸發價才成交 → 掛現價 +1 檔
+        #   sell 觸發 → 價格「跌」到觸發價才成交 → 掛現價 −1 檔
+        trg = align(px + tick if d == "L" else px - tick, tick,
+                    "S" if d == "L" else "L")
+        say(f"  掛觸發 {open_side} 觸發@{trg}（現價 {px}，差 1 檔 → 等價格走到）TP {tp_px} SL {sl_px}")
         r = await api("POST", "/api/v5/trade/order-algo", {
             "instId": iid, "tdMode": "isolated", "side": open_side, "posSide": ps,
             "ordType": "trigger", "sz": str(sz), "triggerPx": str(trg),
@@ -3070,12 +3074,18 @@ async def _apitest_probe(say, sym, spec, d, path):
     if r.get("code") != "0":
         say(f"  {E.LOSS} 下單失敗，本路徑略過")
         return None, created
-    await asyncio.sleep(3)
-    ok, pos = await okx_pos_ex(iid, ps, force=True)
+    # 【v3.7.3】限價單掛在不利側→秒成交；觸發單要等價格走 1 檔，給它 90 秒
+    wait_s = 6 if path == "limit" else 90
+    t0 = time.time(); pos = None
+    while time.time() - t0 < wait_s:
+        await asyncio.sleep(2)
+        _ok, pos = await okx_pos_ex(iid, ps, force=True)
+        if pos: break
     if not pos:
-        say(f"  {E.LOSS} 沒吃到倉（可能未成交/未觸發），本路徑略過")
+        say(f"  {E.LOSS} 等 {int(time.time()-t0)} 秒仍沒吃到倉（未成交/未觸發），本路徑略過")
         return None, created
-    say(f"  ✅ 成交 avgPx={pos.get('avgPx')} 張數={pos.get('pos')}")
+    entry_px = Decimal(str(pos.get("avgPx") or px))
+    say(f"  ✅ 成交 avgPx={entry_px} 張數={pos.get('pos')}（等待 {int(time.time()-t0)} 秒）")
 
     # ── 自動生成的 algo 單 ──
     say("  自動生成的 algo 單：")
@@ -3094,23 +3104,36 @@ async def _apitest_probe(say, sym, spec, d, path):
     if not found:
         say("    （查不到）")
 
-    # ── amend 邊界：這條路徑的 OCO 到底能不能改 ──
-    say("  amend-algos 測試：")
+    # 【v3.7.3】amend 測試拆成「安全」與「邊界」兩段，中間隔著其他測試。
+    # 原因：上次 S 方向「等於現價」那一筆 OKX 回 code=0 然後倉位就沒了
+    # ——SL 貼到現價不是被拒，是當場觸發成交。倉位一死，後面全部測不到。
+    # 所以危險的兩檔（等於現價／越界）一律擺到最後面。
+    async def _amend_try(label, off):
+        """回傳 True=持倉還在可以繼續；False=倉位已被打掉。"""
+        cur  = await get_last(iid)
+        t_sl = align(cur + tick * off, tick, "S" if d == "L" else "L")
+        rr = await api("POST", "/api/v5/trade/amend-algos",
+                       [{"instId": iid, "algoId": oco_id, "newSlTriggerPx": str(t_sl)}])
+        say(f"    {label:10} 現價={cur} SL={t_sl}　{_brief(rr)}")
+        await asyncio.sleep(1.2)
+        _ok, _p = await okx_pos_ex(iid, ps, force=True)
+        if not _p:
+            say("    ⚠️ 此筆之後持倉消失 → 該 SL 是「立刻觸發成交」而非「被拒絕」")
+            return False
+        return True
+
+    # ── 第一段：安全側（這段就能回答「這條路徑的 OCO 到底能不能改」）──
+    say("  amend-algos 測試（安全側，不會觸發）：")
+    alive = True
     if not oco_id:
         say("    （無 OCO 可測）")
     else:
-        cur = await get_last(iid)
-        # 做多：SL 必須低於現價；做空：必須高於現價
-        offs = [(-5, "安全側5檔"), (-1, "安全側1檔"), (0, "等於現價"), (1, "越界1檔")] \
-               if d == "L" else \
-               [(5, "安全側5檔"), (1, "安全側1檔"), (0, "等於現價"), (-1, "越界1檔")]
-        say(f"    當下現價 {cur}")
-        for off, label in offs:
-            t_sl = cur + tick * off
-            rr = await api("POST", "/api/v5/trade/amend-algos",
-                           [{"instId": iid, "algoId": oco_id, "newSlTriggerPx": str(t_sl)}])
-            say(f"    {label:10} SL={t_sl}　{_brief(rr)}")
-            await asyncio.sleep(0.4)
+        for off, label in ([(-5, "安全側5檔"), (-1, "安全側1檔")] if d == "L"
+                           else [(5, "安全側5檔"), (1, "安全側1檔")]):
+            alive = await _amend_try(label, off)
+            if not alive: break
+    if not alive:
+        return ps, created
 
     # ── 換單測試（現行 B 單的修法）──
     if path == "trigger":
@@ -3133,34 +3156,72 @@ async def _apitest_probe(say, sym, spec, d, path):
                 f"{'✅ 可改（換單修法有效）' if (r2.get('data') or [{}])[0].get('sCode') == '0' else '❌ 不可改'}")
 
     # ── 原生移動止損 ──
-    say("  move_order_stop 原生移動止損：")
+    # 【v3.7.3】新增 activePx（啟動價）測試。沒有啟動價，移動止損一掛上去就生效，
+    # 進場後往SL方向走 0.1% 就被掃掉 —— 直接違反「往SL方向不動，有對沖單保護」。
+    # 有啟動價才等於 hug_sl 的「峰值 ≥ 進場價×(1+F) 才啟動」。所以先測有啟動價的。
+    act = align(entry_px * (Decimal("1") + HUG_FIXED if d == "L" else Decimal("1") - HUG_FIXED),
+                tick, "S" if d == "L" else "L")
+    say(f"  move_order_stop 原生移動止損（進場 {entry_px}）：")
+    say(f"    ① 帶啟動價 activePx={act}（進場價 {'+' if d == 'L' else '−'}0.1%）")
     hit = None
     for ratio in ("0.001", "0.002", "0.005", "0.01"):
         rr = await api("POST", "/api/v5/trade/order-algo", {
             "instId": iid, "tdMode": "isolated", "side": close_side, "posSide": ps,
             "ordType": "move_order_stop", "sz": str(sz), "callbackRatio": ratio,
+            "activePx": str(act), "reduceOnly": "true",
             "algoClOrdId": "m" + uuid.uuid4().hex[:14]})
-        say(f"    callbackRatio={ratio:6} {_brief(rr, ['algoId'])}")
+        say(f"      callbackRatio={ratio:6} {_brief(rr, ['algoId'])}")
         if rr.get("code") == "0":
             hit = ratio; break
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.5)
+    if not hit:
+        say("    ② 不帶啟動價（退而求其次，確認是啟動價被拒還是比例被拒）")
+        for ratio in ("0.001", "0.002", "0.005", "0.01"):
+            rr = await api("POST", "/api/v5/trade/order-algo", {
+                "instId": iid, "tdMode": "isolated", "side": close_side, "posSide": ps,
+                "ordType": "move_order_stop", "sz": str(sz), "callbackRatio": ratio,
+                "algoClOrdId": "m" + uuid.uuid4().hex[:14]})
+            say(f"      callbackRatio={ratio:6} {_brief(rr, ['algoId'])}")
+            if rr.get("code") == "0":
+                hit = ratio + "（無啟動價）"; break
+            await asyncio.sleep(0.5)
     if not hit:
         rr = await api("POST", "/api/v5/trade/order-algo", {
             "instId": iid, "tdMode": "isolated", "side": close_side, "posSide": ps,
             "ordType": "move_order_stop", "sz": str(sz),
             "callbackSpread": str(tick * 10),
             "algoClOrdId": "m" + uuid.uuid4().hex[:14]})
-        say(f"    callbackSpread={tick*10}　{_brief(rr, ['algoId'])}")
+        say(f"      callbackSpread={tick*10}　{_brief(rr, ['algoId'])}")
         if rr.get("code") == "0":
             hit = "spread"
     say(f"    → {'✅ 可用，最小 ' + hit if hit else '❌ 全部被拒'}")
 
-    # ── 共存 ──
+    # ── 共存 ── 【v3.7.3】改列清單，不只數總數：上次 S 方向數到 1 張，
+    # 光看數字看不出是「OCO 被擠掉」還是「移動止損沒掛上」。
+    say("  同倉位 algo 清單：")
     tot = 0
     for ot in ("oco", "conditional", "move_order_stop", "trigger"):
         rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-        tot += len([o for o in (rr.get("data") or []) if o.get("posSide") == ps])
-    say(f"  同倉位 algo 總數 {tot} 張 → {'✅ 可共存' if tot >= 2 else '❌ 無法共存'}")
+        for o in (rr.get("data") or []):
+            if o.get("posSide") != ps: continue
+            tot += 1
+            say(f"    [{ot}] algoId={o.get('algoId')} sz={o.get('sz')} "
+                f"sl={o.get('slTriggerPx')} tp={o.get('tpTriggerPx')} "
+                f"cbRatio={o.get('callbackRatio')} activePx={o.get('activePx')}")
+    if not tot: say("    （一張都沒有）")
+    say(f"  → 共 {tot} 張　{'✅ OCO 與移動止損可共存' if tot >= 2 else '❌ 無法共存（後掛的擠掉前面那張）'}")
+
+    # ── 最後一段：SL 邊界（會把倉位打掉，所以擺最後）──
+    # 【這題決定 #23 死鎖怎麼修】緊貼算出來的 SL 越過現價時，
+    # 到底是「被 OKX 拒絕」還是「立刻成交出場」？
+    # 前者要找最近的合法價位，後者表示「直接平倉」才是正解。
+    say("  amend-algos 測試（邊界，可能當場觸發出場）：")
+    if not oco_id:
+        say("    （無 OCO 可測）")
+    else:
+        for off, label in ([(0, "等於現價"), (1, "越界1檔")] if d == "L"
+                           else [(0, "等於現價"), (-1, "越界1檔")]):
+            if not await _amend_try(label, off): break
     return ps, created
 
 
@@ -3170,12 +3231,9 @@ async def _apitest_clean(say, iid, ps, created):
         if created.get("ord"):
             await api("POST", "/api/v5/trade/cancel-order",
                       {"instId": iid, "ordId": created["ord"]})
-        for ot in ("oco", "conditional", "move_order_stop", "trigger"):
-            rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-            ids = [{"instId": iid, "algoId": o["algoId"]}
-                   for o in (rr.get("data") or []) if o.get("algoId")]
-            if ids:
-                await api("POST", "/api/v5/trade/cancel-algos", ids)
+        # 【v3.7.3】先平倉、再看剩下什麼 —— 這樣才答得出「倉位平掉後，
+        # 那些 algo 單會不會自動消失」。舊版先撤單再平倉，等於把答案擦掉了。
+        # 沒有自動消失 = 殘單會卡住下一場的淨場檢查，必須在腳本裡主動撤。
         if ps:
             ok, pos = await okx_pos_ex(iid, ps, force=True)
             if pos:
@@ -3185,11 +3243,32 @@ async def _apitest_clean(say, iid, ps, created):
                     "ordType": "market", "sz": str(pos.get("pos")),
                     "clOrdId": "z" + uuid.uuid4().hex[:14]})
                 say(f"  平測試倉 {pos.get('pos')} 張　{_brief(rr)}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
+            left = []
+            for ot in ("oco", "conditional", "move_order_stop", "trigger"):
+                rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
+                left += [f"{ot}:{o.get('algoId')}" for o in (rr.get("data") or [])
+                         if o.get("posSide") == ps]
+            say(f"  平倉後殘留 algo {len(left)} 張 → "
+                + ("✅ 會自動消失，不必額外撤" if not left
+                   else f"⚠️ 不會自動消失，必須主動撤：{'、'.join(left[:4])}"))
+        for ot in ("oco", "conditional", "move_order_stop", "trigger"):
+            rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
+            ids = [{"instId": iid, "algoId": o["algoId"]}
+                   for o in (rr.get("data") or []) if o.get("algoId")]
+            if ids:
+                await api("POST", "/api/v5/trade/cancel-algos", ids)
         ok, p2 = await okx_pos_ex(iid, ps or "long", force=True)
         _o, _a = await list_all_orders(iid)
-        clean = (not p2) and not _o and not _a
-        say(f"  清場：持倉{'無' if not p2 else '【仍有！】'}｜掛單 {len(_o)+len(_a)} 張　"
+        # 【v3.7.3】list_all_orders 只看 ALGO_TYPES=('trigger','oco')，
+        # 看不到 move_order_stop。清場驗證自己把四種都數一遍，否則會謊報乾淨。
+        extra = 0
+        for ot in ("oco", "conditional", "move_order_stop", "trigger"):
+            rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
+            extra += len(rr.get("data") or [])
+        clean = (not p2) and not _o and extra == 0
+        say(f"  清場：持倉{'無' if not p2 else '【仍有！】'}｜限價單 {len(_o)} 張｜"
+            f"algo（四型全查）{extra} 張　"
             f"{'✅ 已清空' if clean else '⚠️ 未清空，請手動檢查 OKX'}")
         return clean
     except Exception as ex:
@@ -3247,7 +3326,8 @@ async def cmd_apitest(u, c):
     if not a:
         await reply(u, f"{E.BOT} 用法：/apitest 幣種 [L|S|LS]\n"
                        f"例：/apitest WIFUSDT L　（只測多）\n"
-                       f"　　/apitest WIFUSDT LS　（多空都測，約 2 分鐘）\n"
+                       f"　　/apitest WIFUSDT S　（只測空）\n"
+                       f"　　/apitest WIFUSDT LS　（多空都測，約 6 分鐘）\n"
                        f"每個方向都會測【限價單】和【觸發單】兩條路徑，測完自動清場。")
         return
     sym = a[0].upper()
@@ -3271,7 +3351,8 @@ async def cmd_apitest(u, c):
 
     await reply(u, f"{E.BOT} 🔬 開始探測 {sym}　方向 {'／'.join(dirs)}\n"
                    f"每個方向測【限價單】+【觸發單】兩條路徑\n"
-                   f"最小張數，測完自動清場，約 {len(dirs)*60} 秒")
+                   f"最小張數，測完自動清場，約 {len(dirs)*3} 分鐘\n"
+                   f"（觸發單要等價格走 1 檔才會進場，最多等 90 秒，請耐心）")
     lines = await _apitest_run(u, sym, dirs)
     await _reply_long(u, [f"{E.BOT} 🔬 API 探測 {sym}　{VERSION}"], lines,
                       [f"時間：{hhmmss()}"])
