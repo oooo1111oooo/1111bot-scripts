@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -101,12 +101,12 @@ SAVE_FIELDS = ("sym","dir","lev","margin","offset","gap","tp","sl","hug_auto","c
                "locked_dir","pair_state",
                "front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
-               "front_peak","front_exit_reason","front_exit_pnl",
+               "front_peak","front_trough","front_exit_reason","front_exit_pnl",
                "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
                "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
-               "back_peak","back_exit_reason","back_exit_pnl",
+               "back_peak","back_trough","back_exit_reason","back_exit_pnl",
                "algo_id","exit_seq","battle_form","battle_t0","_reported_closes",
-               "hug_note",
+               "hug_note","amp",
                "round_date","round_today","enter_today")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
@@ -269,18 +269,29 @@ def _ws_push_px(iid, px):
             pass
 
 def _update_peak(S, px):
-    """更新兩邊的峰值（做L記最高、做S記最低）。只有已成交的那邊才追蹤。"""
+    """更新兩邊的峰值與谷底。只有已成交的那邊才追蹤。
+      峰值 = 最大【有利】偏移（MFE）→ 緊貼SL 就是跟著它走
+      谷底 = 最大【不利】偏移（MAE）→ 事後判斷靜態SL 是不是設太窄
+    兩個都要留：MAE 貼近 SL 代表這一單一路都在 SL 邊緣求生。"""
     d = S["dir"]
     bd = S.get("back_d", "S" if d == "L" else "L")
-    for side, sd, fld in (("front", d, "front_peak"), ("back", bd, "back_peak")):
-        if not S.get("front_filled" if side == "front" else "back_filled"):
+    for side, sd in (("front", d), ("back", bd)):
+        if not S.get(f"{side}_filled"):
             continue
-        old = S.get(fld)
-        if old is None:
-            S[fld] = str(px); continue
-        o = Decimal(str(old))
-        if (sd == "L" and px > o) or (sd == "S" and px < o):
-            S[fld] = str(px)
+        pk = S.get(f"{side}_peak")
+        if pk is None:
+            S[f"{side}_peak"] = str(px)
+        else:
+            o = Decimal(str(pk))
+            if (sd == "L" and px > o) or (sd == "S" and px < o):
+                S[f"{side}_peak"] = str(px)
+        tr = S.get(f"{side}_trough")
+        if tr is None:
+            S[f"{side}_trough"] = str(px)
+        else:
+            o = Decimal(str(tr))
+            if (sd == "L" and px < o) or (sd == "S" and px > o):
+                S[f"{side}_trough"] = str(px)
 
 async def ws_public_task():
     """公有頻道：訂閱 trades（逐筆成交），持續更新價格與峰值。"""
@@ -682,9 +693,18 @@ async def auto_hug(iid, spec, sl_pct, ref_px):
 
     val  = amp * HUG_K
     note = f"1分K均幅{float(amp * 100):.4f}%×{HUG_K}"
-    cap = sl_pct / 2
+    # 【#42】上限原本是 SL½，但那會把緊貼壓到【比一根平均1分K還窄】——
+    # 實測 2026-09-20 SUI：均幅0.2313%，SL 0.4% → 上限0.200% = 0.86×均幅，
+    # 結果被一次 0.219%（不到一根均K）的普通回撤掃掉，接著行情續走，
+    # 落難方吃滿靜態SL，整場多賠 0.36%。
+    # 改成 SL×0.9（只要不超過靜態SL 就有意義），並加一道「不得低於 1×均幅」的硬下限。
+    cap = sl_pct * Decimal("0.9")
     if val > cap:
-        val = cap; note += f"→受SL½上限{float(cap * 100):.3f}%"
+        val = cap; note += f"→受SL上限{float(cap * 100):.3f}%"
+    if val < amp:
+        val = amp; note += f"→受1×均幅下限{float(amp * 100):.3f}%"
+    if val > sl_pct * Decimal("0.9"):
+        note += "｜⚠️SL過窄"
     try:
         floor_tick = (spec["tick"] * MIN_HUG_TICKS) / Decimal(str(ref_px))
         if val < floor_tick:
@@ -899,6 +919,8 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     _ha, _hn = await auto_hug(iid, spec, sl_pct, front_amb)
     S["hug_auto"] = _ha or Decimal("0")
     S["hug_note"] = _hn
+    _c = _HUG_CACHE.get(iid)
+    S["amp"] = str(_c[0]) if _c else ""     # 進場當下的1分K均幅，事後分析的基準
     print(f"[自動緊貼] {S['sym']} {float((_ha or 0)*100):.4f}%  {_hn}")
 
     front_pos = "long" if d == "L" else "short"
@@ -933,6 +955,7 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["front_move_n"]    = 0
     S["front_move_hist"] = []
     S["front_peak"]      = None
+    S["front_trough"]    = None
     S["back_algo_id"]    = back_algo_id
     S["back_algo2_id"]   = None
     S["back_px"]         = str(back_amb)
@@ -946,6 +969,7 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["back_move_n"]     = 0
     S["back_move_hist"]  = []
     S["back_peak"]       = None
+    S["back_trough"]     = None
     S["back_d"]          = back_d
     S["algo_id"]         = None
     S["exit_seq"]        = 0
@@ -1359,6 +1383,15 @@ def _exit_snapshot(S, side, seq):
         "round": S.get("round_today", "-"),
         "hug": hug_pct(S, pre), "hug_note": S.get("hug_note", ""),
         "spec": S["spec"],
+        # ── 以下純為事後分析保存，交易邏輯不使用 ──
+        "tid": f"{int(time.time()*1000)}-{S['sym']}-{'A' if side=='front' else 'B'}",
+        "ab": "A" if side == "front" else "B",
+        "strat_dir": S.get("locked_dir", S["dir"]),
+        "trough": S.get(f"{pre}_trough"),
+        "amp": S.get("amp", ""),
+        "sl_set": S.get("sl"), "tp_set": S.get("tp"),
+        "gap_set": S.get("gap"), "offset_set": S.get("offset"),
+        "hug_note_full": S.get("hug_note", ""),
     }
 
 
@@ -1505,6 +1538,126 @@ async def _confirm_gone(iid, ps, tries=3, gap=0.3):
     return True
 
 
+def _pct_move(a, b, d):
+    """從 a 到 b，依方向 d 換算成有利百分比（做S 反向）。"""
+    try:
+        a = Decimal(str(a)); b = Decimal(str(b))
+        if a <= 0:
+            return 0.0
+        return float(((b - a) / a * 100) if d == "L" else ((a - b) / a * 100))
+    except Exception:
+        return 0.0
+
+
+def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
+    """把這一單的一切留下來 —— 凡走過必留下痕跡。
+
+    交易邏輯一概不讀這些欄位，它們只為了事後兵推：
+      amp / sl_x / hug_x  把不同幣種放到同一個尺度上比較（絕對%不可比）
+      mfe / mae           這一單最好與最壞走到哪，判斷 SL 與緊貼的鬆緊
+      moves               【完整】的 SL 移動歷史 —— 舊版只存在記憶體，
+                          戰役一結束就永遠消失，這是最該留下的東西
+      post5               出場後5分鐘還走多遠，稍後由 _track_post_exit 補上
+    """
+    d = snap["dir"]
+    ent = snap.get("entry_px"); xpx = (rec or {}).get("closeAvgPx")
+    nv  = float(Decimal(str(snap.get("margin", "1")))) or 1.0
+    try:
+        amp = float(Decimal(str(snap.get("amp") or 0)) * 100)
+    except Exception:
+        amp = 0.0
+    hug = float(Decimal(str(snap.get("hug") or 0)) * 100)
+    try:
+        sl_set = float(snap.get("sl_set") or 0)
+    except Exception:
+        sl_set = 0.0
+    mh = snap.get("move_hist") or []
+    n_ok = sum(1 for m in mh if m.get("type") == E.MOVE_PROFIT)
+    n_tf = sum(1 for m in mh if m.get("type") == E.MOVE_TIME)
+    n_fa = sum(1 for m in mh if m.get("type") == E.MOVE_FAIL)
+    return {
+        "v": VERSION, "tid": snap.get("tid"), "acct": ACCT,
+        "date": today8(), "time": hhmmss(),
+        "sym": snap["sym"], "dir": d, "ab": snap.get("ab"),
+        "strat_dir": str(snap.get("strat_dir") or ""),
+        "reason": reason,
+        "entry": str(ent or ""), "exit": str(xpx or ""),
+        "peak": str(snap.get("peak") or ""), "trough": str(snap.get("trough") or ""),
+        "gross": float(g_r), "fee": float(fee_r), "net": float(net_r), "nv": nv,
+        "hold_s": int(time.time() - ee),
+        # 參數快照
+        "amp": round(amp, 4), "sl": sl_set, "hug": round(hug, 4),
+        "tp": float(snap.get("tp_set") or 0), "gap": float(snap.get("gap_set") or 0),
+        "offset": float(snap.get("offset_set") or 0),
+        "sl_x":  round(sl_set / amp, 2) if amp else 0,
+        "hug_x": round(hug / amp, 2) if amp else 0,
+        # 走勢
+        "mfe": round(_pct_move(ent, snap.get("peak") or ent, d), 4),
+        "mae": round(_pct_move(ent, snap.get("trough") or ent, d), 4),
+        "post5": None,
+        # SL 移動全紀錄
+        "move_n": int(snap.get("move_n", 0)),
+        "move_ok": n_ok, "move_tf": n_tf, "move_fail": n_fa,
+        "moves": mh,
+        "battle": snap.get("round"), "ambush_s": 0,
+    }
+
+
+async def _track_post_exit(rec, wait=300):
+    """出場後 N 秒，回頭查 1分K：價格往這一單的方向又走了多遠。
+
+    這是判斷緊貼鬆緊的【唯一客觀依據】——
+      post5 接近 0  → 出場點抓得準，緊貼合適
+      post5 很大    → 出太早了，緊貼太緊，錯過的就是這個數字
+    對被靜態SL 掃掉的落難方同樣有意義：出場後價格回頭 = SL 太窄。"""
+    try:
+        await asyncio.sleep(wait)
+        sym = rec.get("sym"); xpx = rec.get("exit")
+        if not xpx:
+            return
+        iid = inst_id(sym)
+        r = await pub(f"/api/v5/market/candles?instId={iid}&bar=1m&limit=6")
+        rows = r.get("data") or []
+        if not rows:
+            return
+        d = rec.get("dir")
+        best = None
+        for k in rows:
+            try:
+                v = Decimal(str(k[2])) if d == "L" else Decimal(str(k[3]))
+            except Exception:
+                continue
+            if best is None or (d == "L" and v > best) or (d == "S" and v < best):
+                best = v
+        if best is None:
+            return
+        rec["post5"] = round(_pct_move(xpx, best, d), 4)
+        _update_trade(rec.get("date"), rec.get("tid"), {"post5": rec["post5"]})
+        print(f"[出場後追蹤] {sym} {rec.get('ab')}單 出場後5分 {rec['post5']:+.3f}%")
+    except Exception as e:
+        print("出場後追蹤失敗", type(e).__name__, e)
+
+
+def _update_trade(date, tid, fields):
+    """依 tid 回頭補寫某一筆交易紀錄的欄位。"""
+    if not (date and tid):
+        return
+    try:
+        fp = trade_file(date)
+        arr = json.load(open(fp))
+        for r in arr:
+            if r.get("tid") == tid:
+                r.update(fields); break
+        else:
+            return
+        tmp = fp + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(arr, f, default=str); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, fp)
+    except Exception as e:
+        print("更新交易紀錄失敗", type(e).__name__, e)
+
+
 async def _reconcile(app, chat, S, iid):
     """【#37】出場對帳：拿 OKX 的平倉紀錄跟程式回報過的比對，把漏掉的補登。
 
@@ -1567,15 +1720,17 @@ async def _exit_report(app, chat, S, snaps, tail_fn):
             S[f"{snap['pre']}_exit_reason"] = reason
             S[f"{snap['pre']}_exit_pnl"]    = f"{float(net_r):+.6f}"
             print(f"[{snap['name']}出場] {snap['sym']} {reason} 淨損益={net_r}")
-            log_trade({"date": today8(), "sym": snap["sym"], "dir": snap["dir"],
-                       "reason": reason, "gross": float(g_r), "fee": float(fee_r),
-                       "net": float(net_r),
-                       "nv": float(Decimal(str(snap.get("margin", "1")))),
-                       "hug": float(Decimal(str(snap.get("hug") or 0)) * 100),
-                       "peak_pct": _peak_gain(snap),
-                       "hold_s": int(time.time() - ee), "ambush_s": 0})
+            rec_full = _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee)
+            log_trade(rec_full)
+            # 出場後 5 分鐘再回頭看價格走去哪 —— 這是判斷「出太早」的唯一依據
+            asyncio.create_task(_track_post_exit(rec_full))
             results.append(msg)
         save_state()
+        # 【#40】此刻本輪所有 posId 都已登記，對帳才不會誤判成漏看
+        try:
+            await _reconcile(app, chat, S, S["spec"]["iid"])
+        except Exception as e:
+            print("對帳呼叫失敗", type(e).__name__, e)
         tail = tail_fn()
         for m in results:
             await notify(app, chat, f"{m}\n{tail}")
@@ -1879,7 +2034,10 @@ async def loop(app, chat, S):
 
                 # ---- 戰役結束：零持倉、零掛單 ----
                 await cancel_all_orders(iid)
-                await _reconcile(app, chat, S, iid)     # 【#37】補登程式漏看的成交
+                # 【#40】對帳【不能】在這裡做。此刻 _exit_report 還沒跑，
+                # 剛出場那幾單的 posId 尚未登記，對帳會把它們當成「程式漏看」
+                # 重複補登一次 —— 實測 2026-09-20 第2輪，A單的 -0.004106 被記了兩次。
+                # 改到 _exit_report 內部、所有 posId 登記完之後才比對。
                 prev = {"front": (S.get("front_exit_reason"), S.get("front_exit_pnl")),
                         "back":  (S.get("back_exit_reason"),  S.get("back_exit_pnl"))}
                 had = {"front": bool(S.get("front_ee")), "back": bool(S.get("back_ee"))}
@@ -1997,6 +2155,7 @@ async def rebuild_strat(d):
               "back_algo_id","back_algo2_id","back_amb_px","back_px","back_static_sl",
               "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
               "back_move_n","back_move_hist","front_peak","back_peak",
+              "front_trough","back_trough","amp","hug_auto","hug_note",
               "front_exit_reason","back_exit_reason","front_exit_pnl","back_exit_pnl",
               "algo_id","exit_seq","battle_form","closing",
               "round_date","round_today","enter_today"):
@@ -2218,6 +2377,17 @@ async def cmd_run(u, c):
     warn0 = ""
     if hug_auto is None:
         warn0 = f"\n{E.WARN} {hug_note}"
+    else:
+        _c = _HUG_CACHE.get(spec["iid"])
+        if _c:
+            _amp = _c[0] * 100
+            _x = float(sl / _amp) if _amp else 0
+            if _x < 3:
+                warn0 += (f"\n{E.WARN} SL {pct(sl)}% 只有 {_x:.1f}× 該幣種均幅"
+                          f"（{float(_amp):.3f}%）\n"
+                          f"　建議 SL ≥ {float(_amp * 3):.2f}%（3×），否則靜態SL 會被雜訊掃掉")
+            else:
+                warn0 += f"\n{E.OK} SL {pct(sl)}% = {_x:.1f}× 均幅（健康）"
     floor_a = (tick * MIN_HUG_TICKS) / front_amb
     floor_b = (tick * MIN_HUG_TICKS) / back_amb
     warn = warn0
@@ -2232,9 +2402,13 @@ async def cmd_run(u, c):
     # 最壞情境：A 被靜態SL 掃掉，生還方的緊貼 SL 只鎖住「毛利 - 自身緊貼距離」
     #   A毛 = -SL%；B毛 >= (SL% - 間距) - FEE_B；兩單手續費 = FEE_TOTAL
     #   合計 = -(間距 + FEE_B + FEE_TOTAL)  ← 與 SL% 無關，只由間距決定
-    worst   = -(float(gap) + float(FEE_B * 100) + float(FEE_TOTAL * 100))
-    breakev =   float(gap) + float(FEE_TOTAL * 100)
-    best    =   float(tp) - float(sl) - float(FEE_TOTAL * 100)
+    # 【#41】舊版只算「生還方撐到對手死才出場」這個【較好】情境，低估了真正的最壞。
+    # 實測 2026-09-20：生還方先被中途回撤掃掉（約打平），行情接著恢復、
+    # 落難方吃滿靜態SL → -0.457%，比舊版顯示的 -0.312% 差了 0.145%。
+    worst_bad  = -(float(gap) + float(sl) + float(FEE_TOTAL * 100))   # 生還方也被掃
+    worst_ok   = -(float(gap) + float(FEE_B * 100) + float(FEE_TOTAL * 100))
+    breakev    =   float(gap) + float(FEE_TOTAL * 100)
+    best       =   float(tp) - float(sl) - float(FEE_TOTAL * 100)
 
     PENDING[u.effective_chat.id] = {
         "kind": "run", "t": time.time(),
@@ -2261,7 +2435,8 @@ async def cmd_run(u, c):
         f"靜態TP：{back_tp}（{pct(tp)}%）\n"
         f"靜態SL：{back_static_sl}（{pct(sl)}%）\n"
         f"━━━━━━━━━━\n"
-        f"最壞損失：{worst:+.3f}%\n"
+        f"最壞損失：{worst_bad:+.3f}%（生還方也被掃）\n"
+        f"較好情境：{worst_ok:+.3f}%（生還方撐到最後）\n"
         f"打平需續走：{breakev:.3f}%\n"
         f"最大獲利：{best:+.3f}%（TP觸發）\n"
         f"自動緊貼：A {hug_display(spec, front_amb, hug_a)}｜B {hug_display(spec, back_amb, hug_b)}\n"
@@ -2670,6 +2845,134 @@ async def cmd_summary(u, c):
         await reply(u, "\n".join(D))
 
 
+# ---------- /tune 調參報告 ----------
+def _load_days(n):
+    """讀近 n 天的交易紀錄（跨日彙整，樣本才夠）。"""
+    out = []
+    base = now8()
+    for i in range(n):
+        d = (base - timedelta(days=i)).strftime("%Y-%m-%d")
+        out += load_trades(d)
+    return out
+
+
+def _avg(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _tune_block(sym, rows):
+    """單一幣種的調參診斷。每條建議都附依據，樣本不足會標示。"""
+    L = [f"🔧 {sym}　{len(rows)} 筆出場"]
+    if not rows:
+        return L + ["（尚無資料）"]
+    last = rows[-1]
+    amp = float(last.get("amp") or 0)
+    sl  = float(last.get("sl") or 0)
+    hug = float(last.get("hug") or 0)
+    slx = (sl / amp) if amp else 0
+    hgx = (hug / amp) if amp else 0
+    L.append("━━━━━━━━━━")
+    L.append(f"目前：均幅 {amp:.3f}%｜SL {sl:.2f}%（{slx:.1f}×）｜緊貼 {hug:.3f}%（{hgx:.2f}×）")
+    if hgx and hgx < 1.0:
+        L.append(f"{E.WARN} 緊貼 {hgx:.2f}× 均幅 — 比一根平均K還窄，必被雜訊掃掉")
+    if slx and slx < 3:
+        L.append(f"{E.WARN} SL 僅 {slx:.1f}× 均幅 — 靜態SL 會被雜訊掃掉")
+
+    # 【SL 診斷】
+    ssl = [r for r in rows if r.get("reason") == "靜態SL"]
+    L.append("")
+    L.append(f"【SL 診斷】靜態SL 出場 {len(ssl)} 筆（{len(ssl)/len(rows)*100:.0f}%）")
+    if ssl:
+        fast = [r for r in ssl if int(r.get("hold_s") or 0) <= 120]
+        back = [r for r in ssl if r.get("post5") is not None and float(r["post5"]) > 0]
+        n_p  = len([r for r in ssl if r.get("post5") is not None])
+        L.append(f"  2分鐘內被掃 {len(fast)} 筆（{len(fast)/len(ssl)*100:.0f}%）← 雜訊掃殺")
+        if n_p:
+            L.append(f"  出場後回頭 {len(back)}/{n_p} 筆（{len(back)/n_p*100:.0f}%）← SL太窄鐵證")
+        L.append(f"  平均 MAE {_avg([float(r.get('mae') or 0) for r in ssl]):.3f}%（SL {sl:.2f}%）")
+        if amp:
+            L.append(f"  ▸ 建議 SL：{amp*3:.2f}%（3× 均幅）" if slx < 3
+                     else f"  ▸ SL 倍數健康，維持 {sl:.2f}%")
+
+    # 【緊貼診斷】
+    hgs = [r for r in rows if r.get("reason") == "緊貼SL"]
+    L.append("")
+    L.append(f"【緊貼診斷】緊貼SL 出場 {len(hgs)} 筆")
+    if hgs:
+        mfe  = _avg([float(r.get("mfe") or 0) for r in hgs])
+        real = _avg([float(r.get("net") or 0) / (float(r.get("nv") or 1) or 1) * 100 for r in hgs])
+        ps   = [float(r["post5"]) for r in hgs if r.get("post5") is not None]
+        L.append(f"  平均峰值 {mfe:+.3f}% → 實收 {real:+.3f}%（回吐 {mfe-real:.3f}%）")
+        if ps:
+            miss = [x for x in ps if x > 0.2]
+            L.append(f"  出場後5分平均還走 {_avg(ps):+.3f}%　超過0.2% 有 {len(miss)}/{len(ps)} 筆")
+            if len(ps) >= 10:
+                if len(miss) / len(ps) >= 0.6:
+                    L.append(f"  ▸ 出太早：建議緊貼調鬆到 {max(hug*1.3, amp*1.5):.3f}%")
+                elif _avg(ps) < 0.05:
+                    L.append(f"  ▸ 出場點準：可試著調緊到 {max(hug*0.8, amp*1.0):.3f}%")
+                else:
+                    L.append("  ▸ 目前緊貼合適，維持")
+            else:
+                L.append(f"  ▸ 樣本 {len(ps)} 筆（需10筆才給建議）")
+        else:
+            L.append("  ▸ 出場後追蹤資料累積中")
+    fast_h = [r for r in hgs if int(r.get("hold_s") or 0) <= 60]
+    if len(hgs) >= 10 and len(fast_h) / len(hgs) >= 0.6:
+        L.append(f"  {E.WARN} {len(fast_h)}/{len(hgs)} 筆在1分鐘內出場 ← 貼太緊")
+
+    # 【SL 移動】
+    mv = [int(r.get("move_n") or 0) for r in rows]
+    fails = sum(int(r.get("move_fail") or 0) for r in rows)
+    tfs   = sum(int(r.get("move_tf") or 0) for r in rows)
+    L.append("")
+    L.append(f"【SL移動】平均 {_avg(mv):.1f} 次／單｜TF逼倉 {tfs} 次｜失敗 {fails} 次")
+    nomove = len([x for x in mv if x == 0])
+    L.append(f"  完全沒移動 {nomove}/{len(rows)} 筆（{nomove/len(rows)*100:.0f}%）← 緊貼從未啟動")
+
+    # 【綜合】
+    nets = [float(r.get("net") or 0) for r in rows]
+    nvs  = sum(float(r.get("nv") or 0) for r in rows) or 1
+    win  = len([x for x in nets if x > 0])
+    L.append("")
+    L.append(f"【綜合】淨 {sum(nets):+.6f}（{sum(nets)/nvs*100:+.3f}%）"
+             f"｜勝率 {win/len(rows)*100:.0f}%")
+    L.append(f"　最佳 {max(nets):+.6f}｜最差 {min(nets):+.6f}"
+             f"｜平均持倉 {_avg([int(r.get('hold_s') or 0) for r in rows]):.0f}s")
+    return L
+
+
+async def cmd_tune(u, c):
+    """調參報告：用實測數據回答 SL 與緊貼該設多少。
+    用法：/tune [幣種] [天數]"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    a = c.args or []
+    sym = None; days = 3
+    for x in a:
+        if x.replace(".", "").isdigit():
+            days = max(1, min(30, int(float(x))))
+        else:
+            sym = x.upper()
+    rows = [r for r in _load_days(days) if r.get("reason") != "補登"]
+    if sym:
+        rows = [r for r in rows if r.get("sym") == sym]
+    if not rows:
+        await reply(u, f"{E.BOT} 近 {days} 天沒有可分析的紀錄"
+                       f"{('（' + sym + '）') if sym else ''}"); return
+    syms = sorted({r.get("sym") for r in rows})
+    head = [f"{E.BOT} OKX原K｜{ACCT} {VERSION}",
+            f"🔧 調參報告　近 {days} 天　{len(rows)} 筆",
+            f"幣種：{'、'.join(syms)}"]
+    await reply(u, "\n".join(head))
+    for sy in syms:
+        sub = [r for r in rows if r.get("sym") == sy]
+        for dr in sorted({r.get("dir") for r in sub}):
+            block = _tune_block(f"{sy} {E.dir_word(dr)}", [r for r in sub if r.get("dir") == dr])
+            block.append(f"時間:{hhmmss()}")
+            await reply(u, "\n".join(block))
+
+
 # ---------- /amp 振幅報表（Excel + Email） ----------
 AMP_MAX = 110000     # 單次最多抓幾根（支援整年 5m ≈ 105,120 根）
 AMP_YEAR_BARS = 12 * 24 * 365  # 整年 5m 根數 = 105,120
@@ -2965,6 +3268,7 @@ async def cmd_menu(u, c):
         f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4\n週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
+        "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
@@ -3005,6 +3309,7 @@ async def _post_init(app):
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "當日戰報"),
+            BotCommand("tune", "調參報告"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
             BotCommand("stopall", "停全部"),
@@ -3062,7 +3367,7 @@ def main():
            .get_updates_connect_timeout(30.0).build())
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
-                    ("summary", cmd_summary), ("amp", cmd_amp),
+                    ("summary", cmd_summary), ("tune", cmd_tune), ("amp", cmd_amp),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
