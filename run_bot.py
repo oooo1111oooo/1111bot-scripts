@@ -45,7 +45,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -97,7 +97,7 @@ def pct(v):
     return str(d)
 
 # ---------- 狀態持久化（原子寫入） ----------
-SAVE_FIELDS = ("sym","dir","lev","margin","offset","gap","tp","sl","hug","chat",
+SAVE_FIELDS = ("sym","dir","lev","margin","offset","gap","tp","sl","hug_auto","chat",
                "locked_dir","pair_state",
                "front_oid","front_px","front_static_sl","front_tp_px","front_sl_px",
                "front_filled","front_ee","front_sz","front_move_n","front_move_hist",
@@ -106,6 +106,7 @@ SAVE_FIELDS = ("sym","dir","lev","margin","offset","gap","tp","sl","hug","chat",
                "back_tp_px","back_sl_px","back_filled","back_ee","back_sz","back_d",
                "back_peak","back_exit_reason","back_exit_pnl",
                "algo_id","exit_seq","battle_form","battle_t0","_reported_closes",
+               "hug_note",
                "round_date","round_today","enter_today")
 
 def save_state(_open=open, _replace=os.replace, _fsync=os.fsync, _dump=json.dump):
@@ -637,16 +638,71 @@ def tf_hug_sl(cur_px, d, F, tick, static_sl):
         return nsl if nsl < old else None
 
 
-def hug_pct(S, side):
-    """該單的緊貼距離（= 其來回手續費率）。A=FEE_A、B=FEE_B。
-    再套 tick 地板：低於 MIN_HUG_TICKS 檔會被買賣價差直接掃掉，自動提升。"""
-    F = FEE_A if side == "front" else FEE_B
-    # 使用者設的緊貼距離：只能比手續費率【鬆】，不能更緊 ——
-    # 貼得比手續費還近，出場必定淨虧，那是穩賠的設定。
+HUG_K       = Decimal("1.5")   # 自動緊貼 = 近N根1分K平均振幅 × K（看實測數據再調）
+HUG_BARS    = 60               # 取樣根數
+HUG_TTL     = 300              # 算完快取幾秒（每次部署會重算，行情變了自己跟上）
+_HUG_CACHE  = {}               # iid -> (振幅Decimal, 計算時間)
+
+
+async def auto_hug(iid, spec, sl_pct, ref_px):
+    """依該幣種【自己的波動】算出緊貼距離 —— 不用參數，也不是寫死的常數。
+
+    緊貼距離要對抗的是「行情走到一半的正常回撤」，而每個幣種的回撤幅度差很多：
+    同樣設 0.15%，DOGE 是 13 檔、XRP 是 37 檔，抗雜訊能力差三倍。
+    所以既不該由人輸入，也不該全域寫死 —— 用該幣種近期 1 分K 的平均振幅推算。
+
+      原始值 = 近60根1分K平均振幅 × HUG_K
+      上限  = SL% ÷ 2   （比靜態SL的一半還寬就失去收緊的意義）
+      下限  = MIN_HUG_TICKS 檔（低於此會被買賣價差直接掃掉）
+    另有一道「不得低於該單手續費率」的下限，在 hug_pct() 依 A/B 各自套用。
+
+    回傳 (緊貼距離Decimal, 診斷字串)。取不到K線時回 (None, 原因)，
+    呼叫端沿用手續費率，不影響交易。"""
+    now = time.time()
+    c = _HUG_CACHE.get(iid)
+    amp = c[0] if (c and (now - c[1]) < HUG_TTL) else None
+    if amp is None:
+        try:
+            r = await pub(f"/api/v5/market/candles?instId={iid}&bar=1m&limit={HUG_BARS}")
+            vals = []
+            for k in (r.get("data") or []):
+                try:
+                    hi = Decimal(str(k[2])); lo = Decimal(str(k[3])); cl = Decimal(str(k[4]))
+                    if cl > 0:
+                        vals.append((hi - lo) / cl)
+                except Exception:
+                    continue
+            if vals:
+                amp = sum(vals) / len(vals)
+                _HUG_CACHE[iid] = (amp, now)
+        except Exception as e:
+            print("自動緊貼取K線失敗", iid, type(e).__name__, e)
+    if amp is None:
+        return None, "取不到K線，沿用手續費率"
+
+    val  = amp * HUG_K
+    note = f"1分K均幅{float(amp * 100):.4f}%×{HUG_K}"
+    cap = sl_pct / 2
+    if val > cap:
+        val = cap; note += f"→受SL½上限{float(cap * 100):.3f}%"
     try:
-        user = Decimal(str(S.get("hug", 0) or 0)) / 100
-        if user > F:
-            F = user
+        floor_tick = (spec["tick"] * MIN_HUG_TICKS) / Decimal(str(ref_px))
+        if val < floor_tick:
+            val = floor_tick; note += f"→受{MIN_HUG_TICKS}檔下限"
+    except Exception:
+        pass
+    return val, note
+
+
+def hug_pct(S, side):
+    """該單實際使用的緊貼距離。
+    取 max(自動算出的值, 該單手續費率)，再套 tick 地板。
+    手續費率是硬下限：貼得比手續費還近，出場必定淨虧，那是穩賠的設定。"""
+    F = FEE_A if side == "front" else FEE_B
+    try:
+        auto = Decimal(str(S.get("hug_auto", 0) or 0))
+        if auto > F:
+            F = auto
     except Exception:
         pass
     try:
@@ -837,6 +893,13 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
 
     sz_front = csize(margin, lev, front_amb, spec["ctval"], spec["lot"])
     sz_back  = csize(margin, lev, back_amb,  spec["ctval"], spec["lot"])
+
+    # 每次部署都依該幣種【當下】的波動重算緊貼距離 —— 行情變了它自己跟上，
+    # 不用參數也不寫死。取不到K線就沿用手續費率（hug_pct 會處理）。
+    _ha, _hn = await auto_hug(iid, spec, sl_pct, front_amb)
+    S["hug_auto"] = _ha or Decimal("0")
+    S["hug_note"] = _hn
+    print(f"[自動緊貼] {S['sym']} {float((_ha or 0)*100):.4f}%  {_hn}")
 
     front_pos = "long" if d == "L" else "short"
     back_pos  = "long" if back_d == "L" else "short"
@@ -1294,6 +1357,8 @@ def _exit_snapshot(S, side, seq):
         "move_n": int(S.get(f"{pre}_move_n", 0)),
         "move_hist": list(S.get(f"{pre}_move_hist") or []),
         "round": S.get("round_today", "-"),
+        "hug": hug_pct(S, pre), "hug_note": S.get("hug_note", ""),
+        "spec": S["spec"],
     }
 
 
@@ -1320,6 +1385,17 @@ def _exit_reason(snap, close_px):
             return "TF逼倉"
         return "緊貼SL"
     return "手動/其他"
+
+
+def _peak_gain(snap):
+    """這一單在場期間的最大浮動獲利%（供 /summary 判斷緊貼鬆緊）。"""
+    try:
+        e = Decimal(str(snap.get("entry_px")))
+        p = Decimal(str(snap.get("peak") or e))
+        g = (p - e) / e * 100 if snap["dir"] == "L" else (e - p) / e * 100
+        return float(g)
+    except Exception:
+        return 0.0
 
 
 def _peak_line(snap):
@@ -1378,6 +1454,7 @@ async def _build_exit_msg(snap, rec):
         f"靜態TP：{static_tp}\n"
         f"靜態SL：{static_sl}\n"
         f"最後SL：{snap.get('last_sl','-')}\n"
+        f"自動緊貼：{hug_display(snap['spec'], snap.get('entry_px') or 0, snap.get('hug') or Decimal('0'))}\n"
         f"出場：{xpx} | {hhmmss()}\n"
         f"━━━━━━━━━━\n"
         f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
@@ -1494,6 +1571,8 @@ async def _exit_report(app, chat, S, snaps, tail_fn):
                        "reason": reason, "gross": float(g_r), "fee": float(fee_r),
                        "net": float(net_r),
                        "nv": float(Decimal(str(snap.get("margin", "1")))),
+                       "hug": float(Decimal(str(snap.get("hug") or 0)) * 100),
+                       "peak_pct": _peak_gain(snap),
                        "hold_s": int(time.time() - ee), "ambush_s": 0})
             results.append(msg)
         save_state()
@@ -1708,7 +1787,8 @@ async def loop(app, chat, S):
                     f"進場：{fpx} | {hhmmss()}\n"
                     f"靜態TP：{S['front_tp_px']}（{'+' if d=='L' else '-'}{S['tp']}%）\n"
                     f"靜態SL：{S['front_static_sl']}（{'-' if d=='L' else '+'}{S['sl']}%）\n"
-                    f"緊貼：{hug_display(spec, fpx, hug_pct(S,'front'))}\n"
+                    f"自動緊貼：{hug_display(spec, fpx, hug_pct(S,'front'))}\n"
+                    f"　{S.get('hug_note','')}\n"
                     f"啟動門檻：{_trigger_line(S,'front')}\n"
                     f"━━━━━━━━━━\n"
                     f"對手：{_bnote}\n"
@@ -1735,7 +1815,8 @@ async def loop(app, chat, S):
                     f"進場：{bpx} | {hhmmss()}\n"
                     f"靜態TP：{S['back_tp_px']}（{'+' if back_d=='L' else '-'}{S['tp']}%）\n"
                     f"靜態SL：{S['back_static_sl']}（{'-' if back_d=='L' else '+'}{S['sl']}%）\n"
-                    f"緊貼：{hug_display(spec, bpx, hug_pct(S,'back'))}\n"
+                    f"自動緊貼：{hug_display(spec, bpx, hug_pct(S,'back'))}\n"
+                    f"　{S.get('hug_note','')}\n"
                     f"啟動門檻：{_trigger_line(S,'back')}\n"
                     f"━━━━━━━━━━\n"
                     f"對手：{_anote}\n"
@@ -1902,7 +1983,7 @@ async def rebuild_strat(d):
          "gap": Decimal(str(d.get("gap", d.get("back_offset", 0)))),
          "tp": Decimal(str(d["tp"])),
          "sl": Decimal(str(d["sl"])),
-         "hug": Decimal(str(d.get("hug", 0))),
+         "hug_auto": Decimal(str(d.get("hug_auto", 0))),
          "spec": spec,
          "alive": True, "state": d.get("state", "委託中"),
          "pair_state": _norm_pair_state(d.get("pair_state", "waiting"), d),
@@ -2048,29 +2129,28 @@ def strat_params(sym, dr):
     if not S or S.get("pair_state","idle") == "idle":
         return f"{dr}（已停止）"
     return (f"{dr} {S['lev']}x {pct(S['margin'])} {pct(S['offset'])} "
-            f"{pct(S.get('gap',0))} {pct(S['tp'])} {pct(S['sl'])} {pct(S.get('hug',0))}")
+            f"{pct(S.get('gap',0))} {pct(S['tp'])} {pct(S['sl'])}｜緊貼{float(Decimal(str(S.get('hug_auto',0)))*100):.3f}%")
 
 
 async def cmd_run(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args
-    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL% 緊貼距離%\n"
-           f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4 0.15\n"
+    fmt = (f"{E.BOT} 用法：/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL%\n"
+           f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4\n"
            f"兩單間距% = B進場價比A進場價低(做L)/高(做S)多少；0 = 同價完全對沖\n"
-           f"緊貼距離% = SL 跟著峰值的距離；設 0 = 用手續費率"
-           f"（A {float(FEE_A*100):.3f}%／B {float(FEE_B*100):.3f}%）\n"
-           f"共9個參數，方向只能 L 或 S｜查價 {PRICE_TICK_SEC} 秒（內建）")
-    if len(a) != 9:
-        await reply(u, f"{E.BOT} 參數數量錯誤（需9個）\n{fmt}"); return
+           f"共8個參數，方向只能 L 或 S\n"
+           f"（緊貼距離由腳本依該幣種波動自動計算，查價 {PRICE_TICK_SEC} 秒，皆不需輸入）")
+    if len(a) != 8:
+        await reply(u, f"{E.BOT} 參數數量錯誤（需8個）\n{fmt}"); return
     try:
         sym = a[0].upper(); dr = a[1].upper(); lev = int(a[2].replace("x", ""))
         margin = Decimal(a[3]); offset = Decimal(a[4].rstrip("%")); gap = Decimal(a[5].rstrip("%"))
-        tp = Decimal(a[6].rstrip("%")); sl = Decimal(a[7].rstrip("%")); hug = Decimal(a[8].rstrip("%"))
+        tp = Decimal(a[6].rstrip("%")); sl = Decimal(a[7].rstrip("%"))
     except Exception:
         await reply(u, f"{E.BOT} 參數格式錯誤\n{fmt}"); return
     if dr not in ("L", "S"):
         await reply(u, f"{E.BOT} 方向須 L 或 S"); return
-    for nm, v in (("A單埋伏", offset), ("兩單間距", gap), ("TP", tp), ("SL", sl), ("緊貼距離", hug)):
+    for nm, v in (("A單埋伏", offset), ("兩單間距", gap), ("TP", tp), ("SL", sl)):
         if v < 0:
             await reply(u, f"{E.BOT} {nm} 不可為負數"); return
 
@@ -2131,12 +2211,13 @@ async def cmd_run(u, c):
                        f"至少需 {need:.4f} USDT"); return
 
     # ── 護欄③ 緊貼距離 tick 地板（自動修正，不擋下單） ──
-    hug_u = hug / 100
+    hug_auto, hug_note = await auto_hug(spec["iid"], spec, sl / 100, front_amb)
+    hug_u = hug_auto or Decimal("0")
     hug_a = max(FEE_A, hug_u)
     hug_b = max(FEE_B, hug_u)
     warn0 = ""
-    if 0 < hug_u <= FEE_B:
-        warn0 = f"\n{E.WARN} 緊貼 {pct(hug)}% 未高於 B 的手續費率 → B 自動用 {float(FEE_B*100):.3f}%"
+    if hug_auto is None:
+        warn0 = f"\n{E.WARN} {hug_note}"
     floor_a = (tick * MIN_HUG_TICKS) / front_amb
     floor_b = (tick * MIN_HUG_TICKS) / back_amb
     warn = warn0
@@ -2158,7 +2239,8 @@ async def cmd_run(u, c):
     PENDING[u.effective_chat.id] = {
         "kind": "run", "t": time.time(),
         "sym": sym, "dir": dr, "lev": lev, "margin": margin,
-        "offset": offset, "gap": gap, "tp": tp, "sl": sl, "hug": hug, "spec": spec,
+        "offset": offset, "gap": gap, "tp": tp, "sl": sl, "spec": spec,
+        "hug_auto": hug_u, "hug_note": hug_note,
         "front_amb": front_amb, "front_static_sl": front_static_sl,
         "front_tp": front_tp, "front_sz": sz_front,
         "back_dr": back_dr, "back_amb": back_amb,
@@ -2182,7 +2264,8 @@ async def cmd_run(u, c):
         f"最壞損失：{worst:+.3f}%\n"
         f"打平需續走：{breakev:.3f}%\n"
         f"最大獲利：{best:+.3f}%（TP觸發）\n"
-        f"緊貼距離：A {hug_display(spec, front_amb, hug_a)}｜B {hug_display(spec, back_amb, hug_b)}\n"
+        f"自動緊貼：A {hug_display(spec, front_amb, hug_a)}｜B {hug_display(spec, back_amb, hug_b)}\n"
+        f"　{hug_note}\n"
         f"查價間隔：{PRICE_TICK_SEC}s｜WS：{ws_status()}{warn}\n"
         f"━━━━━━━━━━\n"
         f"{E.WARN} 確認後立即取價埋伏\n下一步：60秒內 /confirm\n時間：{hhmmss()}")
@@ -2360,6 +2443,10 @@ def _side_block(S, side, waiting, holding):
         except Exception:
             out.append(f"  峰值 {pk}")
         stage = "緊貼中" if hug_started(S, pre) else "緩衝中（未啟動）"
+        try:
+            out.append(f"  自動緊貼 {hug_display(S['spec'], S.get(f'{pre}_px') or 0, hug_pct(S, pre))}")
+        except Exception:
+            pass
         mn = int(S.get(f"{pre}_move_n", 0))
         _p, _t, _f = _move_stat(S.get(f"{pre}_move_hist") or [])
         stat = f" {E.MOVE_PROFIT}{_p} {E.MOVE_TIME}{_t} {E.MOVE_FAIL}{_f}" if (_p or _t or _f) else ""
@@ -2371,6 +2458,10 @@ def _side_block(S, side, waiting, holding):
         amb = S.get(f"{pre}_px", "-")
         out.append(f"{nm} 埋伏 @{amb}")
         out.append(f"  TP {S.get(f'{pre}_tp_px','-')}｜SL {S.get(f'{pre}_static_sl','-')}")
+        try:
+            out.append(f"  自動緊貼 {hug_display(S['spec'], amb, hug_pct(S, pre))}")
+        except Exception:
+            pass
     else:
         r = S.get(f"{pre}_exit_reason")
         out.append(f"{nm} 已出場（{r}）" if r else f"{nm} 無")
@@ -2521,6 +2612,15 @@ def battle_lines(recs, ts):
         for r in recs:
             by[r.get("reason", "?")] = by.get(r.get("reason", "?"), 0) + 1
         L.append("出場原因：" + "｜".join("%s%d" % (k2, v2) for k2, v2 in by.items()))
+        hugs = [float(r.get("hug") or 0) for r in recs if r.get("hug")]
+        if hugs:
+            L.append("平均緊貼距離：%.3f%%" % (sum(hugs) / len(hugs)))
+        hg = [r for r in recs if r.get("reason") == "緊貼SL" and r.get("peak_pct")]
+        if hg:
+            pk = sum(float(r["peak_pct"]) for r in hg) / len(hg)
+            nt = sum(float(r.get("net") or 0) / float(r.get("nv") or 1) * 100 for r in hg) / len(hg)
+            L.append("緊貼出場 %d 筆：平均峰值 %+.3f%% → 實收 %+.3f%%" % (len(hg), pk, nt))
+            L.append("　（峰值遠高於實收 → 緊貼偏緊；兩者接近 → 緊貼合適）")
         tfn = by.get("TF逼倉", 0)
         if tfn:
             hrs = max(1.0, (time.time() % 86400) / 3600)
@@ -2861,8 +2961,8 @@ async def cmd_timeframe(u, c):
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
-        "/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL% 緊貼距離%\n"
-        f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4 0.15\n週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
+        "/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% TP% SL%\n"
+        f"例：/run SUIUSDT L 1x 1 1.0 0 2 0.4\n週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
@@ -2873,7 +2973,8 @@ async def cmd_menu(u, c):
         "價格衝出箱子時一邊被SL掃、一邊獨活順勢起飛。\n"
         "━━━━━━━━━━\n"
         "【SL】峰值緊貼，棘輪不後退\n"
-        f"緊貼距離取 max(參數, 手續費率)｜A下限 {float(FEE_A*100):.3f}%、B下限 {float(FEE_B*100):.3f}%\n"
+        f"緊貼距離【自動】：該幣種近{HUG_BARS}根1分K均幅×{HUG_K}\n"
+        f"上限 SL½｜下限 A {float(FEE_A*100):.3f}%／B {float(FEE_B*100):.3f}%（手續費率）\n"
         "峰值達 進場價±緊貼 才啟動，之前靜態SL緩衝區完整保留\n"
         "━━━━━━━━━━\n"
         "【TF】兩單都持倉→不動｜單邊有獲利→不動\n"
