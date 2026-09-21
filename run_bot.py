@@ -37,7 +37,8 @@
   4. Telegram 與 WebSocket 皆為旁路：失效絕不影響交易與保護。
   5. 守門狗只告警不自動平倉；唯一的程式自動平倉是上面那條「越界平倉」。
 """
-import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
+import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os, re, builtins
+from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
 import httpx
@@ -47,6 +48,77 @@ sys.path.insert(0, "/srv/1111bot")
 from app.core import emoji as E
 from app.strategy.normal import next_open_epoch as _noe_unused, TF_SEC as _TFS_unused
 
+# ==================== 診斷紀錄器（/log 的資料來源） ====================
+# 【為什麼要有】以前要 debug 只能 SSH 進 VPS 打 journalctl，還得記得 unit 名稱、
+# 換算 UTC 時區 —— 門檻太高，而且腳本自己什麼都沒留。
+# 這裡把腳本【已經在印的每一行】同時存進記憶體環狀緩衝，/log 直接從 TG 讀。
+# 作法是覆蓋模組層的 print：不必去改幾十個呼叫點，也不會漏掉任何一行。
+# 絕不影響原本的輸出 —— journald 照樣收得到。
+DIAG_MAX     = 800          # 全部輸出保留幾行
+DIAG_ERR_MAX = 250          # 異常行另外保留幾行（/log 預設看這個）
+DIAG      = deque(maxlen=DIAG_MAX)
+DIAG_ERR  = deque(maxlen=DIAG_ERR_MAX)
+# 什麼叫「異常行」：API 錯誤碼、各種失敗、警告、修復、降速、例外
+DIAG_PAT = re.compile(
+    r"sCode=|code=-1|50011|51506|51280|51527|51000|"
+    r"fail|失敗|警告|作廢|自我修復|降速|逾時|Traceback|Error|error|"
+    r"空讀|中止|異常|漏看|補抓|裸倉")
+_SYSPRINT = builtins.print
+
+
+def print(*a, **kw):
+    """覆蓋內建 print：照常輸出，同時留一份給 /log。"""
+    try:
+        s = " ".join(str(x) for x in a)
+        # 自己格式化時間，不依賴後面才定義的 hhmmss —— 模組載入期也能用。
+        # 一律 UTC+8，和 TG 顯示的時間對得起來（VPS 本身多半是 UTC）。
+        line = (datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+                + " " + s)
+        DIAG.append(line)
+        if DIAG_PAT.search(s):
+            DIAG_ERR.append(line)
+    except Exception:
+        pass                      # 紀錄器絕不可以把主程式弄掛
+    _SYSPRINT(*a, **kw)
+
+
+# ---------- API 用量與錯誤碼統計（回答「速率到底用了多少」） ----------
+# 之前我只會【算】額度，沒有【量】過。這裡逐次記下每個端點的呼叫時刻，
+# /log api 會算出任意 2 秒窗內的尖峰值 —— 直接對照 OKX 的限制。
+API_HITS = {}                 # 端點 -> deque[呼叫時刻]
+API_SCODE = {}                # sCode -> 次數
+API_LAT  = {}                 # 端點 -> deque[毫秒]
+
+
+def _api_note(path, ms=None, scode=None):
+    try:
+        k = path.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or path
+        API_HITS.setdefault(k, deque(maxlen=400)).append(time.time())
+        if ms is not None:
+            API_LAT.setdefault(k, deque(maxlen=200)).append(int(ms))
+        if scode:
+            API_SCODE[scode] = API_SCODE.get(scode, 0) + 1
+    except Exception:
+        pass
+
+
+def _peak_in_window(k, win=2.0):
+    """該端點在任意 win 秒窗內的最大呼叫次數 —— 這就是會不會撞限制的指標。"""
+    ts = list(API_HITS.get(k) or ())
+    if not ts:
+        return 0
+    best = 0
+    for i, t0 in enumerate(ts):
+        n = 0
+        for t1 in ts[i:]:
+            if t1 - t0 <= win:
+                n += 1
+            else:
+                break
+        best = max(best, n)
+    return best
+
+
 # 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
 TF_SEC = {"5m": 300, "6m": 360, "8m": 480, "10m": 600,
           "12m": 720, "15m": 900, "20m": 1200, "25m": 1500, "30m": 1800}
@@ -55,7 +127,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.11"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -70,10 +142,28 @@ FEE_A = Decimal("0.00072")   # A單 0.072%
 FEE_B = Decimal("0.00120")   # B單 0.120%
 FEE_TOTAL = FEE_A + FEE_B    # 一場雙邊成交戰役的固定成本 0.192%
 
-PRICE_TICK_SEC = 0.5   # 查價 / SL送單節流間隔（秒）。WS 推送是連續的，此值只節流送單
+# ========== 緊貼節拍（v3.10：整套戰術的獲利關鍵就是這裡） ==========
+# 【為什麼要快】SL = 現價 ∓ 0.1%，取樣越密，越貼近真正的針尖。
+# 一根 3% / 3秒 的針，價格每秒走 1%：
+#   取樣 0.5 秒 → 最多落後真峰 0.5%（比緊貼距離本身還大）
+#   取樣 0.2 秒 → 最多落後 0.2%
+# 針越猛，取樣間隔的代價越大 —— 而針正是這套戰術唯一的獲利來源。
+#
+# 【為什麼不再更快】OKX amend-algos 限 20 次/2秒。所有幣種、A/B 兩側的
+# amend 會合併成【一個】批次請求，所以每個心跳最多送 1 次：
+#   0.2 秒心跳 → 5 次/秒 = 10 次/2秒，用掉額度的一半，留一半餘裕。
+#   0.1 秒心跳 → 20 次/2秒，正好踩滿 —— 一旦 50011，緊貼會整個停擺，
+#                比慢一點更糟。穩定優先於極速。
+MOVE_TICK      = 0.2   # frame_mover 心跳（秒）← 緊貼速度由這一行決定
+# 【必須小於 MOVE_TICK】這是每一側的送單節流。
+# v3.9 以前兩者都是 0.5：節流的起算點是「週期開始時刻」，和下一個週期的
+# 起算點剛好相差一個 MOVE_TICK，浮點抖動就會讓 (now - last) 略小於門檻
+# → 整個週期被靜默跳過。實測 40 個週期被吃掉 8 個，有效節拍變成 0.62 秒。
+# 設成心跳的一半，永遠不會誤殺，而且仍然擋得住同一週期內的重複送單。
+PRICE_TICK_SEC = 0.1
 MIN_HUG_TICKS  = 3     # 緊貼距離下限（檔）。低於此值會被買賣價差直接掃掉
-MOVE_TICK      = 0.5   # frame_mover 心跳（秒）
 AMEND_BACKOFF  = (1, 2, 4, 8)  # amend 連續失敗的退避秒數（問題18：不再每秒無限重試）
+AMEND_COOL     = 2.0   # amend 撞到 50011 後，整個緊貼泵冷卻幾秒（降速，不停擺）
 
 def load_env(p):
     d = {}
@@ -188,10 +278,19 @@ async def api(method, path, body=None):
          "OK-ACCESS-TIMESTAMP": ts,
          "OK-ACCESS-PASSPHRASE": ACC[f"OKX_{ACCT}_PASSPHRASE"],
          "Content-Type": "application/json"}
+    t0 = time.time()
     try:
         r = await HTTP.request(method, BASE + path, headers=h, content=b)
-        return r.json()
+        j = r.json()
+        # 【v3.10】記下用量、延遲、錯誤碼 —— /log api 看得到，不必再用猜的
+        sc = None
+        if str(j.get("code")) not in ("0", "None", ""):
+            d0 = (j.get("data") or [{}])
+            sc = str((d0[0] if d0 else {}).get("sCode") or j.get("code"))
+        _api_note(path, (time.time() - t0) * 1000, sc)
+        return j
     except Exception as e:
+        _api_note(path, (time.time() - t0) * 1000, "EXC")
         print("api fail", path, type(e).__name__, e)
         return {"code": "-1", "msg": str(e), "data": []}
 
@@ -435,7 +534,11 @@ async def reply(u, t):
 # 超限 60%，實測噴滿 50011 Too Many Requests。
 # 而這個端點【一次就回傳所有持倉】，分兩次查 long/short 是純粹浪費。
 # 改成一次查詢、快取 POS_TTL 秒，兩個方向、兩個任務、所有幣種共用同一份。
-POS_TTL   = 0.4
+# 【v3.10】心跳加快到 0.2 秒後，TTL 若仍是 0.4 秒會變成「每兩拍打一次網路」，
+# 讓一半的緊貼週期要等持倉查詢回來。拉到 0.5 秒：每 5 拍才打一次（2 次/秒 =
+# 4 次/2秒，額度 10 次/2秒，留 60% 餘裕），其餘 4 拍純讀快取、零延遲。
+# 出場判定不受影響 —— _confirm_gone 一律 force=True，繞過快取。
+POS_TTL   = 0.5
 POS_CACHE = {"t": 0.0, "data": None, "cool": 0.0}
 _POS_LOCK = None
 POS_COOL  = 2.0     # 撞到 50011 後的冷卻秒數：期間不再 force，避免超限自我延續
@@ -582,6 +685,7 @@ async def cancel_frame(iid, algo_id):
 # 唯一的解是作廢它、自己重掛一張。51506 由 /apitest 在 L/S 兩個方向實測確認。
 AMEND_DEAD_CODES = {"51506"}
 AMEND_DEAD_FAILS = 3        # 任何 algoId 連續失敗這麼多次，一律當成廢單處理
+AMEND_COOL_UNTIL = 0.0      # 撞到 50011 後的冷卻截止時刻（全域，所有幣種共用）
 
 
 async def amend_frames(items):
@@ -601,6 +705,7 @@ async def amend_frames(items):
     B單的母單是 trigger，OKX 自動生成的附屬 OCO 就是這種（/apitest 已實測）。
     舊版把它當一般失敗，於是無限重試＋退避，B 整場緊貼 0 次。
     挑出來讓呼叫端把它作廢、重掛一張自己的。"""
+    global AMEND_COOL_UNTIL
     okset = set(); deadset = set()
     for i in range(0, len(items), 10):
         batch = items[i:i+10]
@@ -611,6 +716,11 @@ async def amend_frames(items):
                 e["newTpTriggerPx"] = str(it[3])
             body.append(e)
         r = await api("POST", "/api/v5/trade/amend-algos", body)
+        # 【v3.10】撞到速率限制就降速，不是停擺。緊貼慢一點還能救，
+        # 整個停掉就是 WIF 第12輪重演。
+        if str(r.get("code")) == "50011":
+            AMEND_COOL_UNTIL = time.time() + AMEND_COOL
+            print(f"[緊貼降速] amend 撞到 50011，冷卻 {AMEND_COOL} 秒")
         data = r.get("data") or []
         for j, it in enumerate(batch):
             d = data[j] if j < len(data) else {}
@@ -1244,6 +1354,11 @@ async def frame_mover(app):
                           if S.get("pair_state", "idle") != "idle"]
             if not candidates:
                 continue
+            # 【v3.10】速率限制冷卻期：本拍不送 amend，下一拍再說。降速不停擺。
+            if now_t < AMEND_COOL_UNTIL:
+                for S in candidates:
+                    _skip(S, "全體", "amend速率冷卻中")
+                continue
 
             amends = []          # (iid, algoId, nsl, S, side, move_type)
             for S in candidates:
@@ -1366,14 +1481,19 @@ async def frame_mover(app):
                     mh = []; S[hist_key] = mh
                 label = f"{S['sym']} {S['dir'] if side == 'front' else S.get('back_d','?')}"
                 if algo_id in okset:
+                    # 【v3.10】記下和上一次成功移動相差幾毫秒 —— 這就是「緊貼速度」
+                    # 的客觀量測值。理論下限 = MOVE_TICK × 1000。實際跑出來的
+                    # 中位數若明顯大於它，就代表有東西在拖慢，看 skip_n 找元兇。
+                    prev_t = float(S.get(f"_last_move_t_{side}", 0) or 0)
+                    dt_ms = int((now_t - prev_t) * 1000) if prev_t else 0
                     S[sl_f] = nsl_s
                     S[f"{side}_move_n"] = int(S.get(f"{side}_move_n", 0)) + 1
                     S[f"_last_move_t_{side}"] = now_t
                     S[f"{side}_move_fail_n"] = 0
-                    print(f"[SL移動] {label} {side} {mtype} {why} 峰值={pk_s} 新SL={nsl_s} "
-                          f"第{S[f'{side}_move_n']}次")
+                    print(f"[SL移動] {label} {side} {mtype} {why} 新SL={nsl_s} "
+                          f"第{S[f'{side}_move_n']}次 間隔{dt_ms}ms")
                     mh.append({"t": hhmmss(), "type": mtype, "peak": pk_s,
-                               "sl": nsl_s, "why": why})
+                               "sl": nsl_s, "why": why, "dt": dt_ms})
                 else:
                     S[f"{side}_move_fail_n"] = int(S.get(f"{side}_move_fail_n", 0)) + 1
                     S[f"_last_fail_t_{side}"] = now_t
@@ -1509,9 +1629,17 @@ def _sl_block(mn, mhist, fn=0):
         head += f"（{E.MOVE_PROFIT}{p} {E.MOVE_TIME}{t} {E.MOVE_FAIL}{f}）"
     lines = ["━━━━━━━━━━", head]
     if mhist:
+        # 【v3.10】緊貼速度：兩次成功移動間隔的最快／中位數（毫秒）。
+        # 理論下限就是心跳 MOVE_TICK×1000。中位數接近它 = 緊貼跑滿速。
+        d_min, d_med = _dt_stat(mhist, "min"), _dt_stat(mhist, "med")
+        if d_med:
+            lines.append(f"緊貼速度：最快 {d_min}ms｜中位 {d_med}ms"
+                         f"（心跳下限 {int(MOVE_TICK*1000)}ms）")
         for m in mhist[-10:]:
-            pk = m.get("peak", m.get("px", ""))
-            lines.append(f"{m.get('t','')} | {m.get('type','')} | 峰值{pk} | 止{m.get('sl','')}")
+            dt = m.get("dt")
+            tail = f" | {dt}ms" if dt else ""
+            lines.append(f"{m.get('t','')} | {m.get('type','')} | "
+                         f"止{m.get('sl','')}{tail}")
         if len(mhist) > 10:
             lines.append(f"（顯示最近10筆，共{len(mhist)}筆）")
     return "\n".join(lines)
@@ -1707,6 +1835,17 @@ def _pct_move(a, b, d):
         return 0.0
 
 
+def _dt_stat(mh, what):
+    """從移動歷史抽出「兩次緊貼間隔」的統計（毫秒）。第一次沒有前值，略過。"""
+    v = sorted(int(m.get("dt") or 0) for m in (mh or [])
+               if m.get("dt") and int(m.get("dt")) > 0)
+    if not v:
+        return 0
+    if what == "min": return v[0]
+    if what == "max": return v[-1]
+    return v[len(v) // 2]
+
+
 def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
     """把這一單的一切留下來 —— 凡走過必留下痕跡。
 
@@ -1756,6 +1895,10 @@ def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
         # SL 移動全紀錄
         "move_n": int(snap.get("move_n", 0)),
         "move_ok": n_ok, "move_tf": n_tf, "move_fail": n_fa,
+        # 【v3.10】緊貼速度的客觀量測：兩次成功移動之間隔了幾毫秒。
+        # 理論下限 = MOVE_TICK×1000。中位數明顯偏大 → 有東西在拖，看 skips。
+        "dt_min": _dt_stat(mh, "min"), "dt_med": _dt_stat(mh, "med"),
+        "dt_max": _dt_stat(mh, "max"),
         "moves": mh,
         # 【v3.8】沒有緊貼的原因 —— 贏要知道怎麼贏，輸要知道怎麼輸。
         # skips 記下本場每一個「這一輪不緊貼」的理由與次數（哪一條規則擋的）；
@@ -3639,6 +3782,123 @@ def _selftest_lines():
     return out
 
 
+# ---------- /log 診斷紀錄 ----------
+# 【和 /summary 的分工】
+#   /summary → 損益。看賺賠、看哪個幣種哪個方向表現好。
+#   /log     → 腳本本身。API 回傳值、錯誤碼、速率用量、緊貼引擎為什麼沒動。
+#              目的是 debug，不是看錢。
+OKX_CODE_CN = {
+    "50011": "速率超限 Too Many Requests",
+    "51506": "此單天生不可修改（B單自動OCO）",
+    "51280": "SL 觸發價越過現價",
+    "51527": "附屬TP/SL 不存在或狀態不符",
+    "51000": "參數錯誤",
+    "51008": "保證金不足",
+    "-1":    "網路／連線失敗",
+    "EXC":   "送出時拋例外",
+}
+# OKX 官方限制，用來算「用掉幾成」
+API_LIMIT = {"positions": (10, 2), "amend-algos": (20, 2), "order": (60, 2),
+             "order-algo": (20, 2), "cancel-algos": (20, 2),
+             "orders-algo-pending": (20, 2), "orders-pending": (60, 2)}
+
+
+def _log_api_lines():
+    out = ["━━━ API 用量（任意 2 秒窗的尖峰）━━━"]
+    rows = []
+    for k in sorted(API_HITS.keys()):
+        peak = _peak_in_window(k, 2.0)
+        lat  = list(API_LAT.get(k) or ())
+        med  = sorted(lat)[len(lat) // 2] if lat else 0
+        lim  = API_LIMIT.get(k)
+        if lim:
+            use = f"{peak}/{lim[0]}　{peak / lim[0] * 100:.0f}%"
+            flag = "🔴" if peak >= lim[0] else ("⚠️" if peak >= lim[0] * 0.8 else "✅")
+        else:
+            use, flag = f"{peak}/—", "　"
+        rows.append(f"{flag} {k:<22}{use:<12}延遲中位 {med}ms")
+    out += rows or ["（尚無紀錄）"]
+    out.append("")
+    out.append("━━━ OKX 錯誤碼累計 ━━━")
+    if API_SCODE:
+        for code, n in sorted(API_SCODE.items(), key=lambda kv: -kv[1]):
+            out.append(f"{code} × {n}　{OKX_CODE_CN.get(code, '')}")
+    else:
+        out.append("✅ 一次都沒有")
+    return out
+
+
+def _log_engine_lines():
+    out = ["━━━ 緊貼引擎現況 ━━━",
+           f"心跳 {MOVE_TICK}s（{1/MOVE_TICK:.0f} 拍/秒）｜"
+           f"每側節流 {PRICE_TICK_SEC}s｜緊貼 {float(HUG_FIXED*100):.3f}%"]
+    live = [S for S in STRATS.values() if S.get("pair_state", "idle") != "idle"]
+    if not live:
+        out.append("（目前沒有運行中的策略）")
+        return out
+    for S in live:
+        out.append(f"· {S.get('sym')} {E.dir_word(S.get('dir'))}")
+        for side, nm in (("front", "A"), ("back", "B")):
+            if not S.get(f"{side}_filled"):
+                continue
+            mh = S.get(f"{side}_move_hist") or []
+            out.append(f"  {nm}單 移動{int(S.get(f'{side}_move_n',0))}次"
+                       f"｜失敗{int(S.get(f'{side}_move_fail_n',0) or 0)}"
+                       f"｜最快{_dt_stat(mh,'min')}ms 中位{_dt_stat(mh,'med')}ms"
+                       f"｜algoId={'有' if S.get('algo_id' if side=='front' else 'back_algo2_id') else '【無】'}")
+        out.append("  " + _skip_note(S, top=5))
+        if int(S.get("fix_n", 0) or 0):
+            out.append(f"  自我修復 {S['fix_n']} 次")
+    return out
+
+
+async def cmd_log(u, c):
+    """/log [api|sl|all|數字] —— 腳本診斷，不是損益（損益看 /summary）。
+
+    參數全部是英文小寫，手機好打：
+      /log      預設，異常 + API用量 + 緊貼現況，三段都給
+      /log api  只看 API 用量與錯誤碼
+      /log sl   只看緊貼引擎（移動幾次、多快、為什麼沒動）
+      /log all  最近 60 行原始輸出
+      /log 100  最近 100 行原始輸出
+    """
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    a = (c.args or [])
+    arg = (a[0].lower() if a else "")
+    head = [f"{E.BOT} 🔧 診斷紀錄　{VERSION}｜{ACCT}"]
+    tail = [f"時間：{hhmmss()}（UTC+8）"]
+
+    if arg == "api":
+        await _reply_long(u, head, _log_api_lines(), tail); return
+    # sl = 主要寫法（就是你天天在講的那個 SL）。後面幾個是相容別名，不用記。
+    if arg in ("sl", "hug", "engine", "引擎"):
+        await _reply_long(u, head, _log_engine_lines(), tail); return
+    if arg == "all" or arg.isdigit():
+        n = int(arg) if arg.isdigit() else 60
+        n = max(5, min(n, DIAG_MAX))
+        body = [f"━━━ 最近 {n} 行全部輸出 ━━━"] + list(DIAG)[-n:]
+        await _reply_long(u, head, body, tail); return
+
+    # 預設：異常優先，再附上 API 用量與引擎現況
+    body = [f"━━━ 異常紀錄（最近 {min(len(DIAG_ERR), 25)} 筆）━━━"]
+    if DIAG_ERR:
+        body += list(DIAG_ERR)[-25:]
+    else:
+        body.append("✅ 目前沒有任何異常")
+    body.append("")
+    body += _log_api_lines()
+    body.append("")
+    body += _log_engine_lines()
+    body.append("")
+    body.append(f"（緩衝：異常 {len(DIAG_ERR)} 筆｜全部 {len(DIAG)} 行）")
+    body.append("━━━━━━━━━━")
+    body.append("/log api　只看API用量與錯誤碼")
+    body.append("/log sl　　只看緊貼引擎")
+    body.append("/log all　最近60行原始輸出")
+    body.append("/log 100　最近100行原始輸出")
+    await _reply_long(u, head, body, tail)
+
+
 async def cmd_selftest(u, c):
     """/selftest —— 當場驗證緊貼規則。不下單、不碰持倉。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
@@ -4031,6 +4291,7 @@ async def _post_init(app):
             BotCommand("tune", "調參報告"),
             BotCommand("apitest", "API探測"),
             BotCommand("selftest", "緊貼規則自檢"),
+            BotCommand("log", "診斷紀錄 api｜sl｜all"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
             BotCommand("stopall", "停全部"),
@@ -4089,7 +4350,8 @@ def main():
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
                     ("summary", cmd_summary), ("tune", cmd_tune),
-                    ("apitest", cmd_apitest), ("selftest", cmd_selftest), ("amp", cmd_amp),
+                    ("apitest", cmd_apitest), ("selftest", cmd_selftest),
+                    ("log", cmd_log), ("amp", cmd_amp),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
