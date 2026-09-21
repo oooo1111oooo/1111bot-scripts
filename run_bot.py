@@ -127,7 +127,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.11"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.12"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -3852,58 +3852,167 @@ def _log_engine_lines():
     return out
 
 
-async def cmd_log(u, c):
-    """/log [api|sl|all|數字] —— 腳本診斷，不是損益（損益看 /summary）。
+def _selftest_fails():
+    """規則自檢的失敗數（不印表，只要結論）。"""
+    bad = 0; tick = Decimal("0.01"); F = HUG_FIXED
+    for cases in (SELFTEST_A, SELFTEST_B):
+        for (n, rl, desc, d, ent, cur, sl, el, wt, exp_a, exp_p) in cases:
+            try:
+                a, p, why, rule = sl_decide(d, ent.strip(), cur.strip(), sl.strip(),
+                                            F, tick, el, wt)
+            except Exception:
+                bad += 1; continue
+            if a != exp_a or rule != rl:
+                bad += 1
+            elif exp_p is not None and (p is None or Decimal(str(p)) != Decimal(exp_p)):
+                bad += 1
+    return bad, len(SELFTEST_A) + len(SELFTEST_B)
 
-    參數全部是英文小寫，手機好打：
-      /log      預設，異常 + API用量 + 緊貼現況，三段都給
-      /log api  只看 API 用量與錯誤碼
-      /log sl   只看緊貼引擎（移動幾次、多快、為什麼沒動）
-      /log all  最近 60 行原始輸出
-      /log 100  最近 100 行原始輸出
+
+def _check_health_lines():
+    """一頁健檢：每一項一個顏色，紅的才需要往下查。
+
+    【設計原則】「沒有資料」絕對不能長得像「一切正常」——
+    那正是 B 單整場不動卻看不出來的同一種錯。沒資料一律標 ⚪。
     """
+    out = []
+
+    # ① 規則：這台機器上的緊貼規則和談好的一致嗎
+    bad, tot = _selftest_fails()
+    out.append(f"{'🟢' if not bad else '🔴'} 規則　　{tot-bad}/{tot} 通過"
+               f"｜緊貼{float(HUG_FIXED*100):.3f}%　A等{HUG30_SEC}s　B等0s")
+
+    # ② 連線
+    lat = [v for dq in API_LAT.values() for v in dq]
+    med = sorted(lat)[len(lat) // 2] if lat else None
+    ws_pub = bool(WS_LIVE.get("pub"))     # 公有斷線 = 取價退回 REST，緊貼直接變慢
+    ws_pri = bool(WS_LIVE.get("pri"))
+    if med is None:
+        out.append(f"⚪ 連線　　尚無 API 呼叫紀錄（剛重啟？）｜WS {ws_status()}")
+    else:
+        ico = "🔴" if not ws_pub else ("🟡" if (not ws_pri or med >= 500) else "🟢")
+        note = "" if ws_pub else "　← 公有WS斷線，取價退回REST，緊貼會變慢"
+        out.append(f"{ico} 連線　　WS {ws_status()}｜OKX 延遲中位 {med}ms{note}")
+
+    # ③ 速率：離 OKX 上限還有多遠
+    worst = 0.0; parts = []
+    for k, (lim, win) in API_LIMIT.items():
+        if k not in API_HITS:
+            continue
+        peak = _peak_in_window(k, win)
+        r = peak / lim
+        worst = max(worst, r)
+        if r >= 0.5:
+            parts.append(f"{k} {peak}/{lim}({r*100:.0f}%)")
+    if not API_HITS:
+        out.append("⚪ 速率　　尚無呼叫紀錄")
+    else:
+        ico = "🔴" if worst >= 1 else ("🟡" if worst >= 0.8 else "🟢")
+        out.append(f"{ico} 速率　　尖峰 {worst*100:.0f}%"
+                   + ("｜" + "　".join(parts) if parts else "（全部低於一半）"))
+
+    # ④ API 錯誤碼
+    if not API_SCODE:
+        out.append("🟢 API錯誤　一次都沒有")
+    else:
+        tally = "　".join(f"{k}×{v}" for k, v in
+                          sorted(API_SCODE.items(), key=lambda kv: -kv[1])[:4])
+        ico = "🔴" if "50011" in API_SCODE else "🟡"
+        out.append(f"{ico} API錯誤　{tally}")
+
+    # ⑤ 緊貼：戰術到底有沒有在執行（最重要的一項）
+    live = [S for S in STRATS.values() if S.get("pair_state", "idle") != "idle"]
+    held = []
+    for S in live:
+        for side, nm in (("front", "A"), ("back", "B")):
+            if S.get(f"{side}_filled"):
+                held.append((S, side, nm))
+    if not held:
+        out.append(f"⚪ 緊貼　　目前無持倉（{len(live)} 個策略埋伏中）")
+    else:
+        bad_l = []
+        for S, side, nm in held:
+            aid = S.get("algo_id" if side == "front" else "back_algo2_id")
+            mn  = int(S.get(f"{side}_move_n", 0) or 0)
+            ee  = S.get(f"{side}_ee")
+            el  = int(time.time() - float(ee)) if ee else 0
+            if not aid:
+                bad_l.append(f"{S['sym']}{nm}單 algoId【無】")
+            elif mn == 0 and el > 30:
+                bad_l.append(f"{S['sym']}{nm}單 進場{el}s 移動0次")
+        if bad_l:
+            out.append("🔴 緊貼　　" + "　".join(bad_l[:3]))
+        else:
+            tot_mv = sum(int(S.get(f"{sd}_move_n", 0) or 0) for S, sd, _ in held)
+            out.append(f"🟢 緊貼　　{len(held)} 單持倉中｜累計移動 {tot_mv} 次")
+
+    out.append(f"{'🟢' if not DIAG_ERR else '🟡'} 異常　　"
+               f"{len(DIAG_ERR)} 筆（緩衝共 {len(DIAG)} 行）")
+    try:
+        rows = [r for r in _load_days(1) if r.get("reason") != "補登"]
+        out.append(f"🟢 今日　　{len(live)} 個策略運行｜{len(rows)} 筆出場紀錄")
+    except Exception:
+        out.append("⚪ 今日　　讀不到交易紀錄")
+    return out
+
+
+class _ShiftArgs:
+    """把 /check data XXX 3 後面的參數轉交給既有指令。"""
+    def __init__(self, args): self.args = args
+
+
+async def cmd_check(u, c):
+    """/check —— 唯一的診斷入口。不帶參數給一頁健檢，有問題再往下查。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = (c.args or [])
     arg = (a[0].lower() if a else "")
-    head = [f"{E.BOT} 🔧 診斷紀錄　{VERSION}｜{ACCT}"]
+    head = [f"{E.BOT} 🩺 健檢　{VERSION}｜{ACCT}"]
     tail = [f"時間：{hhmmss()}（UTC+8）"]
 
     if arg == "api":
         await _reply_long(u, head, _log_api_lines(), tail); return
-    # sl = 主要寫法（就是你天天在講的那個 SL）。後面幾個是相容別名，不用記。
     if arg in ("sl", "hug", "engine", "引擎"):
         await _reply_long(u, head, _log_engine_lines(), tail); return
-    if arg == "all" or arg.isdigit():
+    if arg in ("rule", "rules"):
+        await _reply_long(u, head, _selftest_lines(), tail); return
+    if arg in ("log", "all") or arg.isdigit():
         n = int(arg) if arg.isdigit() else 60
         n = max(5, min(n, DIAG_MAX))
-        body = [f"━━━ 最近 {n} 行全部輸出 ━━━"] + list(DIAG)[-n:]
+        body = [f"━━━ 最近 {n} 行原始輸出 ━━━"] + list(DIAG)[-n:]
         await _reply_long(u, head, body, tail); return
+    if arg in ("data", "tune"):
+        await cmd_tune(u, _ShiftArgs(a[1:])); return
 
-    # 預設：異常優先，再附上 API 用量與引擎現況
-    body = [f"━━━ 異常紀錄（最近 {min(len(DIAG_ERR), 25)} 筆）━━━"]
+    body = _check_health_lines()
     if DIAG_ERR:
-        body += list(DIAG_ERR)[-25:]
-    else:
-        body.append("✅ 目前沒有任何異常")
-    body.append("")
-    body += _log_api_lines()
-    body.append("")
-    body += _log_engine_lines()
-    body.append("")
-    body.append(f"（緩衝：異常 {len(DIAG_ERR)} 筆｜全部 {len(DIAG)} 行）")
-    body.append("━━━━━━━━━━")
-    body.append("/log api　只看API用量與錯誤碼")
-    body.append("/log sl　　只看緊貼引擎")
-    body.append("/log all　最近60行原始輸出")
-    body.append("/log 100　最近100行原始輸出")
+        body.append("")
+        body.append(f"━━━ 最近 {min(len(DIAG_ERR), 8)} 筆異常 ━━━")
+        body += list(DIAG_ERR)[-8:]
+    body += ["", "━━━ 要看細節 ━━━",
+             "/check sl　　緊貼引擎（移動幾次、多快、為何沒動）",
+             "/check api　 API用量與錯誤碼",
+             "/check log　 原始輸出（/check 100 = 最近100行）",
+             "/check rule　規則自檢 18 項",
+             "/check data　歷史交易數據（可加幣種、天數）",
+             "",
+             "實盤探測 OKX 行為 → /apitest（會下真單，需閒置帳戶）"]
     await _reply_long(u, head, body, tail)
 
 
+# ---------- 舊指令別名（保留相容，選單上已移除，統一走 /check） ----------
+# /log /selftest /tune 都是我在不同時間點為了解決不同症狀加的，四個指令
+# 職責重疊、互相不知道對方存在 —— 典型的頭痛醫頭。現在全部收進 /check，
+# 這三個留著只是怕你手指記憶還在，打了不會出錯。
+async def cmd_log(u, c):
+    """（舊）等同 /check。"""
+    await cmd_check(u, c)
+
+
 async def cmd_selftest(u, c):
-    """/selftest —— 當場驗證緊貼規則。不下單、不碰持倉。"""
+    """（舊）等同 /check rule。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
-    await _reply_long(u, [f"{E.BOT} 🧪 緊貼決策情境表　{VERSION}"],
-                      _selftest_lines(), [f"時間：{hhmmss()}"])
+    await _reply_long(u, [f"{E.BOT} 🩺 規則自檢　{VERSION}｜{ACCT}"],
+                      _selftest_lines(), [f"時間：{hhmmss()}　（新入口：/check rule）"])
 
 
 async def cmd_apitest(u, c):
@@ -4288,10 +4397,8 @@ async def _post_init(app):
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "當日戰報"),
-            BotCommand("tune", "調參報告"),
-            BotCommand("apitest", "API探測"),
-            BotCommand("selftest", "緊貼規則自檢"),
-            BotCommand("log", "診斷紀錄 api｜sl｜all"),
+            BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
+            BotCommand("apitest", "實盤API探測(會下真單)"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
             BotCommand("stopall", "停全部"),
@@ -4350,8 +4457,9 @@ def main():
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
                     ("summary", cmd_summary), ("tune", cmd_tune),
-                    ("apitest", cmd_apitest), ("selftest", cmd_selftest),
-                    ("log", cmd_log), ("amp", cmd_amp),
+                    ("check", cmd_check), ("apitest", cmd_apitest),
+                    ("selftest", cmd_selftest), ("log", cmd_log),
+                    ("amp", cmd_amp),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
