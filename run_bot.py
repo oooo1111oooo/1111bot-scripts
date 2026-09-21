@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 # 設計此腳本的目的在於用bot取代我在交易所app上的一切手動行為，切記
-"""B6-1 原K｜多帳戶 — v3.1 跨式雙向埋伏版
+"""B6-1 原K｜多帳戶 — v3.8 跨式雙向埋伏版
 
 【戰術】
   同時掛 A限價 + B觸發（反向、同量）。兩單都成交時完全對沖，損益鎖死 = -兩單間距，
   與價格無關。價格衝出箱子時一邊被SL掃掉、一邊獨活順勢起飛。
   賭的是「一根針」：多數戰役小輸手續費，少數戰役吃到大波動翻盤。
 
-【SL 唯一公式】峰值緊貼，棘輪不後退
-  做L：峰值 = 進場後最高價（初始=進場價）
-       若 峰值 >= 進場價×(1+F) → SL = max(靜態SL, 峰值×(1-F))；否則 SL 不動
-  做S：鏡像（谷值 = 最低價，SL = min(靜態SL, 谷值×(1+F))）
-  F = 該單來回手續費率（A=FEE_A、B=FEE_B）。啟動前靜態SL緩衝區完整保留。
-  此式自然涵蓋三階段：毛利F→SL到進場價(保本)、毛利2F→SL到淨歸零、之後一路緊貼。
+【緊貼四種情境】—— 全部實作在 sl_decide() 一個純函式裡，別處不准自己判斷
+  1. 價格不動        → SL 不動。每秒查兩次。
+  2. 往TP移動        → SL 立刻緊貼到 0.1%。每秒查兩次、移兩次。
+  3. 往SL移動，等待期內 → SL 不動，沉住氣等方向。
+  4. 往SL移動，等待期外 → SL 立刻緊貼到 0.1%，認輸。持續查、持續移。
 
-【TF 判斷樹】TF 是唯一的時間閘門
-  兩單都持倉      → 不動（對沖中、損益鎖死，不許攪局）
-  單邊持倉有獲利  → 不動（讓緊貼SL去跑）
-  單邊持倉無獲利  → SL 貼現價 ∓F（逼出場，沒有對沖就不該久留）
-  零持倉          → 撤所有掛單、重新取價、重新部署
+  【等待期 A/B 不同 —— 這是兩單本質的差別】
+    A單(限價埋伏) 被動成交，方向未知 → 等 30 秒；
+                  但 B 一觸發進場，等待期【立刻作廢】(B進場就是方向信號)。
+    B單(觸發對沖) 主動成交，方向已定 → 不等，第一秒就緊貼。
+
+  SL 一律 = 現價 ∓ 0.1%，【不判斷峰值】，也沒有啟動門檻。
+  唯一限制：只准拉近，不准放鬆（否則 SL 會跟著價格跑，永遠不會出場）。
+  方向以「現價 vs 進場價」認定，不看逐筆漲跌 —— 逐筆會被雜訊左右。
+  靜態SL 只是個基準：第一次緊貼就被取代，OKX 上始終只有一張 SL。
+
+  【壓縮】兩單都在場時，兩條動態SL 從兩側夾住現價，箱寬 0.2%。
+  價格往哪邊動 0.1% 就有一單被逼出，存活那單方向已驗證，繼續緊貼獨走。
+
+【資料鐵則】凡走過必留下痕跡
+  每一次「沒有緊貼」都要留下名字與次數（skip_n），寫進交易紀錄。
+  贏要知道怎麼贏，輸要知道怎麼輸 —— 不明不白的數據等於沒有數據。
 
 【鐵則】
   1. OKX 為唯一真相來源：撤單、持倉、損益一律回查 OKX 確認。
   2. 下單必帶 TP/SL（attachAlgoOrds），成交當下即生效，無裸倉空窗。
   3. 重啟時接管 OKX 上的既有持倉與掛單，不留孤兒。
   4. Telegram 與 WebSocket 皆為旁路：失效絕不影響交易與保護。
-  5. 平倉一律人工，守門狗只告警不自動平倉。
+  5. 守門狗只告警不自動平倉；唯一的程式自動平倉是上面那條「越界平倉」。
 """
 import sys, hmac, base64, hashlib, json, time, asyncio, uuid, os
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
@@ -45,7 +55,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.7.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -568,6 +578,12 @@ async def cancel_frame(iid, algo_id):
     await api("POST", "/api/v5/trade/cancel-algos",
               [{"instId": iid, "algoId": algo_id}])
 
+# 【v3.8】這些 sCode 代表「這張 algo 單天生改不動」，重試沒有意義，
+# 唯一的解是作廢它、自己重掛一張。51506 由 /apitest 在 L/S 兩個方向實測確認。
+AMEND_DEAD_CODES = {"51506"}
+AMEND_DEAD_FAILS = 3        # 任何 algoId 連續失敗這麼多次，一律當成廢單處理
+
+
 async def amend_frames(items):
     """批次修改 algo 單觸發價。
     items 元素可為 3 元組 (instId, algoId, sl) → 只改 SL（移動SL 用，TP 不動）；
@@ -577,8 +593,15 @@ async def amend_frames(items):
     【問題10】回傳「成功的 algoId 集合」，不是筆數。
     舊版用一個布林判定整批成敗：同批任一張失敗，OKX 回 code!=0，
     其餘明明成功的也被標成失敗 → 程式內部 SL 值與 OKX 實際值失聯。
-    改成逐筆看 data[i].sCode，各自認帳。"""
-    okset = set()
+    改成逐筆看 data[i].sCode，各自認帳。
+
+    【v3.8】回傳 (成功集合, 永久失敗集合)。
+    51506 = Order modification unavailable for the order type ——
+    這是「這張單天生不能改」，不是暫時性失敗，重試一萬次也是一樣。
+    B單的母單是 trigger，OKX 自動生成的附屬 OCO 就是這種（/apitest 已實測）。
+    舊版把它當一般失敗，於是無限重試＋退避，B 整場緊貼 0 次。
+    挑出來讓呼叫端把它作廢、重掛一張自己的。"""
+    okset = set(); deadset = set()
     for i in range(0, len(items), 10):
         batch = items[i:i+10]
         body = []
@@ -591,62 +614,115 @@ async def amend_frames(items):
         data = r.get("data") or []
         for j, it in enumerate(batch):
             d = data[j] if j < len(data) else {}
-            if str(d.get("sCode", "")) == "0":
+            sc = str(d.get("sCode", ""))
+            if sc == "0":
                 okset.add(it[1])
             else:
-                print(f"amend fail {it[0]} {it[1]} sCode={d.get('sCode')} {d.get('sMsg')}")
+                if sc in AMEND_DEAD_CODES:
+                    deadset.add(it[1])
+                print(f"amend fail {it[0]} {it[1]} sCode={sc} {d.get('sMsg')}"
+                      + ("　← 永久失敗，將作廢重掛" if sc in AMEND_DEAD_CODES else ""))
         if r.get("code") not in ("0", "2") and not data:
             print("amend_frames 整批失敗", r.get("msg"))
-    return okset
+    return okset, deadset
 
-def hug_sl(entry_px, peak, d, F, tick, static_sl):
-    """【v3.1 唯一的 SL 公式】峰值緊貼，棘輪不後退。
+# ==================== 緊貼決策：唯一真相來源 ====================
+# 【情境只有四種，程式就只寫這四種】
+#   1. 價格不動           → SL 不動。每秒查兩次。
+#   2. 價格往TP移動       → SL 立刻緊貼到 0.1%。每秒查兩次、移兩次。
+#   3. 30秒以內往SL移動   → SL 不動（對沖單保護中）。
+#   4. 30秒以後往SL移動   → SL 立刻緊貼到 0.1%。每秒持續查、持續移。
+#
+# 【不再判斷峰值】SL 一律 = 現價 ∓ 0.1%，不是峰值 ∓ 0.1%。
+# 也沒有啟動門檻 —— 往TP走就貼，不管走了多少。
+# 唯一的限制是「只准拉近，不准放鬆」：緊貼本來就只有拉近的意思，
+# 而且若允許放鬆，SL 會一路跟著價格往下跑，永遠不會出場。
+#
+# 【方向怎麼認】拿現價跟進場價比，不看上一筆的漲跌。
+# 逐筆比較會被雜訊左右（同一秒可能一上一下），拿進場價當基準才穩定：
+#   做多 現價>進場價 = 往TP；現價<進場價 = 往SL；相等 = 不動。做空鏡像。
+#
+# 這是一個【純函式】：不碰 S、不碰網路、不改任何狀態。
+# 給一組數字，回答該做什麼 —— 所以能離線跑十萬組驗證（/selftest）。
 
-    做L：峰值 = 進場後最高價（初始 = 進場價）
-         若 峰值 >= 進場價×(1+F) → SL = 峰值×(1-F)；否則不動（靜態SL緩衝區保留）
-    做S：鏡像（谷值 = 最低價，SL = 谷值×(1+F)）
+HUG30_SEC = 30      # 規則3/4 的分界秒數 ← 要調就改這一行
 
-    這一式自然涵蓋原本規劃的三個階段，不是近似：
-      峰值 = 進場價×(1+F)   → SL 落在進場價        → 保本
-      峰值 = 進場價×(1+2F)  → SL 落在進場價×(1+F)  → 淨損益歸零
-      峰值再往上            → SL 一路緊貼 F 的距離  → 鎖住獲利
-    回傳新 SL（Decimal）或 None（不該動）。
+
+def sl_decide(d, entry, cur, cur_sl, F, tick, elapsed, wait_sec):
+    """緊貼決策。回傳 (action, price, reason, rule)
+
+      action = "hold" 不動 ／ "move" 把 SL 移到 price
+      rule   = 命中第幾條規則（1~4，0=棘輪擋下）
+
+    【wait_sec = 規則3 的等待秒數】A/B 不一樣，這是兩單本質的差別：
+      A單（限價埋伏）被動成交 —— 成交那一刻【方向未知】，價格可能只是掃一下
+        就回頭，所以給它一段時間沉住氣。wait_sec = 30。
+      B單（觸發對沖）主動成交 —— 價格必須「走過去」才會觸發，成交那一刻
+        【方向已經確定】，沒有什麼好觀察的。wait_sec = 0，規則3 直接不存在。
+      而且 A 的等待期在【B 觸發進場那一刻立刻結束】（呼叫端傳 0）——
+      B 進場本身就是方向信號，A 沒有理由再等。
+
+    參數全為純數值，不依賴任何全域狀態。
+      d        "L"/"S"   這一單自己的方向（A/B 各自算，不共用）
+      entry    進場成交價
+      cur      現價
+      cur_sl   目前生效的 SL（第一次 = 靜態SL；靜態SL 只是個基準，
+               第一次緊貼就被取代掉，OKX 上從頭到尾只有一張 SL）
+      F        緊貼距離（0.001 = 0.1%）
+      elapsed  進場後經過幾秒
+      wait_sec 規則3 的等待秒數（A單 30 或 0；B單恆 0）
     """
     try:
-        e = Decimal(str(entry_px)); pk = Decimal(str(peak))
-        cur = Decimal(str(static_sl))
+        e = Decimal(str(entry)); c = Decimal(str(cur)); sl = Decimal(str(cur_sl))
     except Exception:
-        return None
-    if e <= 0 or pk <= 0:
-        return None
-    if d == "L":
-        if pk < e * (Decimal("1") + F):        # 尚未達啟動門檻 → 靜態SL 緩衝區完整保留
-            return None
-        nsl = align(pk * (Decimal("1") - F), tick, "S")
-        return nsl if nsl > cur else None      # 棘輪：只准往上，絕不後退
-    else:
-        if pk > e * (Decimal("1") - F):
-            return None
-        nsl = align(pk * (Decimal("1") + F), tick, "L")
-        return nsl if nsl < cur else None      # 棘輪：只准往下
+        return ("hold", None, "資料不全", 0)
+    if e <= 0 or c <= 0:
+        return ("hold", None, "資料不全", 0)
+    L = (d == "L")
+
+    # 規則1：價格不動 → SL 不動
+    if c == e:
+        return ("hold", None, "規則1 價格不動", 1)
+
+    toward_tp = (c > e) if L else (c < e)
+
+    # 規則3：等待期內往SL移動 → SL 不動（沉住氣，等方向）
+    # wait_sec=0 時這條永遠不成立 —— B單、以及 B 已進場後的 A單，都直接跳過。
+    if not toward_tp and elapsed < wait_sec:
+        return ("hold", None,
+                f"規則3 往SL方向，進場{int(elapsed)}秒未滿{int(wait_sec)}秒", 3)
+
+    # 規則2（往TP）與規則4（等待期外往SL）目標相同：現價 ∓ 0.1%
+    tgt = align(c * (Decimal("1") - F), tick, "S") if L else \
+          align(c * (Decimal("1") + F), tick, "L")
+
+    # 只准拉近。擋下來就是「價格在回撤」或「SL 已經更近」——都屬於規則1 的不動。
+    if (L and tgt <= sl) or (not L and tgt >= sl):
+        return ("hold", None, "規則1 SL已更近，不放鬆", 0)
+
+    if toward_tp:
+        return ("move", tgt, "規則2 往TP緊貼", 2)
+    return ("move", tgt, "規則4 往SL，等待期已過，緊貼認輸", 4)
 
 
-def tf_hug_sl(cur_px, d, F, tick, static_sl):
-    """【TF 逼倉】單邊持倉且無獲利時，把 SL 貼到現價 ∓F，把這單逼出戰場。
-    沒有對沖的單邊倉不該久留 —— 夜長夢多，寧可認手續費水位的虧損。
-    一樣受棘輪保護：只會讓 SL 更靠近現價，不會放鬆。"""
-    try:
-        cur = Decimal(str(cur_px)); old = Decimal(str(static_sl))
-    except Exception:
-        return None
-    if cur <= 0:
-        return None
-    if d == "L":
-        nsl = align(cur * (Decimal("1") - F), tick, "S")
-        return nsl if nsl > old else None
-    else:
-        nsl = align(cur * (Decimal("1") + F), tick, "L")
-        return nsl if nsl < old else None
+def _skip(S, side, why):
+    """【v3.8】每一次「沒有緊貼」都要留下名字和次數。
+    舊版 11 個 continue 裡有 3 個完全靜默 —— 戰術沒執行，log 一個字都沒有，
+    只能事後猜。現在 /status 和交易紀錄都看得到。
+    印 log 用階梯式（1/10/100/1000…）避免洗版，計數則是每次都加。"""
+    c = S.get("skip_n")
+    if not isinstance(c, dict):
+        c = {}; S["skip_n"] = c
+    k = f"{side}|{why}"
+    c[k] = c.get(k, 0) + 1
+    n = c[k]
+    if n in (1, 10, 100, 1000) or n % 5000 == 0:
+        print(f"[跳過] {S.get('sym')} {side} {why} ×{n}")
+
+
+# 【沒有主動平倉】SL 一律由現價算出，永遠落在現價的安全側，
+# 不會出現「算出來的 SL 越過現價」那種狀況，所以不需要市價平倉的逃生口。
+# 出場一律由 OKX 上的 OCO 執行 —— 程式死了 SL 照樣守著。
 
 
 # 【v3.7】緊貼距離改回【固定值】。
@@ -974,6 +1050,11 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["back_d"]          = back_d
     S["algo_id"]         = None
     S["exit_seq"]        = 0
+    # 【v3.8】每場戰役重置：跳過計數、自我修復計數、廢單黑名單
+    S["skip_n"]          = {}
+    S["fix_n"]           = 0
+    S["front_bad_algo"]  = []
+    S["back_bad_algo"]   = []
     for k in ("front_exit_reason","front_exit_pnl","back_exit_reason","back_exit_pnl",
               "battle_form","front_move_fail_n","back_move_fail_n"):
         S.pop(k, None)
@@ -1002,17 +1083,21 @@ async def _okx_has_oco(iid, ps):
         return None
 
 
-async def _okx_oco_id(iid, ps, tries=4, gap=0.2):
+async def _okx_oco_id(iid, ps, tries=4, gap=0.2, skip=None):
     """【問題4 配套】向 OKX 索取守護該持倉方向的 OCO(止盈止損) algoId。
     下單時 attachAlgoOrds 已帶 TP/SL，成交當下由 OKX「自動」生成這張 OCO ——
     程式不再自己補掛第二張（那會變成 2 張），改成回頭跟 OKX 要它的 algoId。
     移動SL(amend-algos) 與贏家方向判定(_algo_actual_side) 都要靠這個 ID。"""
+    # 【v3.8】skip = 已知改不動的 algoId（黑名單）。不跳過的話，修復程序會把
+    # 同一張廢單又撿回來，變成原地打轉。
+    bad = set(skip or ())
     for _ in range(tries):
         try:
             r = await api("GET", f"/api/v5/trade/orders-algo-pending?ordType=oco&instId={iid}")
             if r.get("code") == "0":
                 for o in (r.get("data") or []):
-                    if o.get("posSide") == ps and o.get("algoId"):
+                    if o.get("posSide") == ps and o.get("algoId") \
+                       and o.get("algoId") not in bad:
                         return o.get("algoId")
         except Exception as e:
             print("查 OCO algoId 失敗", iid, ps, type(e).__name__, e)
@@ -1076,20 +1161,63 @@ def tf_expired(S, key):
     return False
 
 
-def hug_started(S, side):
-    """該單的緊貼是否已啟動（峰值已達 進場價×(1±F) 門檻）。
-    啟動 = 這單已經賺過至少一個手續費的幅度，SL 已進入棘輪保護。"""
-    filled = S.get("front_filled" if side == "front" else "back_filled")
-    if not filled:
-        return False
-    try:
-        e  = Decimal(str(S["front_px" if side == "front" else "back_px"]))
-        pk = Decimal(str(S.get("front_peak" if side == "front" else "back_peak") or e))
-    except Exception:
-        return False
-    d = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
-    F = hug_pct(S, side)
-    return pk >= e * (1 + F) if d == "L" else pk <= e * (1 - F)
+# 【已刪除 hug_started】啟動門檻不存在了 —— 往TP走就貼，不管走了多少。
+
+
+def sl_key_of(side):
+    """這一側目前生效的 SL 欄位名。重掛保護單時要用它，不能退回靜態SL ——
+    緊貼已經把 SL 推近了，退回去等於把前面收緊的風險全部放掉。"""
+    return "front_sl_px" if side == "front" else "back_sl_px"
+
+
+def _mark_dead_algo(S, side, aid_f, algo_id, why):
+    """把一張改不動的 algo 單作廢：清掉 id、列入黑名單，下一輪自動走修復。
+    這是 B單「整場緊貼 0 次」的根治點 —— 舊版把 OKX 自動生成那張
+    （永遠回 51506）當成正常保護單沿用，於是每 0.5 秒失敗一次、退避、
+    再失敗，直到戰役結束。"""
+    if not algo_id:
+        return
+    bl = S.get(f"{side}_bad_algo")
+    if not isinstance(bl, list):
+        bl = []; S[f"{side}_bad_algo"] = bl
+    if algo_id not in bl:
+        bl.append(algo_id)
+        if len(bl) > 10:
+            del bl[:-10]
+    S[aid_f] = None
+    S[f"{side}_move_fail_n"] = 0          # 換新的重新計數，不要帶著退避
+    print(f"[作廢廢單] {S.get('sym')} {side} algoId={algo_id} 原因={why} → 下一輪重掛")
+
+
+async def _repair_algo(S, iid, ps, sd, side, aid_f, now_t):
+    """【v3.8 自我修復】持倉中卻沒有可用的 algoId → 每 3 秒嘗試修一次。
+
+    先回頭跟 OKX 要一張【不在黑名單上】的（換單失敗時，OKX 自動生成那張
+    還掛著，但它改不動，不能撿回來用）；真的沒有就依原始 TP/SL 自己掛一張。
+    掛成功後才撤掉黑名單上那些廢單 —— 先掛新、後撤舊，絕不製造裸倉空窗。"""
+    k = f"_fix_t_{side}"
+    if now_t - float(S.get(k, 0) or 0) < 3.0:
+        return
+    S[k] = now_t
+    bad = list(S.get(f"{side}_bad_algo") or [])
+    got = await _okx_oco_id(iid, ps, tries=1, skip=bad)
+    src = "取回"
+    if not got:
+        tp = S.get("front_tp_px"     if side == "front" else "back_tp_px")
+        sl = S.get(sl_key_of(side))   # 用【目前生效的 SL】重掛，不是退回靜態SL
+        sz = S.get("front_sz"        if side == "front" else "back_sz")
+        if tp and sl and sz:
+            got = await place_algo(iid, ps, sd, sz, tp, sl)
+            src = "重掛"
+            if got:
+                for b in bad:            # 新的掛上了，才撤廢單
+                    await cancel_frame(iid, b)
+                S[f"{side}_bad_algo"] = []
+    if got:
+        S[aid_f]   = got
+        S["fix_n"] = int(S.get("fix_n", 0) or 0) + 1
+        print(f"[自我修復] {S.get('sym')} {side} {src} algoId={got} SL={S.get(sl_key_of(side))}"
+              f"（第{S['fix_n']}次）")
 
 
 async def frame_mover(app):
@@ -1097,13 +1225,13 @@ async def frame_mover(app):
 
     追蹤：WS 逐筆推送時已在 _ws_push_px 更新峰值（零成本、永不漏頂）。
           WS 不可用時，這裡每 MOVE_TICK 秒用 REST 補一次。
-    送單：每 PRICE_TICK_SEC 秒檢查一次，只有「新SL 優於現有SL」才送 amend。
+    送單：每 PRICE_TICK_SEC 秒檢查一次 —— A/B 各自獨立節流，
+          所以 A 一秒兩次、B 一秒兩次，互不排擠。
+          amend-algos 限額 20筆/2秒/商品，兩側全開只用掉 8 筆，額度充裕。
 
-    TF 判斷樹（只處理持倉相關的三條，零持倉重新部署由 loop 負責）：
-      兩單都持倉     → 不動。兩單對沖時損益恆等於 -gap，與價格無關，TF 攪局只會
-                       把一個不會惡化的鎖定虧損換成真實虧損，還破壞整個天羅地網。
-      單邊持倉有獲利 → 不動。緊貼已啟動，棘輪會處理。
-      單邊持倉無獲利 → SL 貼現價 ∓F，逼出戰場。沒有對沖就不該久留。
+    【v3.8】這裡不再有任何緊貼規則 —— 全部交給 sl_decide()。
+    本函式只負責：取數字 → 問 sl_decide → 執行（移動/平倉/記錄跳過原因）。
+    TF 逼倉整段刪除，它的職責已被「30秒認輸緊貼」取代，而且 30 秒比 5 分鐘快得多。
     """
     await asyncio.sleep(3)
     print(f"原K止損移動任務已啟動（{VERSION}）")
@@ -1129,7 +1257,11 @@ async def frame_mover(app):
                     ok_f, cur_f = await okx_pos_ex(iid, fps)
                     ok_b, cur_b = await okx_pos_ex(iid, bps)
                     if not (ok_f and ok_b):
-                        continue        # 【#27】查詢未回應，本輪不動任何 SL
+                        # 【#27】查詢未回應，本輪不動任何 SL。
+                        # 【v3.8】這一條會凍結【兩側】，是最容易被忽略的停擺原因，
+                        # 所以一定要計數 —— 次數高就代表被限流，不是「沒行情」。
+                        _skip(S, "全體", "持倉查詢未回應")
+                        continue
 
                     # 守門狗：一律查 OKX，不看內部旗標（孤兒倉正是旗標為 False 的那種）
                     # 【#27】守門狗節流：裸倉告警門檻是 15 秒，不需要每 0.5 秒查一次
@@ -1154,70 +1286,80 @@ async def frame_mover(app):
                     # 取價並補更新峰值（WS 活著時這只是保險，峰值早就逐筆更新過了）
                     px = await get_px(iid)
                     if not px:
+                        _skip(S, "全體", "取不到現價")
                         continue
-                    _update_peak(S, Decimal(str(px)))
-
-                    both = bool(cur_f and cur_b)
-                    tf_hit = tf_expired(S, "_tf_idx_mv")
+                    _update_peak(S, Decimal(str(px)))   # 峰值只為事後兵推記錄，決策不看
+                    S["_last_px"] = str(px)             # /status 判斷現在是哪一條規則用
 
                     for side, sd, ps, cur_pos, sl_f, aid_f in (
                             ("front", d,  fps, cur_f, "front_sl_px", "algo_id"),
                             ("back",  bd, bps, cur_b, "back_sl_px",  "back_algo2_id")):
+                        # 這一側本來就沒倉 —— 正常，不算「跳過緊貼」，不計數
                         if not cur_pos:
                             continue
+                        # ↓↓ 以下每一條都會讓這一側【這一輪不緊貼】，一律留名字＋計數
                         if not S.get("front_filled" if side == "front" else "back_filled"):
-                            continue
+                            _skip(S, side, "進場旗標未設"); continue
                         if S.get("closing"):
-                            continue
+                            _skip(S, side, "戰役結算中"); continue
                         # 退避：連續失敗後拉長重試間隔，不再每秒打爆速率額度
                         fail_n = int(S.get(f"{side}_move_fail_n", 0) or 0)
                         if fail_n:
                             wait = AMEND_BACKOFF[min(fail_n, len(AMEND_BACKOFF)) - 1]
                             if now_t - float(S.get(f"_last_fail_t_{side}", 0)) < wait:
-                                continue
+                                _skip(S, side, f"送單失敗退避中({wait}秒)"); continue
                         if now_t - float(S.get(f"_last_move_t_{side}", 0)) < PRICE_TICK_SEC:
-                            continue
+                            _skip(S, side, "節流：0.5秒內剛移動過"); continue
 
+                        # 【v3.8】沒有 algoId 不再是死路 —— 每 3 秒嘗試自我修復一次
                         algo_id = S.get(aid_f)
                         if not algo_id:
+                            _skip(S, side, "無algoId（修復中）")
+                            await _repair_algo(S, iid, ps, sd, side, aid_f, now_t)
                             continue
-                        F   = hug_pct(S, side)
-                        ent = S["front_px" if side == "front" else "back_px"]
-                        pk  = S.get("front_peak" if side == "front" else "back_peak") or ent
-                        cur_sl = S.get(sl_f) or S["front_static_sl" if side == "front" else "back_static_sl"]
-                        tick = S["spec"]["tick"]
 
-                        nsl = hug_sl(ent, pk, sd, F, tick, cur_sl)
-                        mtype = E.MOVE_PROFIT
-                        # TF 逼倉：只在「單邊持倉且緊貼未啟動」時動作
-                        if nsl is None and tf_hit and not both and not hug_started(S, side):
-                            nsl = tf_hug_sl(px, sd, F, tick, cur_sl)
-                            mtype = E.MOVE_TIME
-                            if nsl is not None:
-                                print(f"[TF逼倉] {S['sym']} {side} 現價={px} SL→{nsl}")
-                        if nsl is None:
+                        F      = hug_pct(S, side)
+                        ent    = S["front_px" if side == "front" else "back_px"]
+                        cur_sl = S.get(sl_f) or S["front_static_sl" if side == "front"
+                                                  else "back_static_sl"]
+                        tick   = S["spec"]["tick"]
+                        ee     = S.get("front_ee" if side == "front" else "back_ee")
+                        elapsed = (now_t - float(ee)) if ee else 0.0
+
+                        # 【規則3 的等待秒數】A/B 不同，而且 A 的等待會被 B 打斷：
+                        #   B單         → 恆 0（觸發進場時方向已確定，沒什麼好等）
+                        #   A單 且 B在場 → 0（B 觸發本身就是方向信號，等待期作廢）
+                        #   A單 且 B未到 → HUG30_SEC
+                        # 「B 在不在場」一律看 OKX 查回來的持倉，不看內部旗標。
+                        if side == "back":
+                            wait = 0.0
+                        else:
+                            wait = 0.0 if cur_b else float(HUG30_SEC)
+
+                        # ── 四條規則全在 sl_decide，本函式不再自己判斷任何事 ──
+                        act, price, why, rule = sl_decide(
+                            sd, ent, px, cur_sl, F, tick, elapsed, wait)
+
+                        if act != "move" or price is None:
+                            _skip(S, side, why)
                             continue
-                        # 【#23】送單前先跟現價比對。峰值算出的 SL 在價格快速回落時
-                        # 可能已越過現價；OKX 對做多要求 SL<最新價、做空要求 SL>最新價，
-                        # 硬送會被 51280 拒絕、計入失敗、觸發退避。
-                        # 越界就跳過這一輪 —— 既有 SL 仍守著，不是保護空窗。
-                        cpx = Decimal(str(px))
-                        if (sd == "L" and nsl >= cpx) or (sd == "S" and nsl <= cpx):
-                            continue
-                        S[f"_pending_{side}"] = (str(nsl), str(pk), mtype)
-                        amends.append((iid, algo_id, nsl, S, side, sl_f))
+                        # 規則4（往SL認輸）標時間型，規則2（往TP）標獲利型 —— 只影響顯示
+                        mtype = E.MOVE_TIME if rule == 4 else E.MOVE_PROFIT
+                        pk = S.get("front_peak" if side == "front" else "back_peak") or ent
+                        S[f"_pending_{side}"] = (str(price), str(pk), mtype, why)
+                        amends.append((iid, algo_id, price, S, side, sl_f))
                 except Exception as e:
                     print("frame_mover 單策略錯誤", S.get("sym"), type(e).__name__, e)
 
             if not amends:
                 continue
 
-            okset = await amend_frames([(a[0], a[1], a[2]) for a in amends])
+            okset, deadset = await amend_frames([(a[0], a[1], a[2]) for a in amends])
             for iid, algo_id, nsl, S, side, sl_f in amends:
                 pend = S.pop(f"_pending_{side}", None)
                 if not pend:
                     continue
-                nsl_s, pk_s, mtype = pend
+                nsl_s, pk_s, mtype, why = pend      # 【v3.8】why = 這次移動的理由
                 hist_key = f"{side}_move_hist"
                 mh = S.get(hist_key)
                 if not isinstance(mh, list):
@@ -1228,15 +1370,25 @@ async def frame_mover(app):
                     S[f"{side}_move_n"] = int(S.get(f"{side}_move_n", 0)) + 1
                     S[f"_last_move_t_{side}"] = now_t
                     S[f"{side}_move_fail_n"] = 0
-                    print(f"[SL移動] {label} {side} {mtype} 峰值={pk_s} 新SL={nsl_s} "
+                    print(f"[SL移動] {label} {side} {mtype} {why} 峰值={pk_s} 新SL={nsl_s} "
                           f"第{S[f'{side}_move_n']}次")
-                    mh.append({"t": hhmmss(), "type": mtype, "peak": pk_s, "sl": nsl_s})
+                    mh.append({"t": hhmmss(), "type": mtype, "peak": pk_s,
+                               "sl": nsl_s, "why": why})
                 else:
                     S[f"{side}_move_fail_n"] = int(S.get(f"{side}_move_fail_n", 0)) + 1
                     S[f"_last_fail_t_{side}"] = now_t
-                    print(f"[SL移動失敗] {label} {side} 峰值={pk_s} 欲改SL={nsl_s} "
-                          f"累計失敗{S[f'{side}_move_fail_n']}次")
-                    mh.append({"t": hhmmss(), "type": E.MOVE_FAIL, "peak": pk_s, "sl": nsl_s})
+                    fn = S[f"{side}_move_fail_n"]
+                    print(f"[SL移動失敗] {label} {side} {why} 欲改SL={nsl_s} "
+                          f"累計失敗{fn}次")
+                    mh.append({"t": hhmmss(), "type": E.MOVE_FAIL, "peak": pk_s,
+                               "sl": nsl_s, "why": why})
+                    # 【v3.8】永久失敗（51506）或連續失敗太多次 → 作廢這張單，
+                    # 下一輪由 _repair_algo 自己重掛一張改得動的。
+                    aid_key = "algo_id" if side == "front" else "back_algo2_id"
+                    if algo_id in deadset:
+                        _mark_dead_algo(S, side, aid_key, algo_id, "sCode=51506 天生不可改")
+                    elif fn >= AMEND_DEAD_FAILS:
+                        _mark_dead_algo(S, side, aid_key, algo_id, f"連續失敗{fn}次")
                 if len(mh) > 200:
                     S[hist_key] = mh[-200:]
             save_state()
@@ -1389,6 +1541,11 @@ def _exit_snapshot(S, side, seq):
         "ab": "A" if side == "front" else "B",
         "strat_dir": S.get("locked_dir", S["dir"]),
         "trough": S.get(f"{pre}_trough"),
+        # 【v3.8】沒有緊貼的原因（哪一條規則擋下、幾次）與自我修復次數。
+        # 這是「為什麼贏／為什麼輸」的關鍵證據，戰役一結束就會被重置，
+        # 所以必須在這裡連同其他欄位一起快照下來。
+        "skip_n": dict(S.get("skip_n") or {}),
+        "fix_n":  int(S.get("fix_n", 0) or 0),
         "amp": S.get("amp", ""),
         "sl_set": S.get("sl"), "tp_set": S.get("tp"),
         "gap_set": S.get("gap"), "offset_set": S.get("offset"),
@@ -1397,7 +1554,7 @@ def _exit_snapshot(S, side, seq):
 
 
 def _exit_reason(snap, close_px):
-    """判定出場原因：TP / 靜態SL / 緊貼SL / TF逼倉 / 手動。"""
+    """判定出場原因：TP / 靜態SL / 緊貼SL（規則2）/ 認輸SL（規則4）/ 手動。"""
     try:
         cp = Decimal(str(close_px))
         tol = snap["tick"] * 3
@@ -1416,8 +1573,8 @@ def _exit_reason(snap, close_px):
             if m.get("type") != E.MOVE_FAIL:
                 last_ok = m; break
         if last_ok and last_ok.get("type") == E.MOVE_TIME:
-            return "TF逼倉"
-        return "緊貼SL"
+            return "認輸SL(規則4)"
+        return "緊貼SL(規則2)"
     return "手動/其他"
 
 
@@ -1600,6 +1757,12 @@ def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
         "move_n": int(snap.get("move_n", 0)),
         "move_ok": n_ok, "move_tf": n_tf, "move_fail": n_fa,
         "moves": mh,
+        # 【v3.8】沒有緊貼的原因 —— 贏要知道怎麼贏，輸要知道怎麼輸。
+        # skips 記下本場每一個「這一輪不緊貼」的理由與次數（哪一條規則擋的）；
+        # moves 裡每一筆的 why 則記下是規則2 還是規則4 讓它動的。
+        # 兩邊合起來，任何一場戰役的每 0.5 秒都能還原「當時為什麼這樣做」。
+        "skips": dict(snap.get("skip_n") or {}),
+        "fix_n": int(snap.get("fix_n", 0) or 0),
         "battle": snap.get("round"), "ambush_s": 0,
     }
 
@@ -1802,7 +1965,12 @@ async def _ensure_a_oco(S, iid, a_ps, d, fill_px):
     aid = await _okx_oco_id(iid, a_ps)
     S["algo_id"] = aid
     if aid:
-        ok = await amend_frames([(iid, aid, n_sl, n_tp)])
+        ok, dead = await amend_frames([(iid, aid, n_sl, n_tp)])
+        if aid in dead:
+            # A 的 OCO 理論上改得動（limit 母單），萬一真的改不動就當場作廢，
+            # 讓 frame_mover 下一輪重掛一張 —— 絕不沿用一張改不動的保護單。
+            _mark_dead_algo(S, "front", "algo_id", aid, "A單OCO 天生不可改")
+            return None
         if aid not in ok:
             print(f"[警告] {S['sym']} A單 TP/SL 校正失敗，沿用掛單時的值")
     return aid
@@ -1832,21 +2000,37 @@ async def _ensure_b_oco(S, iid, b_ps, back_d, fill_px):
         S["back_algo2_id"] = new_id
         print(f"[B保護換單] {S['sym']} 成交={fill_px} TP={n_tp} SL={n_sl} algo={new_id}")
         return True
-    S["back_algo2_id"] = old_id                  # 換不成就沿用舊的，至少還有保護
-    print(f"[警告] {S['sym']} B單 OCO 換單失敗，沿用自動生成那張（移動SL 可能失效）")
+    # 【v3.8 關鍵修正】換不成【絕不沿用舊的】。
+    # 舊版寫 S["back_algo2_id"] = old_id「至少還有保護」—— 保護是還在（OKX 上
+    # 那張 OCO 的確守著靜態SL），但它【永遠改不動】（51506，/apitest 兩個方向
+    # 都實測過）。程式拿著它當可用的 algoId，於是每 0.5 秒 amend 一次、失敗、
+    # 退避、再失敗，直到戰役結束 —— B 單整場緊貼 0 次。
+    # 這就是 WIF 第12輪：B 峰值到過 +0.648%，一次都沒貼，吃滿靜態SL。
+    # 正確做法：id 留空並把那張列入黑名單，frame_mover 下一輪會自己重掛一張
+    # 改得動的（先掛新、後撤舊），保護從頭到尾沒有空窗。
+    S["back_algo2_id"] = None
+    if old_id:
+        bl = S.get("back_bad_algo")
+        if not isinstance(bl, list):
+            bl = []; S["back_bad_algo"] = bl
+        if old_id not in bl:
+            bl.append(old_id)
+    print(f"[警告] {S['sym']} B單 OCO 換單失敗 → 自動那張已作廢並列入黑名單，"
+          f"下一輪自我修復會重掛一張改得動的（OKX 上的保護不中斷）")
     return False
 
 
 def _trigger_line(S, side):
-    """進場通知用：緊貼的啟動門檻（價格走到這裡緊貼才會開始動）。"""
+    """進場通知用：價格一往TP走，SL 立刻會被貼到哪裡（= 進場價 ∓ 緊貼距離）。
+    【v3.8】不再是「啟動門檻」—— 沒有門檻了，往TP走就貼。"""
     pre = "front" if side == "front" else "back"
     d = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
     try:
         e = Decimal(str(S[f"{pre}_px"]))
         F = hug_pct(S, pre)
         tick = S["spec"]["tick"]
-        thr = align(e * (1 + F), tick, "S") if d == "L" else align(e * (1 - F), tick, "L")
-        return str(thr)
+        sl0 = align(e * (1 - F), tick, "S") if d == "L" else align(e * (1 + F), tick, "L")
+        return str(sl0)
     except Exception:
         return "-"
 
@@ -1945,7 +2129,7 @@ async def loop(app, chat, S):
                     f"靜態SL：{S['front_static_sl']}（{'-' if d=='L' else '+'}{S['sl']}%）\n"
                     f"緊貼：{hug_display(spec, fpx, hug_pct(S,'front'))}（固定）\n"
                     f"　{S.get('hug_note','')}\n"
-                    f"啟動門檻：{_trigger_line(S,'front')}\n"
+                    f"一往TP動，SL立刻貼到：{_trigger_line(S,'front')}\n"
                     f"━━━━━━━━━━\n"
                     f"對手：{_bnote}\n"
                     f"時間：{hhmmss()}")
@@ -1973,7 +2157,7 @@ async def loop(app, chat, S):
                     f"靜態SL：{S['back_static_sl']}（{'-' if back_d=='L' else '+'}{S['sl']}%）\n"
                     f"緊貼：{hug_display(spec, bpx, hug_pct(S,'back'))}（固定）\n"
                     f"　{S.get('hug_note','')}\n"
-                    f"啟動門檻：{_trigger_line(S,'back')}\n"
+                    f"一往TP動，SL立刻貼到：{_trigger_line(S,'back')}\n"
                     f"━━━━━━━━━━\n"
                     f"對手：{_anote}\n"
                     f"時間：{hhmmss()}")
@@ -2314,16 +2498,26 @@ async def cmd_run(u, c):
         if v < 0:
             await reply(u, f"{E.BOT} {nm} 不可為負數"); return
 
-    # ── 護欄① 兩單間距上限 ──
-    # A 死時 B 的毛利 = SL% - 間距%。這個毛利必須 >= B 的手續費率，
-    # B 的緊貼才會啟動；否則 B 還停在原始靜態SL 裸奔，價格一回頭就是雙殺。
-    gap_max = sl - FEE_B * 100
-    if gap > gap_max:
+    # ── 護欄① 兩單間距 ──
+    # 【v3.8 重寫】舊護欄 `間距 ≤ SL% − 手續費` 的理由是「B 的緊貼才會啟動」，
+    # 那是啟動門檻時代的邏輯。現在沒有門檻了，B 一進場就緊貼，該理由作廢。
+    #
+    # 真正還成立的只有一條：間距是【對沖成形前 A 的虧損上限】。
+    #   價格跌不到間距 → B 沒觸發 → A 的浮虧一定小於間距
+    #   價格跌到間距   → B 觸發，對沖成形，損益和鎖死 = −間距
+    # 所以只要 間距 ≥ SL%，A 的靜態SL 會比 B 的觸發價先被打到 ——
+    # A 先死，對沖從頭到尾形不成，整套戰術失效。這是硬性拒絕。
+    hug_p = HUG_FIXED * 100          # 緊貼距離（%）
+    if gap >= sl:
         await reply(u, f"{E.BOT} {E.LOSS} 兩單間距過大\n"
-                       f"間距 {pct(gap)}% > 上限 {gap_max:.3f}%\n"
-                       f"（A被SL掃掉時 B 的毛利只剩 {float(sl-gap):.3f}%，"
-                       f"不足 B 的手續費 {float(FEE_B*100):.3f}%，B 的緊貼來不及啟動 → 會雙殺）\n"
-                       f"請把間距降到 {gap_max:.3f}% 以下，或把 SL% 加大"); return
+                       f"間距 {pct(gap)}% ≥ SL {pct(sl)}%\n"
+                       f"A 的靜態SL 會比 B 的觸發價先被打到，A 先死、對沖形不成。\n"
+                       f"請把間距降到 {pct(sl)}% 以下，或把 SL% 加大"); return
+    if gap + hug_p >= sl:
+        await reply(u, f"{E.BOT} {E.WARN} 提醒：間距 {pct(gap)}% + 緊貼 "
+                       f"{float(hug_p):.3f}% ≥ SL {pct(sl)}%\n"
+                       f"→ 等待期過後 A 的緊貼落點已到靜態SL 附近，對 A 幾乎沒有改善空間"
+                       f"（對 B 不影響）。仍可執行。")
     # ── 護欄② TP 必須大於總成本 ──
     tp_min = sl + FEE_TOTAL * 100
     if tp <= tp_min:
@@ -2619,7 +2813,7 @@ def _side_block(S, side, waiting, holding):
             out.append(f"  峰值 {pD}（{g:+.3f}%）")
         except Exception:
             out.append(f"  峰值 {pk}")
-        stage = "緊貼中" if hug_started(S, pre) else "緩衝中（未啟動）"
+        stage = _hug_state(S, pre)
         try:
             out.append(f"  緊貼 {hug_display(S['spec'], S.get(f'{pre}_px') or 0, hug_pct(S, pre))}（固定）")
         except Exception:
@@ -2630,7 +2824,7 @@ def _side_block(S, side, waiting, holding):
         out.append(f"  SL {S.get(f'{pre}_sl_px','-')} {stage}{stat}")
         if mn:
             for m in (S.get(f"{pre}_move_hist") or [])[-5:]:
-                out.append(f"    {m.get('t','')} {m.get('type','')} 峰{m.get('peak', m.get('px',''))} 止{m.get('sl','')}")
+                out.append(f"    {m.get('t','')} {m.get('type','')} 止{m.get('sl','')} {m.get('why','')}")
     elif waiting:
         amb = S.get(f"{pre}_px", "-")
         out.append(f"{nm} 埋伏 @{amb}")
@@ -2646,19 +2840,51 @@ def _side_block(S, side, waiting, holding):
 
 
 def _tf_note(S, holding_a, holding_b):
-    """下個 TF 到期時，判斷樹會走哪一條 —— 直接寫出來，不用自己推。"""
+    """下個 TF 到期時會發生什麼。
+    【v3.8】TF 不再碰 SL —— 舊版的「TF 逼倉」已被 30 秒認輸緊貼取代
+    （30 秒比 5 分鐘快十倍，而且不必等 K 棒收）。TF 現在只剩一個職責：
+    零持倉時撤單、重新取價、重新部署。"""
     tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
     left = int((int(time.time() // tf_sec) + 1) * tf_sec - time.time())
     m, sec = divmod(left, 60)
     t = f"{m}分{sec:02d}秒後" if m else f"{sec}秒後"
-    if holding_a and holding_b:
-        act = "兩單都在，不干預"
-    elif holding_a or holding_b:
-        side = "front" if holding_a else "back"
-        act = "單邊有獲利，不干預" if hug_started(S, side) else "單邊無獲利，SL貼現價逼出場"
-    else:
-        act = "零持倉，撤單重新部署"
+    act = "有持倉，TF 不干預" if (holding_a or holding_b) else "零持倉，撤單重新部署"
     return f"下個TF：{t}（{act}）"
+
+
+def _hug_state(S, side):
+    """這一側的緊貼現況，一行講完：啟動了沒、30秒那一次用了沒、移動幾次。"""
+    if not S.get("front_filled" if side == "front" else "back_filled"):
+        return "未進場"
+    n   = int(S.get(f"{side}_move_n", 0) or 0)
+    fn  = int(S.get(f"{side}_move_fail_n", 0) or 0)
+    ee  = S.get("front_ee" if side == "front" else "back_ee")
+    el  = int(time.time() - float(ee)) if ee else 0
+    try:                                   # /status 永遠不該因為顯示而炸掉
+        d   = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
+        e   = Decimal(str(S["front_px" if side == "front" else "back_px"]))
+        cur = Decimal(str(S.get("_last_px") or e))
+        if cur == e:
+            st = "規則1 價格不動"
+        elif (cur > e) if d == "L" else (cur < e):
+            st = "規則2 往TP，持續緊貼"
+        elif el < HUG30_SEC:
+            st = f"規則3 往SL，{HUG30_SEC - el}秒後轉規則4"
+        else:
+            st = "規則4 往SL超過30秒，持續緊貼"
+    except Exception:
+        st = f"進場{el}秒"
+    return st + f"｜移動{n}次" + (f"｜失敗{fn}" if fn else "")
+
+
+def _skip_note(S, top=4):
+    """本場戰役「沒有緊貼」的原因排行 —— 戰術沒執行，理由必須看得見。"""
+    c = S.get("skip_n")
+    if not isinstance(c, dict) or not c:
+        return "跳過：無"
+    items = sorted(c.items(), key=lambda kv: -kv[1])[:top]
+    return "未緊貼原因：" + "｜".join(f"{k.split('|',1)[0]}·{k.split('|',1)[1]}×{v}"
+                                     for k, v in items)
 
 
 async def cmd_status(u, c):
@@ -2718,6 +2944,12 @@ async def cmd_status(u, c):
 
         L += _side_block(s, "front", front_waiting, front_in)
         L += _side_block(s, "back",  back_waiting,  back_in)
+        # 【v3.8】未緊貼原因 —— 這行是判斷「戰術有沒有執行」的依據。
+        # 緊貼現況已由 _side_block 逐邊印出，這裡只補全場的跳過統計。
+        if front_in or back_in:
+            L.append(_skip_note(s))
+            if int(s.get("fix_n", 0) or 0):
+                L.append(f"自我修復：{s['fix_n']} 次")
         L.append(_tf_note(s, front_in, back_in))
 
     L.append("━━━━━━━━━━")
@@ -3318,6 +3550,102 @@ async def _apitest_run(u, sym, dirs):
     return L
 
 
+# ---------- /selftest 緊貼決策情境表 ----------
+# 緊貼規則是一個純函式 sl_decide()，不碰網路、不碰持倉，
+# 所以可以在正式機上直接餵情境進去，當場看它每一種怎麼決定。
+# 部署完先跑這個：表全過，才代表這台機器上的規則跟談好的一致。
+# 不下任何單、不碰任何持倉，隨時可跑。
+#
+# 進場價 100.00、tick 0.01 —— 0.1% 剛好 0.10 U，數字可心算核對。
+# 做多靜態SL 99.60（-0.4%）；做空靜態SL 100.40（+0.4%）
+# (編號, 規則, 說明, 方向, 進場, 現價, 現SL, 秒, 等待秒, 預期action, 預期價)
+SELFTEST_A = [
+ (1, 1,"價格不動",                  "L","100.00","100.00"," 99.60",  1,30,"hold",None),
+ (2, 2,"往TP +0.02U（極小也貼）",    "L","100.00","100.02"," 99.60",  1,30,"move","99.92"),
+ (3, 2,"往TP +0.10U",              "L","100.00","100.10"," 99.93", 10,30,"move","100.00"),
+ (4, 2,"往TP +0.80U",              "L","100.00","100.80","100.00", 20,30,"move","100.70"),
+ (5, 0,"往TP後回撤，SL已更近",       "L","100.00","100.50","100.70", 40,30,"hold",None),
+ (6, 3,"往SL -0.20U，10秒（沉住氣）","L","100.00"," 99.80"," 99.60", 10,30,"hold",None),
+ (7, 3,"往SL -0.20U，29秒",         "L","100.00"," 99.80"," 99.60", 29,30,"hold",None),
+ (8, 4,"往SL -0.20U，30秒（認輸）",  "L","100.00"," 99.80"," 99.60", 30,30,"move","99.71"),
+ (9, 4,"★往SL，B已進場→等待作廢",   "L","100.00"," 99.90"," 99.60",  5, 0,"move","99.81"),
+ (10,0,"往SL續跌，不准放鬆",         "L","100.00"," 99.75"," 99.71", 95,30,"hold",None),
+ (11,2,"認輸後反彈翻身",             "L","100.00","100.20"," 99.71",120,30,"move","100.10"),
+]
+SELFTEST_B = [
+ (12,1,"B：價格不動",               "S"," 99.90"," 99.90","100.30",  1, 0,"hold",None),
+ (13,2,"B：往TP -0.05U（立刻貼）",   "S"," 99.90"," 99.85","100.30",  1, 0,"move","99.94"),
+ (14,2,"B：往TP -0.40U",            "S"," 99.90"," 99.50"," 99.94", 20, 0,"move","99.59"),
+ (15,4,"★B：往SL +0.05U，第1秒就貼", "S"," 99.90"," 99.95","100.30",  1, 0,"move","100.04"),
+ (16,4,"★B：往SL +0.10U，第3秒",     "S"," 99.90","100.00","100.30",  3, 0,"move","100.10"),
+ (17,0,"B：往SL續漲，不准放鬆",      "S"," 99.90","100.05","100.04", 10, 0,"hold",None),
+ (18,0,"B：往TP後反彈，SL已更近",    "S"," 99.90"," 99.70"," 99.59", 60, 0,"hold",None),
+]
+RULE_CN = {0:"棘輪擋(規則1)", 1:"規則1不動", 2:"規則2往TP貼",
+           3:"規則3沉住氣", 4:"規則4認輸貼"}
+
+
+def _selftest_rows(cases, out):
+    tick = Decimal("0.01"); F = HUG_FIXED
+    bad = 0
+    for (n, rl, desc, d, ent, cur, sl, el, wt, exp_a, exp_p) in cases:
+        ent = ent.strip(); cur = cur.strip(); sl = sl.strip()
+        try:
+            a, p, why, rule = sl_decide(d, ent, cur, sl, F, tick, el, wt)
+        except Exception as ex:
+            out.append(f"{n:>2} {desc} 💥 {type(ex).__name__}: {ex}"); bad += 1; continue
+        okA = (a == exp_a)
+        okP = (exp_p is None) or (p is not None and Decimal(str(p)) == Decimal(exp_p))
+        okR = (rule == rl)
+        good = okA and okP and okR
+        if not good:
+            bad += 1; mark = f"❌應為{RULE_CN.get(rl,rl)}/{exp_a}{exp_p or ''}"
+        else:
+            mark = "✅"
+        act = f"移SL→{p}" if a == "move" else "不動"
+        out.append(f"{n:>2} {desc}")
+        out.append(f"   現{cur} SL{sl} {el}秒(等待{wt}) → {act}　{mark}")
+        out.append(f"   {why}")
+    return bad
+
+
+def _selftest_lines():
+    """跑情境表，回傳給 TG 的行陣列。純計算，不碰網路。"""
+    F = HUG_FIXED; tick = Decimal("0.01")
+    out = [f"緊貼 {F*100}% = 0.10 U｜A單等待 {HUG30_SEC} 秒｜B單等待 0 秒",
+           "進場價 100.00｜tick 0.01（0.1% = 0.10 U，可心算）", ""]
+    out.append("━━ A單（限價埋伏）進場100.00 靜態SL 99.60 ━━")
+    bad = _selftest_rows(SELFTEST_A, out)
+    out.append("")
+    out.append("━━ B單（觸發對沖）進場99.90 靜態SL 100.30 ━━")
+    bad += _selftest_rows(SELFTEST_B, out)
+
+    # ── 壓縮帶：兩單都在場時，兩條動態SL 從兩側夾住現價 ──
+    out.append("")
+    out.append("━━ 壓縮帶：兩單都在場，價格被關在多寬的箱子 ━━")
+    out.append("現價　│ A(多)SL　B(空)SL │ 箱寬　→ 破哪邊誰出場")
+    for p in ("100.00", "99.95", "99.90", "99.80"):
+        c = Decimal(p)
+        sa = align(c * (Decimal("1") - F), tick, "S")
+        sb = align(c * (Decimal("1") + F), tick, "L")
+        out.append(f"{c} │ {sa}　{sb} │ {sb-sa}")
+    out.append("→ 價格動 0.1% 就有一單被逼出，存活的那單繼續緊貼")
+
+    out.append("")
+    tot = len(SELFTEST_A) + len(SELFTEST_B)
+    out.append(f"{tot} 種情境｜通過 {tot-bad}｜失敗 {bad}")
+    if bad:
+        out.append(f"{E.LOSS} 有情境不符預期 —— 這台機器的規則跟談好的不一致，先別交易")
+    return out
+
+
+async def cmd_selftest(u, c):
+    """/selftest —— 當場驗證緊貼規則。不下單、不碰持倉。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    await _reply_long(u, [f"{E.BOT} 🧪 緊貼決策情境表　{VERSION}"],
+                      _selftest_lines(), [f"時間：{hhmmss()}"])
+
+
 async def cmd_apitest(u, c):
     """/apitest 幣種 [L|S|LS] —— 用最小張數實測 OKX API，把原始回應印出來。
     純診斷：不碰 loop、不碰 frame_mover、不碰任何出場邏輯。"""
@@ -3662,13 +3990,18 @@ async def cmd_menu(u, c):
         "兩單都成交時完全對沖，損益鎖死=-間距，與價格無關；\n"
         "價格衝出箱子時一邊被SL掃、一邊獨活順勢起飛。\n"
         "━━━━━━━━━━\n"
-        "【SL】峰值緊貼，棘輪不後退\n"
-        f"緊貼距離【固定 {float(HUG_FIXED*100):.3f}%】A/B 共用（下限 {MIN_HUG_TICKS} 檔）\n"
+        "【緊貼四種情境】\n"
+        "1 價格不動→SL不動\n"
+        f"2 往TP→立刻貼到 {float(HUG_FIXED*100):.3f}%（下限 {MIN_HUG_TICKS} 檔）\n"
+        "3 往SL·等待期內→不動，沉住氣\n"
+        f"4 往SL·等待期外→立刻貼到 {float(HUG_FIXED*100):.3f}%，認輸\n"
+        f"等待期：A單 {HUG30_SEC}秒（B一進場就作廢）｜B單 0秒\n"
+        f"SL=現價±{float(HUG_FIXED*100):.3f}%，不判斷峰值、無啟動門檻，只准拉近\n"
+        f"每 {PRICE_TICK_SEC}s 一次，A/B 各自獨立\n"
+        "規則全在 sl_decide() 一處，/selftest 可當場驗證\n"
         f"手續費 A {float(FEE_A*100):.3f}%／B {float(FEE_B*100):.3f}%（只用於損益，不決定緊貼）\n"
-        "峰值達 進場價±緊貼 才啟動，之前靜態SL緩衝區完整保留\n"
         "━━━━━━━━━━\n"
-        "【TF】兩單都持倉→不動｜單邊有獲利→不動\n"
-        "單邊無獲利→SL貼現價逼出場｜零持倉→撤單重新部署\n"
+        "【TF】只剩一個職責：零持倉→撤單重新部署\n"
         "━━━━━━━━━━\n"
         f"查價 {PRICE_TICK_SEC}s｜WS：{ws_status()}\n"
         f"{E.WARN} 真實下單，循環交易\n{E.OK} 重啟接管持倉與掛單")
@@ -3697,6 +4030,7 @@ async def _post_init(app):
             BotCommand("summary", "當日戰報"),
             BotCommand("tune", "調參報告"),
             BotCommand("apitest", "API探測"),
+            BotCommand("selftest", "緊貼規則自檢"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
             BotCommand("stopall", "停全部"),
@@ -3755,7 +4089,7 @@ def main():
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
                     ("summary", cmd_summary), ("tune", cmd_tune),
-                    ("apitest", cmd_apitest), ("amp", cmd_amp),
+                    ("apitest", cmd_apitest), ("selftest", cmd_selftest), ("amp", cmd_amp),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
