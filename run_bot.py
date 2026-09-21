@@ -127,7 +127,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.0.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.1.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -1181,6 +1181,12 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["fix_n"]           = 0
     S["front_bad_algo"]  = []
     S["back_bad_algo"]   = []
+    # 【v4.1】緊貼間隔的計時基準要跟著戰役重置。
+    # 不清掉的話，新戰役第一次移動會拿上一場的時刻去減，
+    # 跑出 602599ms 這種荒謬數字，把速度中位數整個拉歪。
+    S.pop("_last_move_t_front", None)
+    S.pop("_last_move_t_back", None)
+    S["_need_replace"]   = False
     for k in ("front_exit_reason","front_exit_pnl","back_exit_reason","back_exit_pnl",
               "battle_form","front_move_fail_n","back_move_fail_n"):
         S.pop(k, None)
@@ -1509,8 +1515,10 @@ async def frame_mover(app):
                     S[f"{side}_move_fail_n"] = 0
                     print(f"[SL移動] {label} {side} {mtype} {why} 新SL={nsl_s} "
                           f"第{S[f'{side}_move_n']}次 間隔{dt_ms}ms")
+                    # 【v4.1.1】存下當下現價：出場明細要用它算「這一次貼了幾 %」。
+                    # 只存 SL 價算不出來 —— 必須知道當時 SL 距離現價多遠。
                     mh.append({"t": hhmmss(), "type": mtype, "peak": pk_s,
-                               "sl": nsl_s, "why": why, "dt": dt_ms})
+                               "sl": nsl_s, "why": why, "dt": dt_ms, "px": str(px)})
                 elif algo_id in softset:
                     # 【v3.13】邊界錯誤：不是這張單壞了，是價格在往返途中走掉了。
                     # 不計入失敗、不退避、不作廢 —— 下一拍用新價重算就好。
@@ -1666,28 +1674,42 @@ def _move_stat(mhist):
 
 def _sl_block(mn, mhist, fn=0):
     """SL 移動明細區塊。
-    【v3.1 改】顯示「峰值」而非「現價」—— 新公式 SL = 峰值∓F，SL 停在哪裡
-    完全由峰值決定。顯示現價會看不懂 SL 為何不動（現價跌了但峰值沒變）。
-    只列最近 10 筆：出場價一定由最後一筆 SL 決定，早期那幾筆參考價值低。"""
+
+    【v4.1.2 每一行只印一個數字：實際緊貼了幾 %】
+    行首已經有時間戳，再印毫秒是重複的。真正要看的是
+      貼x%  這一次 SL 離【當時現價】多遠 —— 設定 0.1%，
+            對齊 tick 之後實際落在 0.09~0.11%。
+            這一欄偏離 0.1% 太多，就代表緊貼出問題了。
+    毫秒只留在標題那一行的速度摘要（判斷有沒有跑滿心跳用的）。
+    """
     p, t, f = _move_stat(mhist)
     head = f"SL移動 {mn} 次"
     if p or t or f:
         head += f"（{E.MOVE_PROFIT}{p} {E.MOVE_TIME}{t} {E.MOVE_FAIL}{f}）"
     lines = ["━━━━━━━━━━", head]
-    if mhist:
-        # 【v3.10】緊貼速度：兩次成功移動間隔的最快／中位數（毫秒）。
-        # 理論下限就是心跳 MOVE_TICK×1000。中位數接近它 = 緊貼跑滿速。
-        d_min, d_med = _dt_stat(mhist, "min"), _dt_stat(mhist, "med")
-        if d_med:
-            lines.append(f"緊貼速度：最快 {d_min}ms｜中位 {d_med}ms"
-                         f"（心跳下限 {int(MOVE_TICK*1000)}ms）")
-        for m in mhist[-10:]:
-            dt = m.get("dt")
-            tail = f" | {dt}ms" if dt else ""
-            lines.append(f"{m.get('t','')} | {m.get('type','')} | "
-                         f"止{m.get('sl','')}{tail}")
-        if len(mhist) > 10:
-            lines.append(f"（顯示最近10筆，共{len(mhist)}筆）")
+    if not mhist:
+        return "\n".join(lines)
+
+    def _hug_pct(m):
+        """這一次 SL 離當時現價多遠（%）。舊格式沒存現價就回空字串。"""
+        try:
+            sl = Decimal(str(m.get("sl")))
+            px = Decimal(str(m.get("px") or 0))
+            if px > 0:
+                return f" | 貼{abs(px - sl) / px * 100:.3f}%"
+        except Exception:
+            pass
+        return ""
+
+    d_min, d_med = _dt_stat(mhist, "min"), _dt_stat(mhist, "med")
+    if d_med:
+        lines.append(f"緊貼速度：最快 {d_min}ms｜中位 {d_med}ms"
+                     f"（心跳下限 {int(MOVE_TICK*1000)}ms）")
+    for m in mhist[-10:]:
+        lines.append(f"{m.get('t','')} | {m.get('type','')} | "
+                     f"止{m.get('sl','')}{_hug_pct(m)}")
+    if len(mhist) > 10:
+        lines.append(f"（顯示最近10筆，共{len(mhist)}筆）")
     return "\n".join(lines)
 
 
@@ -1728,20 +1750,42 @@ def _exit_snapshot(S, side, seq):
 
 
 def _exit_reason(snap, close_px):
-    """判定出場原因：TP / 靜態SL / 緊貼SL（規則2）/ 認輸SL（規則4）/ 手動。"""
+    """判定出場原因：TP / 靜態SL / 緊貼SL（規則2）/ 認輸SL（規則4）/ 手動。
+
+    【v4.1 修正滑價誤判】SL 觸發後送的是【市價單】，成交價一定比 SL 差一點。
+    舊版用對稱的 3 檔容差，滑超過 3 檔就被歸成「手動/其他」——
+    實測 2026-09-21 14:45：最後SL 0.9556、實際成交 0.9550（滑 6 檔），
+    明明是緊貼SL 打的，卻記成「手動/其他」，兵推數據直接被污染。
+
+    改成【不對稱】比對：滑價只會往不利的那一側，所以那一側放寬、
+    有利那一側維持嚴格。這樣既認得出滑價，也不會把別的出場誤認成 SL。
+    """
     try:
         cp = Decimal(str(close_px))
-        tol = snap["tick"] * 3
+        tick = snap["tick"]
+        tol  = tick * 3                       # 有利側：嚴格
+        slip = max(tick * 30, cp * Decimal("0.003"))   # 不利側：容許滑價
         tp  = Decimal(str(snap.get("tp_px") or 0))
         ssl = Decimal(str(snap.get("static_sl") or 0))
         lsl = Decimal(str(snap.get("last_sl") or ssl))
+        L = (snap.get("dir") == "L")
     except Exception:
         return "手動/其他"
-    if tp and abs(cp - tp) <= tol:
+
+    def _hit(level):
+        """成交價是不是這個 SL 打的（含市價滑價）。
+        做多：SL 觸發後往下滑 → 成交價落在 [level-slip, level+tol]
+        做空：往上滑 → [level-tol, level+slip]"""
+        if not level:
+            return False
+        return (level - slip <= cp <= level + tol) if L else \
+               (level - tol <= cp <= level + slip)
+
+    if tp and abs(cp - tp) <= max(tol, slip):
         return "TP"
-    if abs(cp - ssl) <= tol and abs(lsl - ssl) <= tol:
+    if _hit(ssl) and abs(lsl - ssl) <= tol:
         return "靜態SL"
-    if abs(cp - lsl) <= tol:
+    if _hit(lsl):
         last_ok = None
         for m in reversed(snap.get("move_hist") or []):
             if m.get("type") != E.MOVE_FAIL:
@@ -2231,7 +2275,21 @@ def _trigger_line(S, side):
 
 
 async def _pending_side_note(S, iid, side):
-    """戰場狀態用：對手單目前是持倉中 / 等待觸發 / 已出場。"""
+    """對手單的狀態。回傳 (訊息, 戰役是否續行)。
+
+    【v4.1 關鍵修正】戰役要不要結束，只看一件事：【對手有沒有持倉】。
+
+    舊版對「持倉中」和「只有掛單、沒進場」回傳同一種東西，呼叫端一律
+    當成續行 —— 但你的規則是「任一單出場，另一單若沒進場就結束戰役、
+    撤掉掛單、重新部署」。結果 A 出場後戰役卡在「B單等待觸發」，
+    要等到下一個 TF 邊界才被救回來，最久卡 5 分鐘。
+    更糟的是它取決於「那一瞬間查不查得到 B 的掛單」—— 查到就卡住、
+    剛好查不到就正常結束，於是同一種情況有時對有時錯。
+
+    現在只認持倉：
+      對手持倉中（或持倉查詢失敗）→ 續行（生還者獨走，這是戰術核心）
+      對手沒持倉（不管有沒有掛單）→ 結束，撤單重新部署
+    """
     pre = "front" if side == "front" else "back"
     nm  = "A單" if side == "front" else "B單"
     d = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
@@ -2239,22 +2297,15 @@ async def _pending_side_note(S, iid, side):
     # 【#28】查不到答案時保守視為「對手還在」—— 寧可晚一輪結束戰役，
     # 也不能因為一次查詢異常就宣告結束、撤光掛單。
     ok_p, pos_p = await okx_pos_ex(iid, ps)
-    if (not ok_p) or pos_p:
+    if not ok_p:
+        # 【#28】持倉查不到答案 → 保守視為對手還在，寧可晚一輪結束
+        return (f"戰場狀態：{nm} 持倉查詢未回應，保守視為仍在場", True)
+    if pos_p:
         pk = S.get(f"{pre}_peak") or S.get(f"{pre}_px") or "-"
         sl = S.get(f"{pre}_sl_px") or S.get(f"{pre}_static_sl") or "-"
-        return f"戰場狀態：{nm} 持倉中\n峰值 {pk}｜SL {sl}"
-    ords, algos = await list_all_orders(iid)
-    for o in (ords + algos):
-        if _is_position_guard(o):
-            continue
-        if o.get("posSide") == ps:
-            px = o.get("px") or o.get("triggerPx") or "-"
-            return f"戰場狀態：{nm} 等待觸發 @{px}"
-    if not ORDERS_OK["ok"]:
-        # 【v3.13】回 None 等於宣告「對手也沒了、戰役結束」。查單失敗時
-        # 絕不能下這個結論 —— 寧可晚一輪結束，也不能撤掉還活著的掛單。
-        return f"戰場狀態：{nm} 查單未回應，保守視為仍在場"
-    return None
+        return (f"戰場狀態：{nm} 持倉中，繼續獨走\n峰值 {pk}｜SL {sl}", True)
+    # 對手沒持倉 → 戰役結束。掛單有沒有都一樣，等一下會一併撤掉。
+    return (f"戰場狀態：{nm} 未進場 → 撤單，戰役結束", False)
 
 
 async def loop(app, chat, S):
@@ -2269,6 +2320,7 @@ async def loop(app, chat, S):
         ok = await _place_pair(S, iid, chat, app, label="首次埋伏")
         if not ok:
             S["pair_state"] = "waiting"
+            S["_need_replace"] = True      # 【v4.1】失敗了要快速重試，不等 TF
             save_state()
 
         loop_tick = 0
@@ -2403,11 +2455,14 @@ async def loop(app, chat, S):
                 save_state()
 
                 other = "back" if (a_gone and not b_gone) else ("front" if (b_gone and not a_gone) else None)
-                note = await _pending_side_note(S, iid, other) if other else None
-                if note:
+                note, alive = (await _pending_side_note(S, iid, other)) if other else (None, False)
+                if note and alive:
+                    # 對手【持倉中】才續行 —— 生還者要獨走完才算一場
                     asyncio.create_task(_exit_report(app, chat, S, snaps,
                         lambda n=note: f"━━━━━━━━━━\n{n}\n時間：{hhmmss()}"))
                     continue
+                if note:
+                    print(f"[戰役結束] {S['sym']} {note.splitlines()[0]}")
 
                 # 【#32 硬性檢查】仍有未結清的單就絕不宣告戰役結束
                 if S.get("front_filled") or S.get("back_filled"):
@@ -2431,6 +2486,7 @@ async def loop(app, chat, S):
                 S["dir"] = S.get("locked_dir", d)
                 S["pair_state"] = "waiting"
                 redeploy = await _place_pair(S, iid, chat, app, label="新戰役")
+                S["_need_replace"] = (not redeploy)   # 【v4.1】失敗→快速重試
                 new_a = S.get("front_px") if redeploy else None
                 new_b = S.get("back_px")  if redeploy else None
 
@@ -2484,7 +2540,20 @@ async def loop(app, chat, S):
                     print(f"[TF重錨定] {S['sym']} {d} 零持倉 → 撤單依現價重新部署（錯開{_stg}s）")
                     await cancel_all_orders(iid)
                     await _reconcile(app, chat, S, iid)
-                    await _place_pair(S, iid, chat, app, label="TF重錨定")
+                    _ok_tf = await _place_pair(S, iid, chat, app, label="TF重錨定")
+                    S["_need_replace"] = (not _ok_tf)
+
+                # 【v4.1】埋伏中卻一張掛單都沒有 → 立刻補掛，不等下一個 TF。
+                # 舊版 _place_pair 失敗只留一句「稍後重試」，而「稍後」是下一個
+                # TF 邊界 —— 最久整整 5 分鐘這個策略完全不在戰場上。
+                # WIF 第13輪 /status 顯示「A單 無 B單 無」就是卡在這裡。
+                elif S.get("_need_replace") and \
+                        time.time() - float(S.get("_replace_t", 0) or 0) >= 15:
+                    S["_replace_t"] = time.time()
+                    print(f"[補掛] {S['sym']} {d} 零持倉零掛單 → 立刻重新部署")
+                    await cancel_all_orders(iid)
+                    _ok_rp = await _place_pair(S, iid, chat, app, label="補掛")
+                    S["_need_replace"] = (not _ok_rp)
                 continue
 
     except asyncio.CancelledError:
