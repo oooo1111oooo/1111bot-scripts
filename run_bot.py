@@ -127,7 +127,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v3.12"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v3.13"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -684,7 +684,17 @@ async def cancel_frame(iid, algo_id):
 # 【v3.8】這些 sCode 代表「這張 algo 單天生改不動」，重試沒有意義，
 # 唯一的解是作廢它、自己重掛一張。51506 由 /apitest 在 L/S 兩個方向實測確認。
 AMEND_DEAD_CODES = {"51506"}
-AMEND_DEAD_FAILS = 3        # 任何 algoId 連續失敗這麼多次，一律當成廢單處理
+# 【v3.13】邊界錯誤 ≠ 壞單。這兩碼代表「要放的 SL 已經在現價的錯誤一側」，
+# 由 /apitest 在 SUIUSDT 實測確認：
+#   51280 做多：SL trigger price must be less than the last price
+#   51278 做空：SL trigger price cannot be lower than the last price
+# 成因是【送單往返期間價格又動了】—— 心跳 0.2 秒、針一秒走 1%，
+# 算的時候合法、到 OKX 時已經越界。這在針來的時候本來就會發生。
+# 正確反應：下一拍用新價重算（本來就會），不計入失敗、不退避，
+# 更不可以因為連續三次就把一張好好的 OCO 當廢單撤掉重掛 ——
+# 那是在針的正中央製造保護空窗。v3.9~v3.12 有這個缺陷，這裡修掉。
+AMEND_SOFT_CODES = {"51280", "51278"}
+AMEND_DEAD_FAILS = 3        # 連續「非邊界」失敗這麼多次，才當成廢單處理
 AMEND_COOL_UNTIL = 0.0      # 撞到 50011 後的冷卻截止時刻（全域，所有幣種共用）
 
 
@@ -706,7 +716,7 @@ async def amend_frames(items):
     舊版把它當一般失敗，於是無限重試＋退避，B 整場緊貼 0 次。
     挑出來讓呼叫端把它作廢、重掛一張自己的。"""
     global AMEND_COOL_UNTIL
-    okset = set(); deadset = set()
+    okset = set(); deadset = set(); softset = set()
     for i in range(0, len(items), 10):
         batch = items[i:i+10]
         body = []
@@ -727,6 +737,12 @@ async def amend_frames(items):
             sc = str(d.get("sCode", ""))
             if sc == "0":
                 okset.add(it[1])
+            elif sc in AMEND_SOFT_CODES:
+                # 邊界錯誤：價格在往返途中又動了。下一拍用新價重算即可，
+                # 不算失敗、不退避、不作廢。針來的時候這個會很常見。
+                softset.add(it[1])
+                print(f"amend 邊界 {it[0]} {it[1]} sCode={sc} {d.get('sMsg')}"
+                      f"　← 價格在往返中走掉了，下一拍重算")
             else:
                 if sc in AMEND_DEAD_CODES:
                     deadset.add(it[1])
@@ -734,7 +750,7 @@ async def amend_frames(items):
                       + ("　← 永久失敗，將作廢重掛" if sc in AMEND_DEAD_CODES else ""))
         if r.get("code") not in ("0", "2") and not data:
             print("amend_frames 整批失敗", r.get("msg"))
-    return okset, deadset
+    return okset, deadset, softset
 
 # ==================== 緊貼決策：唯一真相來源 ====================
 # 【情境只有四種，程式就只寫這四種】
@@ -1469,7 +1485,8 @@ async def frame_mover(app):
             if not amends:
                 continue
 
-            okset, deadset = await amend_frames([(a[0], a[1], a[2]) for a in amends])
+            okset, deadset, softset = await amend_frames(
+                [(a[0], a[1], a[2]) for a in amends])
             for iid, algo_id, nsl, S, side, sl_f in amends:
                 pend = S.pop(f"_pending_{side}", None)
                 if not pend:
@@ -1494,6 +1511,14 @@ async def frame_mover(app):
                           f"第{S[f'{side}_move_n']}次 間隔{dt_ms}ms")
                     mh.append({"t": hhmmss(), "type": mtype, "peak": pk_s,
                                "sl": nsl_s, "why": why, "dt": dt_ms})
+                elif algo_id in softset:
+                    # 【v3.13】邊界錯誤：不是這張單壞了，是價格在往返途中走掉了。
+                    # 不計入失敗、不退避、不作廢 —— 下一拍用新價重算就好。
+                    # 針來的時候價格一秒走 1%，這個本來就會頻繁出現。
+                    S[f"{side}_soft_n"] = int(S.get(f"{side}_soft_n", 0) or 0) + 1
+                    _skip(S, side, "邊界(價格往返中走掉)")
+                    mh.append({"t": hhmmss(), "type": E.MOVE_FAIL, "peak": pk_s,
+                               "sl": nsl_s, "why": why + "｜邊界重算", "soft": 1})
                 else:
                     S[f"{side}_move_fail_n"] = int(S.get(f"{side}_move_fail_n", 0)) + 1
                     S[f"_last_fail_t_{side}"] = now_t
@@ -1523,20 +1548,41 @@ async def frame_mover(app):
 ALGO_TYPES = ("trigger", "oco")   # 本腳本用到的兩種 algo 單：觸發進場、OCO止盈止損
 
 
+# 【v3.13】查詢是否成功，供需要「零掛單」這個結論的地方判斷。
+# 為什麼要有：/apitest 實測到 OKX 會回 51054 Request timed out —— 那是一個
+# 【查不到答案】的回應，但 data 是空的，和「真的沒有掛單」長得一模一樣。
+# 這和持倉查詢的假出場災情是同一種錯：把「不知道」當成「沒有」。
+# 有這個旗標，「淨場」才能只在真的查到的時候才成立。
+ORDERS_OK = {"ok": True}
+
+
 async def list_all_orders(iid=None, pos_side=None):
     """查該幣種所有掛單。回傳 (普通單list, algo單list)。
     【統一入口】algo 單一律涵蓋 trigger + oco 兩類 ——
-    只查 trigger 會漏掉 OCO，撤不乾淨、數量也不準。全檔查掛單都走這裡。"""
+    只查 trigger 會漏掉 OCO，撤不乾淨、數量也不準。全檔查掛單都走這裡。
+
+    任一次查詢失敗（逾時、限流…）就把 ORDERS_OK["ok"] 設 False，
+    呼叫端要下「沒有掛單」這種結論前必須檢查它。"""
+    ok = True
     q = f"?instId={iid}" if iid else ""
     r1 = await api("GET", f"/api/v5/trade/orders-pending{q}")
+    if str(r1.get("code")) != "0":
+        ok = False
+        print(f"[查單失敗] orders-pending code={r1.get('code')} {r1.get('msg')}"
+              f"　← 本次結果不完整，不可當成『沒有掛單』")
     orders = [o for o in (r1.get("data") or [])
               if (not pos_side or o.get("posSide") == pos_side)]
     algos = []
     for ot in ALGO_TYPES:
         sep = "&" if q else "?"
         r2 = await api("GET", f"/api/v5/trade/orders-algo-pending{q}{sep}ordType={ot}")
+        if str(r2.get("code")) != "0":
+            ok = False
+            print(f"[查單失敗] algo/{ot} code={r2.get('code')} {r2.get('msg')}"
+                  f"　← 本次結果不完整，不可當成『沒有掛單』")
         algos += [o for o in (r2.get("data") or [])
                   if (not pos_side or o.get("posSide") == pos_side)]
+    ORDERS_OK["ok"] = ok
     return orders, algos
 
 
@@ -2080,6 +2126,12 @@ async def _field_is_clear(iid):
     """戰場是否完全清空：無任何掛單(普通+trigger+oco) 且 無任何持倉。
     回傳 (是否清空, 掛單數, 持倉數)。"""
     orders, algos = await list_all_orders(iid)
+    if not ORDERS_OK["ok"]:
+        # 【v3.13】查單失敗（51054 逾時等）→ 一律回「未清空」。
+        # 空的 data 和「真的沒掛單」長得一樣，拿它去宣告淨場會帶著
+        # 沒撤掉的單重新部署。和持倉查詢同一個鐵則：不知道 ≠ 沒有。
+        print(f"[淨場判定中止] {iid} 查單未回應，本輪不宣告清空")
+        return False, -1, -1
     n_ord = len(orders) + len(algos)
     n_pos = 0
     # 【#29】改走共用快取，且查詢失敗一律回「未清空」。
@@ -2108,7 +2160,7 @@ async def _ensure_a_oco(S, iid, a_ps, d, fill_px):
     aid = await _okx_oco_id(iid, a_ps)
     S["algo_id"] = aid
     if aid:
-        ok, dead = await amend_frames([(iid, aid, n_sl, n_tp)])
+        ok, dead, _soft = await amend_frames([(iid, aid, n_sl, n_tp)])
         if aid in dead:
             # A 的 OCO 理論上改得動（limit 母單），萬一真的改不動就當場作廢，
             # 讓 frame_mover 下一輪重掛一張 —— 絕不沿用一張改不動的保護單。
@@ -2198,6 +2250,10 @@ async def _pending_side_note(S, iid, side):
         if o.get("posSide") == ps:
             px = o.get("px") or o.get("triggerPx") or "-"
             return f"戰場狀態：{nm} 等待觸發 @{px}"
+    if not ORDERS_OK["ok"]:
+        # 【v3.13】回 None 等於宣告「對手也沒了、戰役結束」。查單失敗時
+        # 絕不能下這個結論 —— 寧可晚一輪結束，也不能撤掉還活著的掛單。
+        return f"戰場狀態：{nm} 查單未回應，保守視為仍在場"
     return None
 
 
@@ -3436,9 +3492,11 @@ async def _apitest_probe(say, sym, spec, d, path):
         # 兩次測試都沒吃到倉。正確做法：掛在「會被立刻走到」的那一側，只差 1 檔。
         #   buy  觸發 → 價格「漲」到觸發價才成交 → 掛現價 +1 檔
         #   sell 觸發 → 價格「跌」到觸發價才成交 → 掛現價 −1 檔
-        trg = align(px + tick if d == "L" else px - tick, tick,
+        # 【v3.13】1 檔太吃運氣：SUIUSDT 第4組等了 91 秒價格就是沒往那邊走。
+        # 改成 2 檔，並在等待中途若還沒觸發就撤單改掛另一側，確保測得到。
+        trg = align(px + tick * 2 if d == "L" else px - tick * 2, tick,
                     "S" if d == "L" else "L")
-        say(f"  掛觸發 {open_side} 觸發@{trg}（現價 {px}，差 1 檔 → 等價格走到）TP {tp_px} SL {sl_px}")
+        say(f"  掛觸發 {open_side} 觸發@{trg}（現價 {px}，差 2 檔 → 等價格走到）TP {tp_px} SL {sl_px}")
         r = await api("POST", "/api/v5/trade/order-algo", {
             "instId": iid, "tdMode": "isolated", "side": open_side, "posSide": ps,
             "ordType": "trigger", "sz": str(sz), "triggerPx": str(trg),
