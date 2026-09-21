@@ -127,7 +127,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.0.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.0.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -3487,60 +3487,67 @@ async def _apitest_probe(say, sym, spec, d, path):
         say(f"  {_brief(r, ['ordId'])}")
         created["ord"] = (r.get("data") or [{}])[0].get("ordId")
     else:
-        # 【v4.0】觸發單掛在哪一側，改成【順著當下的行情動能】。
-        # OKX 觸發單是「等價格走到觸發價」才觸發，掛在上方就等漲、掛在下方就等跌。
-        # v3.13 固定掛一側 → 行情往反方向走就永遠等不到（SUIUSDT 第4組
-        # 兩次都等滿 91 秒空手而回）。這裡先花 3 秒量一下價格往哪走，
-        # 把觸發價掛在【正在走的那一側】，2 檔。等不到再自動換邊重試一次。
-        px0 = px
-        await asyncio.sleep(3)
-        px1 = await get_last(iid)
-        up = (px1 >= px0)          # 正在往上 → 掛上方等漲；往下 → 掛下方等跌
-        say(f"  量動能：{px0} → {px1}（{'往上' if up else '往下'}），觸發價掛在"
-            f"{'上方' if up else '下方'} 2 檔")
-
-        async def _place_trg(go_up, note):
-            t = align(px1 + tick * 2 if go_up else px1 - tick * 2, tick,
+        # 【v4.0.1】觸發單改成【追價】，不再賭方向。
+        # OKX 觸發單一定要「價格真的走到觸發價」才會成交，掛在上方等漲、
+        # 下方等跌。所以不管掛哪一側，都在賭接下來幾十秒往哪走 ——
+        # v4.0.0 量了 3 秒動能就押一次，兩次都押錯（SUIUSDT 第4組：
+        # 押跌，結果那 46 秒漲了 6 檔；換邊押漲，結果又不動了）。
+        #
+        # 追價的作法：每 8 秒撤掉重掛一次，永遠掛在【當下現價 ±1 檔】，
+        # 方向取最近一次的漲跌。價格只要動 1 檔就成交，而且每 8 秒重新
+        # 對準一次，不會像固定掛單那樣被行情走開就再也追不上。
+        # SUIUSDT 那 46 秒走了 6 檔 —— 用追價早就成交好幾次了。
+        async def _place_trg(ref, go_up, note):
+            t = align(ref + tick if go_up else ref - tick, tick,
                       "S" if go_up else "L")
-            say(f"  掛觸發 {open_side} 觸發@{t}（現價 {px1}，{note}）TP {tp_px} SL {sl_px}")
             rr = await api("POST", "/api/v5/trade/order-algo", {
                 "instId": iid, "tdMode": "isolated", "side": open_side, "posSide": ps,
                 "ordType": "trigger", "sz": str(sz), "triggerPx": str(t),
                 "orderPx": "-1", "triggerPxType": "last",
                 "algoClOrdId": "b" + uuid.uuid4().hex[:14], "attachAlgoOrds": attach})
-            say(f"  {_brief(rr, ['algoId'])}")
+            say(f"  掛觸發 {open_side} @{t}（現價 {ref}，{note}）　{_brief(rr, ['algoId'])}")
             return rr, (rr.get("data") or [{}])[0].get("algoId")
 
-        r, trg_aid = await _place_trg(up, "順著動能")
-
-    if r.get("code") != "0":
-        say(f"  {E.LOSS} 下單失敗，本路徑略過")
-        return None, created
-
-    async def _wait_fill(sec):
-        t0 = time.time(); p = None
-        while time.time() - t0 < sec:
-            await asyncio.sleep(2)
-            _ok, p = await okx_pos_ex(iid, ps, force=True)
-            if p: return p, int(time.time() - t0)
-        return None, int(time.time() - t0)
+        say(f"  追價模式：每 8 秒對準現價重掛一次，只需價格動 1 檔")
+        r = {"code": "0"}; trg_aid = None; pos = None; waited = 0
+        prev = px
+        for attempt in range(1, 9):                 # 最多 8 次 ≈ 64 秒
+            ref = await get_last(iid)
+            up  = (ref >= prev); prev = ref
+            if trg_aid:
+                await cancel_frame(iid, trg_aid)
+            r, trg_aid = await _place_trg(ref, up, f"第{attempt}次 追{'漲' if up else '跌'}")
+            if r.get("code") != "0":
+                say(f"  {E.LOSS} 下單失敗，本路徑略過")
+                return None, created
+            t0 = time.time()
+            while time.time() - t0 < 8:
+                await asyncio.sleep(2)
+                _ok, pos = await okx_pos_ex(iid, ps, force=True)
+                if pos: break
+            waited += int(time.time() - t0)
+            if pos:
+                break
+        if not pos:
+            if trg_aid:
+                await cancel_frame(iid, trg_aid)
+            say(f"  {E.LOSS} 追價 8 次共 {waited} 秒仍沒吃到倉 —— "
+                f"該幣種此刻幾乎不動，本路徑略過（不是 API 問題）")
+            return None, created
 
     if path == "limit":
-        pos, waited = await _wait_fill(6)
-    else:
-        pos, waited = await _wait_fill(45)
+        if r.get("code") != "0":
+            say(f"  {E.LOSS} 下單失敗，本路徑略過")
+            return None, created
+        t0 = time.time(); pos = None
+        while time.time() - t0 < 6:
+            await asyncio.sleep(2)
+            _ok, pos = await okx_pos_ex(iid, ps, force=True)
+            if pos: break
+        waited = int(time.time() - t0)
         if not pos:
-            # 【v4.0】等不到就換邊再試一次 —— 行情總有一邊會走到
-            say(f"  等 {waited} 秒沒觸發 → 撤單，改掛另一側重試")
-            await cancel_frame(iid, trg_aid)
-            px1 = await get_last(iid)
-            r2, trg_aid = await _place_trg(not up, "換邊重試")
-            if r2.get("code") == "0":
-                p2, w2 = await _wait_fill(45)
-                pos = p2; waited += w2
-    if not pos:
-        say(f"  {E.LOSS} 等 {waited} 秒仍沒吃到倉（未成交/未觸發），本路徑略過")
-        return None, created
+            say(f"  {E.LOSS} 等 {waited} 秒仍沒吃到倉，本路徑略過")
+            return None, created
     entry_px = Decimal(str(pos.get("avgPx") or px))
     say(f"  ✅ 成交 avgPx={entry_px} 張數={pos.get('pos')}（等待 {waited} 秒）")
 
@@ -4141,7 +4148,7 @@ async def cmd_apitest(u, c):
     await reply(u, f"{E.BOT} 🔬 開始探測 {sym}　方向 {'／'.join(dirs)}\n"
                    f"每個方向測【限價單】+【觸發單】兩條路徑\n"
                    f"最小張數，測完自動清場，約 {len(dirs)*3} 分鐘\n"
-                   f"（觸發單順著動能掛，等不到會自動換邊重試，單組最多 2 分鐘）")
+                   f"（觸發單用追價模式，每 8 秒對準現價重掛，單組最多 70 秒）")
     lines = await _apitest_run(u, sym, dirs)
     await _reply_long(u, [f"{E.BOT} 🔬 API 探測 {sym}　{VERSION}"], lines,
                       [f"時間：{hhmmss()}"])
