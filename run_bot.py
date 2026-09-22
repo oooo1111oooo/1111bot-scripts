@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 # 設計此腳本的目的在於用bot取代我在交易所app上的一切手動行為，切記
-"""B6-1 原K｜多帳戶 — v3.8 跨式雙向埋伏版
+"""B6-1 原K｜多帳戶 — v4.2 雙模式緊貼版
 
 【戰術】
   同時掛 A限價 + B觸發（反向、同量）。兩單都成交時完全對沖，損益鎖死 = -兩單間距，
   與價格無關。價格衝出箱子時一邊被SL掃掉、一邊獨活順勢起飛。
-  賭的是「一根針」：多數戰役小輸手續費，少數戰役吃到大波動翻盤。
+  目標順序：先求打平，再求小勝；大勝靠機構把價格打出控制範圍。
 
-【緊貼四種情境】—— 全部實作在 sl_decide() 一個純函式裡，別處不准自己判斷
-  1. 價格不動        → SL 不動。每秒查兩次。
-  2. 往TP移動        → SL 立刻緊貼到 0.1%。每秒查兩次、移兩次。
-  3. 往SL移動，等待期內 → SL 不動，沉住氣等方向。
-  4. 往SL移動，等待期外 → SL 立刻緊貼到 0.1%，認輸。持續查、持續移。
+【緊貼只有兩個模式】—— 全部實作在 sl_decide() 一個純函式裡，別處不准自己判斷
+  開關只有一個：這一場戰役【B單觸發過沒有】。時間不是訊號。
 
-  【等待期 A/B 不同 —— 這是兩單本質的差別】
-    A單(限價埋伏) 被動成交，方向未知 → 等 30 秒；
-                  但 B 一觸發進場，等待期【立刻作廢】(B進場就是方向信號)。
-    B單(觸發對沖) 主動成交，方向已定 → 不等，第一秒就緊貼。
+  模式一　B單還沒觸發（只有 A 在場）＝ 按兵不動
+    規則1 價格不動            → 不動
+    規則3 往SL                → 不動。不怕碰到靜態SL —— 間距(0.1%)一定比
+                                靜態SL(0.4%)先被打到，對沖會先成形。
+    規則3 往TP 未達手續費率     → 不動。局勢不明朗，別把保護單擋在門外。
+    規則2 往TP 超過手續費率     → 緊貼到 0.1%。
+      比較的數字就是 A單來回手續費率 FEE_A = 0.070%，沒有另一個常數。
 
-  SL 一律 = 現價 ∓ 0.1%，【不判斷峰值】，也沒有啟動門檻。
+  模式二　B單觸發過（閂，不翻回去）＝ 全面緊貼
+    規則2 往TP → 緊貼鎖利　　　規則4 往SL → 緊貼減損
+    兩邊一起貼，夾出 0.2% 的壓縮帶；誰被擠出去，另一單就獨走。
+    對沖成形後損益和鎖死 = -間距，勝負全在「落單者獨走多遠」。
+
+  SL 一律 = 現價 ∓ 緊貼距離，【不判斷峰值】。
   唯一限制：只准拉近，不准放鬆（否則 SL 會跟著價格跑，永遠不會出場）。
   方向以「現價 vs 進場價」認定，不看逐筆漲跌 —— 逐筆會被雜訊左右。
   靜態SL 只是個基準：第一次緊貼就被取代，OKX 上始終只有一張 SL。
 
-  【壓縮】兩單都在場時，兩條動態SL 從兩側夾住現價，箱寬 0.2%。
-  價格往哪邊動 0.1% 就有一單被逼出，存活那單方向已驗證，繼續緊貼獨走。
+【持倉暫存器】A格/B格，一律以 OKX 查回來的持倉為準，不看內部旗標。
+  現值總和歸零（且本場曾經>0）→ 戰役結束、撤單重新部署
+  B格曾經=1 → 緊貼模式二（閂：只從一翻到二，戰役結束才歸零）
 
 【資料鐵則】凡走過必留下痕跡
   每一次「沒有緊貼」都要留下名字與次數（skip_n），寫進交易紀錄。
@@ -127,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.1.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.2.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -136,11 +142,18 @@ STATE_FILE = f"/srv/1111bot/data/strategies_{ACCT}.json"
 NAKED_ALERT_SEC = 15  # 守門狗：有倉但未掛止盈止損超過 N 秒 → 只發一次 TG 告警（絕不自動平倉）
 
 # ---------- 交易所相關常數（換交易所時改這裡，不是改參數） ----------
-# 來回手續費率。A單=限價進場(maker)+市價出場(taker)；B單=市價進場+市價出場(taker×2)。
-# 這兩個值同時就是各自的「SL緊貼距離」：貼在手續費水位上，出場即約略打平。
-FEE_A = Decimal("0.00072")   # A單 0.072%
-FEE_B = Decimal("0.00120")   # B單 0.120%
-FEE_TOTAL = FEE_A + FEE_B    # 一場雙邊成交戰役的固定成本 0.192%
+# 來回手續費率。OKX 永續合約普通用戶：掛單 maker 0.020%、吃單 taker 0.050%。
+#   A單 = 限價埋伏進場(maker) + 市價出場(taker) = 0.070%
+#   B單 = 觸發市價進場(taker) + 市價出場(taker) = 0.100%
+# 【對過帳，不是查表】2026-09-21 SUI 實單：
+#   進場 0.9711 × 0.020% = 0.00019422
+#   出場 0.9715 × 0.050% = 0.00048575   合計 0.00068
+#   OKX 回傳的 fee 欄位正是 -0.000680 —— 完全吻合。
+# 【為什麼拿不到 maker+maker 的 0.040%】出場一律市價（tpOrdPx/slOrdPx = -1）。
+# 要 maker 出場就得掛限價 SL，而限價 SL 可能掛不上去 = 裸奔，違反下單鐵則。
+FEE_A = Decimal("0.00070")   # A單 0.070%
+FEE_B = Decimal("0.00100")   # B單 0.100%
+FEE_TOTAL = FEE_A + FEE_B    # 一場雙邊成交戰役的固定成本 0.170%
 
 # ========== 緊貼節拍（v3.10：整套戰術的獲利關鍵就是這裡） ==========
 # 【為什麼要快】SL = 現價 ∓ 0.1%，取樣越密，越貼近真正的針尖。
@@ -753,40 +766,43 @@ async def amend_frames(items):
     return okset, deadset, softset
 
 # ==================== 緊貼決策：唯一真相來源 ====================
-# 【情境只有四種，程式就只寫這四種】
-#   1. 價格不動           → SL 不動。每秒查兩次。
-#   2. 價格往TP移動       → SL 立刻緊貼到 0.1%。每秒查兩次、移兩次。
-#   3. 30秒以內往SL移動   → SL 不動（對沖單保護中）。
-#   4. 30秒以後往SL移動   → SL 立刻緊貼到 0.1%。每秒持續查、持續移。
+# 【v4.2 把 30 秒拿掉，改用「B單觸發過沒有」當開關】
+# 時間從來不是訊號，B單有沒有被觸發才是。整場戰役只有兩個模式：
 #
-# 【不再判斷峰值】SL 一律 = 現價 ∓ 0.1%，不是峰值 ∓ 0.1%。
-# 也沒有啟動門檻 —— 往TP走就貼，不管走了多少。
-# 唯一的限制是「只准拉近，不准放鬆」：緊貼本來就只有拉近的意思，
-# 而且若允許放鬆，SL 會一路跟著價格往下跑，永遠不會出場。
+# ── 模式一　B單還沒觸發過（只有 A 在場）＝ 按兵不動 ────────────
+#   往SL          → 不動。不怕碰到靜態SL，因為 B 的觸發價（間距 0.1%）
+#                   一定比靜態SL（0.4%）先被打到，對沖會先成形。
+#                   護欄在 cmd_run：間距 >= SL% 直接拒絕開單。
+#   往TP 未達手續費率 → 不動。局勢不明朗，別亂動 SL 把保護單擋在門外。
+#   往TP 超過手續費率 → 緊貼到 0.1%。比較的就是 A單來回手續費 0.070%。
+#
+# ── 模式二　B單觸發過（閂，不翻回去）＝ 全面緊貼 ────────────────
+#   往TP → 緊貼（鎖利）
+#   往SL → 緊貼（減損）      ← 兩邊一起貼，夾出 0.2% 的壓縮帶
+#   對沖成形後兩單損益和鎖死 = -間距，勝負全在「落單者獨走多遠」，
+#   所以落難方要快點被擠出去，得勢方才能早點獨走。
+#
+# 【閂為什麼不能翻回去】壓縮帶把 B 擠出場後暫存器從 2 掉回 1，
+# 但那一刻 A 正在獨走 —— 那一段才是勝負所在。模式若跟著掉回一，
+# A 會剛好在最關鍵的時候停止緊貼。所以只從一翻到二，戰役結束才歸零。
+#
+# 【不判斷峰值】SL 一律 = 現價 ∓ 緊貼距離，不是峰值 ∓ 緊貼距離。
+# 唯一的限制是「只准拉近，不准放鬆」——若允許放鬆，SL 會一路跟著
+# 價格往回跑，永遠不會出場。
 #
 # 【方向怎麼認】拿現價跟進場價比，不看上一筆的漲跌。
 # 逐筆比較會被雜訊左右（同一秒可能一上一下），拿進場價當基準才穩定：
 #   做多 現價>進場價 = 往TP；現價<進場價 = 往SL；相等 = 不動。做空鏡像。
 #
 # 這是一個【純函式】：不碰 S、不碰網路、不改任何狀態。
-# 給一組數字，回答該做什麼 —— 所以能離線跑十萬組驗證（/selftest）。
-
-HUG30_SEC = 30      # 規則3/4 的分界秒數 ← 要調就改這一行
+# 給一組數字，回答該做什麼 —— 所以能離線跑十萬組驗證（/check rule）。
 
 
-def sl_decide(d, entry, cur, cur_sl, F, tick, elapsed, wait_sec):
+def sl_decide(d, entry, cur, cur_sl, F, tick, hedged, gate):
     """緊貼決策。回傳 (action, price, reason, rule)
 
       action = "hold" 不動 ／ "move" 把 SL 移到 price
       rule   = 命中第幾條規則（1~4，0=棘輪擋下）
-
-    【wait_sec = 規則3 的等待秒數】A/B 不一樣，這是兩單本質的差別：
-      A單（限價埋伏）被動成交 —— 成交那一刻【方向未知】，價格可能只是掃一下
-        就回頭，所以給它一段時間沉住氣。wait_sec = 30。
-      B單（觸發對沖）主動成交 —— 價格必須「走過去」才會觸發，成交那一刻
-        【方向已經確定】，沒有什麼好觀察的。wait_sec = 0，規則3 直接不存在。
-      而且 A 的等待期在【B 觸發進場那一刻立刻結束】（呼叫端傳 0）——
-      B 進場本身就是方向信號，A 沒有理由再等。
 
     參數全為純數值，不依賴任何全域狀態。
       d        "L"/"S"   這一單自己的方向（A/B 各自算，不共用）
@@ -795,11 +811,14 @@ def sl_decide(d, entry, cur, cur_sl, F, tick, elapsed, wait_sec):
       cur_sl   目前生效的 SL（第一次 = 靜態SL；靜態SL 只是個基準，
                第一次緊貼就被取代掉，OKX 上從頭到尾只有一張 SL）
       F        緊貼距離（0.001 = 0.1%）
-      elapsed  進場後經過幾秒
-      wait_sec 規則3 的等待秒數（A單 30 或 0；B單恆 0）
+      hedged   這場戰役 B單觸發過沒有。True = 模式二，全面緊貼。
+               B單自己在場時恆為 True（觸發進場，方向已確定）。
+      gate     模式一比較用的手續費率（0.0007 = 0.070%，呼叫端傳 FEE_A）。
+               只在模式一、且往TP 時才會用到；模式二完全不看。
     """
     try:
         e = Decimal(str(entry)); c = Decimal(str(cur)); sl = Decimal(str(cur_sl))
+        g = Decimal(str(gate))
     except Exception:
         return ("hold", None, "資料不全", 0)
     if e <= 0 or c <= 0:
@@ -812,15 +831,33 @@ def sl_decide(d, entry, cur, cur_sl, F, tick, elapsed, wait_sec):
 
     toward_tp = (c > e) if L else (c < e)
 
-    # 規則3：等待期內往SL移動 → SL 不動（沉住氣，等方向）
-    # wait_sec=0 時這條永遠不成立 —— B單、以及 B 已進場後的 A單，都直接跳過。
-    if not toward_tp and elapsed < wait_sec:
-        return ("hold", None,
-                f"規則3 往SL方向，進場{int(elapsed)}秒未滿{int(wait_sec)}秒", 3)
+    # ── 模式一：B 還沒觸發過 —— 按兵不動，把戰場留給保護單 ──
+    if not hedged:
+        if not toward_tp:
+            return ("hold", None, "規則3 按兵不動·往SL等保護單", 3)
+        gain = ((c - e) / e) if L else ((e - c) / e)
+        if gain <= g:
+            return ("hold", None,
+                    f"規則3 按兵不動·獲利{gain * 100:.3f}%未達手續費率"
+                    f"{g * 100:.3f}%", 3)
+        # 走到這裡 = 獲利超過手續費率，往下走規則2 的緊貼
 
-    # 規則2（往TP）與規則4（等待期外往SL）目標相同：現價 ∓ 0.1%
+    # 規則2（往TP）與規則4（模式二往SL）落點相同：現價 ∓ 緊貼距離
     tgt = align(c * (Decimal("1") - F), tick, "S") if L else \
           align(c * (Decimal("1") + F), tick, "L")
+
+    # 【安全側保險 v4.2】tick 粗到比緊貼距離還大時（例：tick=1、價格 660、
+    # 0.1% 只有 0.66），對齊之後 SL 會落到現價的【另一側】—— 一送上去
+    # OKX 立刻觸發，當場市價平倉。隨機測試 12 萬組抓到 41 筆。
+    # 正常跑不會發生（hug_pct() 有 MIN_HUG_TICKS 地板），但 sl_decide 是
+    # 唯一真相來源，不能靠呼叫端替它守規矩。
+    if tick > 0:
+        for _ in range(3):
+            if (L and tgt < c) or ((not L) and tgt > c):
+                break
+            tgt = (tgt - tick) if L else (tgt + tick)
+    if tgt <= 0 or (L and tgt >= c) or ((not L) and tgt <= c):
+        return ("hold", None, "規則1 tick過粗，SL會越過現價", 0)
 
     # 只准拉近。擋下來就是「價格在回撤」或「SL 已經更近」——都屬於規則1 的不動。
     if (L and tgt <= sl) or (not L and tgt >= sl):
@@ -828,7 +865,34 @@ def sl_decide(d, entry, cur, cur_sl, F, tick, elapsed, wait_sec):
 
     if toward_tp:
         return ("move", tgt, "規則2 往TP緊貼", 2)
-    return ("move", tgt, "規則4 往SL，等待期已過，緊貼認輸", 4)
+    return ("move", tgt, "規則4 對沖中·往SL緊貼減損", 4)
+
+
+def reg_update(S, cur_a, cur_b):
+    """【v4.2 持倉暫存器】A格／B格，各 0 或 1，一律以 OKX 查回來的持倉為準，
+    絕不看內部旗標（孤兒倉正是旗標錯的那種）。呼叫端必須先確認查詢成功；
+    查詢失敗時整輪跳過，不准拿「不知道」餵進來當「沒有」。
+
+        reg_a / reg_b   這一刻各格的值
+        reg_now         現值總和 0/1/2
+        reg_max         本場戰役到過的最高水位
+        hedged          B格曾經=1 → 緊貼模式二（閂，戰役結束才歸零）
+
+    兩個用途分得很清楚：
+      戰役是否結束 → 看【現值】：reg_max>0 而 reg_now==0，兩單都確認無持倉
+      緊貼哪個模式 → 看【曾經】：hedged
+
+    回傳 True = 這一刻剛翻成模式二（呼叫端可印一行 log）。"""
+    a = 1 if cur_a else 0
+    b = 1 if cur_b else 0
+    S["reg_a"] = a
+    S["reg_b"] = b
+    S["reg_now"] = a + b
+    S["reg_max"] = max(a + b, int(S.get("reg_max", 0) or 0))
+    if b and not S.get("hedged"):
+        S["hedged"] = True
+        return True
+    return False
 
 
 def _skip(S, side, why):
@@ -856,6 +920,10 @@ def _skip(S, side, why):
 # WIF 峰值 +0.6% 只鎖到 +0.358%，回吐 0.242%；固定 0.1% 可鎖到 +0.500%。
 # 均幅仍照算並寫進交易紀錄（/tune 分析要用），只是不再決定緊貼距離。
 HUG_FIXED   = Decimal("0.001")  # 緊貼距離 0.1%（A/B 共用）← 要調就改這一行
+
+# 【沒有第二個常數】模式一（B單還沒觸發）A單往TP 要走超過多少才准緊貼？
+# 答案就是 A單的來回手續費率 FEE_A = 0.070%，直接用它，不另外定義。
+# 多一個常數就多一個會跟你講的數字不一致的地方。
 HUG_K       = Decimal("1.5")   # 均幅係數（目前僅供 /tune 參考，不影響交易）
 HUG_BARS    = 60               # 取樣根數
 HUG_TTL     = 300              # 算完快取幾秒（每次部署會重算，行情變了自己跟上）
@@ -925,8 +993,8 @@ def hug_pct(S, side):
     """該單實際使用的緊貼距離 —— v3.7 起為固定值 HUG_FIXED，A/B 共用。
 
     只保留一道 tick 地板：低於 MIN_HUG_TICKS 檔會被買賣價差直接掃掉。
-    【取捨】0.1% 低於 B 單的來回手續費 0.120%，B 若剛好在啟動門檻附近被掃
-    會小虧約 0.02%。這是為了多鎖利刻意接受的代價。"""
+    【取捨】0.1% 低於 B 單的來回手續費 0.100%，B 若剛好在這個距離被掃
+    會小虧。這是為了多鎖利刻意接受的代價。"""
     F = HUG_FIXED
     try:
         # 參考價各用各的：A 用 front_px、B 用 back_px，不可互相借用
@@ -1176,6 +1244,13 @@ async def _place_pair(S, iid, chat, app, label="新一輪"):
     S["back_d"]          = back_d
     S["algo_id"]         = None
     S["exit_seq"]        = 0
+    # 【v4.2】暫存器與緊貼模式閂：每一場戰役重新開始。
+    # hedged 在戰役期間只會 False→True，絕不翻回去 —— 落單者獨走那一段
+    # 才是勝負所在，那時候不能退回按兵不動。歸零的時機只有這裡。
+    S["reg_a"] = S["reg_b"] = S["reg_now"] = S["reg_max"] = 0
+    S["hedged"]          = False
+    S.pop("_pending_front", None)
+    S.pop("_pending_back", None)
     # 【v3.8】每場戰役重置：跳過計數、自我修復計數、廢單黑名單
     S["skip_n"]          = {}
     S["fix_n"]           = 0
@@ -1293,7 +1368,7 @@ def tf_expired(S, key):
     return False
 
 
-# 【已刪除 hug_started】啟動門檻不存在了 —— 往TP走就貼，不管走了多少。
+# 【已刪除 hug_started】沒有「啟動一次」這種狀態 —— 每一拍都重新問 sl_decide。
 
 
 def sl_key_of(side):
@@ -1362,8 +1437,8 @@ async def frame_mover(app):
           amend-algos 限額 20筆/2秒/商品，兩側全開只用掉 8 筆，額度充裕。
 
     【v3.8】這裡不再有任何緊貼規則 —— 全部交給 sl_decide()。
-    本函式只負責：取數字 → 問 sl_decide → 執行（移動/平倉/記錄跳過原因）。
-    TF 逼倉整段刪除，它的職責已被「30秒認輸緊貼」取代，而且 30 秒比 5 分鐘快得多。
+    本函式只負責：取數字 → 問 sl_decide → 執行（移動 / 記錄跳過原因）。
+    TF 逼倉整段刪除，它的職責已被緊貼引擎取代。
     """
     await asyncio.sleep(3)
     print(f"原K止損移動任務已啟動（{VERSION}）")
@@ -1399,6 +1474,11 @@ async def frame_mover(app):
                         # 所以一定要計數 —— 次數高就代表被限流，不是「沒行情」。
                         _skip(S, "全體", "持倉查詢未回應")
                         continue
+
+                    # 【v4.2】暫存器：查詢成功才更新。B 一進場就把模式閂扣上，
+                    # 不等 loop 那邊偵測 —— 緊貼要在 B 成交的下一拍就全開。
+                    if reg_update(S, cur_f, cur_b):
+                        print(f"[緊貼模式] {S['sym']} B單在場 → 模式二 全面緊貼")
 
                     # 守門狗：一律查 OKX，不看內部旗標（孤兒倉正是旗標為 False 的那種）
                     # 【#27】守門狗節流：裸倉告警門檻是 15 秒，不需要每 0.5 秒查一次
@@ -1460,30 +1540,27 @@ async def frame_mover(app):
                         cur_sl = S.get(sl_f) or S["front_static_sl" if side == "front"
                                                   else "back_static_sl"]
                         tick   = S["spec"]["tick"]
-                        ee     = S.get("front_ee" if side == "front" else "back_ee")
-                        elapsed = (now_t - float(ee)) if ee else 0.0
 
-                        # 【規則3 的等待秒數】A/B 不同，而且 A 的等待會被 B 打斷：
-                        #   B單         → 恆 0（觸發進場時方向已確定，沒什麼好等）
-                        #   A單 且 B在場 → 0（B 觸發本身就是方向信號，等待期作廢）
-                        #   A單 且 B未到 → HUG30_SEC
-                        # 「B 在不在場」一律看 OKX 查回來的持倉，不看內部旗標。
-                        if side == "back":
-                            wait = 0.0
-                        else:
-                            wait = 0.0 if cur_b else float(HUG30_SEC)
+                        # 【v4.2 模式開關】只看一件事：這場 B單觸發過沒有。
+                        #   B單自己（side=="back"）恆為模式二 —— 它是觸發進場，
+                        #   成交那一刻方向就確定了，沒有按兵不動這回事。
+                        #   閂由 reg_update() 扣上，只從一翻到二，戰役結束才歸零。
+                        hedged = bool(S.get("hedged")) or (side == "back")
 
-                        # ── 四條規則全在 sl_decide，本函式不再自己判斷任何事 ──
+                        # ── 規則全在 sl_decide，本函式不再自己判斷任何事 ──
                         act, price, why, rule = sl_decide(
-                            sd, ent, px, cur_sl, F, tick, elapsed, wait)
+                            sd, ent, px, cur_sl, F, tick, hedged, FEE_A)
 
                         if act != "move" or price is None:
                             _skip(S, side, why)
                             continue
-                        # 規則4（往SL認輸）標時間型，規則2（往TP）標獲利型 —— 只影響顯示
+                        # 規則4（對沖中往SL減損）標 ⏰，規則2（往TP鎖利）標 ✅
+                        # —— 只影響顯示，不影響任何決策
                         mtype = E.MOVE_TIME if rule == 4 else E.MOVE_PROFIT
                         pk = S.get("front_peak" if side == "front" else "back_peak") or ent
-                        S[f"_pending_{side}"] = (str(price), str(pk), mtype, why)
+                        # cur_sl = 移動前的 SL，出場明細要印「SL舊→SL新」
+                        S[f"_pending_{side}"] = (str(price), str(pk), mtype, why,
+                                                 str(cur_sl))
                         amends.append((iid, algo_id, price, S, side, sl_f))
                 except Exception as e:
                     print("frame_mover 單策略錯誤", S.get("sym"), type(e).__name__, e)
@@ -1495,9 +1572,12 @@ async def frame_mover(app):
                 [(a[0], a[1], a[2]) for a in amends])
             for iid, algo_id, nsl, S, side, sl_f in amends:
                 pend = S.pop(f"_pending_{side}", None)
-                if not pend:
+                # 長度檢查：舊版存檔留下的 4 元素 _pending_* 會讓解包炸掉，
+                # 而這裡一炸就是整個 frame_mover 停擺。寧可丟掉一筆。
+                if not pend or len(pend) != 5:
                     continue
-                nsl_s, pk_s, mtype, why = pend      # 【v3.8】why = 這次移動的理由
+                # 【v3.8】why = 這次移動的理由；【v4.2】sl0_s = 移動前的 SL
+                nsl_s, pk_s, mtype, why, sl0_s = pend
                 hist_key = f"{side}_move_hist"
                 mh = S.get(hist_key)
                 if not isinstance(mh, list):
@@ -1518,7 +1598,8 @@ async def frame_mover(app):
                     # 【v4.1.1】存下當下現價：出場明細要用它算「這一次貼了幾 %」。
                     # 只存 SL 價算不出來 —— 必須知道當時 SL 距離現價多遠。
                     mh.append({"t": hhmmss(), "type": mtype, "peak": pk_s,
-                               "sl": nsl_s, "why": why, "dt": dt_ms, "px": str(px)})
+                               "sl0": sl0_s, "sl": nsl_s, "why": why,
+                               "dt": dt_ms, "px": str(px)})
                 elif algo_id in softset:
                     # 【v3.13】邊界錯誤：不是這張單壞了，是價格在往返途中走掉了。
                     # 不計入失敗、不退避、不作廢 —— 下一拍用新價重算就好。
@@ -1526,7 +1607,8 @@ async def frame_mover(app):
                     S[f"{side}_soft_n"] = int(S.get(f"{side}_soft_n", 0) or 0) + 1
                     _skip(S, side, "邊界(價格往返中走掉)")
                     mh.append({"t": hhmmss(), "type": E.MOVE_FAIL, "peak": pk_s,
-                               "sl": nsl_s, "why": why + "｜邊界重算", "soft": 1})
+                               "sl0": sl0_s, "sl": nsl_s,
+                               "why": why + "｜邊界重算", "soft": 1})
                 else:
                     S[f"{side}_move_fail_n"] = int(S.get(f"{side}_move_fail_n", 0)) + 1
                     S[f"_last_fail_t_{side}"] = now_t
@@ -1534,7 +1616,7 @@ async def frame_mover(app):
                     print(f"[SL移動失敗] {label} {side} {why} 欲改SL={nsl_s} "
                           f"累計失敗{fn}次")
                     mh.append({"t": hhmmss(), "type": E.MOVE_FAIL, "peak": pk_s,
-                               "sl": nsl_s, "why": why})
+                               "sl0": sl0_s, "sl": nsl_s, "why": why})
                     # 【v3.8】永久失敗（51506）或連續失敗太多次 → 作廢這張單，
                     # 下一輪由 _repair_algo 自己重掛一張改得動的。
                     aid_key = "algo_id" if side == "front" else "back_algo2_id"
@@ -1675,12 +1757,11 @@ def _move_stat(mhist):
 def _sl_block(mn, mhist, fn=0):
     """SL 移動明細區塊。
 
-    【v4.1.2 每一行只印一個數字：實際緊貼了幾 %】
-    行首已經有時間戳，再印毫秒是重複的。真正要看的是
-      貼x%  這一次 SL 離【當時現價】多遠 —— 設定 0.1%，
-            對齊 tick 之後實際落在 0.09~0.11%。
-            這一欄偏離 0.1% 太多，就代表緊貼出問題了。
-    毫秒只留在標題那一行的速度摘要（判斷有沒有跑滿心跳用的）。
+    每一行只有一件事：這一次 SL 從哪裡搬到哪裡，以及搬完離當時現價幾 %。
+      SL舊→SL新(0.093%)
+    設定 0.100%，對齊 tick 之後實際落在 0.09~0.11%。這一欄偏離太多，
+    就代表緊貼出問題了 —— 這是唯一能當場驗算的數字。
+    毫秒摘要已移除（要看速度去 /check sl，交易紀錄裡 dt 仍照記）。
     """
     p, t, f = _move_stat(mhist)
     head = f"SL移動 {mn} 次"
@@ -1696,18 +1777,16 @@ def _sl_block(mn, mhist, fn=0):
             sl = Decimal(str(m.get("sl")))
             px = Decimal(str(m.get("px") or 0))
             if px > 0:
-                return f" | 貼{abs(px - sl) / px * 100:.3f}%"
+                return f"({abs(px - sl) / px * 100:.3f}%)"
         except Exception:
             pass
         return ""
 
-    d_min, d_med = _dt_stat(mhist, "min"), _dt_stat(mhist, "med")
-    if d_med:
-        lines.append(f"緊貼速度：最快 {d_min}ms｜中位 {d_med}ms"
-                     f"（心跳下限 {int(MOVE_TICK*1000)}ms）")
     for m in mhist[-10:]:
-        lines.append(f"{m.get('t','')} | {m.get('type','')} | "
-                     f"止{m.get('sl','')}{_hug_pct(m)}")
+        sl0 = m.get("sl0")
+        sl  = m.get("sl", "")
+        arrow = f"SL{sl0}→SL{sl}" if sl0 else f"SL{sl}"
+        lines.append(f"{m.get('t','')} {m.get('type','')} {arrow}{_hug_pct(m)}")
     if len(mhist) > 10:
         lines.append(f"（顯示最近10筆，共{len(mhist)}筆）")
     return "\n".join(lines)
@@ -1750,7 +1829,7 @@ def _exit_snapshot(S, side, seq):
 
 
 def _exit_reason(snap, close_px):
-    """判定出場原因：TP / 靜態SL / 緊貼SL（規則2）/ 認輸SL（規則4）/ 手動。
+    """判定出場原因：TP / 靜態SL / 緊貼SL（規則2）/ 減損SL（規則4）/ 手動。
 
     【v4.1 修正滑價誤判】SL 觸發後送的是【市價單】，成交價一定比 SL 差一點。
     舊版用對稱的 3 檔容差，滑超過 3 檔就被歸成「手動/其他」——
@@ -1791,7 +1870,7 @@ def _exit_reason(snap, close_px):
             if m.get("type") != E.MOVE_FAIL:
                 last_ok = m; break
         if last_ok and last_ok.get("type") == E.MOVE_TIME:
-            return "認輸SL(規則4)"
+            return "減損SL(規則4)"
         return "緊貼SL(規則2)"
     return "手動/其他"
 
@@ -1811,13 +1890,13 @@ def _peak_line(snap):
     """峰值顯示行（獨立一行，避免訊息過寬）。"""
     ent = snap.get("entry_px"); pk = snap.get("peak") or ent
     if not ent or not pk:
-        return "峰值：-"
+        return "峰值 -"
     try:
         e = Decimal(str(ent)); p = Decimal(str(pk))
         gain = (p - e) / e * 100 if snap["dir"] == "L" else (e - p) / e * 100
-        return f"峰值：{p}（{gain:+.3f}%）"
+        return f"峰值 {p}（{gain:+.3f}%）"
     except Exception:
-        return f"峰值：{pk}"
+        return f"峰值 {pk}"
 
 
 async def _build_exit_msg(snap, rec):
@@ -1826,9 +1905,9 @@ async def _build_exit_msg(snap, rec):
     mv = float(Decimal(str(snap.get("margin", "1"))))
     # 【#30】不再查 OKX 即時掛單。記帳是背景執行的，那時新戰役的掛單早就掛上去了，
     # live 查詢會抓到【下一場】的 TP/SL（實測第63輪顯示 0.09086/0.08701，
-    # 那是新 A 埋伏價 0.08736 算出來的，不是這一單的）。一律用進場當下的快照。
-    static_tp = snap.get("tp_px", "-")
-    static_sl = snap.get("static_sl", "-")
+    # 那是新 A 埋伏價 0.08736 算出來的，不是這一單的）。
+    # 【v4.2】出場畫面已不印靜態TP/SL（進場通知印過了），但 _exit_reason 還是
+    # 用快照裡的 tp_px/static_sl 判定，一樣不碰即時查詢。
     ee = snap.get("entry_ee")
     entry_t = datetime.fromtimestamp(float(ee), TZ8).strftime("%H:%M:%S") if ee else "-"
 
@@ -1851,24 +1930,19 @@ async def _build_exit_msg(snap, rec):
     net_pct = float(net_r) / mv * 100 if mv else 0
     ico = E.WIN if net_r >= 0 else E.LOSS
 
+    hold_s = int(time.time() - float(ee)) if ee else 0
     msg = (
-        f"{E.BOT} OKX原K｜{ACCT}\n"
-        f"事件：{ico} {snap['name']}出場成交（本場第{snap['seq']}個出場）\n"
-        f"━━━━━━━━━━\n"
-        f"商品：{E.dir_emoji(d)} {snap['sym']} {E.dir_word(d)} {snap.get('lev')}x {snap.get('margin')}\n"
+        f"{ico} {snap['name']}出場成交 {snap['sym']} {E.dir_word(d)} "
+        f"{snap.get('lev')}x {snap.get('margin')}\n"
         f"出場原因：{reason}\n"
         f"━━━━━━━━━━\n"
-        f"進場：{snap.get('entry_px','-')} | {entry_t}\n"
+        f"進場 {snap.get('entry_px','-')}　{entry_t}\n"
+        f"出場 {xpx}　{hhmmss()}　持倉 {hold_s} 秒\n"
         f"{_peak_line(snap)}\n"
-        f"靜態TP：{static_tp}\n"
-        f"靜態SL：{static_sl}\n"
-        f"最後SL：{snap.get('last_sl','-')}\n"
-        f"緊貼：{hug_display(snap['spec'], snap.get('entry_px') or 0, snap.get('hug') or Decimal('0'))}（固定）\n"
-        f"出場：{xpx} | {hhmmss()}\n"
         f"━━━━━━━━━━\n"
-        f"毛損益：{g_r:+.6f} ({g_pct:+.3f}%)\n"
-        f"手續費：{fee_r:.6f} ({fee_pct:+.3f}%)\n"
-        f"淨損益：{net_r:+.6f} ({net_pct:+.3f}%) {ico}\n"
+        f"毛 {g_r:+.6f}（{g_pct:+.3f}%）\n"
+        f"費 {fee_r:.6f}（{fee_pct:+.3f}%）\n"
+        f"淨 {net_r:+.6f}（{net_pct:+.3f}%）{ico}　淨利率\n"
         f"{_sl_block(snap['move_n'], snap['move_hist'])}"
     )
     return msg, g_r, fee_r, net_r, reason
@@ -1936,6 +2010,26 @@ def _dt_stat(mh, what):
     return v[len(v) // 2]
 
 
+def _slip_pct(snap, close_px):
+    """市價出場滑了多少（%，相對出場價）。正值 = 比 SL 差。
+
+    只有被 SL 打出去的那些單才有意義（TP 或手動平倉回 None）。
+    做多：SL 觸發後市價往【下】滑 → slip = (SL - 成交價)/成交價
+    做空：往【上】滑            → slip = (成交價 - SL)/成交價
+    """
+    try:
+        if not close_px:
+            return None
+        cp = Decimal(str(close_px))
+        sl = Decimal(str(snap.get("last_sl") or snap.get("static_sl") or 0))
+        if cp <= 0 or sl <= 0:
+            return None
+        v = (sl - cp) if snap.get("dir") == "L" else (cp - sl)
+        return round(float(v / cp * 100), 4)
+    except Exception:
+        return None
+
+
 def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
     """把這一單的一切留下來 —— 凡走過必留下痕跡。
 
@@ -1982,6 +2076,12 @@ def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
         "mfe": round(_pct_move(ent, snap.get("peak") or ent, d), 4),
         "mae": round(_pct_move(ent, snap.get("trough") or ent, d), 4),
         "post5": None,
+        # 【v4.2】市價出場的滑價：SL 掛在哪、實際成交在哪，差了幾 %。
+        # 這是手續費之外的第三筆成本，而且量級相當（實測 SUI 滑過 6 檔 ≈ 0.062%）。
+        # 正值 = 比 SL 差（往不利方向滑），這是常態；負值 = 比 SL 好。
+        # 決定緊貼距離要用真實中位數，不能用猜的 —— 這一欄就是它的來源。
+        # 只有 SL 打出去的單才記；TP 與手動平倉記 None，免得污染中位數。
+        "slip": (_slip_pct(snap, xpx) if "SL" in (reason or "") else None),
         # SL 移動全紀錄
         "move_n": int(snap.get("move_n", 0)),
         "move_ok": n_ok, "move_tf": n_tf, "move_fail": n_fa,
@@ -2128,9 +2228,13 @@ async def _exit_report(app, chat, S, snaps, tail_fn):
             await _reconcile(app, chat, S, S["spec"]["iid"])
         except Exception as e:
             print("對帳呼叫失敗", type(e).__name__, e)
-        tail = tail_fn()
-        for m in results:
-            await notify(app, chat, f"{m}\n{tail}")
+        # 【v4.2】戰役結束說明只接在【最後一則】出場通知下面。
+        # 兩單同一輪一起出場時 results 有兩則，每則都加就變成講兩次。
+        # tail 為空字串 = 戰役還沒結束（對手還在場上獨走），什麼都不加。
+        tail = tail_fn() or ""
+        for i, m in enumerate(results):
+            last = (i == len(results) - 1)
+            await notify(app, chat, f"{m}\n{tail}" if (last and tail) else m)
     except Exception as e:
         print("背景記帳錯誤", type(e).__name__, e)
 
@@ -2259,16 +2363,37 @@ async def _ensure_b_oco(S, iid, b_ps, back_d, fill_px):
     return False
 
 
+def _hug_brief(spec, ref_px, F):
+    """緊貼距離的短寫：0.100%|9檔"""
+    try:
+        ref = Decimal(str(ref_px))
+        n = int(((ref * F) / spec["tick"]).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        return f"{F * 100:.3f}%|{n}檔"
+    except Exception:
+        return f"{F * 100:.3f}%"
+
+
 def _trigger_line(S, side):
-    """進場通知用：價格一往TP走，SL 立刻會被貼到哪裡（= 進場價 ∓ 緊貼距離）。
-    【v3.8】不再是「啟動門檻」—— 沒有門檻了，往TP走就貼。"""
+    """進場通知用：這一單的 SL【第一次】會被貼到哪裡。
+
+    【v4.2】A/B 不一樣，因為兩單一進場就處在不同模式：
+      A單 = 模式一（B還沒觸發）→ 要先往TP走超過手續費率 FEE_A 才准貼，
+            所以第一次的落點是 進場×(1±手續費率) 再退 緊貼距離。
+      B單 = 模式二（它自己就是對沖成形）→ 一往TP走就貼，
+            所以第一次的落點是 進場 ∓ 緊貼距離。
+    印出來的數字要跟引擎真的會做的事一致 —— 印一個不會發生的價格，
+    等於沒有印。"""
     pre = "front" if side == "front" else "back"
     d = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
     try:
         e = Decimal(str(S[f"{pre}_px"]))
         F = hug_pct(S, pre)
         tick = S["spec"]["tick"]
-        sl0 = align(e * (1 - F), tick, "S") if d == "L" else align(e * (1 + F), tick, "L")
+        # B單 恆模式二，不看手續費率；A單 要先走超過 FEE_A
+        g = Decimal("0") if side == "back" else FEE_A
+        arm = e * (1 + g) if d == "L" else e * (1 - g)
+        sl0 = align(arm * (1 - F), tick, "S") if d == "L" else \
+              align(arm * (1 + F), tick, "L")
         return str(sl0)
     except Exception:
         return "-"
@@ -2348,11 +2473,16 @@ async def loop(app, chat, S):
                 continue
             a_open = bool(S.get("front_filled"))
             b_open = bool(S.get("back_filled"))
+            # 【v4.2】暫存器：查詢成功才更新（上面已擋掉查詢失敗）
+            if reg_update(S, cur_a, cur_b):
+                print(f"[緊貼模式] {S['sym']} B單在場 → 模式二 全面緊貼")
 
             if loop_tick % 10 == 0:
                 print(f"[loop] {S['sym']} {VERSION} "
                       f"A={'倉' if cur_a else '空'}/{'開' if a_open else '待'} "
                       f"B={'倉' if cur_b else '空'}/{'開' if b_open else '待'} "
+                      f"暫存器={S.get('reg_now',0)}(max{S.get('reg_max',0)}) "
+                      f"模式{'二' if S.get('hedged') else '一'} "
                       f"ocoA={bool(S.get('algo_id'))} ocoB={bool(S.get('back_algo2_id'))} "
                       f"WS={ws_status()}")
 
@@ -2372,18 +2502,16 @@ async def loop(app, chat, S):
                 print(f"[A進場] {S['sym']} {d} {fpx}")
                 _bnote = "B單 持倉中" if cur_b else f"B單 等待觸發 @{S.get('back_px','-')}"
                 await notify(app, chat,
-                    f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} A單進場成交\n"
+                    f"{E.ENTRY} A單進場成交 {S['sym']} {E.dir_word(d)} "
+                    f"{S.get('lev')}x {S.get('margin')}\n"
                     f"━━━━━━━━━━\n"
-                    f"商品：{E.dir_emoji(d)} {S['sym']} {E.dir_word(d)} {S.get('lev')}x {S.get('margin')}\n"
-                    f"進場：{fpx} | {hhmmss()}\n"
-                    f"靜態TP：{S['front_tp_px']}（{'+' if d=='L' else '-'}{S['tp']}%）\n"
-                    f"靜態SL：{S['front_static_sl']}（{'-' if d=='L' else '+'}{S['sl']}%）\n"
-                    f"緊貼：{hug_display(spec, fpx, hug_pct(S,'front'))}（固定）\n"
-                    f"　{S.get('hug_note','')}\n"
-                    f"一往TP動，SL立刻貼到：{_trigger_line(S,'front')}\n"
+                    f"進場 {fpx}　{hhmmss()}\n"
+                    f"初始TP {S['front_tp_px']}（{'+' if d=='L' else '-'}"
+                    f"{float(S['tp']):.1f}%）\n"
+                    f"初始SL {S['front_static_sl']} → {_trigger_line(S,'front')}"
+                    f"({_hug_brief(spec, fpx, hug_pct(S,'front'))})\n"
                     f"━━━━━━━━━━\n"
-                    f"對手：{_bnote}\n"
-                    f"時間：{hhmmss()}")
+                    f"對手 {_bnote}")
 
             # ========== B 進場偵測 ==========
             if cur_b and not b_open:
@@ -2400,18 +2528,16 @@ async def loop(app, chat, S):
                 print(f"[B進場] {S['sym']} {back_d} {bpx}")
                 _anote = "A單 持倉中" if cur_a else f"A單 等待成交 @{S.get('front_px','-')}"
                 await notify(app, chat,
-                    f"{E.BOT} OKX原K｜{ACCT}\n事件：{E.ENTRY} B單觸發進場成交\n"
+                    f"{E.ENTRY} B單進場成交 {S['sym']} {E.dir_word(back_d)} "
+                    f"{S.get('lev')}x {S.get('margin')}\n"
                     f"━━━━━━━━━━\n"
-                    f"商品：{E.dir_emoji(back_d)} {S['sym']} {E.dir_word(back_d)} {S.get('lev')}x {S.get('margin')}\n"
-                    f"進場：{bpx} | {hhmmss()}\n"
-                    f"靜態TP：{S['back_tp_px']}（{'+' if back_d=='L' else '-'}{S['tp']}%）\n"
-                    f"靜態SL：{S['back_static_sl']}（{'-' if back_d=='L' else '+'}{S['sl']}%）\n"
-                    f"緊貼：{hug_display(spec, bpx, hug_pct(S,'back'))}（固定）\n"
-                    f"　{S.get('hug_note','')}\n"
-                    f"一往TP動，SL立刻貼到：{_trigger_line(S,'back')}\n"
+                    f"進場 {bpx}　{hhmmss()}\n"
+                    f"初始TP {S['back_tp_px']}（{'+' if back_d=='L' else '-'}"
+                    f"{float(S['tp']):.1f}%）\n"
+                    f"初始SL {S['back_static_sl']} → {_trigger_line(S,'back')}"
+                    f"({_hug_brief(spec, bpx, hug_pct(S,'back'))})\n"
                     f"━━━━━━━━━━\n"
-                    f"對手：{_anote}\n"
-                    f"時間：{hhmmss()}")
+                    f"對手 {_anote}")
 
             # ========== 出場偵測（A/B 各自獨立，同一輪可同時處理） ==========
             a_gone = a_open and not cur_a
@@ -2457,9 +2583,11 @@ async def loop(app, chat, S):
                 other = "back" if (a_gone and not b_gone) else ("front" if (b_gone and not a_gone) else None)
                 note, alive = (await _pending_side_note(S, iid, other)) if other else (None, False)
                 if note and alive:
-                    # 對手【持倉中】才續行 —— 生還者要獨走完才算一場
-                    asyncio.create_task(_exit_report(app, chat, S, snaps,
-                        lambda n=note: f"━━━━━━━━━━\n{n}\n時間：{hhmmss()}"))
+                    # 對手【持倉中】才續行 —— 生還者要獨走完才算一場。
+                    # 【v4.2】戰役還沒結束，出場通知就到此為止，不加任何尾巴。
+                    # 對手出場時會有它自己的通知，戰役結束說明接在那一則下面。
+                    print(f"[戰役續行] {S['sym']} {note.splitlines()[0]}")
+                    asyncio.create_task(_exit_report(app, chat, S, snaps, lambda: ""))
                     continue
                 if note:
                     print(f"[戰役結束] {S['sym']} {note.splitlines()[0]}")
@@ -2467,8 +2595,7 @@ async def loop(app, chat, S):
                 # 【#32 硬性檢查】仍有未結清的單就絕不宣告戰役結束
                 if S.get("front_filled") or S.get("back_filled"):
                     print(f"[戰役續行] {S['sym']} 仍有未結清的單，不重新部署")
-                    asyncio.create_task(_exit_report(app, chat, S, snaps,
-                        lambda: f"━━━━━━━━━━\n戰場狀態：另一單尚未結清\n時間：{hhmmss()}"))
+                    asyncio.create_task(_exit_report(app, chat, S, snaps, lambda: ""))
                     continue
 
                 # ---- 戰役結束：零持倉、零掛單 ----
@@ -2481,21 +2608,20 @@ async def loop(app, chat, S):
                         "back":  (S.get("back_exit_reason"),  S.get("back_exit_pnl"))}
                 had = {"front": bool(S.get("front_ee")), "back": bool(S.get("back_ee"))}
                 rnd = S.get("round_today", "-")
-                mvv = float(Decimal(str(S.get("margin", "1")))) or 1.0
                 skey_now = skey(S["sym"], S.get("locked_dir", d))
                 S["dir"] = S.get("locked_dir", d)
                 S["pair_state"] = "waiting"
                 redeploy = await _place_pair(S, iid, chat, app, label="新戰役")
                 S["_need_replace"] = (not redeploy)   # 【v4.1】失敗→快速重試
-                new_a = S.get("front_px") if redeploy else None
-                new_b = S.get("back_px")  if redeploy else None
 
-                def _settle_tail(S=S, prev=prev, had=had, rnd=rnd, mvv=mvv,
-                                 new_a=new_a, new_b=new_b, kk=skey_now):
+                def _settle_tail(S=S, prev=prev, had=had, rnd=rnd, kk=skey_now):
+                    """【v4.2】戰役結束只說三行：誰打的、A怎麼走的、B怎麼走的。
+
+                    損益一概不印 —— 上面的出場通知已經有 OKX 回傳的毛/費/淨，
+                    這裡再算一次只會變成「我自己算的數字」，那不是數據。
+                    重新部署也不印 —— 沒有戰役就不需要說明。"""
                     a_r = S.get("front_exit_reason") or prev["front"][0]
-                    a_p = S.get("front_exit_pnl")    or prev["front"][1]
                     b_r = S.get("back_exit_reason")  or prev["back"][0]
-                    b_p = S.get("back_exit_pnl")     or prev["back"][1]
                     # 【#31】區分「從未進場」與「進場過但沒拿到出場結果」
                     a_txt = a_r or ("結果未取得" if had["front"] else "未成交")
                     b_txt = b_r or ("結果未取得" if had["back"]  else "未成交")
@@ -2507,22 +2633,11 @@ async def loop(app, chat, S):
                         form = "B單獨成交"
                     else:
                         form = "未成交"
-                    try:
-                        tot = float(a_p or 0) + float(b_p or 0)
-                    except Exception:
-                        tot = 0.0
                     bump(kk, f"form_{form}")
-                    t = (f"━━━━━━━━━━\n"
-                         f"🏁 戰役結束 第{rnd}輪\n"
-                         f"A單：{a_txt}  {a_p or '-'}\n"
-                         f"B單：{b_txt}  {b_p or '-'}\n"
-                         f"戰役淨損益：{tot:+.6f}（{tot/mvv*100:+.3f}%）\n"
-                         f"形態：{form}")
-                    if new_a and new_b:
-                        t += f"\n━━━━━━━━━━\n重新部署：A埋伏 {new_a}\nB觸發 {new_b}"
-                    else:
-                        t += "\n━━━━━━━━━━\n重新部署：稍後重試（戰場尚未清空）"
-                    return t + f"\n時間：{hhmmss()}"
+                    return (f"━━━━━━━━━━\n"
+                            f"🏁 戰役結束 第{rnd}輪｜{form}\n"
+                            f"A單 {a_txt}\n"
+                            f"B單 {b_txt}")
 
                 asyncio.create_task(_exit_report(app, chat, S, snaps, _settle_tail))
                 continue
@@ -2768,7 +2883,7 @@ async def cmd_run(u, c):
 
     # ── 護欄① 兩單間距 ──
     # 【v3.8 重寫】舊護欄 `間距 ≤ SL% − 手續費` 的理由是「B 的緊貼才會啟動」，
-    # 那是啟動門檻時代的邏輯。現在沒有門檻了，B 一進場就緊貼，該理由作廢。
+    # 那是舊版啟動條件時代的邏輯。現在 B 一進場就緊貼，該理由作廢。
     #
     # 真正還成立的只有一條：間距是【對沖成形前 A 的虧損上限】。
     #   價格跌不到間距 → B 沒觸發 → A 的浮虧一定小於間距
@@ -2784,7 +2899,7 @@ async def cmd_run(u, c):
     if gap + hug_p >= sl:
         await reply(u, f"{E.BOT} {E.WARN} 提醒：間距 {pct(gap)}% + 緊貼 "
                        f"{float(hug_p):.3f}% ≥ SL {pct(sl)}%\n"
-                       f"→ 等待期過後 A 的緊貼落點已到靜態SL 附近，對 A 幾乎沒有改善空間"
+                       f"→ 對沖成形後 A 的減損落點已到靜態SL 附近，對 A 幾乎沒有改善空間"
                        f"（對 B 不影響）。仍可執行。")
     # ── 護欄② TP 必須大於總成本 ──
     tp_min = sl + FEE_TOTAL * 100
@@ -3109,9 +3224,8 @@ def _side_block(S, side, waiting, holding):
 
 def _tf_note(S, holding_a, holding_b):
     """下個 TF 到期時會發生什麼。
-    【v3.8】TF 不再碰 SL —— 舊版的「TF 逼倉」已被 30 秒認輸緊貼取代
-    （30 秒比 5 分鐘快十倍，而且不必等 K 棒收）。TF 現在只剩一個職責：
-    零持倉時撤單、重新取價、重新部署。"""
+    【v3.8】TF 不再碰 SL —— 舊版的「TF 逼倉」早已被緊貼引擎取代。
+    TF 現在只剩一個職責：零持倉時撤單、重新取價、重新部署。"""
     tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
     left = int((int(time.time() // tf_sec) + 1) * tf_sec - time.time())
     m, sec = divmod(left, 60)
@@ -3121,7 +3235,10 @@ def _tf_note(S, holding_a, holding_b):
 
 
 def _hug_state(S, side):
-    """這一側的緊貼現況，一行講完：啟動了沒、30秒那一次用了沒、移動幾次。"""
+    """這一側的緊貼現況，一行講完：現在哪一條規則在管、移動幾次。
+
+    【v4.2】顯示的判斷邏輯必須和 sl_decide 完全一致，否則畫面會騙人。
+    這裡只是把同一組條件用中文講出來，不做任何決策。"""
     if not S.get("front_filled" if side == "front" else "back_filled"):
         return "未進場"
     n   = int(S.get(f"{side}_move_n", 0) or 0)
@@ -3132,17 +3249,24 @@ def _hug_state(S, side):
         d   = S["dir"] if side == "front" else S.get("back_d", "S" if S["dir"] == "L" else "L")
         e   = Decimal(str(S["front_px" if side == "front" else "back_px"]))
         cur = Decimal(str(S.get("_last_px") or e))
+        hedged = bool(S.get("hedged")) or (side == "back")
         if cur == e:
             st = "規則1 價格不動"
         elif (cur > e) if d == "L" else (cur < e):
-            st = "規則2 往TP，持續緊貼"
-        elif el < HUG30_SEC:
-            st = f"規則3 往SL，{HUG30_SEC - el}秒後轉規則4"
+            gain = ((cur - e) / e) if d == "L" else ((e - cur) / e)
+            if hedged or gain > FEE_A:
+                st = "規則2 往TP，持續緊貼"
+            else:
+                st = (f"規則3 按兵不動，獲利{gain*100:.3f}%"
+                      f"／手續費率{float(FEE_A*100):.3f}%")
+        elif hedged:
+            st = "規則4 對沖中往SL，持續緊貼減損"
         else:
-            st = "規則4 往SL超過30秒，持續緊貼"
+            st = "規則3 按兵不動，往SL等保護單"
     except Exception:
         st = f"進場{el}秒"
-    return st + f"｜移動{n}次" + (f"｜失敗{fn}" if fn else "")
+    mode = "模式二" if (bool(S.get("hedged")) or side == "back") else "模式一"
+    return f"{mode}｜{st}｜移動{n}次" + (f"｜失敗{fn}" if fn else "")
 
 
 def _skip_note(S, top=4):
@@ -3420,9 +3544,13 @@ def _tune_block(sym, all_rows):
                      else f"  ▸ SL 倍數健康，維持 {sl:.2f}%")
 
     # 【緊貼診斷】
-    hgs = [r for r in rows if r.get("reason") == "緊貼SL"]
+    # 【v4.2 修正】出場原因字串是「緊貼SL(規則2)」「減損SL(規則4)」，
+    # 舊版寫死比對 == "緊貼SL" 永遠 0 筆 —— 整段診斷一直是空的卻長得像正常。
+    # 這正是「沒有資料不能長得像一切正常」那條原則被自己違反的例子。
+    hgs = [r for r in rows if str(r.get("reason") or "").startswith(("緊貼SL", "減損SL"))]
     L.append("")
-    L.append(f"【緊貼診斷】緊貼SL 出場 {len(hgs)} 筆")
+    L.append(f"【緊貼診斷】動態SL 出場 {len(hgs)} 筆"
+             + ("" if hgs else "　⚪ 尚無資料"))
     if hgs:
         mfe  = _avg([float(r.get("mfe") or 0) for r in hgs])
         real = _avg([float(r.get("net") or 0) / (float(r.get("nv") or 1) or 1) * 100 for r in hgs])
@@ -3451,9 +3579,23 @@ def _tune_block(sym, all_rows):
     fails = sum(int(r.get("move_fail") or 0) for r in rows)
     tfs   = sum(int(r.get("move_tf") or 0) for r in rows)
     L.append("")
-    L.append(f"【SL移動】平均 {_avg(mv):.1f} 次／單｜TF逼倉 {tfs} 次｜失敗 {fails} 次")
+    L.append(f"【SL移動】平均 {_avg(mv):.1f} 次／單｜規則4減損 {tfs} 次｜失敗 {fails} 次")
     nomove = len([x for x in mv if x == 0])
-    L.append(f"  完全沒移動 {nomove}/{len(rows)} 筆（{nomove/len(rows)*100:.0f}%）← 緊貼從未啟動")
+    L.append(f"  完全沒移動 {nomove}/{len(rows)} 筆（{nomove/len(rows)*100:.0f}%）"
+             f"← 模式一按兵不動也算在內")
+
+    # 【市價滑價】v4.2：手續費之外的第三筆成本，決定緊貼距離要用真實數字。
+    sp = sorted(float(r["slip"]) for r in rows if r.get("slip") is not None)
+    L.append("")
+    if sp:
+        med = sp[len(sp) // 2]
+        L.append(f"【滑價】SL出場 {len(sp)} 筆　中位 {med:+.3f}%"
+                 f"｜最差 {sp[-1]:+.3f}%｜最好 {sp[0]:+.3f}%")
+        L.append(f"  ▸ 真實打平點 ≈ 緊貼 {hug:.3f}% + A費 "
+                 f"{float(FEE_A*100):.3f}% + 滑價 {max(med,0):.3f}% = "
+                 f"{hug + float(FEE_A*100) + max(med, 0):.3f}%")
+    else:
+        L.append("【滑價】⚪ 尚無資料（v4.2 起才記錄，跑幾場就有）")
 
     # 【綜合】損益用全部紀錄（舊版也有記損益，是有效的）
     nets = [float(r.get("net") or 0) for r in all_rows]
@@ -3867,42 +4009,44 @@ async def _apitest_run(u, sym, dirs):
 # 部署完先跑這個：表全過，才代表這台機器上的規則跟談好的一致。
 # 不下任何單、不碰任何持倉，隨時可跑。
 #
-# 進場價 100.00、tick 0.01 —— 0.1% 剛好 0.10 U，數字可心算核對。
-# 做多靜態SL 99.60（-0.4%）；做空靜態SL 100.40（+0.4%）
-# (編號, 規則, 說明, 方向, 進場, 現價, 現SL, 秒, 等待秒, 預期action, 預期價)
+# 進場價 100.00、tick 0.01 —— 緊貼 0.1% 剛好 0.10 U，手續費率 0.07% 剛好 0.07 U，
+# 數字可心算核對。做多靜態SL 99.60（-0.4%）；做空靜態SL 100.30（+0.4% of 99.90）
+# (編號, 規則, 說明, 方向, 進場, 現價, 現SL, hedged, 預期action, 預期價)
 SELFTEST_A = [
- (1, 1,"價格不動",                  "L","100.00","100.00"," 99.60",  1,30,"hold",None),
- (2, 2,"往TP +0.02U（極小也貼）",    "L","100.00","100.02"," 99.60",  1,30,"move","99.92"),
- (3, 2,"往TP +0.10U",              "L","100.00","100.10"," 99.93", 10,30,"move","100.00"),
- (4, 2,"往TP +0.80U",              "L","100.00","100.80","100.00", 20,30,"move","100.70"),
- (5, 0,"往TP後回撤，SL已更近",       "L","100.00","100.50","100.70", 40,30,"hold",None),
- (6, 3,"往SL -0.20U，10秒（沉住氣）","L","100.00"," 99.80"," 99.60", 10,30,"hold",None),
- (7, 3,"往SL -0.20U，29秒",         "L","100.00"," 99.80"," 99.60", 29,30,"hold",None),
- (8, 4,"往SL -0.20U，30秒（認輸）",  "L","100.00"," 99.80"," 99.60", 30,30,"move","99.71"),
- (9, 4,"★往SL，B已進場→等待作廢",   "L","100.00"," 99.90"," 99.60",  5, 0,"move","99.81"),
- (10,0,"往SL續跌，不准放鬆",         "L","100.00"," 99.75"," 99.71", 95,30,"hold",None),
- (11,2,"認輸後反彈翻身",             "L","100.00","100.20"," 99.71",120,30,"move","100.10"),
+ (1, 1,"價格不動",                     "L","100.00","100.00"," 99.60",0,"hold",None),
+ (2, 3,"往TP +0.05U（未達手續費率0.07U）","L","100.00","100.05"," 99.60",0,"hold",None),
+ (3, 3,"★往TP +0.07U（剛好等於，不貼）", "L","100.00","100.07"," 99.60",0,"hold",None),
+ (4, 2,"★往TP +0.08U（超過，開始緊貼）", "L","100.00","100.08"," 99.60",0,"move","99.98"),
+ (5, 2,"往TP +1.00U（一路跟上去）",     "L","100.00","101.00"," 99.60",0,"move","100.90"),
+ (6, 3,"★往SL -0.20U（按兵不動等B）",   "L","100.00"," 99.80"," 99.60",0,"hold",None),
+ (7, 3,"★往SL -0.39U（快碰靜態SL也不動）","L","100.00"," 99.61"," 99.60",0,"hold",None),
+ (8, 0,"往TP後回撤，SL已更近",          "L","100.00","101.00","100.95",0,"hold",None),
+]
+SELFTEST_H = [
+ (9, 2,"★模式二 往TP +0.02U（不看手續費率）","L","100.00","100.02"," 99.60",1,"move","99.92"),
+ (10,4,"★模式二 往SL -0.20U（減損）",   "L","100.00"," 99.80"," 99.60",1,"move","99.71"),
+ (11,0,"模式二 往SL續跌，不准放鬆",      "L","100.00"," 99.75"," 99.71",1,"hold",None),
+ (12,1,"模式二 價格不動",               "L","100.00","100.00"," 99.71",1,"hold",None),
 ]
 SELFTEST_B = [
- (12,1,"B：價格不動",               "S"," 99.90"," 99.90","100.30",  1, 0,"hold",None),
- (13,2,"B：往TP -0.05U（立刻貼）",   "S"," 99.90"," 99.85","100.30",  1, 0,"move","99.94"),
- (14,2,"B：往TP -0.40U",            "S"," 99.90"," 99.50"," 99.94", 20, 0,"move","99.59"),
- (15,4,"★B：往SL +0.05U，第1秒就貼", "S"," 99.90"," 99.95","100.30",  1, 0,"move","100.04"),
- (16,4,"★B：往SL +0.10U，第3秒",     "S"," 99.90","100.00","100.30",  3, 0,"move","100.10"),
- (17,0,"B：往SL續漲，不准放鬆",      "S"," 99.90","100.05","100.04", 10, 0,"hold",None),
- (18,0,"B：往TP後反彈，SL已更近",    "S"," 99.90"," 99.70"," 99.59", 60, 0,"hold",None),
+ (13,1,"B：價格不動",                  "S"," 99.90"," 99.90","100.30",1,"hold",None),
+ (14,2,"B：往TP -0.05U（立刻貼）",      "S"," 99.90"," 99.85","100.30",1,"move","99.94"),
+ (15,2,"B：往TP -0.40U",               "S"," 99.90"," 99.50"," 99.94",1,"move","99.59"),
+ (16,4,"★B：往SL +0.05U（減損）",       "S"," 99.90"," 99.95","100.30",1,"move","100.04"),
+ (17,0,"B：往SL續漲，不准放鬆",         "S"," 99.90","100.05","100.04",1,"hold",None),
+ (18,0,"B：往TP後反彈，SL已更近",       "S"," 99.90"," 99.70"," 99.59",1,"hold",None),
 ]
 RULE_CN = {0:"棘輪擋(規則1)", 1:"規則1不動", 2:"規則2往TP貼",
-           3:"規則3沉住氣", 4:"規則4認輸貼"}
+           3:"規則3按兵不動", 4:"規則4對沖減損"}
 
 
 def _selftest_rows(cases, out):
     tick = Decimal("0.01"); F = HUG_FIXED
     bad = 0
-    for (n, rl, desc, d, ent, cur, sl, el, wt, exp_a, exp_p) in cases:
+    for (n, rl, desc, d, ent, cur, sl, hg, exp_a, exp_p) in cases:
         ent = ent.strip(); cur = cur.strip(); sl = sl.strip()
         try:
-            a, p, why, rule = sl_decide(d, ent, cur, sl, F, tick, el, wt)
+            a, p, why, rule = sl_decide(d, ent, cur, sl, F, tick, bool(hg), FEE_A)
         except Exception as ex:
             out.append(f"{n:>2} {desc} 💥 {type(ex).__name__}: {ex}"); bad += 1; continue
         okA = (a == exp_a)
@@ -3915,7 +4059,7 @@ def _selftest_rows(cases, out):
             mark = "✅"
         act = f"移SL→{p}" if a == "move" else "不動"
         out.append(f"{n:>2} {desc}")
-        out.append(f"   現{cur} SL{sl} {el}秒(等待{wt}) → {act}　{mark}")
+        out.append(f"   現{cur} SL{sl} {'模式二' if hg else '模式一'} → {act}　{mark}")
         out.append(f"   {why}")
     return bad
 
@@ -3923,12 +4067,17 @@ def _selftest_rows(cases, out):
 def _selftest_lines():
     """跑情境表，回傳給 TG 的行陣列。純計算，不碰網路。"""
     F = HUG_FIXED; tick = Decimal("0.01")
-    out = [f"緊貼 {F*100}% = 0.10 U｜A單等待 {HUG30_SEC} 秒｜B單等待 0 秒",
+    out = [f"緊貼 {float(F*100):.3f}% = 0.10 U｜"
+           f"模式一 往TP 要超過手續費率 {float(FEE_A*100):.3f}% = 0.07 U 才貼",
+           "模式一 = B單未觸發（按兵不動）｜模式二 = B單觸發過（全面緊貼）",
            "進場價 100.00｜tick 0.01（0.1% = 0.10 U，可心算）", ""]
-    out.append("━━ A單（限價埋伏）進場100.00 靜態SL 99.60 ━━")
+    out.append("━━ 模式一　A單（限價埋伏）進場100.00 靜態SL 99.60 ━━")
     bad = _selftest_rows(SELFTEST_A, out)
     out.append("")
-    out.append("━━ B單（觸發對沖）進場99.90 靜態SL 100.30 ━━")
+    out.append("━━ 模式二　A單（B已觸發過）進場100.00 ━━")
+    bad += _selftest_rows(SELFTEST_H, out)
+    out.append("")
+    out.append("━━ B單（觸發對沖，恆模式二）進場99.90 靜態SL 100.30 ━━")
     bad += _selftest_rows(SELFTEST_B, out)
 
     # ── 壓縮帶：兩單都在場時，兩條動態SL 從兩側夾住現價 ──
@@ -3943,7 +4092,7 @@ def _selftest_lines():
     out.append("→ 價格動 0.1% 就有一單被逼出，存活的那單繼續緊貼")
 
     out.append("")
-    tot = len(SELFTEST_A) + len(SELFTEST_B)
+    tot = len(SELFTEST_A) + len(SELFTEST_H) + len(SELFTEST_B)
     out.append(f"{tot} 種情境｜通過 {tot-bad}｜失敗 {bad}")
     if bad:
         out.append(f"{E.LOSS} 有情境不符預期 —— 這台機器的規則跟談好的不一致，先別交易")
@@ -4022,19 +4171,20 @@ def _log_engine_lines():
 
 def _selftest_fails():
     """規則自檢的失敗數（不印表，只要結論）。"""
-    bad = 0; tick = Decimal("0.01"); F = HUG_FIXED
-    for cases in (SELFTEST_A, SELFTEST_B):
-        for (n, rl, desc, d, ent, cur, sl, el, wt, exp_a, exp_p) in cases:
+    bad = 0; tick = Decimal("0.01"); F = HUG_FIXED; tot = 0
+    for cases in (SELFTEST_A, SELFTEST_H, SELFTEST_B):
+        tot += len(cases)
+        for (n, rl, desc, d, ent, cur, sl, hg, exp_a, exp_p) in cases:
             try:
                 a, p, why, rule = sl_decide(d, ent.strip(), cur.strip(), sl.strip(),
-                                            F, tick, el, wt)
+                                            F, tick, bool(hg), FEE_A)
             except Exception:
                 bad += 1; continue
             if a != exp_a or rule != rl:
                 bad += 1
             elif exp_p is not None and (p is None or Decimal(str(p)) != Decimal(exp_p)):
                 bad += 1
-    return bad, len(SELFTEST_A) + len(SELFTEST_B)
+    return bad, tot
 
 
 def _check_health_lines():
@@ -4048,7 +4198,8 @@ def _check_health_lines():
     # ① 規則：這台機器上的緊貼規則和談好的一致嗎
     bad, tot = _selftest_fails()
     out.append(f"{'🟢' if not bad else '🔴'} 規則　　{tot-bad}/{tot} 通過"
-               f"｜緊貼{float(HUG_FIXED*100):.3f}%　A等{HUG30_SEC}s　B等0s")
+               f"｜緊貼{float(HUG_FIXED*100):.3f}%　"
+               f"模式一手續費率{float(FEE_A*100):.3f}%")
 
     # ② 連線
     lat = [v for dq in API_LAT.values() for v in dq]
@@ -4527,16 +4678,20 @@ async def cmd_menu(u, c):
         "兩單都成交時完全對沖，損益鎖死=-間距，與價格無關；\n"
         "價格衝出箱子時一邊被SL掃、一邊獨活順勢起飛。\n"
         "━━━━━━━━━━\n"
-        "【緊貼四種情境】\n"
-        "1 價格不動→SL不動\n"
-        f"2 往TP→立刻貼到 {float(HUG_FIXED*100):.3f}%（下限 {MIN_HUG_TICKS} 檔）\n"
-        "3 往SL·等待期內→不動，沉住氣\n"
-        f"4 往SL·等待期外→立刻貼到 {float(HUG_FIXED*100):.3f}%，認輸\n"
-        f"等待期：A單 {HUG30_SEC}秒（B一進場就作廢）｜B單 0秒\n"
-        f"SL=現價±{float(HUG_FIXED*100):.3f}%，不判斷峰值、無啟動門檻，只准拉近\n"
+        "【緊貼兩個模式】開關只有一個：B單觸發過沒有\n"
+        "模式一 B未觸發＝按兵不動\n"
+        f"　往SL→不動｜往TP未超過手續費率 {float(FEE_A*100):.3f}%→不動\n"
+        f"　往TP超過 {float(FEE_A*100):.3f}%→緊貼到 {float(HUG_FIXED*100):.3f}%\n"
+        "模式二 B觸發過＝全面緊貼（閂，不翻回去）\n"
+        f"　往TP→貼鎖利｜往SL→貼減損，夾出 "
+        f"{float(HUG_FIXED*200):.3f}% 壓縮帶\n"
+        f"SL=現價±{float(HUG_FIXED*100):.3f}%（下限 {MIN_HUG_TICKS} 檔），"
+        f"不判斷峰值，只准拉近\n"
+        f"比較用的就是 A單來回手續費率，沒有第二個常數\n"
         f"每 {PRICE_TICK_SEC}s 一次，A/B 各自獨立\n"
-        "規則全在 sl_decide() 一處，/selftest 可當場驗證\n"
-        f"手續費 A {float(FEE_A*100):.3f}%／B {float(FEE_B*100):.3f}%（只用於損益，不決定緊貼）\n"
+        "規則全在 sl_decide() 一處，/check rule 可當場驗證\n"
+        f"手續費 A {float(FEE_A*100):.3f}%（maker+taker）／"
+        f"B {float(FEE_B*100):.3f}%（taker×2）\n"
         "━━━━━━━━━━\n"
         "【TF】只剩一個職責：零持倉→撤單重新部署\n"
         "━━━━━━━━━━\n"
