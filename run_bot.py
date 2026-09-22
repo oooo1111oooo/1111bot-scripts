@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.2.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.2.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -1757,15 +1757,19 @@ def _move_stat(mhist):
 def _sl_block(mn, mhist, fn=0):
     """SL 移動明細區塊。
 
-    每一行只有一件事：這一次 SL 從哪裡搬到哪裡，以及搬完離當時現價幾 %。
-      SL舊→SL新(0.093%)
-    設定 0.100%，對齊 tick 之後實際落在 0.09~0.11%。這一欄偏離太多，
-    就代表緊貼出問題了 —— 這是唯一能當場驗算的數字。
-    毫秒摘要已移除（要看速度去 /check sl，交易紀錄裡 dt 仍照記）。
+      15:08:48 | 0.09866▶️0.09904 (0.091%)
+
+    括號裡是搬完之後 SL 離【當時現價】多遠。設定 0.100%，對齊 tick 之後
+    實際落在 0.09~0.11%；偏離太多就是緊貼出問題了 —— 這是唯一能當場驗算的數字。
+
+    【為什麼成功的那些不印圖示】九成以上都是成功，每行一個 ✅ 只是噪音。
+    但【不是成功的一定要看得見】：規則4 減損（⏰）和送單失敗（🚫）會保留圖示，
+    標題也會補上次數。全部成功時標題就乾淨地只有一行 —— 乾淨代表真的沒事，
+    不是因為把壞消息藏起來。
     """
     p, t, f = _move_stat(mhist)
     head = f"SL移動 {mn} 次"
-    if p or t or f:
+    if t or f:                       # 只有「不是全部成功」時才標次數
         head += f"（{E.MOVE_PROFIT}{p} {E.MOVE_TIME}{t} {E.MOVE_FAIL}{f}）"
     lines = ["━━━━━━━━━━", head]
     if not mhist:
@@ -1777,7 +1781,7 @@ def _sl_block(mn, mhist, fn=0):
             sl = Decimal(str(m.get("sl")))
             px = Decimal(str(m.get("px") or 0))
             if px > 0:
-                return f"({abs(px - sl) / px * 100:.3f}%)"
+                return f" ({abs(px - sl) / px * 100:.3f}%)"
         except Exception:
             pass
         return ""
@@ -1785,8 +1789,10 @@ def _sl_block(mn, mhist, fn=0):
     for m in mhist[-10:]:
         sl0 = m.get("sl0")
         sl  = m.get("sl", "")
-        arrow = f"SL{sl0}→SL{sl}" if sl0 else f"SL{sl}"
-        lines.append(f"{m.get('t','')} {m.get('type','')} {arrow}{_hug_pct(m)}")
+        arrow = f"{sl0}▶️{sl}" if sl0 else f"{sl}"
+        ty = m.get("type", "")
+        mark = "" if ty == E.MOVE_PROFIT else f"{ty} "
+        lines.append(f"{m.get('t','')} | {mark}{arrow}{_hug_pct(m)}")
     if len(mhist) > 10:
         lines.append(f"（顯示最近10筆，共{len(mhist)}筆）")
     return "\n".join(lines)
@@ -1803,6 +1809,8 @@ def _exit_snapshot(S, side, seq):
         "dir": d, "sym": S["sym"], "iid": S["spec"]["iid"], "tick": S["spec"]["tick"],
         "pos_side": "long" if d == "L" else "short",
         "lev": S.get("lev"), "margin": S.get("margin"), "seq": seq,
+        # 【v4.2.1】張數 —— 算「名目本金」用，它才是損益%的正確分母。
+        "sz": S.get(f"{pre}_sz"),
         "entry_px": S.get(f"{pre}_px"), "entry_ee": S.get(f"{pre}_ee"),
         "tp_px": S.get(f"{pre}_tp_px"), "static_sl": S.get(f"{pre}_static_sl"),
         "last_sl": S.get(f"{pre}_sl_px"), "peak": S.get(f"{pre}_peak"),
@@ -1902,7 +1910,9 @@ def _peak_line(snap):
 async def _build_exit_msg(snap, rec):
     """組出場通知全文（從快照，不碰 S）。回傳 (訊息, 毛, 費, 淨, 原因)。"""
     d = snap["dir"]
-    mv = float(Decimal(str(snap.get("margin", "1"))))
+    # 【v4.2.1】損益%的分母改用【名目本金】，不是保證金。理由見 _notional()。
+    _nv, _nv_ok = _notional(snap)
+    mv = float(_nv)
     # 【#30】不再查 OKX 即時掛單。記帳是背景執行的，那時新戰役的掛單早就掛上去了，
     # live 查詢會抓到【下一場】的 TP/SL（實測第63輪顯示 0.09086/0.08701，
     # 那是新 A 埋伏價 0.08736 算出來的，不是這一單的）。
@@ -1940,10 +1950,11 @@ async def _build_exit_msg(snap, rec):
         f"出場 {xpx}　{hhmmss()}　持倉 {hold_s} 秒\n"
         f"{_peak_line(snap)}\n"
         f"━━━━━━━━━━\n"
-        f"毛 {g_r:+.6f}（{g_pct:+.3f}%）\n"
-        f"費 {fee_r:.6f}（{fee_pct:+.3f}%）\n"
-        f"淨 {net_r:+.6f}（{net_pct:+.3f}%）{ico}　淨利率\n"
-        f"{_sl_block(snap['move_n'], snap['move_hist'])}"
+        f"毛利(率)　：{g_r:+.6f}（{g_pct:+.3f}%）\n"
+        f"手續費(率)：{fee_r:.6f}（{fee_pct:+.3f}%）\n"
+        f"淨利(率)　：{net_r:+.6f}（{net_pct:+.3f}%）{ico}\n"
+        + ("" if _nv_ok else "（%以保證金估算：查不到張數）\n")
+        + f"{_sl_block(snap['move_n'], snap['move_hist'])}"
     )
     return msg, g_r, fee_r, net_r, reason
 
@@ -2010,6 +2021,32 @@ def _dt_stat(mh, what):
     return v[len(v) // 2]
 
 
+def _notional(snap):
+    """這一單的【名目本金】= 進場價 × 張數 × 每張合約價值。
+
+    【為什麼不能用保證金當分母】保證金是「我打算投入多少」，名目本金是
+    「實際買到多少」，兩者因為張數要無條件捨去而不相等。
+    實測 2026-09-22 DOGE：保證金 1.2U，1.2÷0.09906÷10 = 1.21 張 → 捨去成
+    1 張 = 10 DOGE = 0.9906U。用 1.2 當分母，手續費算出來是 0.058%，
+    但真實費率是 0.070% —— 正好是引擎拿來比較的那個數字，對不起來就等於
+    畫面在騙人。
+    算不出來（缺張數或合約價值）才退回保證金，並回傳 False 讓呼叫端知道。
+    回傳 (分母, 是否為名目本金)。"""
+    try:
+        sz = Decimal(str(snap.get("sz") or 0))
+        cv = Decimal(str((snap.get("spec") or {}).get("ctval") or 0))
+        px = Decimal(str(snap.get("entry_px") or 0))
+        nv = sz * cv * px
+        if nv > 0:
+            return nv, True
+    except Exception:
+        pass
+    try:
+        return Decimal(str(snap.get("margin") or 1)), False
+    except Exception:
+        return Decimal("1"), False
+
+
 def _slip_pct(snap, close_px):
     """市價出場滑了多少（%，相對出場價）。正值 = 比 SL 差。
 
@@ -2042,7 +2079,10 @@ def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
     """
     d = snap["dir"]
     ent = snap.get("entry_px"); xpx = (rec or {}).get("closeAvgPx")
-    nv  = float(Decimal(str(snap.get("margin", "1")))) or 1.0
+    # 【v4.2.1】nv 改為【名目本金】（實際買到多少），不再是保證金（打算投入多少）。
+    # v4.2.1 之前的紀錄 nv 是保證金，兩者相差張數捨去的那一截，%不可直接互比。
+    _nv_d, _nv_ok = _notional(snap)
+    nv  = float(_nv_d) or 1.0
     try:
         amp = float(Decimal(str(snap.get("amp") or 0)) * 100)
     except Exception:
@@ -2065,6 +2105,10 @@ def _trade_record(snap, reason, g_r, fee_r, net_r, rec, ee):
         "entry": str(ent or ""), "exit": str(xpx or ""),
         "peak": str(snap.get("peak") or ""), "trough": str(snap.get("trough") or ""),
         "gross": float(g_r), "fee": float(fee_r), "net": float(net_r), "nv": nv,
+        # nvsrc 記下分母是什麼 —— 混著舊紀錄分析時才知道哪些可以比
+        "nvsrc": "名目" if _nv_ok else "保證金",
+        "margin": float(Decimal(str(snap.get("margin") or 0)) or 0),
+        "sz": str(snap.get("sz") or ""),
         "hold_s": int(time.time() - ee),
         # 參數快照
         "amp": round(amp, 4), "sl": sl_set, "hug": round(hug, 4),
@@ -2363,16 +2407,6 @@ async def _ensure_b_oco(S, iid, b_ps, back_d, fill_px):
     return False
 
 
-def _hug_brief(spec, ref_px, F):
-    """緊貼距離的短寫：0.100%|9檔"""
-    try:
-        ref = Decimal(str(ref_px))
-        n = int(((ref * F) / spec["tick"]).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-        return f"{F * 100:.3f}%|{n}檔"
-    except Exception:
-        return f"{F * 100:.3f}%"
-
-
 def _trigger_line(S, side):
     """進場通知用：這一單的 SL【第一次】會被貼到哪裡。
 
@@ -2508,8 +2542,7 @@ async def loop(app, chat, S):
                     f"進場 {fpx}　{hhmmss()}\n"
                     f"初始TP {S['front_tp_px']}（{'+' if d=='L' else '-'}"
                     f"{float(S['tp']):.1f}%）\n"
-                    f"初始SL {S['front_static_sl']} → {_trigger_line(S,'front')}"
-                    f"({_hug_brief(spec, fpx, hug_pct(S,'front'))})\n"
+                    f"初始SL {S['front_static_sl']} → {_trigger_line(S,'front')}\n"
                     f"━━━━━━━━━━\n"
                     f"對手 {_bnote}")
 
@@ -2534,8 +2567,7 @@ async def loop(app, chat, S):
                     f"進場 {bpx}　{hhmmss()}\n"
                     f"初始TP {S['back_tp_px']}（{'+' if back_d=='L' else '-'}"
                     f"{float(S['tp']):.1f}%）\n"
-                    f"初始SL {S['back_static_sl']} → {_trigger_line(S,'back')}"
-                    f"({_hug_brief(spec, bpx, hug_pct(S,'back'))})\n"
+                    f"初始SL {S['back_static_sl']} → {_trigger_line(S,'back')}\n"
                     f"━━━━━━━━━━\n"
                     f"對手 {_anote}")
 
@@ -3229,9 +3261,9 @@ def _tf_note(S, holding_a, holding_b):
     tf_sec = TF_SEC.get(S.get("tf", ACCOUNT_TF), 300)
     left = int((int(time.time() // tf_sec) + 1) * tf_sec - time.time())
     m, sec = divmod(left, 60)
-    t = f"{m}分{sec:02d}秒後" if m else f"{sec}秒後"
-    act = "有持倉，TF 不干預" if (holding_a or holding_b) else "零持倉，撤單重新部署"
-    return f"下個TF：{t}（{act}）"
+    t = f"{m}分{sec:02d}秒" if m else f"{sec}秒"
+    return (f"下個TF：尚有{t}\n"
+            f"（確認零持倉才會撤單重新部署）")
 
 
 def _hug_state(S, side):
