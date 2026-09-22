@@ -40,7 +40,7 @@ WINDOW_SEC = 120          # 往前看幾秒（對應你的持倉時間 14~217 �
 HUG_GRID   = [0.05, 0.075, 0.10, 0.125, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40,
               0.50, 0.60, 0.70, 0.85, 1.00]      # 緊貼候選 %
 ENTRY_STEP = 5            # 每幾秒取一個模擬進場點
-REQ_PER_SEC = 8.0         # 送出速率（OKX 限 20次/2秒，留一半餘裕）
+REQ_PER_SEC = 6.0         # 送出速率（OKX 限 20次/2秒；壓低以免影響同 IP 的交易 bot）
 
 # ==================== 小工具 ====================
 def log(*a):
@@ -165,10 +165,13 @@ def do_probe():
 
 # ==================== 下載 ====================
 def fetch_series(iid, bar, page, seconds_back):
-    """往回抓到指定秒數，回 (ts, o, h, l, c) 五個 np.array（時間由舊到新）。"""
+    """往回抓到指定秒數，回 (ts,o,h,l,c) 的 np.array（時間由舊到新）。
+
+    【記憶體】每頁立刻轉成 numpy 小陣列再丟掉原始 JSON —— 累積 list 的話
+    26 萬根會吃掉 100MB+，而這台機器上有正在跑的交易 bot，不能冒 OOM 的險。"""
     need_ms = seconds_back * 1000
     newest = None; oldest = None
-    rows = []
+    chunks = []; total = 0; pages = 0
     while True:
         q = f"/api/v5/market/history-candles?instId={iid}&bar={bar}&limit={page}"
         if oldest:
@@ -176,18 +179,24 @@ def fetch_series(iid, bar, page, seconds_back):
         d = http_get(q)
         if not d:
             break
-        rows.extend(d)
+        chunks.append(np.array([[float(r[0]), float(r[1]), float(r[2]),
+                                 float(r[3]), float(r[4])] for r in d],
+                               dtype=np.float64))
+        total += len(d); pages += 1
         if newest is None:
             newest = float(d[0][0])
         oldest = d[-1][0]
+        if pages % 100 == 0:
+            od = datetime.datetime.fromtimestamp(float(oldest) / 1000).strftime("%m-%d %H:%M")
+            log(f"    …{total} 根，最舊 {od}")
         if newest - float(oldest) >= need_ms:
             break
-        if len(rows) > 2_000_000:
+        if total > 1_500_000:
             break
-    if not rows:
+    if not chunks:
         return None
-    arr = np.array([[float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])]
-                    for r in rows], dtype=np.float64)
+    arr = np.concatenate(chunks)
+    del chunks
     arr = arr[np.argsort(arr[:, 0])]
     _, keep = np.unique(arr[:, 0], return_index=True)
     arr = arr[np.sort(keep)]
@@ -478,6 +487,9 @@ def main():
             nomail = True
         elif x == "--only" and i + 1 < len(a):
             only = {s.strip().upper() for s in a[i + 1].split(",") if s.strip()}
+        elif x == "--rate" and i + 1 < len(a):
+            globals()["REQ_PER_SEC"] = max(1.0, min(9.0, float(a[i + 1])))
+            log(f"送出速率設為 {REQ_PER_SEC}/秒")
     if mode == "probe":
         return do_probe()
     if mode == "run":
