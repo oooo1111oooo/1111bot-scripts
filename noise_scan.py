@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-noise_scan.py v3 —— 1秒K 雜訊掃描（獨立腳本，不碰 run_bot.py）
+noise_scan.py v4 —— 雜訊存活分析（獨立腳本，不碰 run_bot.py）
 
-v3 改了什麼（v2 的結論不可信，原因是方法不是數字）：
-  1. 【埋伏條件進場】v2 每 5 秒取一點當進場 —— 那是隨機進場，本來就沒有優勢。
-     v3 只在「價格剛從近期低/高點走了 AMBUSH% 」的那一刻進場，模擬 A 單真實成交。
-     同時保留隨機進場當對照組，兩個數字並排你才知道埋伏本身有沒有價值。
-  2. 【緊貼網格改用檔數】3~85 檔。v2 用固定 % 網格，結果 WIF/ADA/TAO/WLD
-     最佳值落在 0.05%，但它們的 3 檔地板就 0.07~0.14%，那個值生產環境設不出來。
-  3. 【直接印淨利】毛利 − 手續費。v2 只印毛利，害你得自己減。
-  4. 【三個窗口】60/120/300 秒。你的持倉是 14~217 秒，v2 只測 120 秒可能砍掉長單。
-  5. 滑價緩衝改 4 檔（WIF 實測值），可用 --slip-ticks 調。
-  6. 刪掉 instId 與秒波動P50（16 個幣有 13 個是 0），tick 改文字避免科學符號。
-  7.「被停損%」更名「停損觸發%」並加真正的「勝率%」——
-     追蹤停損被打到本來就是正常出場，不是虧損。
+【v4 和前三版的根本差別】
+前三版在算「哪個停損距離的平均毛利最高」。在接近隨機的價格上，那個答案
+永遠是「越緊越好」—— 緊的停損虧得少。那是數學必然，不是交易發現，
+而且和實盤事實相反（緊貼 0.1% 兩秒就被掃掉）。
+
+v4 改問一個問題，而且只問這一個：
+    「要離多遠，部位才不會被日常震盪掃掉？」
+
+做法：從每個時點進場，量價格【第一次】逆向走到 X% 需要多久。
+     對每個距離 X，算出撐過 10/30/60/120/300 秒的比例。
+     雜訊% = 讓部位能撐過 60 秒、存活率達 70% 的那個距離。
+
+這個定義可以直接驗證：把 WIF 的 0.1% 那一列拉出來看 10 秒存活率，
+如果模型是對的，它應該很低 —— 因為你實盤就是兩秒被掃。
 
 用法
   python3 noise_scan.py probe
-  python3 noise_scan.py run                     預設 3 天，會直接吃既有快取
-  python3 noise_scan.py run --days 3 --ambush 0.5
-  python3 noise_scan.py run --no-mail --only WIFUSDT,SUIUSDT
+  python3 noise_scan.py run                          預設 7 天，重新下載
+  python3 noise_scan.py run --days 7 --fresh         強制重抓不讀快取
+  python3 noise_scan.py run --cache                  讀既有快取（快，但資料是舊的）
+  python3 noise_scan.py run --no-mail --only WIFUSDT
 """
 
 import os, sys, time, json, smtplib, datetime
@@ -32,7 +35,6 @@ from numpy.lib.stride_tricks import sliding_window_view
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 
-# ==================== 設定 ====================
 BASE      = "/srv/1111bot"
 CACHE_DIR = os.path.join(BASE, "data", "noise_cache")
 OUT_DIR   = os.path.join(BASE, "data")
@@ -42,18 +44,22 @@ SYMBOLS = ["AAVEUSD", "ADAUSDT", "AVAXUSDT", "BTCUSDT", "DOGEUSDT", "ETHUSDT",
            "HYPEUSDT", "LINKUSDT", "SOLUSDT", "SUIUSDT", "TAOUSDT", "WIFUSDT",
            "WLDUSDT", "XAUUSDT", "XRPUSDT", "ZECUSDT"]
 
-HUG_TICKS   = [3, 4, 5, 6, 8, 10, 13, 16, 20, 26, 33, 42, 53, 67, 85]
-WINDOWS     = [60, 120, 300]      # 秒
-AMBUSH_PCT  = 0.5                 # 埋伏率%（可用 --ambush 改）
-AMBUSH_LOOK = 600                 # 往回幾秒找低/高點
-MIN_GAP     = 120                 # 兩次埋伏成交至少隔幾秒（保持樣本獨立）
-MAX_ENTRY   = 20000               # 進場點上限（超過就等距抽樣）
-FEE_A       = 0.070               # A單來回手續費%
-FEE_B       = 0.100               # B單來回手續費%
-SLIP_TICKS  = 4                   # 滑價緩衝（檔）
+# 候選距離（%）—— 涵蓋你現在用的 0.1% 到遠得多的 3%
+DIST = [0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40,
+        0.50, 0.75, 1.00, 1.50, 2.00, 3.00]
+SURV_SEC   = [10, 30, 60, 120, 300]     # 存活率觀察秒數
+KEY_SEC    = 60                          # 雜訊%以哪個秒數為準
+KEY_SURV   = 70.0                        # 雜訊%：存活率門檻（%）
+GAP_SURV   = 80.0                        # 兩單間距：更嚴格的門檻
+AMBUSH_SET = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+AMBUSH_LOOK = 600
+MIN_GAP     = 120
+MAX_ENTRY   = 30000
+SLIP_TICKS  = 4
 REQ_PER_SEC = 6.0
+FONT_NAME   = "蘋方-繁"
+FONT_SIZE   = 12
 
-# ==================== 小工具 ====================
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
 
@@ -63,21 +69,20 @@ def load_env(path):
         for line in open(path, encoding="utf-8"):
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                d[k.strip()] = v.strip().strip('"').strip("'")
+                k, v = line.split("=", 1); d[k.strip()] = v.strip().strip('"').strip("'")
     except Exception:
         pass
     return d
 
-_last_req = [0.0]
+_last = [0.0]
 def http_get(path, tries=4):
     for i in range(tries):
-        gap = 1.0 / REQ_PER_SEC - (time.time() - _last_req[0])
+        gap = 1.0 / REQ_PER_SEC - (time.time() - _last[0])
         if gap > 0:
             time.sleep(gap)
-        _last_req[0] = time.time()
+        _last[0] = time.time()
         try:
-            req = urllib.request.Request(OKX + path, headers={"User-Agent": "noise-scan/3.0"})
+            req = urllib.request.Request(OKX + path, headers={"User-Agent": "noise-scan/4.0"})
             with urllib.request.urlopen(req, timeout=20) as r:
                 j = json.loads(r.read().decode("utf-8"))
             if str(j.get("code")) == "0":
@@ -120,14 +125,13 @@ def probe_bar(iid):
     return None, 0
 
 def tick_str(t):
-    """避免 Excel 把 1e-05 顯示成科學符號。"""
     s = f"{t:.10f}".rstrip("0")
     return s + "0" if s.endswith(".") else s
 
-# ==================== 下載（與 v2 相同，快取可直接沿用）====================
+# ==================== 下載 ====================
 def fetch_series(iid, bar, page, seconds_back):
-    need_ms = seconds_back * 1000
-    newest = None; oldest = None
+    need = seconds_back * 1000
+    newest = oldest = None
     chunks = []; total = 0; pages = 0
     while True:
         q = f"/api/v5/market/history-candles?instId={iid}&bar={bar}&limit={page}"
@@ -136,16 +140,16 @@ def fetch_series(iid, bar, page, seconds_back):
         d = http_get(q)
         if not d:
             break
-        chunks.append(np.array([[float(r[0]), float(r[1]), float(r[2]),
-                                 float(r[3]), float(r[4])] for r in d], dtype=np.float64))
+        chunks.append(np.array([[float(r[0]), float(r[2]), float(r[3]), float(r[4])]
+                                for r in d], dtype=np.float64))
         total += len(d); pages += 1
         if newest is None:
             newest = float(d[0][0])
         oldest = d[-1][0]
-        if pages % 100 == 0:
+        if pages % 150 == 0:
             od = datetime.datetime.fromtimestamp(float(oldest) / 1000).strftime("%m-%d %H:%M")
             log(f"    …{total} 根，最舊 {od}")
-        if newest - float(oldest) >= need_ms or total > 1_500_000:
+        if newest - float(oldest) >= need or total > 2_500_000:
             break
     if not chunks:
         return None
@@ -154,14 +158,12 @@ def fetch_series(iid, bar, page, seconds_back):
     _, keep = np.unique(arr[:, 0], return_index=True)
     return arr[np.sort(keep)]
 
-def get_data(sym, iid, bar, page, days):
+def get_data(sym, iid, bar, page, days, use_cache):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    cf = os.path.join(CACHE_DIR, f"{sym}_{bar}_{days}d.npy")
-    if os.path.exists(cf):
+    cf = os.path.join(CACHE_DIR, f"v4_{sym}_{bar}_{days}d.npy")
+    if use_cache and os.path.exists(cf):
         try:
-            a = np.load(cf)
-            log(f"  {sym} 讀快取 {len(a)} 根（不重新下載）")
-            return a
+            a = np.load(cf); log(f"  {sym} 讀快取 {len(a)} 根"); return a
         except Exception:
             pass
     log(f"  {sym} 下載 {bar} 約 {days} 天 …")
@@ -172,12 +174,74 @@ def get_data(sym, iid, bar, page, days):
     log(f"  {sym} 完成 {len(a)} 根")
     return a
 
-# ==================== 統計 ====================
-def pct(a, q):
-    return float(np.percentile(a, q)) if len(a) else float("nan")
+# ==================== 核心：雜訊存活分析 ====================
+def survival(h, l, c, maxsec):
+    """量「價格第一次逆向走到 X% 需要多久」。
+    多空各算一次再合併 —— 做多怕跌、做空怕漲，兩邊都是雜訊。
+    回 firstk[樣本, 距離]，未觸及者為 maxsec+1。"""
+    n = len(c) - maxsec - 2
+    if n <= 1000:
+        return None, 0
+    step = max(1, n // MAX_ENTRY)
+    idx = np.arange(0, n, step, dtype=np.int64)
+    X = np.array(DIST) / 100.0
+    outs = []
+    for d in ("L", "S"):
+        entry = c[idx]
+        cur = entry.copy()
+        firstk = np.full((len(idx), len(X)), maxsec + 1, dtype=np.int32)
+        done = np.zeros((len(idx), len(X)), dtype=bool)
+        for k in range(1, maxsec + 1):
+            j = idx + k
+            if d == "L":
+                cur = np.minimum(cur, l[j])
+                adv = (entry - cur) / entry          # 做多：跌多少
+            else:
+                cur = np.maximum(cur, h[j])
+                adv = (cur - entry) / entry          # 做空：漲多少
+            for q in range(len(X)):
+                if done[:, q].all():
+                    continue
+                hit = (~done[:, q]) & (adv >= X[q])
+                if hit.any():
+                    firstk[hit, q] = k
+                    done[hit, q] = True
+            if done.all():
+                break
+        outs.append(firstk)
+    return np.vstack(outs), len(idx) * 2
 
-def adverse_depth(h, l, c, W):
-    """逆行深度：在『這一單最後會賺』的前提下，中途往虧損方向最多走多少 %。"""
+def surv_table(firstk):
+    """回 list of dict：每個距離的各秒數存活率與中位撐多久。"""
+    rows = []
+    for q, X in enumerate(DIST):
+        col = firstk[:, q]
+        r = {"dist": X}
+        for s in SURV_SEC:
+            r[f"s{s}"] = float((col > s).mean() * 100.0)
+        alive = col[col <= max(SURV_SEC)]
+        r["med"] = float(np.median(alive)) if len(alive) else float("nan")
+        r["never"] = float((col > max(SURV_SEC)).mean() * 100.0)
+        rows.append(r)
+    return rows
+
+def need_dist(rows, sec, want):
+    """要達到 want% 存活率，需要離多遠。線性內插；超出網格回最大值。"""
+    key = f"s{sec}"
+    prev = None
+    for r in rows:
+        if r[key] >= want:
+            if prev is None:
+                return r["dist"]
+            x0, y0 = prev["dist"], prev[key]
+            x1, y1 = r["dist"], r[key]
+            if y1 == y0:
+                return x1
+            return x0 + (want - y0) * (x1 - x0) / (y1 - y0)
+        prev = r
+    return float(DIST[-1])
+
+def adverse_depth(h, l, c, W=120):
     n = len(c) - W - 1
     if n <= 100:
         return np.array([])
@@ -188,235 +252,143 @@ def adverse_depth(h, l, c, W):
     dn = (c0 - fmin) / c0 * 100.0
     return np.concatenate([up[dn > up], dn[up > dn]])
 
-def _thin(mask, min_gap):
+def _thin(mask, gap):
     idx = np.flatnonzero(mask)
     if len(idx) == 0:
-        return idx
-    out = [idx[0]]; last = idx[0]
+        return 0
+    cnt = 1; last = idx[0]
     for i in idx[1:]:
-        if i - last >= min_gap:
-            out.append(i); last = i
-    return np.array(out, dtype=np.int64)
+        if i - last >= gap:
+            cnt += 1; last = i
+    return cnt
 
-def ambush_entries(h, l, c, off_pct, look, W, min_gap):
-    """模擬 A 單埋伏成交點。
-    做空埋伏掛在上方 → 價格從近 look 秒的低點【上漲】off% 時被吃到。
-    做多埋伏掛在下方 → 價格從近 look 秒的高點【下跌】off% 時被吃到。"""
-    n = len(c) - W - 2
-    if n <= look + 50:
-        return np.array([], np.int64), np.array([], np.int64)
+def ambush_count(h, l, off_pct, look, gap):
     off = off_pct / 100.0
-    rmin = np.full(len(l), np.inf)
-    rmin[look - 1:] = sliding_window_view(l, look).min(axis=1)
-    rmax = np.full(len(h), -np.inf)
-    rmax[look - 1:] = sliding_window_view(h, look).max(axis=1)
-    s_hit = h[:n] >= rmin[:n] * (1 + off)      # 做空埋伏被吃
-    l_hit = l[:n] <= rmax[:n] * (1 - off)      # 做多埋伏被吃
-    return _thin(s_hit, min_gap), _thin(l_hit, min_gap)
+    if len(l) <= look + 100:
+        return 0
+    rmin = np.full(len(l), np.inf); rmin[look - 1:] = sliding_window_view(l, look).min(axis=1)
+    rmax = np.full(len(h), -np.inf); rmax[look - 1:] = sliding_window_view(h, look).max(axis=1)
+    return _thin(h >= rmin * (1 + off), gap) + _thin(l <= rmax * (1 - off), gap)
 
-def trail_one(h, l, c, idx, F, d, W):
-    """棘輪追蹤停損模擬（落單者）。回 (毛利%, 是否被停損, 持倉秒)。"""
-    entry = c[idx].copy()
-    ext = entry.copy()
-    stop = entry * (1 - F) if d == "L" else entry * (1 + F)
-    alive = np.ones(len(idx), bool)
-    out = np.full(len(idx), np.nan)
-    hold = np.full(len(idx), float(W))
-    for k in range(1, W + 1):
-        j = idx + k
-        hi, lo = h[j], l[j]
-        hit = (alive & (lo <= stop)) if d == "L" else (alive & (hi >= stop))
-        if hit.any():
-            g = (stop - entry) / entry * 100.0
-            out[hit] = g[hit] if d == "L" else -g[hit]
-            hold[hit] = k
-            alive &= ~hit
-        if d == "L":
-            ext = np.maximum(ext, hi)
-            cand = ext * (1 - F)
-            stop = np.where(alive & (cand > stop), cand, stop)
-        else:
-            ext = np.minimum(ext, lo)
-            cand = ext * (1 + F)
-            stop = np.where(alive & (cand < stop), cand, stop)
-    last = c[idx + W]
-    g2 = (last - entry) / entry * 100.0
-    out[alive] = g2[alive] if d == "L" else -g2[alive]
-    return out, ~alive, hold
+def pctl(a, q):
+    return float(np.percentile(a, q)) if len(a) else float("nan")
 
-def scan(h, l, c, idx_s, idx_l, F, W):
-    """合併多空兩邊。回 dict。"""
-    parts, stops, holds = [], [], []
-    for idx, d in ((idx_s, "S"), (idx_l, "L")):
-        if len(idx) == 0:
-            continue
-        o, st, hd = trail_one(h, l, c, idx, F, d, W)
-        parts.append(o); stops.append(st); holds.append(hd)
-    if not parts:
-        return None
-    g = np.concatenate(parts); st = np.concatenate(stops); hd = np.concatenate(holds)
-    net = g - FEE_A
-    return {"n": len(g), "mean": float(g.mean()), "med": float(np.median(g)),
-            "net": float(net.mean()), "win": float((net > 0).mean() * 100),
-            "stop": float(st.mean() * 100), "hold": float(hd.mean())}
-
-def analyse(sym, iid, tick, arr, ambush, slip_ticks):
-    h, l, c, ts = arr[:, 2], arr[:, 3], arr[:, 4], arr[:, 0]
+def analyse(sym, tick, arr):
+    ts, h, l, c = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
     px = float(np.median(c))
+    firstk, nsamp = survival(h, l, c, max(SURV_SEC))
+    if firstk is None:
+        return None
+    rows = surv_table(firstk)
+    noise = need_dist(rows, KEY_SEC, KEY_SURV)
+    gapd = need_dist(rows, KEY_SEC, GAP_SURV)
+    adv = adverse_depth(h, l, c)
     tickp = tick / px * 100.0
     floor3 = tickp * 3.0
-    adv = adverse_depth(h, l, c, 120)
-    Wmax = max(WINDOWS)
-    a_s, a_l = ambush_entries(h, l, c, ambush, AMBUSH_LOOK, Wmax, MIN_GAP)
-    # 隨機進場對照組
-    step = max(1, (len(c) - Wmax - 2) // MAX_ENTRY)
-    r_all = np.arange(0, len(c) - Wmax - 2, step, dtype=np.int64)
-    rows = []
-    for W in WINDOWS:
-        for nt in HUG_TICKS:
-            F = (tick * nt) / px
-            if F >= 0.05:              # 超過 5% 沒有意義
-                continue
-            a = scan(h, l, c, a_s, a_l, F, W)
-            r = scan(h, l, c, r_all, r_all, F, W)
-            if not a:
-                continue
-            rows.append({"W": W, "ticks": nt, "F": F * 100, **a,
-                         "rand_net": (r["net"] if r else float("nan"))})
-    best = max(rows, key=lambda x: x["net"]) if rows else None
-    gap = pct(adv, 70)
-    slip = tickp * slip_ticks
-    hug = best["F"] if best else float("nan")
-    minsl = gap + hug + slip if best else float("nan")
-    note = []
-    if best and best["net"] <= 0:
-        note.append("★沒有任何緊貼能賺到手續費")
-    if best and best["ticks"] == HUG_TICKS[0]:
-        note.append("最佳落在3檔地板，可能更小才好但設不出來")
-    if tickp > 0.03:
-        note.append("tick粗")
-    if len(a_s) + len(a_l) < 200:
-        note.append(f"埋伏樣本僅{len(a_s)+len(a_l)}筆")
+    hug = max(noise, floor3)
+    slip = tickp * SLIP_TICKS
     return {"sym": sym, "px": px, "tick": tick, "tickp": tickp, "floor3": floor3,
-            "bars": len(c), "days": (ts[-1] - ts[0]) / 86400000.0,
-            "amb_n": len(a_s) + len(a_l),
-            "a60": pct(adv, 60), "a70": pct(adv, 70), "a80": pct(adv, 80),
-            "gap": gap, "slip": slip, "minsl": minsl, "best": best, "rows": rows,
-            "note": "／".join(note)}
+            "noise": noise, "gap": max(gapd, hug + floor3),
+            "hug": hug, "slmin": max(gapd, hug + floor3) + hug + slip,
+            "p50": pctl(adv, 50), "p60": pctl(adv, 60),
+            "p70": pctl(adv, 70), "p80": pctl(adv, 80),
+            "amb": {a: ambush_count(h, l, a, AMBUSH_LOOK, MIN_GAP) for a in AMBUSH_SET},
+            "rows": rows, "nsamp": nsamp,
+            "days": (ts[-1] - ts[0]) / 86400000.0, "bars": len(c)}
 
 # ==================== Excel ====================
 HEAD = PatternFill("solid", fgColor="1F3864")
-BADF = PatternFill("solid", fgColor="FCE4E4")
-WARNF = PatternFill("solid", fgColor="FFF2CC")
 
-def write_xlsx(res, path, days, bar, ambush, slip_ticks):
-    wb = Workbook(); ws = wb.active; ws.title = "雜訊總表"
-    cols = [("幣種", 11), ("最新價", 12), ("tick", 12), ("一檔%", 9), ("3檔地板%", 10),
-            ("天數", 7), ("根數", 9), (f"埋伏{ambush}%\n成交次數", 11),
-            ("逆行P60%", 10), ("逆行P70%", 10), ("逆行P80%", 10),
-            ("▶建議間距%", 11), ("▶建議緊貼%", 11), ("緊貼檔數", 9), ("最佳窗口秒", 10),
-            ("毛利%", 9), ("▶淨利%\n(扣A費0.07)", 13), ("勝率%", 9),
-            ("停損觸發%", 10), ("平均持倉秒", 10), ("樣本數", 9),
-            ("隨機進場淨利%", 13), (f"滑價緩衝%\n({slip_ticks}檔)", 11),
-            ("▶最低可行SL%", 13), ("備註", 34)]
-    ws.append([c[0] for c in cols])
-    for i, (t, w) in enumerate(cols, 1):
+def style(ws, ncol, widths):
+    for i in range(1, ncol + 1):
         cl = ws.cell(row=1, column=i)
-        cl.font = Font(bold=True, color="FFFFFF", size=9); cl.fill = HEAD
-        cl.alignment = Alignment(horizontal="center", wrap_text=True)
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
-    ws.freeze_panes = "B2"
-    for r in sorted(res, key=lambda x: -(x["best"]["net"] if x["best"] else -9)):
-        b = r["best"]
-        ws.append([r["sym"], round(r["px"], 8), tick_str(r["tick"]), round(r["tickp"], 4),
-                   round(r["floor3"], 4), round(r["days"], 2), r["bars"], r["amb_n"],
-                   round(r["a60"], 4), round(r["a70"], 4), round(r["a80"], 4),
-                   round(r["gap"], 3),
-                   round(b["F"], 4) if b else None, b["ticks"] if b else None,
-                   b["W"] if b else None,
-                   round(b["mean"], 4) if b else None, round(b["net"], 4) if b else None,
-                   round(b["win"], 1) if b else None, round(b["stop"], 1) if b else None,
-                   round(b["hold"], 1) if b else None, b["n"] if b else None,
-                   round(b["rand_net"], 4) if b else None,
-                   round(r["slip"], 4), round(r["minsl"], 3), r["note"]])
-        i = ws.max_row
-        for cc in (12, 13, 17, 24):
-            ws.cell(row=i, column=cc).font = Font(bold=True)
-        if b and b["net"] <= 0:
-            for cc in range(1, len(cols) + 1):
-                ws.cell(row=i, column=cc).fill = BADF
-        elif r["note"]:
-            for cc in range(1, len(cols) + 1):
-                ws.cell(row=i, column=cc).fill = WARNF
+        cl.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="FFFFFF")
+        cl.fill = HEAD
+        cl.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[cl.column_letter].width = widths[i - 1]
+    for row in ws.iter_rows(min_row=2):
+        for cl in row:
+            cl.font = Font(name=FONT_NAME, size=FONT_SIZE)
+            cl.alignment = Alignment(horizontal="center")
 
-    ws2 = wb.create_sheet("緊貼掃描")
-    hd2 = ["幣種", "窗口秒", "檔數", "緊貼%", "毛利%", "淨利%(扣A費)", "勝率%",
-           "停損觸發%", "平均持倉秒", "樣本數", "隨機進場淨利%"]
-    ws2.append(hd2)
-    for i in range(1, len(hd2) + 1):
-        cl = ws2.cell(row=1, column=i); cl.font = Font(bold=True, color="FFFFFF"); cl.fill = HEAD
-    ws2.freeze_panes = "A2"
+def write_xlsx(res, path, days, bar):
+    res = sorted(res, key=lambda r: r["noise"])          # 雜訊由小到大
+    wb = Workbook(); ws = wb.active; ws.title = "雜訊總表"
+    cols = ["幣種", "最新價", "tick", "一檔%", "三檔地板%", "雜訊%",
+            "逆行P50%", "逆行P60%", "逆行P70%", "逆行P80%",
+            "埋伏0.5%\n成交次數", "埋伏0.6%\n成交次數", "埋伏0.7%\n成交次數",
+            "埋伏0.8%\n成交次數", "埋伏0.9%\n成交次數", "埋伏1.0%\n成交次數",
+            "建議兩單間距%", "建議緊貼度%", "SL下限%"]
+    w = [11, 12, 11, 9, 10, 9, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 13, 13, 11]
+    ws.append(cols)
     for r in res:
-        bf = (r["best"]["W"], r["best"]["ticks"]) if r["best"] else None
+        ws.append([r["sym"], round(r["px"], 8), tick_str(r["tick"]),
+                   round(r["tickp"], 4), round(r["floor3"], 4), round(r["noise"], 3),
+                   round(r["p50"], 3), round(r["p60"], 3), round(r["p70"], 3), round(r["p80"], 3)]
+                  + [r["amb"][a] for a in AMBUSH_SET]
+                  + [round(r["gap"], 3), round(r["hug"], 3), round(r["slmin"], 3)])
+    style(ws, len(cols), w)
+    ws.freeze_panes = "B2"
+
+    ws2 = wb.create_sheet("雜訊存活表")
+    h2 = ["幣種", "距離%"] + [f"撐過{s}秒\n存活率%" for s in SURV_SEC] + ["被掃到的中位秒數"]
+    ws2.append(h2)
+    for r in res:
         for x in r["rows"]:
-            ws2.append([r["sym"], x["W"], x["ticks"], round(x["F"], 4),
-                        round(x["mean"], 4), round(x["net"], 4), round(x["win"], 1),
-                        round(x["stop"], 1), round(x["hold"], 1), x["n"],
-                        round(x["rand_net"], 4)])
-            if bf == (x["W"], x["ticks"]):
-                for cc in range(1, len(hd2) + 1):
-                    ws2.cell(row=ws2.max_row, column=cc).font = Font(bold=True)
+            ws2.append([r["sym"], x["dist"]] + [round(x[f"s{s}"], 1) for s in SURV_SEC]
+                       + [round(x["med"], 1) if x["med"] == x["med"] else ""])
+    style(ws2, len(h2), [11, 9] + [11] * len(SURV_SEC) + [16])
+    ws2.freeze_panes = "C2"
 
     ws3 = wb.create_sheet("怎麼看")
     for ln in [
-        f"資料：OKX {bar} K線 約 {days} 天｜埋伏率 {ambush}%｜滑價緩衝 {slip_ticks} 檔",
+        f"資料：OKX {bar} K線 約 {days} 天",
         "",
-        "■ 和上一版最大的不同：進場條件",
-        "　上一版每 5 秒取一點當進場 = 隨機進場，本來就沒有優勢，結果必然難看。",
-        f"　這一版只在「價格剛從近 {AMBUSH_LOOK} 秒的低/高點走了 {ambush}%」時進場，",
-        "　模擬 A 單埋伏被吃到的那一刻。「隨機進場淨利%」留著當對照組：",
-        "　兩者差距 = 埋伏這個動作本身值多少。差距接近 0 = 埋伏沒有加值。",
+        "■ 雜訊% ＝ 讓部位能撐過 60 秒、存活率達 70% 所需的距離。",
+        "　白話：停損要離現價多遠，才不會被日常來回震盪掃掉。",
+        "　這是整張表的核心，其他欄位都是它的佐證或延伸。",
         "",
-        "■ 淨利% = 毛利% − A單來回手續費 0.070%。B 單當落單者的話要再扣 0.030%。",
-        "　★ 淨利為負 = 這個幣在這個時間尺度上，追蹤停損賺不到手續費。整列會標紅。",
+        "■ 怎麼驗證這個數字可不可信：翻到「雜訊存活表」，找你的幣、找 0.1% 那一列，",
+        "　看「撐過10秒存活率」。你實盤緊貼 0.1% 兩秒被掃，如果那個數字很低，",
+        "　代表模型和你的實盤吻合，這張表可以信。如果很高，代表模型還是錯的，告訴我。",
         "",
-        "■ 停損觸發% 不是虧損率。追蹤停損被打到本來就是正常出場方式，",
-        "　它可以是獲利出場。真正要看的是【勝率%】（扣完手續費還賺的比例）。",
+        "■ 建議緊貼度% ＝ 雜訊%（若低於三檔地板則取地板，因為引擎設不出更小的）。",
+        "■ 建議兩單間距% ＝ 撐過 60 秒存活率達 80% 的距離，比緊貼更嚴格，",
+        "　因為 B 單一旦被雜訊觸發就多付一次手續費，門檻要更高。",
         "",
-        "■ 緊貼檔數：3 檔是引擎硬下限（MIN_HUG_TICKS），低於此會被買賣價差掃掉。",
-        "　最佳值若落在 3 檔，代表真正的最佳可能更小，但生產環境設不出來。",
-        "",
-        "■ 逆行深度：從任一點進場、在『最後會賺』的前提下中途往虧損方向最多走多少。",
-        "　→ 決定【兩單間距】。建議間距取 P70。",
-        "",
-        "■ 最低可行SL% = 建議間距 + 建議緊貼 + 滑價緩衝。",
-        "　★ SL 必須大於這個值，否則 B 觸發時 A 的緊貼落點等於或超過靜態SL，",
+        "■ SL下限% ＝ 建議間距 + 建議緊貼 + 滑價緩衝。",
+        "　★ SL 必須大於這個數字。否則 B 觸發時 A 的緊貼落點會等於或超過靜態SL，",
         "　　A 一步都動不了，直接吃滿 SL 加滑價。2026-09-22 WIF 那場就是這樣虧 1.244%。",
-        "　這是【下限】不是建議值，實際設定請留餘裕。",
+        "　這是下限不是建議值，實際設定請再留餘裕。",
+        "",
+        "■ 逆行P50~P80 ＝ 在「這一單最後會賺」的前提下，中途往虧損方向最多走多少。",
+        "　用來交叉檢查間距：間距若小於 P50，代表超過一半的好單會被 B 誤觸發。",
+        "",
+        "■ 埋伏X%成交次數 ＝ 這段期間內，埋伏在 X% 外的單子會被吃到幾次。",
+        "　直接告訴你每個幣、每個埋伏率，可以打幾場戰役。次數太少代表要等很久。",
     ]:
         ws3.append([ln])
+    for row in ws3.iter_rows():
+        for cl in row:
+            cl.font = Font(name=FONT_NAME, size=FONT_SIZE)
     ws3.column_dimensions["A"].width = 100
     wb.save(path)
 
-def send_mail(path, name, res, days, bar, ambush):
+def send_mail(path, name, res, days, bar):
     env = load_env(os.path.join(BASE, ".env"))
     user = env.get("GMAIL_USER"); pwd = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "")
     to = env.get("REPORT_TO") or env.get("REPORT_EMAIL_TO") or user
     if not user or not pwd:
-        log("！ .env 未設定 Gmail，略過寄送"); log(f"  檔案在：{path}"); return
+        log(f"！ .env 未設定 Gmail，檔案在 {path}"); return
     m = EmailMessage()
-    pos = [r for r in res if r["best"] and r["best"]["net"] > 0]
-    m["Subject"] = f"OKX 雜訊掃描 v3 {bar} {days}天 埋伏{ambush}%（{len(pos)}/{len(res)} 個幣淨利為正）"
+    m["Subject"] = f"OKX 雜訊存活分析 v4 {bar} {days}天（{len(res)} 個幣）"
     m["From"] = user; m["To"] = to
-    b = [f"{'幣種':<10}{'間距%':>8}{'緊貼%':>8}{'檔':>4}{'窗口':>6}{'淨利%':>9}{'勝率%':>7}{'最低SL%':>9}"]
-    for r in sorted(res, key=lambda x: -(x["best"]["net"] if x["best"] else -9)):
-        x = r["best"]
-        if not x:
-            continue
-        b.append(f"{r['sym']:<10}{r['gap']:>8.3f}{x['F']:>8.4f}{x['ticks']:>4}"
-                 f"{x['W']:>6}{x['net']:>9.4f}{x['win']:>7.1f}{r['minsl']:>9.3f}")
-    b += ["", "淨利已扣 A單來回手續費 0.070%。為負代表這個幣賺不到手續費。",
-          "欄位說明見附件「怎麼看」分頁。"]
+    b = [f"{'幣種':<10}{'雜訊%':>8}{'間距%':>8}{'緊貼%':>8}{'SL下限%':>9}"]
+    for r in sorted(res, key=lambda x: x["noise"]):
+        b.append(f"{r['sym']:<10}{r['noise']:>8.3f}{r['gap']:>8.3f}{r['hug']:>8.3f}{r['slmin']:>9.3f}")
+    b += ["", "雜訊% = 撐過 60 秒、存活率 70% 所需的距離。",
+          "驗證法：附件「雜訊存活表」找 0.1% 那一列的 10 秒存活率，",
+          "應該很低才對得上你實盤兩秒被掃的經驗。"]
     m.set_content("\n".join(b))
     m.add_attachment(open(path, "rb").read(), maintype="application",
                      subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -425,26 +397,22 @@ def send_mail(path, name, res, days, bar, ambush):
         s.login(user, pwd); s.send_message(m)
     log(f"已寄送至 {to}")
 
-# ==================== 主流程 ====================
 def do_probe():
     insts = fetch_instruments()
     if not insts:
         log("！ 無法取得商品清單"); return 1
-    print(f"{'代號':<11}{'instId':<20}{'tick':<13}{'一檔%':<9}{'3檔地板%':<10}{'1sK'}")
-    print("-" * 70)
     for sym in SYMBOLS:
         iid = resolve(sym, insts)
         if not iid:
-            print(f"{sym:<11}{'✗ 找不到'}"); continue
+            print(f"{sym:<11}✗ 找不到"); continue
         tick = float(insts[iid]["tickSz"])
         d = http_get(f"/api/v5/market/candles?instId={iid}&bar=1m&limit=1")
         px = float(d[0][4]) if d else 0.0
-        tp = (tick / px * 100) if px else 0.0
         bar, _ = probe_bar(iid)
-        print(f"{sym:<11}{iid:<20}{tick_str(tick):<13}{tp:<9.4f}{tp*3:<10.4f}{bar or '✗'}")
+        print(f"{sym:<11}{iid:<20}{tick_str(tick):<13}{tick/px*100 if px else 0:<9.4f}{bar or '✗'}")
     return 0
 
-def do_run(days, nomail, only, ambush, slip_ticks):
+def do_run(days, nomail, only, use_cache):
     t0 = time.time()
     insts = fetch_instruments()
     if not insts:
@@ -455,35 +423,36 @@ def do_run(days, nomail, only, ambush, slip_ticks):
         log(f"[{n}/{len(syms)}] {sym}")
         iid = resolve(sym, insts)
         if not iid:
-            log(f"  {sym} 找不到合約，略過"); continue
+            continue
         bar, page = probe_bar(iid)
         if not bar:
-            log(f"  {sym} 取不到K線，略過"); continue
+            continue
         bar_used = bar
-        arr = get_data(sym, iid, bar, page, days)
+        arr = get_data(sym, iid, bar, page, days, use_cache)
         if arr is None:
             continue
         try:
-            r = analyse(sym, iid, float(insts[iid]["tickSz"]), arr, ambush, slip_ticks)
+            r = analyse(sym, float(insts[iid]["tickSz"]), arr)
+            if not r:
+                log(f"  {sym} 樣本不足"); continue
             res.append(r)
-            b = r["best"]
-            if b:
-                log(f"  → 間距 {r['gap']:.3f}%｜緊貼 {b['F']:.4f}%({b['ticks']}檔)"
-                    f"｜窗口 {b['W']}s｜淨利 {b['net']:+.4f}%｜勝率 {b['win']:.0f}%"
-                    + (f"　[{r['note']}]" if r["note"] else ""))
+            s10 = [x for x in r["rows"] if abs(x["dist"] - 0.10) < 1e-9]
+            chk = f"｜0.1%撐過10秒 {s10[0]['s10']:.0f}%" if s10 else ""
+            log(f"  → 雜訊 {r['noise']:.3f}%｜間距 {r['gap']:.3f}%｜緊貼 {r['hug']:.3f}%"
+                f"｜SL下限 {r['slmin']:.3f}%{chk}")
         except Exception as e:
             log(f"  {sym} 分析失敗 {type(e).__name__}: {e}")
     if not res:
         log("！ 沒有任何幣種分析成功"); return 1
     os.makedirs(OUT_DIR, exist_ok=True)
     day = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    name = f"OKX.noise.v3.{bar_used}.{days}d.amb{ambush}.{day}.xlsx"
+    name = f"OKX.noise.v4.{bar_used}.{days}d.{day}.xlsx"
     path = os.path.join(OUT_DIR, name)
-    write_xlsx(res, path, days, bar_used, ambush, slip_ticks)
+    write_xlsx(res, path, days, bar_used)
     log(f"已產生 {path}")
     if not nomail:
         try:
-            send_mail(path, name, res, days, bar_used, ambush)
+            send_mail(path, name, res, days, bar_used)
         except Exception as e:
             log(f"！ 寄信失敗 {type(e).__name__}: {e}｜檔案仍在 {path}")
     log(f"完成，耗時 {(time.time()-t0)/60:.1f} 分鐘")
@@ -492,24 +461,24 @@ def do_run(days, nomail, only, ambush, slip_ticks):
 def main():
     a = sys.argv[1:]
     mode = a[0] if a else "probe"
-    days = 3; nomail = False; only = set(); amb = AMBUSH_PCT; slip = SLIP_TICKS
+    days = 7; nomail = False; only = set(); use_cache = False
     for i, x in enumerate(a):
         if x == "--days" and i + 1 < len(a):
             days = max(1, min(30, int(a[i + 1])))
         elif x == "--no-mail":
             nomail = True
+        elif x == "--cache":
+            use_cache = True
+        elif x == "--fresh":
+            use_cache = False
         elif x == "--only" and i + 1 < len(a):
             only = {s.strip().upper() for s in a[i + 1].split(",") if s.strip()}
-        elif x == "--ambush" and i + 1 < len(a):
-            amb = max(0.05, min(5.0, float(a[i + 1])))
-        elif x == "--slip-ticks" and i + 1 < len(a):
-            slip = max(0, min(50, int(a[i + 1])))
         elif x == "--rate" and i + 1 < len(a):
             globals()["REQ_PER_SEC"] = max(1.0, min(9.0, float(a[i + 1])))
     if mode == "probe":
         return do_probe()
     if mode == "run":
-        return do_run(days, nomail, only, amb, slip)
+        return do_run(days, nomail, only, use_cache)
     print(__doc__); return 1
 
 if __name__ == "__main__":
