@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4724,13 +4724,12 @@ async def cmd_amp(u, c):
 # ---------- /runtest 模擬埋伏＋600秒逐秒記錄（v4.4） ----------
 # 純模擬：只查價格，不下任何單，不碰 STRATS / 掛單 / 持倉，不影響 /run。
 # 流程：下指令當下埋伏 → 每 5 分鐘 K 線開盤用新現價重新埋伏 → 碰到埋伏價即進場
-#       → 每秒記錄 600 筆 → 產生 Excel（TG 傳檔 + Email）→ 自動回到埋伏，循環到 /stopruntest。
+#       → 每秒記錄 600 筆 → 產生 Excel（TG 傳檔）→ 自動回到埋伏，循環到 /stopruntest。
+# v4.5：折返次數改為「燈號改變就 +1」；取消 Email；查價改 WS 優先、REST 備援。
 RT_REARM_SEC = 300          # 重新埋伏週期：固定 5 分鐘（不跟 /timeframe 變）
 RT_ROWS      = 600          # 進場後記錄秒數
 RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
 RT_DIR       = "/srv/1111bot/data/runtest"
-RT_MAIL_ENV  = "/srv/1111bot/config/gmail.env"
-RT_MAIL_TO   = "a0936880936@gmail.com"
 RT = {}                     # key -> {"sym","dr","off","chat","task","state","n"}
 
 def rt_save():
@@ -4759,26 +4758,17 @@ async def rt_send(app, chat, text):
         except Exception as e:
             print("[runtest] tg fail", i, e); await asyncio.sleep(2)
 
-def rt_mail_blocking(path, subject, body):
-    import smtplib
-    from email.message import EmailMessage
-    if not os.path.exists(RT_MAIL_ENV):
-        return "未設定寄信帳號（gmail.env 不存在）"
-    env = load_env(RT_MAIL_ENV)
-    user = env.get("GMAIL_USER", "").strip()
-    pw = env.get("GMAIL_APP_PASS", "").replace(" ", "").strip()
-    if not user or not pw:
-        return "gmail.env 缺少 GMAIL_USER 或 GMAIL_APP_PASS"
-    msg = EmailMessage()
-    msg["Subject"] = subject; msg["From"] = user; msg["To"] = RT_MAIL_TO
-    msg.set_content(body)
-    with open(path, "rb") as f:
-        msg.add_attachment(f.read(), maintype="application",
-                           subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           filename=os.path.basename(path))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-        s.login(user, pw); s.send_message(msg)
-    return ""
+async def rt_px(iid):
+    """runtest 查價：WS 逐筆報價優先（不吃 REST 額度），沒有就走 REST，REST 失敗重試一次；
+    再失敗但 WS 有最後成交價就用它。全部失敗才回 None（該秒記為查價失敗）。"""
+    WS_WANT.add(iid)
+    for _ in range(2):
+        try:
+            return await get_px(iid)
+        except Exception:
+            await asyncio.sleep(0.15)
+    v = WS_PX.get(iid)
+    return v[0] if v else None
 
 def rt_build_excel(path, meta, rows):
     from openpyxl import Workbook
@@ -4850,7 +4840,7 @@ async def rt_record(app, T, spec, amb, base):
         f"進場價 {amb}（埋伏價）\n"
         f"開始記錄 {RT_ROWS} 秒，預計 {t_end} 完成\n"
         f"時間：{t_in.strftime('%H:%M:%S')}")
-    rows = []; hi = lo = amb; prev = amb; last_dir = 0; flip = 0; miss = 0
+    rows = []; hi = lo = amb; prev = amb; last_light = None; flip = 0; miss = 0
     lf = open(log_path, "w")
     lf.write("秒,時間,進場價,當時價,振幅%,毛利價,毛利率%,燈號,折返次數\n")
     t0 = time.time()
@@ -4861,21 +4851,19 @@ async def rt_record(app, T, spec, amb, base):
             else:
                 wait = t0 + i - time.time()
                 if wait > 0: await asyncio.sleep(wait)
-                try:
-                    px = await get_last(iid)
-                except Exception:
+                px = await rt_px(iid)
+                if px is None:
                     px = prev; miss += 1
             if px > hi: hi = px
             if px < lo: lo = px
             amp = (hi - lo) / amb * 100
-            if px != prev:
-                d = 1 if px > prev else -1
-                if last_dir and d != last_dir: flip += 1
-                last_dir = d
             prev = px
             gp = (px - amb) if dr == "L" else (amb - px)
             rate = gp / amb * 100
             light = "🟢" if gp > 0 else ("🔴" if gp < 0 else "⚪")
+            # 折返次數：燈號和上一秒相同不累計，燈號改變就 +1（第 1 行固定 0）
+            if last_light is not None and light != last_light: flip += 1
+            last_light = light
             t = datetime.fromtimestamp(t0 + i, TZ8).strftime("%H:%M:%S")
             rows.append({"t": t, "px": px, "amp": amp, "gp": gp, "rate": rate,
                          "light": light, "flip": flip})
@@ -4903,15 +4891,6 @@ async def rt_record(app, T, spec, amb, base):
              if info["has_r"] else "最大虧損：無（全程未虧損）")
     L.append(f"最終振幅 {float(r[-1]['amp']):.4f}%｜折返 {r[-1]['flip']} 次")
     if miss: L.append(f"{E.WARN} 查價失敗 {miss} 秒（沿用前一秒價格）")
-    summary = "\n".join(L)
-    try:
-        err = await asyncio.get_running_loop().run_in_executor(
-            None, rt_mail_blocking, xlsx,
-            f"OKX runtest {sym} {dr} {pct(T['off'])}% {t_in.strftime('%m/%d %H:%M:%S')}（{ACCT}）",
-            summary.replace(f"{E.BOT} {E.OK} ", ""))
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-    L.append(f"Email：已寄到 {RT_MAIL_TO}" if not err else f"{E.WARN} Email 未寄出：{err}")
     L.append("已回到埋伏，下一輪繼續")
     try:
         with open(xlsx, "rb") as f:
@@ -4932,8 +4911,8 @@ async def rt_worker(app, key):
             # ── 埋伏 ──
             base = T.pop("base0", None)
             while base is None:
-                try: base = await get_last(iid)
-                except Exception: await asyncio.sleep(1)
+                base = await rt_px(iid)
+                if base is None: await asyncio.sleep(1)
             amb = rt_amb_price(base, dr, off, tick)
             T["state"] = "埋伏中"; T["amb"] = amb
             next_rearm = (int(time.time()) // RT_REARM_SEC + 1) * RT_REARM_SEC
@@ -4944,9 +4923,8 @@ async def rt_worker(app, key):
                 if now_s >= next_rearm:
                     break                            # 新的 5 分鐘 K 線 → 重新埋伏
                 await asyncio.sleep(1 - (now_s % 1))
-                try:
-                    px = await get_last(iid)
-                except Exception:
+                px = await rt_px(iid)
+                if px is None:
                     continue
                 hit = (px <= amb) if dr == "L" else (px >= amb)
             if hit:
@@ -4970,7 +4948,7 @@ async def cmd_runtest(u, c):
     fmt = (f"{E.BOT} 用法：/runtest 商品 方向 埋伏%\n"
            f"例：/runtest BTCUSDT L 0.4%\n"
            f"純模擬不下單；每5分鐘重新埋伏，進場後逐秒記錄{RT_ROWS}秒，\n"
-           f"完成後 Excel 傳到 TG + Email，然後自動繼續埋伏\n"
+           f"完成後 Excel 傳到 TG，然後自動繼續埋伏\n"
            f"全部停止：/stopruntest")
     a = c.args or []
     if not a:
@@ -5078,7 +5056,7 @@ async def cmd_menu(u, c):
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
-        "/runtest 商品 方向 埋伏%　模擬埋伏＋進場後600秒逐秒記錄（不下單，Excel 傳TG+寄信）\n"
+        "/runtest 商品 方向 埋伏%　模擬埋伏＋進場後600秒逐秒記錄（不下單，Excel 傳TG）\n"
         "　例：/runtest BTCUSDT L 0.4%　｜不帶參數＝查看進行中\n"
         "/stopruntest 停止全部 runtest\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
