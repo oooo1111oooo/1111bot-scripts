@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4721,6 +4721,332 @@ async def cmd_amp(u, c):
                    f"下載（Mac 終端機執行）：\n"
                    f"scp 1111bot:/srv/1111bot/data/{name} ~/Downloads/")
 
+# ---------- /runtest 模擬埋伏＋600秒逐秒記錄（v4.4） ----------
+# 純模擬：只查價格，不下任何單，不碰 STRATS / 掛單 / 持倉，不影響 /run。
+# 流程：下指令當下埋伏 → 每 5 分鐘 K 線開盤用新現價重新埋伏 → 碰到埋伏價即進場
+#       → 每秒記錄 600 筆 → 產生 Excel（TG 傳檔 + Email）→ 自動回到埋伏，循環到 /stopruntest。
+RT_REARM_SEC = 300          # 重新埋伏週期：固定 5 分鐘（不跟 /timeframe 變）
+RT_ROWS      = 600          # 進場後記錄秒數
+RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
+RT_DIR       = "/srv/1111bot/data/runtest"
+RT_MAIL_ENV  = "/srv/1111bot/config/gmail.env"
+RT_MAIL_TO   = "a0936880936@gmail.com"
+RT = {}                     # key -> {"sym","dr","off","chat","task","state","n"}
+
+def rt_save():
+    try:
+        data = [{"sym": v["sym"], "dr": v["dr"], "off": str(v["off"]), "chat": v["chat"]}
+                for v in RT.values()]
+        tmp = RT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, RT_FILE)
+    except Exception as e:
+        print("[runtest] save fail", e)
+
+def rt_amb_price(px, dr, off, tick):
+    """L：現價×(1-埋伏%) 往下取到 tick；S：現價×(1+埋伏%) 往上取到 tick。"""
+    if dr == "L":
+        v = px * (1 - off / 100)
+        return (v / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    v = px * (1 + off / 100)
+    return (v / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+
+async def rt_send(app, chat, text):
+    for i in range(2):
+        try:
+            await app.bot.send_message(chat, text); return
+        except Exception as e:
+            print("[runtest] tg fail", i, e); await asyncio.sleep(2)
+
+def rt_mail_blocking(path, subject, body):
+    import smtplib
+    from email.message import EmailMessage
+    if not os.path.exists(RT_MAIL_ENV):
+        return "未設定寄信帳號（gmail.env 不存在）"
+    env = load_env(RT_MAIL_ENV)
+    user = env.get("GMAIL_USER", "").strip()
+    pw = env.get("GMAIL_APP_PASS", "").replace(" ", "").strip()
+    if not user or not pw:
+        return "gmail.env 缺少 GMAIL_USER 或 GMAIL_APP_PASS"
+    msg = EmailMessage()
+    msg["Subject"] = subject; msg["From"] = user; msg["To"] = RT_MAIL_TO
+    msg.set_content(body)
+    with open(path, "rb") as f:
+        msg.add_attachment(f.read(), maintype="application",
+                           subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           filename=os.path.basename(path))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+        s.login(user, pw); s.send_message(msg)
+    return ""
+
+def rt_build_excel(path, meta, rows):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    F = "Arial"; fb = Font(name=F, bold=True); fn = Font(name=F)
+    wb = Workbook(); ws = wb.active; ws.title = "runtest"
+    ws["A1"] = f"/runtest {meta['sym']} {meta['dr']} {meta['off_s']}%　{ACCT}"
+    ws["A1"].font = Font(name=F, bold=True, size=13)
+    ws["A2"] = (f"埋伏價 {meta['amb']}（埋伏時現價 {meta['base']} × (1{'−' if meta['dr']=='L' else '+'}"
+                f"{meta['off_s']}%)）　進場時間 {meta['t_in']}　記錄 {len(rows)} 秒　"
+                f"純模擬、未扣手續費")
+    ws["A2"].font = fn
+    n = len(rows)
+    iM = max(range(n), key=lambda i: (rows[i]["rate"], -i))
+    im = min(range(n), key=lambda i: (rows[i]["rate"], i))
+    has_g = rows[iM]["rate"] > 0; has_r = rows[im]["rate"] < 0
+    g = sum(1 for r in rows if r["rate"] > 0); rd = sum(1 for r in rows if r["rate"] < 0)
+    summ = [("最高獲利", f"{float(rows[iM]['rate']):+.4f}%（{rows[iM]['t']}，第{iM+1}秒）" if has_g else "無（全程未獲利）"),
+            ("最大虧損", f"{float(rows[im]['rate']):+.4f}%（{rows[im]['t']}，第{im+1}秒）" if has_r else "無（全程未虧損）"),
+            (f"第{n}秒毛利率", f"{float(rows[-1]['rate']):+.4f}%"),
+            ("最終振幅", f"{float(rows[-1]['amp']):.4f}%"),
+            ("總折返次數", f"{rows[-1]['flip']} 次"),
+            ("綠燈秒數 / 紅燈秒數 / 平盤秒數", f"{g} / {rd} / {n - g - rd}")]
+    if meta.get("miss"):
+        summ.append(("查價失敗秒數", f"{meta['miss']} 秒（該秒沿用前一秒價格）"))
+    for k, (a, v) in enumerate(summ):
+        ws.cell(4 + k, 1, a).font = fb; ws.cell(4 + k, 3, v).font = fn
+    hr = 4 + len(summ) + 1
+    H = ["幣種", "時間", "進場價", "當時價", "振幅%", "毛利價", "毛利率", "燈號", "折返次數"]
+    for j, h in enumerate(H, 1):
+        c = ws.cell(hr, j, h)
+        c.font = Font(name=F, bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="404040")
+        c.alignment = Alignment(horizontal="center")
+    GF = PatternFill("solid", fgColor="C6EFCE"); RF = PatternFill("solid", fgColor="FFC7CE")
+    thin = Side(style="thin", color="BBBBBB")
+    dec = max(0, -meta["tick"].as_tuple().exponent)
+    pxf = "0" if dec == 0 else "0." + "0" * dec
+    fmts = [None, None, pxf, pxf, '0.0000"%"', "+" + pxf + ";-" + pxf + ";" + pxf,
+            '+0.0000"%";-0.0000"%";0.0000"%"', None, "0"]
+    for i, r in enumerate(rows):
+        vals = [meta["sym"], r["t"], float(meta["amb"]), float(r["px"]), float(r["amp"]),
+                float(r["gp"]), float(r["rate"]), r["light"], r["flip"]]
+        for j, v in enumerate(vals, 1):
+            c = ws.cell(hr + 1 + i, j, v); c.font = fn; c.border = Border(bottom=thin)
+            if fmts[j - 1]: c.number_format = fmts[j - 1]
+            if j in (1, 2, 8, 9): c.alignment = Alignment(horizontal="center")
+            if has_g and i == iM: c.fill = GF
+            if has_r and i == im: c.fill = RF
+    ws.freeze_panes = ws.cell(hr + 1, 1)
+    for col, w in zip("ABCDEFGHI", [12, 10, 12, 12, 10, 11, 11, 6, 9]):
+        ws.column_dimensions[col].width = w
+    wb.save(path)
+    return {"iM": iM, "im": im, "has_g": has_g, "has_r": has_r}
+
+async def rt_record(app, T, spec, amb, base):
+    """已碰到埋伏價：第 1 行 = 進場那一秒（當時價 = 埋伏價，振幅 0%），之後每秒一行。"""
+    sym, dr, chat = T["sym"], T["dr"], T["chat"]
+    iid, tick = spec["iid"], spec["tick"]
+    os.makedirs(RT_DIR, exist_ok=True)
+    t_in = now8()
+    stamp = t_in.strftime("%Y%m%d_%H%M%S")
+    base_name = f"runtest.{ACCT}.{sym}.{dr}.{pct(T['off'])}.{stamp}"
+    log_path = f"{RT_DIR}/{base_name}.log"
+    T["state"] = "記錄中"; T["n"] = 0
+    t_end = (t_in + timedelta(seconds=RT_ROWS - 1)).strftime("%H:%M:%S")
+    await rt_send(app, chat,
+        f"{E.BOT} runtest 進場｜{sym} {E.dir_word(dr)}\n"
+        f"進場價 {amb}（埋伏價）\n"
+        f"開始記錄 {RT_ROWS} 秒，預計 {t_end} 完成\n"
+        f"時間：{t_in.strftime('%H:%M:%S')}")
+    rows = []; hi = lo = amb; prev = amb; last_dir = 0; flip = 0; miss = 0
+    lf = open(log_path, "w")
+    lf.write("秒,時間,進場價,當時價,振幅%,毛利價,毛利率%,燈號,折返次數\n")
+    t0 = time.time()
+    try:
+        for i in range(RT_ROWS):
+            if i == 0:
+                px = amb
+            else:
+                wait = t0 + i - time.time()
+                if wait > 0: await asyncio.sleep(wait)
+                try:
+                    px = await get_last(iid)
+                except Exception:
+                    px = prev; miss += 1
+            if px > hi: hi = px
+            if px < lo: lo = px
+            amp = (hi - lo) / amb * 100
+            if px != prev:
+                d = 1 if px > prev else -1
+                if last_dir and d != last_dir: flip += 1
+                last_dir = d
+            prev = px
+            gp = (px - amb) if dr == "L" else (amb - px)
+            rate = gp / amb * 100
+            light = "🟢" if gp > 0 else ("🔴" if gp < 0 else "⚪")
+            t = datetime.fromtimestamp(t0 + i, TZ8).strftime("%H:%M:%S")
+            rows.append({"t": t, "px": px, "amp": amp, "gp": gp, "rate": rate,
+                         "light": light, "flip": flip})
+            lf.write(f"{i+1},{t},{amb},{px},{float(amp):.6f},{gp},{float(rate):.6f},{light},{flip}\n")
+            if i % 30 == 0: lf.flush()
+            T["n"] = i + 1
+    finally:
+        lf.close()
+
+    xlsx = f"{RT_DIR}/{base_name}.xlsx"
+    meta = {"sym": sym, "dr": dr, "off_s": pct(T["off"]), "amb": amb, "base": base,
+            "t_in": t_in.strftime("%H:%M:%S"), "tick": tick, "miss": miss}
+    try:
+        info = await asyncio.get_running_loop().run_in_executor(None, rt_build_excel, xlsx, meta, rows)
+    except Exception as e:
+        await rt_send(app, chat, f"{E.LOSS} runtest {sym} Excel 產生失敗：{type(e).__name__}: {e}\n"
+                                 f"逐秒紀錄仍保留在 {log_path}")
+        return
+    r = rows
+    L = [f"{E.BOT} {E.OK} runtest 完成｜{sym} {E.dir_word(dr)}",
+         f"進場 {amb}｜第{RT_ROWS}秒 {float(r[-1]['rate']):+.4f}%"]
+    L.append(f"最高獲利 {float(r[info['iM']]['rate']):+.4f}%（{r[info['iM']]['t']}）"
+             if info["has_g"] else "最高獲利：無（全程未獲利）")
+    L.append(f"最大虧損 {float(r[info['im']]['rate']):+.4f}%（{r[info['im']]['t']}）"
+             if info["has_r"] else "最大虧損：無（全程未虧損）")
+    L.append(f"最終振幅 {float(r[-1]['amp']):.4f}%｜折返 {r[-1]['flip']} 次")
+    if miss: L.append(f"{E.WARN} 查價失敗 {miss} 秒（沿用前一秒價格）")
+    summary = "\n".join(L)
+    try:
+        err = await asyncio.get_running_loop().run_in_executor(
+            None, rt_mail_blocking, xlsx,
+            f"OKX runtest {sym} {dr} {pct(T['off'])}% {t_in.strftime('%m/%d %H:%M:%S')}（{ACCT}）",
+            summary.replace(f"{E.BOT} {E.OK} ", ""))
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    L.append(f"Email：已寄到 {RT_MAIL_TO}" if not err else f"{E.WARN} Email 未寄出：{err}")
+    L.append("已回到埋伏，下一輪繼續")
+    try:
+        with open(xlsx, "rb") as f:
+            await app.bot.send_document(chat, f, filename=os.path.basename(xlsx),
+                                        caption="\n".join(L)[:1000])
+    except Exception as e:
+        print("[runtest] send_document fail", e)
+        L.append(f"{E.WARN} TG 傳檔失敗，下載：scp 1111bot:{xlsx} ~/Downloads/")
+        await rt_send(app, chat, "\n".join(L))
+
+async def rt_worker(app, key):
+    T = RT[key]
+    sym, dr, off = T["sym"], T["dr"], T["off"]
+    try:
+        spec = await get_spec(sym)
+        iid, tick = spec["iid"], spec["tick"]
+        while key in RT:
+            # ── 埋伏 ──
+            base = T.pop("base0", None)
+            while base is None:
+                try: base = await get_last(iid)
+                except Exception: await asyncio.sleep(1)
+            amb = rt_amb_price(base, dr, off, tick)
+            T["state"] = "埋伏中"; T["amb"] = amb
+            next_rearm = (int(time.time()) // RT_REARM_SEC + 1) * RT_REARM_SEC
+            print(f"[runtest] {sym} {dr} 埋伏 現價{base} → {amb}")
+            hit = False
+            while key in RT and not hit:
+                now_s = time.time()
+                if now_s >= next_rearm:
+                    break                            # 新的 5 分鐘 K 線 → 重新埋伏
+                await asyncio.sleep(1 - (now_s % 1))
+                try:
+                    px = await get_last(iid)
+                except Exception:
+                    continue
+                hit = (px <= amb) if dr == "L" else (px >= amb)
+            if hit:
+                await rt_record(app, T, spec, amb, base)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print("[runtest] worker fail", key, type(e).__name__, e)
+        await rt_send(app, T["chat"], f"{E.LOSS} runtest {sym} {E.dir_word(dr)} 異常停止：{type(e).__name__}: {e}")
+        RT.pop(key, None); rt_save()
+
+def rt_start(app, sym, dr, off, chat, base0=None):
+    key = skey(sym, dr)
+    RT[key] = {"sym": sym, "dr": dr, "off": off, "chat": chat, "state": "啟動中", "n": 0,
+               "base0": base0}
+    RT[key]["task"] = asyncio.create_task(rt_worker(app, key))
+    rt_save()
+
+async def cmd_runtest(u, c):
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    fmt = (f"{E.BOT} 用法：/runtest 商品 方向 埋伏%\n"
+           f"例：/runtest BTCUSDT L 0.4%\n"
+           f"純模擬不下單；每5分鐘重新埋伏，進場後逐秒記錄{RT_ROWS}秒，\n"
+           f"完成後 Excel 傳到 TG + Email，然後自動繼續埋伏\n"
+           f"全部停止：/stopruntest")
+    a = c.args or []
+    if not a:
+        L = [fmt, "━━━━━━━━━━"]
+        if RT:
+            L.append("進行中：")
+            for v in RT.values():
+                extra = f"{v.get('n', 0)}/{RT_ROWS}" if v.get("state") == "記錄中" else f"埋伏價 {v.get('amb', '-')}"
+                L.append(f"{v['sym']} {E.dir_word(v['dr'])} {pct(v['off'])}%｜{v.get('state')}｜{extra}")
+        else:
+            L.append("目前沒有進行中的 runtest")
+        await reply(u, "\n".join(L)); return
+    if len(a) != 3:
+        await reply(u, f"{E.BOT} 參數數量錯誤（需3個）\n{fmt}"); return
+    sym = a[0].upper(); dr = a[1].upper()
+    try:
+        off = Decimal(a[2].rstrip("%"))
+    except Exception:
+        await reply(u, f"{E.BOT} 埋伏% 格式錯誤\n{fmt}"); return
+    if dr not in ("L", "S"):
+        await reply(u, f"{E.BOT} 方向須 L 或 S\n{fmt}"); return
+    if not (Decimal("0") < off <= Decimal("20")):
+        await reply(u, f"{E.BOT} 埋伏% 須大於 0 且不超過 20\n{fmt}"); return
+    key = skey(sym, dr)
+    if key in RT:
+        await reply(u, f"{E.WARN} {sym} {E.dir_word(dr)} 已經在跑 runtest（埋伏 {pct(RT[key]['off'])}%）\n"
+                       f"要換參數請先 /stopruntest"); return
+    try:
+        spec = await get_spec(sym); px = await get_last(spec["iid"])
+    except Exception:
+        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
+    amb = rt_amb_price(px, dr, off, spec["tick"])
+    rt_start(c.application, sym, dr, off, u.effective_chat.id, base0=px)
+    await reply(u, f"{E.BOT} runtest 啟動｜{ACCT}\n"
+                   f"{sym} {E.dir_word(dr)}｜埋伏 {pct(off)}%\n"
+                   f"現價 {px} → 埋伏價 {amb}\n"
+                   f"每 5 分鐘重新埋伏，進場後記錄 {RT_ROWS} 秒\n"
+                   f"純模擬，不下單\n"
+                   f"時間：{hhmmss()}")
+
+async def cmd_stopruntest(u, c):
+    if not RT:
+        await reply(u, f"{E.BOT} 目前沒有進行中的 runtest"); return
+    L = [f"{E.BOT} runtest 全部停止｜{ACCT}"]
+    first = True
+    for key in list(RT.keys()):
+        v = RT.pop(key)
+        st = v.get("state")
+        note = f"（記錄中 {v.get('n', 0)}/{RT_ROWS}，作廢）" if st == "記錄中" else f"（{st}）"
+        L.append(("已取消：" if first else "　　　　") + f"{v['sym']} {E.dir_word(v['dr'])}{note}")
+        first = False
+        t = v.get("task")
+        if t: t.cancel()
+    rt_save()
+    L.append(f"時間：{hhmmss()}")
+    await reply(u, "\n".join(L))
+
+async def rt_recover(app):
+    """重開後恢復 runtest 清單：一律回到埋伏狀態（重開當下正在記錄的那一輪作廢）。"""
+    try:
+        if not os.path.exists(RT_FILE): return
+        data = json.load(open(RT_FILE))
+    except Exception as e:
+        print("[runtest] recover read fail", e); return
+    names = []
+    for d in data:
+        try:
+            rt_start(app, d["sym"], d["dr"], Decimal(d["off"]), d["chat"])
+            names.append(f"{d['sym']} {E.dir_word(d['dr'])} {pct(d['off'])}%")
+        except Exception as e:
+            print("[runtest] recover fail", d, e)
+    if names and data:
+        await rt_send(app, data[0]["chat"],
+            f"{E.BOT} runtest 已自動恢復（bot 重開）\n" + "\n".join(names) +
+            f"\n全部回到埋伏；重開當下若有正在記錄的那一輪已作廢\n時間：{hhmmss()}")
+
 async def cmd_coins(u, c):
     on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
@@ -4752,6 +5078,9 @@ async def cmd_menu(u, c):
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
+        "/runtest 商品 方向 埋伏%　模擬埋伏＋進場後600秒逐秒記錄（不下單，Excel 傳TG+寄信）\n"
+        "　例：/runtest BTCUSDT L 0.4%　｜不帶參數＝查看進行中\n"
+        "/stopruntest 停止全部 runtest\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
@@ -4803,6 +5132,8 @@ async def _post_init(app):
             BotCommand("apitest", "實盤API探測(會下真單)"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
+            BotCommand("runtest", "模擬埋伏600秒記錄"),
+            BotCommand("stopruntest", "停止全部runtest"),
             BotCommand("stopall", "停全部"),
             BotCommand("stop", "停指定"),
             BotCommand("run", "建立策略"),
@@ -4836,6 +5167,7 @@ async def _post_init(app):
     asyncio.create_task(ws_public_task())
     asyncio.create_task(ws_private_task())
     await startup_recover(app)
+    await rt_recover(app)
     for S in STRATS.values():
         try:
             if S.get("pair_state", "idle") != "idle":
@@ -4862,6 +5194,7 @@ def main():
                     ("check", cmd_check), ("apitest", cmd_apitest),
                     ("selftest", cmd_selftest), ("log", cmd_log),
                     ("amp", cmd_amp),
+                    ("runtest", cmd_runtest), ("stopruntest", cmd_stopruntest),
                     ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
