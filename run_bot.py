@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4721,13 +4721,15 @@ async def cmd_amp(u, c):
                    f"下載（Mac 終端機執行）：\n"
                    f"scp 1111bot:/srv/1111bot/data/{name} ~/Downloads/")
 
-# ---------- /runtest 模擬埋伏＋600秒逐秒記錄（v4.4） ----------
+# ---------- /runtest 模擬埋伏＋900秒逐秒記錄（v4.4） ----------
 # 純模擬：只查價格，不下任何單，不碰 STRATS / 掛單 / 持倉，不影響 /run。
 # 流程：下指令當下埋伏 → 每 5 分鐘 K 線開盤用新現價重新埋伏 → 碰到埋伏價即進場
-#       → 每秒記錄 600 筆 → 產生 Excel（TG 傳檔）→ 自動回到埋伏，循環到 /stopruntest。
+#       → 每秒記錄 900 筆 → 產生 Excel（TG 傳檔）→ 自動回到埋伏，循環到 /stopruntest。
 # v4.5：折返次數改為「燈號改變就 +1」；取消 Email；查價改 WS 優先、REST 備援。
+# v4.6：記錄 900 秒；改模擬【觸發式委託】—— 觸發價位置不變（L 在下、S 在上），
+#       碰到即以觸發價進場（無法模擬滑價），盈虧方向與限價相反（L 觸發=做空、S 觸發=做多）。
 RT_REARM_SEC = 300          # 重新埋伏週期：固定 5 分鐘（不跟 /timeframe 變）
-RT_ROWS      = 600          # 進場後記錄秒數
+RT_ROWS      = 900          # 進場後記錄秒數
 RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
 RT_DIR       = "/srv/1111bot/data/runtest"
 RT = {}                     # key -> {"sym","dr","off","chat","task","state","n"}
@@ -4777,7 +4779,7 @@ def rt_build_excel(path, meta, rows):
     wb = Workbook(); ws = wb.active; ws.title = "runtest"
     ws["A1"] = f"/runtest {meta['sym']} {meta['dr']} {meta['off_s']}%　{ACCT}"
     ws["A1"].font = Font(name=F, bold=True, size=13)
-    ws["A2"] = (f"埋伏價 {meta['amb']}（埋伏時現價 {meta['base']} × (1{'−' if meta['dr']=='L' else '+'}"
+    ws["A2"] = (f"觸發價 {meta['amb']}（觸發式委託，盈虧與限價相反；埋伏時現價 {meta['base']} × (1{'−' if meta['dr']=='L' else '+'}"
                 f"{meta['off_s']}%)）　進場時間 {meta['t_in']}　記錄 {len(rows)} 秒　"
                 f"純模擬、未扣手續費")
     ws["A2"].font = fn
@@ -4837,7 +4839,7 @@ async def rt_record(app, T, spec, amb, base):
     t_end = (t_in + timedelta(seconds=RT_ROWS - 1)).strftime("%H:%M:%S")
     await rt_send(app, chat,
         f"{E.BOT} runtest 進場｜{sym} {E.dir_word(dr)}\n"
-        f"進場價 {amb}（埋伏價）\n"
+        f"進場價 {amb}（觸發價）\n"
         f"開始記錄 {RT_ROWS} 秒，預計 {t_end} 完成\n"
         f"時間：{t_in.strftime('%H:%M:%S')}")
     rows = []; hi = lo = amb; prev = amb; last_light = None; flip = 0; miss = 0
@@ -4858,7 +4860,7 @@ async def rt_record(app, T, spec, amb, base):
             if px < lo: lo = px
             amp = (hi - lo) / amb * 100
             prev = px
-            gp = (px - amb) if dr == "L" else (amb - px)
+            gp = (amb - px) if dr == "L" else (px - amb)   # 觸發式：與限價相反
             rate = gp / amb * 100
             light = "🟢" if gp > 0 else ("🔴" if gp < 0 else "⚪")
             # 折返次數：燈號和上一秒相同不累計，燈號改變就 +1（第 1 行固定 0）
@@ -4884,7 +4886,7 @@ async def rt_record(app, T, spec, amb, base):
         return
     r = rows
     L = [f"{E.BOT} {E.OK} runtest 完成｜{sym} {E.dir_word(dr)}",
-         f"進場 {amb}｜第{RT_ROWS}秒 {float(r[-1]['rate']):+.4f}%"]
+         f"進場價格 {amb} ({meta['t_in']})"]
     L.append(f"最高獲利 {float(r[info['iM']]['rate']):+.4f}%（{r[info['iM']]['t']}）"
              if info["has_g"] else "最高獲利：無（全程未獲利）")
     L.append(f"最大虧損 {float(r[info['im']]['rate']):+.4f}%（{r[info['im']]['t']}）"
@@ -4984,7 +4986,8 @@ async def cmd_runtest(u, c):
     rt_start(c.application, sym, dr, off, u.effective_chat.id, base0=px)
     await reply(u, f"{E.BOT} runtest 啟動｜{ACCT}\n"
                    f"{sym} {E.dir_word(dr)}｜埋伏 {pct(off)}%\n"
-                   f"現價 {px} → 埋伏價 {amb}\n"
+                   f"現價 {px} → 觸發價 {amb}\n"
+                   f"觸發式委託：碰到即以觸發價進場，盈虧與限價相反\n"
                    f"每 5 分鐘重新埋伏，進場後記錄 {RT_ROWS} 秒\n"
                    f"純模擬，不下單\n"
                    f"時間：{hhmmss()}")
@@ -5056,7 +5059,7 @@ async def cmd_menu(u, c):
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
-        "/runtest 商品 方向 埋伏%　模擬埋伏＋進場後600秒逐秒記錄（不下單，Excel 傳TG）\n"
+        "/runtest 商品 方向 埋伏%　模擬埋伏＋觸發後900秒逐秒記錄（不下單，Excel 傳TG）\n"
         "　例：/runtest BTCUSDT L 0.4%　｜不帶參數＝查看進行中\n"
         "/stopruntest 停止全部 runtest\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
@@ -5110,7 +5113,7 @@ async def _post_init(app):
             BotCommand("apitest", "實盤API探測(會下真單)"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
-            BotCommand("runtest", "模擬埋伏600秒記錄"),
+            BotCommand("runtest", "模擬觸發900秒記錄"),
             BotCommand("stopruntest", "停止全部runtest"),
             BotCommand("stopall", "停全部"),
             BotCommand("stop", "停指定"),
