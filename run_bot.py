@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4728,8 +4728,13 @@ async def cmd_amp(u, c):
 # v4.5：折返次數改為「燈號改變就 +1」；取消 Email；查價改 WS 優先、REST 備援。
 # v4.6：記錄 900 秒；改模擬【觸發式委託】—— 觸發價位置不變（L 在下、S 在上），
 #       碰到即以觸發價進場（無法模擬滑價），盈虧方向與限價相反（L 觸發=做空、S 觸發=做多）。
+# v4.7：更正觸發位置 —— L 觸發價放【上方】現價×(1+%)、S 放【下方】現價×(1-%)，
+#       L 做多 / S 做空；每 0.5 秒一筆（900 秒共 1800 筆）；TG 檔名縮短；完成訊息改版。
 RT_REARM_SEC = 300          # 重新埋伏週期：固定 5 分鐘（不跟 /timeframe 變）
 RT_ROWS      = 900          # 進場後記錄秒數
+RT_STEP      = 0.5          # 每幾秒記錄一筆（一秒 2 次）
+# v4.8：時間一律 hh:mm:ss（不顯示小數秒）；完成訊息加查詢價格時間、TF 與折返次數。
+RT_N         = int(RT_ROWS / RT_STEP)   # 總筆數 1800
 RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
 RT_DIR       = "/srv/1111bot/data/runtest"
 RT = {}                     # key -> {"sym","dr","off","chat","task","state","n"}
@@ -4746,12 +4751,13 @@ def rt_save():
         print("[runtest] save fail", e)
 
 def rt_amb_price(px, dr, off, tick):
-    """L：現價×(1-埋伏%) 往下取到 tick；S：現價×(1+埋伏%) 往上取到 tick。"""
+    """觸發式：L 觸發價 = 現價×(1+埋伏%) 放上方（往上取到 tick）；
+    S 觸發價 = 現價×(1-埋伏%) 放下方（往下取到 tick）。"""
     if dr == "L":
-        v = px * (1 - off / 100)
-        return (v / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
-    v = px * (1 + off / 100)
-    return (v / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+        v = px * (1 + off / 100)
+        return (v / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+    v = px * (1 - off / 100)
+    return (v / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
 async def rt_send(app, chat, text):
     for i in range(2):
@@ -4779,23 +4785,23 @@ def rt_build_excel(path, meta, rows):
     wb = Workbook(); ws = wb.active; ws.title = "runtest"
     ws["A1"] = f"/runtest {meta['sym']} {meta['dr']} {meta['off_s']}%　{ACCT}"
     ws["A1"].font = Font(name=F, bold=True, size=13)
-    ws["A2"] = (f"觸發價 {meta['amb']}（觸發式委託，盈虧與限價相反；埋伏時現價 {meta['base']} × (1{'−' if meta['dr']=='L' else '+'}"
-                f"{meta['off_s']}%)）　進場時間 {meta['t_in']}　記錄 {len(rows)} 秒　"
-                f"純模擬、未扣手續費")
+    ws["A2"] = (f"觸發價 {meta['amb']}（{'上方' if meta['dr']=='L' else '下方'}觸發；埋伏時現價 {meta['base']} × (1{'+' if meta['dr']=='L' else '−'}"
+                f"{meta['off_s']}%)）　進場時間 {meta['t_in']}　進場時價 {meta['hit_px']}　"
+                f"記錄 {RT_ROWS} 秒（每 {RT_STEP} 秒一筆，共 {len(rows)} 筆）　純模擬、未扣手續費")
     ws["A2"].font = fn
     n = len(rows)
     iM = max(range(n), key=lambda i: (rows[i]["rate"], -i))
     im = min(range(n), key=lambda i: (rows[i]["rate"], i))
     has_g = rows[iM]["rate"] > 0; has_r = rows[im]["rate"] < 0
     g = sum(1 for r in rows if r["rate"] > 0); rd = sum(1 for r in rows if r["rate"] < 0)
-    summ = [("最高獲利", f"{float(rows[iM]['rate']):+.4f}%（{rows[iM]['t']}，第{iM+1}秒）" if has_g else "無（全程未獲利）"),
-            ("最大虧損", f"{float(rows[im]['rate']):+.4f}%（{rows[im]['t']}，第{im+1}秒）" if has_r else "無（全程未虧損）"),
-            (f"第{n}秒毛利率", f"{float(rows[-1]['rate']):+.4f}%"),
+    summ = [("最高獲利", f"{float(rows[iM]['rate']):+.4f}%（{rows[iM]['t']}｜{rows[iM]['px']}）" if has_g else "無（全程未獲利）"),
+            ("最大虧損", f"{float(rows[im]['rate']):+.4f}%（{rows[im]['t']}｜{rows[im]['px']}）" if has_r else "無（全程未虧損）"),
+            (f"第{RT_ROWS}秒毛利率", f"{float(rows[-1]['rate']):+.4f}%"),
             ("最終振幅", f"{float(rows[-1]['amp']):.4f}%"),
             ("總折返次數", f"{rows[-1]['flip']} 次"),
-            ("綠燈秒數 / 紅燈秒數 / 平盤秒數", f"{g} / {rd} / {n - g - rd}")]
+            ("綠燈筆數 / 紅燈筆數 / 平盤筆數", f"{g} / {rd} / {n - g - rd}")]
     if meta.get("miss"):
-        summ.append(("查價失敗秒數", f"{meta['miss']} 秒（該秒沿用前一秒價格）"))
+        summ.append(("查價失敗筆數", f"{meta['miss']} 筆（該筆沿用前一筆價格）"))
     for k, (a, v) in enumerate(summ):
         ws.cell(4 + k, 1, a).font = fb; ws.cell(4 + k, 3, v).font = fn
     hr = 4 + len(summ) + 1
@@ -4821,17 +4827,19 @@ def rt_build_excel(path, meta, rows):
             if has_g and i == iM: c.fill = GF
             if has_r and i == im: c.fill = RF
     ws.freeze_panes = ws.cell(hr + 1, 1)
-    for col, w in zip("ABCDEFGHI", [12, 10, 12, 12, 10, 11, 11, 6, 9]):
+    for col, w in zip("ABCDEFGHI", [12, 12, 12, 12, 10, 11, 11, 6, 9]):
         ws.column_dimensions[col].width = w
     wb.save(path)
     return {"iM": iM, "im": im, "has_g": has_g, "has_r": has_r}
 
-async def rt_record(app, T, spec, amb, base):
-    """已碰到埋伏價：第 1 行 = 進場那一秒（當時價 = 埋伏價，振幅 0%），之後每秒一行。"""
+async def rt_record(app, T, spec, amb, base, hit_px, base_t):
+    """已碰到觸發價：第 1 筆 = 進場那一刻（當時價 = 觸發價，振幅 0%），之後每 0.5 秒一筆。
+    hit_px = 觸發那一刻實際查到的價格（進場時價，看得出跳過觸發價多少）。"""
     sym, dr, chat = T["sym"], T["dr"], T["chat"]
     iid, tick = spec["iid"], spec["tick"]
     os.makedirs(RT_DIR, exist_ok=True)
-    t_in = now8()
+    t0 = time.time()                      # 第 1 筆 = 觸發當下
+    t_in = datetime.fromtimestamp(t0, TZ8)
     stamp = t_in.strftime("%Y%m%d_%H%M%S")
     base_name = f"runtest.{ACCT}.{sym}.{dr}.{pct(T['off'])}.{stamp}"
     log_path = f"{RT_DIR}/{base_name}.log"
@@ -4839,19 +4847,18 @@ async def rt_record(app, T, spec, amb, base):
     t_end = (t_in + timedelta(seconds=RT_ROWS - 1)).strftime("%H:%M:%S")
     await rt_send(app, chat,
         f"{E.BOT} runtest 進場｜{sym} {E.dir_word(dr)}\n"
-        f"進場價 {amb}（觸發價）\n"
+        f"進場價 {amb}（觸發價）｜進場時價 {hit_px}\n"
         f"開始記錄 {RT_ROWS} 秒，預計 {t_end} 完成\n"
         f"時間：{t_in.strftime('%H:%M:%S')}")
     rows = []; hi = lo = amb; prev = amb; last_light = None; flip = 0; miss = 0
     lf = open(log_path, "w")
-    lf.write("秒,時間,進場價,當時價,振幅%,毛利價,毛利率%,燈號,折返次數\n")
-    t0 = time.time()
+    lf.write("筆,時間,進場價,當時價,振幅%,毛利價,毛利率%,燈號,折返次數\n")
     try:
-        for i in range(RT_ROWS):
+        for i in range(RT_N):
             if i == 0:
                 px = amb
             else:
-                wait = t0 + i - time.time()
+                wait = t0 + i * RT_STEP - time.time()
                 if wait > 0: await asyncio.sleep(wait)
                 px = await rt_px(iid)
                 if px is None:
@@ -4860,24 +4867,25 @@ async def rt_record(app, T, spec, amb, base):
             if px < lo: lo = px
             amp = (hi - lo) / amb * 100
             prev = px
-            gp = (amb - px) if dr == "L" else (px - amb)   # 觸發式：與限價相反
+            gp = (px - amb) if dr == "L" else (amb - px)   # L 上方觸發做多、S 下方觸發做空
             rate = gp / amb * 100
             light = "🟢" if gp > 0 else ("🔴" if gp < 0 else "⚪")
             # 折返次數：燈號和上一秒相同不累計，燈號改變就 +1（第 1 行固定 0）
             if last_light is not None and light != last_light: flip += 1
             last_light = light
-            t = datetime.fromtimestamp(t0 + i, TZ8).strftime("%H:%M:%S")
+            _dt = datetime.fromtimestamp(t0 + i * RT_STEP, TZ8)
+            t = _dt.strftime("%H:%M:%S")
             rows.append({"t": t, "px": px, "amp": amp, "gp": gp, "rate": rate,
                          "light": light, "flip": flip})
             lf.write(f"{i+1},{t},{amb},{px},{float(amp):.6f},{gp},{float(rate):.6f},{light},{flip}\n")
-            if i % 30 == 0: lf.flush()
-            T["n"] = i + 1
+            if i % 60 == 0: lf.flush()
+            T["n"] = int((i + 1) * RT_STEP)
     finally:
         lf.close()
 
     xlsx = f"{RT_DIR}/{base_name}.xlsx"
-    meta = {"sym": sym, "dr": dr, "off_s": pct(T["off"]), "amb": amb, "base": base,
-            "t_in": t_in.strftime("%H:%M:%S"), "tick": tick, "miss": miss}
+    meta = {"sym": sym, "dr": dr, "off_s": pct(T["off"]), "amb": amb, "base": base, "hit_px": hit_px,
+            "t_in": rows[0]["t"], "tick": tick, "miss": miss}
     try:
         info = await asyncio.get_running_loop().run_in_executor(None, rt_build_excel, xlsx, meta, rows)
     except Exception as e:
@@ -4885,18 +4893,23 @@ async def rt_record(app, T, spec, amb, base):
                                  f"逐秒紀錄仍保留在 {log_path}")
         return
     r = rows
-    L = [f"{E.BOT} {E.OK} runtest 完成｜{sym} {E.dir_word(dr)}",
-         f"進場價格 {amb} ({meta['t_in']})"]
-    L.append(f"最高獲利 {float(r[info['iM']]['rate']):+.4f}%（{r[info['iM']]['t']}）"
-             if info["has_g"] else "最高獲利：無（全程未獲利）")
-    L.append(f"最大虧損 {float(r[info['im']]['rate']):+.4f}%（{r[info['im']]['t']}）"
-             if info["has_r"] else "最大虧損：無（全程未虧損）")
-    L.append(f"最終振幅 {float(r[-1]['amp']):.4f}%｜折返 {r[-1]['flip']} 次")
-    if miss: L.append(f"{E.WARN} 查價失敗 {miss} 秒（沿用前一秒價格）")
+    L = [f"{E.BOT} {E.OK} runtest 完成｜{sym} {dr} {pct(T['off'])}",
+         f"查詢價格 {base_t} | {base} | {amb}",
+         f"進場價格 {meta['t_in']} | {hit_px}"]
+    ev = []   # (筆序, 文字) → 依時間先後排列
+    if info["has_g"]:
+        x = r[info["iM"]]; ev.append((info["iM"], f"最大獲利 {x['t']} | {x['px']} | {float(x['rate']):+.4f}%"))
+    if info["has_r"]:
+        x = r[info["im"]]; ev.append((info["im"], f"最大虧損 {x['t']} | {x['px']} | {float(x['rate']):+.4f}%"))
+    L += [txt for _, txt in sorted(ev)]
+    if not info["has_g"]: L.append("最大獲利 無（全程未獲利）")
+    if not info["has_r"]: L.append("最大虧損 無（全程未虧損）")
+    L.append(f"TF={RT_ROWS // 60}m, 折返次數={r[-1]['flip']}次")
+    if miss: L.append(f"{E.WARN} 查價失敗 {miss} 筆（沿用前一筆價格）")
     L.append("已回到埋伏，下一輪繼續")
     try:
         with open(xlsx, "rb") as f:
-            await app.bot.send_document(chat, f, filename=os.path.basename(xlsx),
+            await app.bot.send_document(chat, f, filename=f"runtest.{sym}.{dr}.{pct(T['off'])}.{t_in.strftime('%Y%m%d')}.xlsx",
                                         caption="\n".join(L)[:1000])
     except Exception as e:
         print("[runtest] send_document fail", e)
@@ -4911,7 +4924,7 @@ async def rt_worker(app, key):
         iid, tick = spec["iid"], spec["tick"]
         while key in RT:
             # ── 埋伏 ──
-            base = T.pop("base0", None)
+            base = T.pop("base0", None); base_t = hhmmss()
             while base is None:
                 base = await rt_px(iid)
                 if base is None: await asyncio.sleep(1)
@@ -4924,13 +4937,13 @@ async def rt_worker(app, key):
                 now_s = time.time()
                 if now_s >= next_rearm:
                     break                            # 新的 5 分鐘 K 線 → 重新埋伏
-                await asyncio.sleep(1 - (now_s % 1))
+                await asyncio.sleep(RT_STEP - (now_s % RT_STEP))
                 px = await rt_px(iid)
                 if px is None:
                     continue
-                hit = (px <= amb) if dr == "L" else (px >= amb)
+                hit = (px >= amb) if dr == "L" else (px <= amb)
             if hit:
-                await rt_record(app, T, spec, amb, base)
+                await rt_record(app, T, spec, amb, base, px, base_t)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -4949,7 +4962,7 @@ async def cmd_runtest(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     fmt = (f"{E.BOT} 用法：/runtest 商品 方向 埋伏%\n"
            f"例：/runtest BTCUSDT L 0.4%\n"
-           f"純模擬不下單；每5分鐘重新埋伏，進場後逐秒記錄{RT_ROWS}秒，\n"
+           f"純模擬不下單；每5分鐘重新埋伏，觸發後每0.5秒記錄一筆共{RT_ROWS}秒，\n"
            f"完成後 Excel 傳到 TG，然後自動繼續埋伏\n"
            f"全部停止：/stopruntest")
     a = c.args or []
@@ -4987,7 +5000,7 @@ async def cmd_runtest(u, c):
     await reply(u, f"{E.BOT} runtest 啟動｜{ACCT}\n"
                    f"{sym} {E.dir_word(dr)}｜埋伏 {pct(off)}%\n"
                    f"現價 {px} → 觸發價 {amb}\n"
-                   f"觸發式委託：碰到即以觸發價進場，盈虧與限價相反\n"
+                   f"觸發式委託：{'L 放上方做多' if dr == 'L' else 'S 放下方做空'}，碰到即以觸發價進場\n"
                    f"每 5 分鐘重新埋伏，進場後記錄 {RT_ROWS} 秒\n"
                    f"純模擬，不下單\n"
                    f"時間：{hhmmss()}")
@@ -5059,7 +5072,7 @@ async def cmd_menu(u, c):
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
-        "/runtest 商品 方向 埋伏%　模擬埋伏＋觸發後900秒逐秒記錄（不下單，Excel 傳TG）\n"
+        "/runtest 商品 方向 埋伏%　模擬埋伏＋觸發後900秒每0.5秒記錄（不下單，Excel 傳TG）\n"
         "　例：/runtest BTCUSDT L 0.4%　｜不帶參數＝查看進行中\n"
         "/stopruntest 停止全部 runtest\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
