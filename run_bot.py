@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -5009,16 +5009,17 @@ def rt_build_excel(path, meta, rows):
         ws.cell(5 + k, 1, a).font = fb; ws.cell(5 + k, 3, v).font = fn
     hr = 5 + len(summ) + 1
     top = hr + 1
-    ws.cell(hr - 1, 12, "名目本金(U)").font = fb
-    ws.cell(hr - 1, 13, float(meta["notional"])).font = Font(name=F, color="0000FF")
-    H = ["幣種", "時間", "進場價", "當時價", "最高振幅%", "平均振幅%", "差異振幅%", "毛利價", "毛利率", "燈號", "折返次數",
-         "毛利(U)", "當時TP", "當時SL", "動作"]
+    # v4.9.5：「燈號」改名「損益燈號」（跟進場價比），新增「漲跌燈號」（跟上一筆比），後面的欄位往右移一欄。
+    ws.cell(hr - 1, 13, "名目本金(U)").font = fb
+    ws.cell(hr - 1, 14, float(meta["notional"])).font = Font(name=F, color="0000FF")
+    H = ["幣種", "時間", "進場價", "當時價", "最高振幅%", "平均振幅%", "差異振幅%", "毛利價", "毛利率", "損益燈號", "漲跌燈號",
+         "折返次數", "毛利(U)", "當時TP", "當時SL", "動作"]
     for j, h in enumerate(H, 1):
         c = ws.cell(hr, j, h)
         c.font = Font(name=F, bold=True, color="FFFFFF")
-        c.fill = PatternFill("solid", fgColor="404040" if j <= 11 else "1F4E79")
+        c.fill = PatternFill("solid", fgColor="404040" if j <= 12 else "1F4E79")
         c.alignment = Alignment(horizontal="center")
-    ws.cell(hr, 12).comment = Comment("L～O 欄：核對 TP/SL 緊貼有沒有照規則動。", "1111bot")
+    ws.cell(hr, 13).comment = Comment("M～P 欄：核對 TP/SL 緊貼有沒有照規則動。", "1111bot")
     GF = PatternFill("solid", fgColor="C6EFCE"); RF = PatternFill("solid", fgColor="FFC7CE")
     YF = PatternFill("solid", fgColor="FFEB9C")
     thin = Side(style="thin", color="BBBBBB")
@@ -5026,31 +5027,33 @@ def rt_build_excel(path, meta, rows):
     pxf = "0" if dec == 0 else "0." + "0" * dec
     pf = '0.0000"%"'
     fmts = [None, None, pxf, pxf, pf, pf, pf, "+" + pxf + ";-" + pxf + ";" + pxf,
-            '+0.0000"%";-0.0000"%";0.0000"%"', None, "0", "+0.0000;-0.0000;0.0000", pxf, pxf, None]
+            '+0.0000"%";-0.0000"%";0.0000"%"', None, None, "0", "+0.0000;-0.0000;0.0000", pxf, pxf, None]
     for i, r in enumerate(rows):
         rr = top + i
         # 平均振幅% = 逐列累加平均（跟 AVERAGE(E$top:E列) 數字完全一樣，但列數很多時不會拖慢 Excel）
         favg = f"=E{rr}" if i == 0 else f"=F{rr-1}+(E{rr}-F{rr-1})/(ROW()-{top - 1})"
         vals = [T["sym"], r["t"], float(meta["amb"]), float(r["px"]), float(r["amp"]),
-                favg, f"=E{rr}-F{rr}", float(r["gp"]), float(r["rate"]), r["light"], r["flip"],
-                f"=I{rr}/100*$M${hr - 1}",
+                favg, f"=E{rr}-F{rr}", float(r["gp"]), float(r["rate"]), r["light"], r["move"], r["flip"],
+                f"=I{rr}/100*$N${hr - 1}",
                 float(r["tp"]) if r["tp"] is not None else None,
                 float(r["sl"]) if r["sl"] is not None else None, r["act"] or None]
         for j, v in enumerate(vals, 1):
             c = ws.cell(rr, j, v); c.font = fn; c.border = Border(bottom=thin)
             if fmts[j - 1]: c.number_format = fmts[j - 1]
-            if j in (1, 2, 10, 11, 15): c.alignment = Alignment(horizontal="center")
+            if j in (1, 2, 10, 11, 12, 16): c.alignment = Alignment(horizontal="center")
             if has_g and i == iM: c.fill = GF
             if has_r and i == im: c.fill = RF
             if i == n - 1: c.fill = YF
     ws.freeze_panes = ws.cell(top, 1)
-    for col, w in zip("ABCDEFGHIJKLMNO", [12, 10, 11, 11, 13, 13, 13, 10, 12, 6, 9, 11, 11, 11, 12]):
+    for col, w in zip("ABCDEFGHIJKLMNOP", [12, 10, 11, 11, 13, 13, 13, 10, 12, 11, 11, 9, 11, 11, 11, 12]):
         ws.column_dimensions[col].width = w
     wb.save(path)
     return {"iM": iM, "has_g": has_g}
 
 def rt_row(T, t_epoch, px, st, act):
-    """一筆紀錄。st 存最高/最低/上一燈號/折返次數。"""
+    """一筆紀錄。st 存最高/最低/上一燈號/折返次數/上一筆價格。
+    損益燈號（light）：跟進場價比，賺 🟢／虧 🔴／平 ⚪；折返次數照它算。
+    漲跌燈號（move）：跟上一筆比，漲 🟢／跌 🔴／沒動 ⚪（第一筆固定 ⚪），跟做多做空無關。"""
     entry, pos = T["entry"], T["pos"]
     px = rt_q(px, T["tick"])
     if px > st["hi"]: st["hi"] = px
@@ -5061,8 +5064,11 @@ def rt_row(T, t_epoch, px, st, act):
     light = "🟢" if gp > 0 else ("🔴" if gp < 0 else "⚪")
     if st["last"] is not None and light != st["last"]: st["flip"] += 1
     st["last"] = light
+    pv = st.get("prev")
+    move = "⚪" if pv is None or px == pv else ("🟢" if px > pv else "🔴")
+    st["prev"] = px
     t = datetime.fromtimestamp(t_epoch, TZ8).strftime("%H:%M:%S")
-    return {"t": t, "px": px, "amp": amp, "gp": gp, "rate": rate, "light": light, "flip": st["flip"],
+    return {"t": t, "px": px, "amp": amp, "gp": gp, "rate": rate, "light": light, "move": move, "flip": st["flip"],
             "tp": T["tp_px"], "sl": T["sl_px"], "act": act}
 
 async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
@@ -5103,11 +5109,11 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     rows = [rt_row(T, t0, entry, st, "")]          # 第 1 筆 = 進場那一刻（當時價 = 進場價）
     prev = entry; miss = 0; i = 0; xout = None
     lf = open(log_path, "w")
-    lf.write("筆,時間,進場價,當時價,最高振幅%,毛利價,毛利率%,燈號,折返次數,當時TP,當時SL,動作\n")
+    lf.write("筆,時間,進場價,當時價,最高振幅%,毛利價,毛利率%,損益燈號,漲跌燈號,折返次數,當時TP,當時SL,動作\n")
 
     def _log(r, k):
         lf.write(f"{k},{r['t']},{entry},{r['px']},{float(r['amp']):.6f},{r['gp']},{float(r['rate']):.6f},"
-                 f"{r['light']},{r['flip']},{r['tp']},{r['sl']},{r['act']}\n")
+                 f"{r['light']},{r['move']},{r['flip']},{r['tp']},{r['sl']},{r['act']}\n")
     _log(rows[0], 1)
     try:
         while key in RT:
