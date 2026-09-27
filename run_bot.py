@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4749,7 +4749,11 @@ RT_DESC = {"LA": "上方限價賣出(做空)", "LB": "上方觸發買入(做多)
 # v4.9.1：TG 畫面改半形、去多餘空格（1111 核可）；出場通知加「今日同幣種同方向統計」；
 #         SL/TP 移動% 改成真實移動幅度 = (這次價位 − 上一次價位) ÷ 上一次價位。
 RT_STATS_FILE = f"/srv/1111bot/data/runtest_stats_{ACCT}.json"   # 今日統計（台灣時間，每天 00:00 重算）
-RT_PKEYS = ("off", "tp", "sl", "hug_tp", "hug_sl", "go_tp", "go_sl")
+RT_PKEYS = ("off", "tp", "sl", "hug_tp", "hug_sl", "go_tp", "go_sl", "rec")
+# v4.9.2：第 12 個參數【止損回利%】—— 還在虧損時也可以提早發動 SL 緊貼：
+#   持倉中每 0.5 秒用 OKX 查到的現價算毛利率（進場價 vs 現價），記下最大虧損%；
+#   毛利率從最大虧損% 回升 ≥ 止損回利% → SL 發動緊貼（出場原因「回升SL」）。
+#   SL 一旦發動（不論回升或獲利發動）就一路緊貼到出場，只進不退。TP 不受影響。
 
 def rt_pos(dr):
     """成交後持倉方向：LB/SA 做多，LA/SB 做空。"""
@@ -4800,19 +4804,33 @@ def rt_rate(pos, entry, px):
 
 def rt_hug(T, px, tick, t_epoch):
     """依查詢現價做一次緊貼判斷，回傳動作文字（沒動回傳 ""）。
-    SL：毛利率 > SL發動條件 → 候選 = 現價 ∓ SL緊貼點%，只准往獲利方向前進。
+    SL 發動（兩個條件先到先算，發動後一路緊貼到出場）：
+      ① 毛利率 > SL發動條件（獲利發動 → 出場原因「緊貼SL」）
+      ② 曾經虧損，且毛利率 − 最大虧損% ≥ 止損回利%（回升發動 → 出場原因「回升SL」）
+      發動後每次：候選 = 現價 ∓ SL緊貼點%，只准往獲利方向前進。
     TP：毛利率 > TP發動條件 → 候選 = 現價 ± TP緊貼點%；第一次發動直接拉過來，之後只准往獲利方向後退。"""
     pos, entry = T["pos"], T["entry"]
     rate = rt_rate(pos, entry, px)
     t = datetime.fromtimestamp(t_epoch, TZ8).strftime("%H:%M:%S")
     acts = []
-    if rate > T["go_sl"]:
+    if rate < T["worst"]:
+        T["worst"] = rate                                    # 最大虧損%（查詢現價算的毛利率）
+    fired = ""
+    if T["sl_via"] is None:
+        if rate > T["go_sl"]:
+            T["sl_via"] = "獲利"
+        elif T["worst"] < 0 and rate - T["worst"] >= T["rec"]:
+            T["sl_via"] = "回升"; fired = "SL回升發動"
+    if T["sl_via"] is not None:
         if pos == "L":
             c = _rt_round(px * (1 - T["hug_sl"] / 100), tick, False); better = c > T["sl_px"]
         else:
             c = _rt_round(px * (1 + T["hug_sl"] / 100), tick, True);  better = c < T["sl_px"]
         if better:
-            T["smv"].append({"t": t, "v": c, "v0": T["sl_px"], "px": px}); T["sl_px"] = c; acts.append("SL緊貼")
+            T["smv"].append({"t": t, "v": c, "v0": T["sl_px"], "px": px}); T["sl_px"] = c
+            acts.append(fired or "SL緊貼")
+        elif fired:
+            acts.append(fired)
     if rate > T["go_tp"]:
         if pos == "L":
             c = _rt_round(px * (1 + T["hug_tp"] / 100), tick, True);  better = c > T["tp_px"]
@@ -4934,7 +4952,8 @@ def rt_head(T):
 
 def rt_cmd_text(T):
     return (f"/runtest {T['sym']} {T['dr']} {T['lev']}x {pct(T['mg'])}u {pct(T['off'])} {pct(T['tp'])} "
-            f"{pct(T['sl'])} {pct(T['hug_tp'])} {pct(T['hug_sl'])} >{pct(T['go_tp'])}% >{pct(T['go_sl'])}%")
+            f"{pct(T['sl'])} {pct(T['hug_tp'])} {pct(T['hug_sl'])} >{pct(T['go_tp'])}% >{pct(T['go_sl'])}% "
+            f"{pct(T['rec'])}")
 
 def rt_move_lines(name, mv):
     L = [f"{name}移動 {len(mv)} 次"]
@@ -4963,7 +4982,8 @@ def rt_build_excel(path, meta, rows):
     tps, sls = ("+", "-") if pos == "L" else ("-", "+")
     ws["A3"] = (f"初始TP {meta['tp0']}（{tps}{pct(T['tp'])}%）　初始SL {meta['sl0']}（{sls}{pct(T['sl'])}%）　"
                 f"緊貼規則：毛利率 >{pct(T['go_sl'])}% → SL 貼現價 {pct(T['hug_sl'])}%（只進不退）；"
-                f"毛利率 >{pct(T['go_tp'])}% → TP 貼現價 {pct(T['hug_tp'])}%（只退不進）")
+                f"毛利率 >{pct(T['go_tp'])}% → TP 貼現價 {pct(T['hug_tp'])}%（只退不進）；"
+                f"止損回利：從最大虧損回升 ≥{pct(T['rec'])}% → SL 提早發動緊貼")
     ws["A2"].font = fn; ws["A3"].font = fn
     n = len(rows)
     iM = max(range(n), key=lambda i: (rows[i]["rate"], -i))
@@ -5060,7 +5080,8 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
         tp0 = _rt_round(entry * (1 - T["tp"] / 100), tick, False)
         sl0 = _rt_round(entry * (1 + T["sl"] / 100), tick, True)
     T.update({"pos": pos, "entry": entry, "tick": tick, "tp_px": tp0, "sl_px": sl0, "tp_on": False,
-              "smv": [], "tmv": [], "hit": None, "xhit": None, "t_in": t0})
+              "smv": [], "tmv": [], "hit": None, "xhit": None, "t_in": t0,
+              "worst": Decimal(0), "sl_via": None})
     T["ev"].clear()
     T["state"] = "持倉中"          # 從這一刻起 WS 逐筆檢查出場
     os.makedirs(RT_DIR, exist_ok=True)
@@ -5113,7 +5134,8 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
             return
         tx, xpx, why = xout
         if why == "SL":
-            x_level = T["sl_px"]; reason = "緊貼SL" if T["smv"] else "靜態SL"
+            x_level = T["sl_px"]
+            reason = ("回升SL" if T["sl_via"] == "回升" else "緊貼SL") if T["smv"] else "靜態SL"
         else:
             x_level = T["tp_px"]; reason = "緊貼TP" if T["tmv"] else "靜態TP"
         r = rt_row(T, tx, xpx, st, "出場")
@@ -5137,6 +5159,11 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
         peak = f"峰值 {rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"
     else:
         peak = "峰值 無(全程未獲利)"
+    im = min(range(len(rows)), key=lambda k: (rows[k]["rate"], k))
+    if rows[im]["rate"] < 0:
+        trough = f"谷底 {rows[im]['px']}({float(rows[im]['rate']):+.3f}%)"
+    else:
+        trough = "谷底 無(全程未虧損)"
     ico = E.WIN if netU >= 0 else E.LOSS
     L = [f"{ico} 出場成交 {rt_head(T)}",
          f"出場原因:{reason}",
@@ -5144,6 +5171,7 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
          f"進場 {t_in.strftime('%H:%M:%S')}|{entry}",
          f"出場 {x_t}|{x_level}|{rt_hms(tx - t0)}",
          peak,
+         trough,
          "━━━━━━━━━━",
          f"毛利(率):{gU:+.4f} U ({grate:+.3f}%)",
          f"手續(率):{feeU:+.4f} U (-{fee:.3f}%)",
@@ -5225,8 +5253,8 @@ def rt_start(app, p, chat, base0=None):
     rt_save()
 
 RT_USAGE = (f"{E.BOT} 用法：/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% "
-            f"TP緊貼點% SL緊貼點% TP發動條件% SL發動條件%\n"
-            f"例：/runtest ZECUSDT LB 1x 100u 0.4 2 0.5 0.1 0.1 >0.3% >0.1%\n"
+            f"TP緊貼點% SL緊貼點% TP發動條件% SL發動條件% 止損回利%\n"
+            f"例：/runtest ZECUSDT LB 1x 100u 0.4 2 0.5 0.1 0.1 >0.3% >0.1% 0.4\n"
             f"方向：LA 上方限價賣出（做空）｜LB 上方觸發買入（做多）\n"
             f"　　　SA 下方限價買入（做多）｜SB 下方觸發賣出（做空）\n"
             f"槓桿要加 x、保證金要加 u、發動條件要加 >（大小寫皆可）\n"
@@ -5234,9 +5262,9 @@ RT_USAGE = (f"{E.BOT} 用法：/runtest 商品 方向 槓桿 保證金 埋伏點
             f"全部停止：/stopruntest")
 
 def rt_parse(a):
-    """解析 11 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
-    if len(a) != 11:
-        return None, f"參數數量錯誤（需11個，收到{len(a)}個）"
+    """解析 12 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
+    if len(a) != 12:
+        return None, f"參數數量錯誤（需12個，收到{len(a)}個）"
     p = {"sym": a[0].upper(), "dr": a[1].upper()}
     if p["dr"] not in RT_DESC:
         return None, "方向須是 LA / LB / SA / SB"
@@ -5248,7 +5276,7 @@ def rt_parse(a):
     if not m or Decimal(m.group(1)) <= 0:
         return None, "保證金須是數字加 u（例 100u）"
     p["mg"] = Decimal(m.group(1))
-    names = ["埋伏點%", "TP點%", "SL點%", "TP緊貼點%", "SL緊貼點%", "TP發動條件%", "SL發動條件%"]
+    names = ["埋伏點%", "TP點%", "SL點%", "TP緊貼點%", "SL緊貼點%", "TP發動條件%", "SL發動條件%", "止損回利%"]
     for k, nm, raw in zip(RT_PKEYS, names, a[4:]):
         s = raw.strip()
         if k in ("go_tp", "go_sl"):
@@ -5309,7 +5337,7 @@ async def cmd_runtest(u, c):
                    f"━━━━━━━━━━\n"
                    f"埋伏 {pct(p['off'])}%｜TP {pct(p['tp'])}%｜SL {pct(p['sl'])}%\n"
                    f"緊貼 TP {pct(p['hug_tp'])}%｜SL {pct(p['hug_sl'])}%\n"
-                   f"發動 TP >{pct(p['go_tp'])}%｜SL >{pct(p['go_sl'])}%\n"
+                   f"發動 TP >{pct(p['go_tp'])}%｜SL >{pct(p['go_sl'])}%｜回升 {pct(p['rec'])}%\n"
                    f"━━━━━━━━━━\n"
                    f"現價 {px}→{word} {amb}\n"
                    f"{p['dr']}={RT_DESC[p['dr']]}\n"
@@ -5347,7 +5375,7 @@ async def rt_recover(app):
     names = []; old = []
     for d in data:
         try:
-            if "lev" not in d:
+            if "lev" not in d or "rec" not in d:      # v4.9.1 以前的格式缺參數
                 old.append(f"{d.get('sym')} {d.get('dr')} {d.get('off')}%"); continue
             p = {"sym": d["sym"], "dr": d["dr"], "lev": int(d["lev"]), "mg": Decimal(d["mg"]),
                  **{k: Decimal(d[k]) for k in RT_PKEYS}}
@@ -5398,9 +5426,9 @@ async def cmd_menu(u, c):
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
-        "/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% TP緊貼點% SL緊貼點% TP發動條件% SL發動條件%\n"
+        "/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% TP緊貼點% SL緊貼點% TP發動條件% SL發動條件% 止損回利%\n"
         "　模擬單邊交易，碰到 TP/SL 出場（不下單，Excel 附在出場通知）\n"
-        "　例：/runtest ZECUSDT LB 1x 100u 0.4 2 0.5 0.1 0.1 >0.3% >0.1%　｜不帶參數＝查看進行中\n"
+        "　例：/runtest ZECUSDT LB 1x 100u 0.4 2 0.5 0.1 0.1 >0.3% >0.1% 0.4　｜不帶參數＝查看進行中\n"
         "/stopruntest 停止全部 runtest\n"
         "/timeframe 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
