@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4729,9 +4729,11 @@ async def cmd_amp(u, c):
 #       → 依 TP/SL 緊貼規則移動 → 碰到 TP 或 SL 出場（沒有時間限制）
 #       → 出場通知附 Excel → 自動回到埋伏，循環到 /stopruntest。
 # v4.9 指令：/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% TP緊貼點% SL緊貼點% TP發動條件% SL發動條件%
-#   方向（L/S 決定掛在現價上方或下方，A/B 決定委託種類）：
-#     LA 上方 限價賣出 → 做空　　LB 上方 觸發買入 → 做多
-#     SA 下方 限價買入 → 做多　　SB 下方 觸發賣出 → 做空
+#   方向（v4.9.7 更正）：第一個字母 L＝做多、S＝做空；第二個字母 A＝限價、B＝觸發。
+#     LA 下方 限價買入 → 做多（抄底）　　LB 上方 觸發買入 → 做多（追高）
+#     SA 上方 限價賣出 → 做空（逢高空）　SB 下方 觸發賣出 → 做空（殺低）
+#   LA 與 SB 都掛在現價下方、LB 與 SA 都掛在現價上方，但持倉方向相反，TP/SL 位置也相反。
+#   （v4.9～v4.9.6 把 LA、SA 對調了：當時的 LA 實際是上方限價做空、SA 是下方限價做多。）
 #   緊貼（每 0.5 秒用查詢現價計算一次）：
 #     毛利率 > SL發動條件 → SL 貼到 現價 ∓ SL緊貼點%，只進不退
 #     毛利率 > TP發動條件 → TP 貼到 現價 ± TP緊貼點%，第一次從初始TP拉過來，之後只退不進
@@ -4744,8 +4746,8 @@ RT_MOVE_SHOW = 10           # 出場通知 SL/TP 移動清單顯示最近幾筆
 RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
 RT_DIR       = "/srv/1111bot/data/runtest"
 RT = {}                     # key -> 參數＋狀態（見 rt_start）
-RT_DESC = {"LA": "上方限價賣出(做空)", "LB": "上方觸發買入(做多)",
-           "SA": "下方限價買入(做多)", "SB": "下方觸發賣出(做空)"}
+RT_DESC = {"LA": "下方限價買入(做多)", "LB": "上方觸發買入(做多)",
+           "SA": "上方限價賣出(做空)", "SB": "下方觸發賣出(做空)"}
 # v4.9.1：TG 畫面改半形、去多餘空格（1111 核可）；出場通知加「今日同幣種同方向統計」；
 #         SL/TP 移動% 改成真實移動幅度 = (這次價位 − 上一次價位) ÷ 上一次價位。
 RT_STATS_FILE = f"/srv/1111bot/data/runtest_stats_{ACCT}.json"   # 今日統計（台灣時間，每天 00:00 重算）
@@ -4756,12 +4758,12 @@ RT_PKEYS = ("off", "tp", "sl", "hug_tp", "hug_sl", "go_tp", "go_sl", "rec")
 #   SL 一旦發動（不論回升或獲利發動）就一路緊貼到出場，只進不退。TP 不受影響。
 
 def rt_pos(dr):
-    """成交後持倉方向：LB/SA 做多，LA/SB 做空。"""
-    return "L" if dr in ("LB", "SA") else "S"
+    """成交後持倉方向：第一個字母 L＝做多、S＝做空（LA/LB 做多，SA/SB 做空）。"""
+    return "L" if dr[0] == "L" else "S"
 
 def rt_up(dr):
-    """埋伏位置：LA/LB 在現價上方，SA/SB 在現價下方。"""
-    return dr[0] == "L"
+    """埋伏位置：LB/SA 在現價上方，LA/SB 在現價下方。"""
+    return dr in ("LB", "SA")
 
 def rt_save():
     try:
@@ -4973,8 +4975,8 @@ def rt_build_excel(path, meta, rows):
     wb = Workbook(); ws = wb.active; ws.title = "runtest"
     ws["A1"] = f"{rt_cmd_text(T)}　{ACCT}"
     ws["A1"].font = Font(name=F, bold=True, size=13)
-    word = {"LA": "上方限價賣出＝做空", "LB": "上方觸發買入＝做多",
-            "SA": "下方限價買入＝做多", "SB": "下方觸發賣出＝做空"}[T["dr"]]
+    word = {"LA": "下方限價買入＝做多", "LB": "上方觸發買入＝做多",
+            "SA": "上方限價賣出＝做空", "SB": "下方觸發賣出＝做空"}[T["dr"]]
     ws["A2"] = (f"{'觸發價' if kind == 'B' else '限價'} {meta['amb']}（{word}；埋伏時現價 {meta['base']} × "
                 f"(1{'+' if up else '-'}{pct(T['off'])}%)）　進場時間 {meta['t_in']}　進場時價 {meta['hit_px']}　"
                 f"名目本金 {pct(meta['notional'])}U（{pct(T['mg'])}u × {T['lev']}x）　"
@@ -5309,9 +5311,9 @@ RT_USAGE = (f"{E.BOT} 用法：\n"
             f"0.2 0.15\n"
             f"TP發動條件% SL發動條件% 止損回利%\n"
             f">0.4% >0.2% 0.5\n"
-            f"LA 上方限價賣出(做空)\n"
+            f"LA 下方限價買入(做多)\n"
             f"LB 上方觸發買入(做多)\n"
-            f"SA 下方限價買入(做多)\n"
+            f"SA 上方限價賣出(做空)\n"
             f"SB 下方觸發賣出(做空)\n"
             f"\n"
             f"全部停止：/stopruntest")
