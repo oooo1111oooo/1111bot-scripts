@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -5252,13 +5252,21 @@ def rt_start(app, p, chat, base0=None):
     RT[key]["task"] = asyncio.create_task(rt_worker(app, key))
     rt_save()
 
-RT_USAGE = (f"{E.BOT} 用法：/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% "
-            f"TP緊貼點% SL緊貼點% TP發動條件% SL發動條件% 止損回利%\n"
-            f"例：/runtest ZECUSDT LB 1x 100u 0.4 2 0.5 0.1 0.1 >0.3% >0.1% 0.4\n"
-            f"方向：LA 上方限價賣出（做空）｜LB 上方觸發買入（做多）\n"
-            f"　　　SA 下方限價買入（做多）｜SB 下方觸發賣出（做空）\n"
-            f"槓桿要加 x、保證金要加 u、發動條件要加 >（大小寫皆可）\n"
-            f"純模擬不下單；碰到 TP/SL 出場，Excel 附在出場通知，然後自動繼續埋伏\n"
+# v4.9.3：用法畫面與「進行中」清單改版（1111 核可）：⏱️ 埋伏中｜🎯 持倉中，去掉中文字與空格。
+RT_USAGE = (f"{E.BOT} 用法：\n"
+            f"/runtest 商品 方向 槓桿 保證金\n"
+            f"/runtest ZECUSDT LB 1x 100u\n"
+            f"埋伏點% TP點% SL點%\n"
+            f"0.8 1.0 1.0\n"
+            f"TP緊貼點% SL緊貼點%\n"
+            f"0.2 0.15\n"
+            f"TP發動條件% SL發動條件% 止損回利%\n"
+            f">0.4% >0.2% 0.5\n"
+            f"LA 上方限價賣出(做空)\n"
+            f"LB 上方觸發買入(做多)\n"
+            f"SA 下方限價買入(做多)\n"
+            f"SB 下方觸發賣出(做空)\n"
+            f"\n"
             f"全部停止：/stopruntest")
 
 def rt_parse(a):
@@ -5301,20 +5309,17 @@ def rt_parse(a):
     return p, None
 
 def rt_status_line(v):
-    st = v.get("state")
-    if st == "持倉中":
-        hold = rt_hold_str(time.time() - v.get("t_in", time.time()))
-        return f"{rt_head(v)}｜持倉中 {hold}｜TP {v.get('tp_px')}｜SL {v.get('sl_px')}"
-    word = "觸發價" if v["dr"][1] == "B" else "限價"
-    return f"{rt_head(v)}｜{st}｜{word} {v.get('amb', '-')}"
+    """🎯 持倉中：進場價｜持倉時間　⏱️ 埋伏中：掛單價（A=限價、B=觸發價，方向代號已表示）。"""
+    if v.get("state") == "持倉中":
+        return f"🎯{v['sym']} {v['dr']}|{v.get('entry', '-')}|{rt_hms(time.time() - v.get('t_in', time.time()))}"
+    return f"⏱️{v['sym']} {v['dr']}|{v.get('amb', '-')}"
 
 async def cmd_runtest(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args or []
     if not a:
-        L = [RT_USAGE, "━━━━━━━━━━"]
+        L = [RT_USAGE, "", "進行中："]
         if RT:
-            L.append("進行中：")
             L += [rt_status_line(v) for v in RT.values()]
         else:
             L.append("目前沒有進行中的 runtest")
