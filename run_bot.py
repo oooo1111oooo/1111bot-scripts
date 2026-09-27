@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -5169,6 +5169,9 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
          f"出場原因:{reason}",
          "━━━━━━━━━━",
          f"進場 {t_in.strftime('%H:%M:%S')}|{entry}",
+         # v4.9.4：初始 TP/SL（進場那一刻設定）。用全形 ＴＰ／ＳＬ，寬度跟「進場」兩個中文字一樣，TG 上才對得齊。
+         f"ＴＰ {t_in.strftime('%H:%M:%S')}|{tp0}",
+         f"ＳＬ {t_in.strftime('%H:%M:%S')}|{sl0}",
          f"出場 {x_t}|{x_level}|{rt_hms(tx - t0)}",
          peak,
          trough,
