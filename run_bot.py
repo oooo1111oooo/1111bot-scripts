@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -5149,6 +5149,7 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     finally:
         lf.close()
     T["state"] = "結算中"
+    T["next_at"] = rt_next_open(tx)                     # v4.9.6：出場後等下一根 5m 開盤
     kind = dr[1]
     notional = T["mg"] * T["lev"]
     grate = rt_rate(pos, entry, x_level)
@@ -5189,7 +5190,7 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     L += rt_move_lines("SL", T["smv"])
     L += rt_move_lines("TP", T["tmv"])
     if miss: L.append(f"{E.WARN} 查價失敗 {miss} 筆(沿用前一筆價格)")
-    L.append("已回到埋伏，下一輪繼續")
+    L.append(f"等到 {datetime.fromtimestamp(T['next_at'], TZ8).strftime('%H:%M:%S')} 重新埋伏")
     L += rt_stats_lines(T, rt_stats_add(skey(sym, dr), tx, nrate, netU))
     msg = "\n".join(L)
     xlsx = f"{RT_DIR}/{base_name}.xlsx"
@@ -5222,17 +5223,34 @@ async def rt_worker(app, key):
         iid, tick = spec["iid"], spec["tick"]
         T["iid"] = iid
         WS_WANT.add(iid)
+        # v4.9.6：所有掛單都對齊 5m K 線開盤 —— 下指令、出場、bot 重開之後，都等到下一根 5m 開盤才掛；
+        #         埋伏價用那一根 5m K 線的【開盤價】（OKX candles），跟 K 線數據完全對齊。
+        next_open = T.get("next_at") or rt_next_open(time.time())
         while key in RT:
-            # ── 埋伏 ──
-            base = T.pop("base0", None); base_t = hhmmss()
-            while base is None:
-                base = await rt_px(iid)
-                if base is None: await asyncio.sleep(1)
+            # ── 等開盤 ──
+            T["amb"] = None; T["hit"] = None; T["xhit"] = None
+            T["next_at"] = next_open; T["state"] = "等開盤"
+            while key in RT and time.time() < next_open:
+                await asyncio.sleep(min(1.0, max(0.05, next_open - time.time())))
+            if key not in RT:
+                return
+            # ── 埋伏（用這根 5m K 線的開盤價）──
+            base = await rt_candle_open(iid, next_open)
+            base_t = datetime.fromtimestamp(next_open, TZ8).strftime("%H:%M:%S")
+            if base is None:                          # K 線一直拿不到（極少見）→ 用當下價格，時間照實記
+                while base is None and key in RT:
+                    base = await rt_px(iid)
+                    if base is None: await asyncio.sleep(1)
+                base_t = hhmmss()
+                print(f"[runtest] {sym} {dr} 取不到 5m 開盤價，改用現價 {base}")
+            if key not in RT:
+                return
             amb = rt_amb_price(base, dr, T["off"], tick)
             T["hit"] = None; T["xhit"] = None; T["ev"].clear()
             T["amb"] = amb; T["state"] = "埋伏中"   # 從這一刻起 WS 逐筆檢查進場
-            next_rearm = (int(time.time()) // RT_REARM_SEC + 1) * RT_REARM_SEC
-            print(f"[runtest] {sym} {dr} 埋伏 現價{base} → {amb}")
+            next_rearm = next_open + RT_REARM_SEC
+            next_open = next_rearm                    # 沒成交 → 下一根開盤重新埋伏（不必再等）
+            print(f"[runtest] {sym} {dr} 埋伏 {base_t} 開盤價{base} → {amb}")
             hit = None
             while key in RT and hit is None:
                 now_s = time.time()
@@ -5246,6 +5264,7 @@ async def rt_worker(app, key):
                     hit = (time.time(), px)
             if hit and key in RT:
                 await rt_hold(app, key, T, spec, amb, base, base_t, hit)
+                next_open = T.get("next_at") or rt_next_open(time.time())   # 出場後等下一根 5m 開盤
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -5253,15 +5272,34 @@ async def rt_worker(app, key):
         await rt_send(app, T["chat"], f"{E.LOSS} runtest {rt_head(T)} 異常停止：{type(e).__name__}: {e}")
         RT.pop(key, None); rt_save()
 
-def rt_start(app, p, chat, base0=None):
-    """p = 解析好的參數 dict（sym dr lev mg off tp sl hug_tp hug_sl go_tp go_sl）。"""
+def rt_next_open(t):
+    """t 之後的下一根 5m K 線開盤時間（epoch 秒，嚴格大於 t）。"""
+    return (int(t) // RT_REARM_SEC + 1) * RT_REARM_SEC
+
+async def rt_candle_open(iid, t_open):
+    """取 OKX 5m K 線在 t_open 那一根的開盤價。K 線剛開、還沒出現就每 0.5 秒重試，最多約 15 秒；
+    拿不到回 None。"""
+    for _ in range(30):
+        r = await pub(f"/api/v5/market/candles?instId={iid}&bar=5m&limit=3")
+        for row in (r.get("data") or []):
+            try:
+                if int(row[0]) // 1000 == int(t_open):
+                    return Decimal(row[1])
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+    return None
+
+def rt_start(app, p, chat, next_at=None):
+    """p = 解析好的參數 dict（sym dr lev mg off tp sl hug_tp hug_sl go_tp go_sl rec）。
+    next_at = 第一次掛單的 5m 開盤時間（下指令時算好，跟啟動訊息顯示的時間一致）。"""
     key = skey(p["sym"], p["dr"])
-    RT[key] = {**p, "chat": chat, "state": "啟動中", "n": 0, "base0": base0,
+    RT[key] = {**p, "chat": chat, "state": "等開盤", "n": 0, "next_at": next_at,
                "ev": asyncio.Event(), "hit": None, "xhit": None}
     RT[key]["task"] = asyncio.create_task(rt_worker(app, key))
     rt_save()
 
-# v4.9.3：用法畫面與「進行中」清單改版（1111 核可）：⏱️ 埋伏中｜🎯 持倉中，去掉中文字與空格。
+# v4.9.3：用法畫面與「進行中」清單改版（1111 核可），去掉中文字與空格；v4.9.6 起 🎯 持倉中｜💡 埋伏中｜⏳ 等開盤。
 RT_USAGE = (f"{E.BOT} 用法：\n"
             f"/runtest 商品 方向 槓桿 保證金\n"
             f"/runtest ZECUSDT LB 1x 100u\n"
@@ -5318,10 +5356,14 @@ def rt_parse(a):
     return p, None
 
 def rt_status_line(v):
-    """🎯 持倉中：進場價｜持倉時間　⏱️ 埋伏中：掛單價（A=限價、B=觸發價，方向代號已表示）。"""
-    if v.get("state") == "持倉中":
+    """🎯 持倉中：進場價｜持倉時間　💡 埋伏中：掛單價　⏳ 等開盤：預計掛單時間（v4.9.6）。"""
+    st = v.get("state")
+    if st == "持倉中":
         return f"🎯{v['sym']} {v['dr']}|{v.get('entry', '-')}|{rt_hms(time.time() - v.get('t_in', time.time()))}"
-    return f"⏱️{v['sym']} {v['dr']}|{v.get('amb', '-')}"
+    if st == "埋伏中":
+        return f"💡{v['sym']} {v['dr']}|{v.get('amb', '-')}"
+    na = v.get("next_at")
+    return f"⏳{v['sym']} {v['dr']}|{datetime.fromtimestamp(na, TZ8).strftime('%H:%M:%S') if na else '-'}"
 
 async def cmd_runtest(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
@@ -5343,9 +5385,8 @@ async def cmd_runtest(u, c):
         spec = await get_spec(p["sym"]); px = await get_last(spec["iid"])
     except Exception:
         await reply(u, f"{E.LOSS} 找不到商品 {p['sym']}"); return
-    amb = rt_amb_price(px, p["dr"], p["off"], spec["tick"])
-    rt_start(c.application, p, u.effective_chat.id, base0=px)
-    word = "觸發價" if p["dr"][1] == "B" else "限價"
+    nxt = rt_next_open(time.time())
+    rt_start(c.application, p, u.effective_chat.id, next_at=nxt)
     await reply(u, f"{E.BOT} runtest 啟動｜{ACCT}\n"
                    f"{rt_head(p)}\n"
                    f"━━━━━━━━━━\n"
@@ -5353,9 +5394,9 @@ async def cmd_runtest(u, c):
                    f"緊貼 TP {pct(p['hug_tp'])}%｜SL {pct(p['hug_sl'])}%\n"
                    f"發動 TP >{pct(p['go_tp'])}%｜SL >{pct(p['go_sl'])}%｜回升 {pct(p['rec'])}%\n"
                    f"━━━━━━━━━━\n"
-                   f"現價 {px}→{word} {amb}\n"
+                   f"現價 {px}\n"
                    f"{p['dr']}={RT_DESC[p['dr']]}\n"
-                   f"每 5 分鐘重新埋伏\n"
+                   f"下一根 5m 開盤 {datetime.fromtimestamp(nxt, TZ8).strftime('%H:%M:%S')} 掛單\n"
                    f"時間:{hhmmss()}")
 
 async def cmd_stopruntest(u, c):
