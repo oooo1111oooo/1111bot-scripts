@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4744,8 +4744,11 @@ RT_MOVE_SHOW = 10           # 出場通知 SL/TP 移動清單顯示最近幾筆
 RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
 RT_DIR       = "/srv/1111bot/data/runtest"
 RT = {}                     # key -> 參數＋狀態（見 rt_start）
-RT_DESC = {"LA": "上方限價賣出（做空）", "LB": "上方觸發買入（做多）",
-           "SA": "下方限價買入（做多）", "SB": "下方觸發賣出（做空）"}
+RT_DESC = {"LA": "上方限價賣出(做空)", "LB": "上方觸發買入(做多)",
+           "SA": "下方限價買入(做多)", "SB": "下方觸發賣出(做空)"}
+# v4.9.1：TG 畫面改半形、去多餘空格（1111 核可）；出場通知加「今日同幣種同方向統計」；
+#         SL/TP 移動% 改成真實移動幅度 = (這次價位 − 上一次價位) ÷ 上一次價位。
+RT_STATS_FILE = f"/srv/1111bot/data/runtest_stats_{ACCT}.json"   # 今日統計（台灣時間，每天 00:00 重算）
 RT_PKEYS = ("off", "tp", "sl", "hug_tp", "hug_sl", "go_tp", "go_sl")
 
 def rt_pos(dr):
@@ -4809,14 +4812,14 @@ def rt_hug(T, px, tick, t_epoch):
         else:
             c = _rt_round(px * (1 + T["hug_sl"] / 100), tick, True);  better = c < T["sl_px"]
         if better:
-            T["sl_px"] = c; T["smv"].append({"t": t, "v": c, "px": px}); acts.append("SL緊貼")
+            T["smv"].append({"t": t, "v": c, "v0": T["sl_px"], "px": px}); T["sl_px"] = c; acts.append("SL緊貼")
     if rate > T["go_tp"]:
         if pos == "L":
             c = _rt_round(px * (1 + T["hug_tp"] / 100), tick, True);  better = c > T["tp_px"]
         else:
             c = _rt_round(px * (1 - T["hug_tp"] / 100), tick, False); better = c < T["tp_px"]
         if (not T["tp_on"] and c != T["tp_px"]) or (T["tp_on"] and better):
-            T["tp_px"] = c; T["tmv"].append({"t": t, "v": c, "px": px}); acts.append("TP緊貼")
+            T["tmv"].append({"t": t, "v": c, "v0": T["tp_px"], "px": px}); T["tp_px"] = c; acts.append("TP緊貼")
         T["tp_on"] = True
     return "+".join(acts)
 
@@ -4884,6 +4887,43 @@ def rt_hold_str(sec):
     if sec < 3600: return f"{sec // 60}分{sec % 60:02d}秒"
     return f"{sec // 3600}時{sec % 3600 // 60:02d}分{sec % 60:02d}秒"
 
+def rt_hms(sec):
+    """持倉時間 hh:mm:ss（出場通知用）。"""
+    sec = int(sec)
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+def rt_stats_add(key, t_epoch, nrate, netU):
+    """記一筆出場到今日統計（台灣時間；換日自動清空），回傳今天這個 key 的全部紀錄。
+    存成檔案，bot 重開不會歸零。"""
+    day = datetime.fromtimestamp(t_epoch, TZ8).strftime("%Y-%m-%d")
+    try:
+        data = json.load(open(RT_STATS_FILE)) if os.path.exists(RT_STATS_FILE) else {}
+    except Exception as e:
+        print("[runtest] stats read fail", e); data = {}
+    if data.get("date") != day:
+        data = {"date": day, "items": {}}
+    lst = data["items"].setdefault(key, [])
+    lst.append({"n": str(nrate), "u": str(netU)})
+    try:
+        tmp = RT_STATS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, RT_STATS_FILE)
+    except Exception as e:
+        print("[runtest] stats save fail", e)
+    return lst
+
+def rt_stats_lines(T, lst):
+    ns = [Decimal(x["n"]) for x in lst]
+    us = [Decimal(x["u"]) for x in lst]
+    win = sum(1 for v in ns if v > 0)
+    return ["━━━━━━━━━━",
+            f"📊 今日 {T['sym']} {T['dr']} 統計(共{len(ns)}場)",
+            f"勝 {win}｜負 {len(ns) - win}",
+            f"累計淨利 {sum(us):+.4f} U ({sum(ns):+.3f}%)",
+            f"最佳淨利 {max(ns):+.3f}%",
+            f"最差淨利 {min(ns):+.3f}%"]
+
 def rt_p1(v):
     """參數顯示：2 → "2.0"、0.5 → "0.5"、0.25 → "0.25"。"""
     s = pct(v)
@@ -4899,9 +4939,10 @@ def rt_cmd_text(T):
 def rt_move_lines(name, mv):
     L = [f"{name}移動 {len(mv)} 次"]
     for m in mv[-RT_MOVE_SHOW:]:
-        L.append(f"{m['t']} | {m['v']} ({abs(m['px'] - m['v']) / m['px'] * 100:.3f}%)")
+        # 真實移動幅度：(這次價位 − 上一次價位) ÷ 上一次價位；往上 +、往下 −
+        L.append(f"{m['t']}|{m['v']} ({(m['v'] - m['v0']) / m['v0'] * 100:+.3f}%)")
     if len(mv) > RT_MOVE_SHOW:
-        L.append(f"（顯示最近{RT_MOVE_SHOW}筆，共{len(mv)}筆）")
+        L.append(f"(顯示最近{RT_MOVE_SHOW}筆,共{len(mv)}筆)")
     return L
 
 def rt_build_excel(path, meta, rows):
@@ -5031,12 +5072,12 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     await rt_send(app, chat,
         f"{E.ENTRY} 進場成交 {rt_head(T)}\n"
         f"━━━━━━━━━━\n"
-        f"查詢 {base_t} | {base}\n"
-        f"進場 {t_in.strftime('%H:%M:%S')} | {entry} | 時價 {hit_px}\n"
-        f"初始TP {tp0}（{tps}{rt_p1(T['tp'])}%）\n"
-        f"初始SL {sl0}（{sls}{rt_p1(T['sl'])}%）\n"
+        f"查詢 {base_t}|{base}\n"
+        f"進場 {t_in.strftime('%H:%M:%S')}|{entry}|🔍{hit_px}\n"
+        f"初始TP {tp0}({tps}{rt_p1(T['tp'])}%)\n"
+        f"初始SL {sl0}({sls}{rt_p1(T['sl'])}%)\n"
         f"━━━━━━━━━━\n"
-        f"時間：{hhmmss()}")
+        f"時間:{hhmmss()}")
     st = {"hi": entry, "lo": entry, "last": None, "flip": 0}
     rows = [rt_row(T, t0, entry, st, "")]          # 第 1 筆 = 進場那一刻（當時價 = 進場價）
     prev = entry; miss = 0; i = 0; xout = None
@@ -5093,25 +5134,26 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     xpx_s = rt_q(xpx, tick)
     iM = max(range(len(rows)), key=lambda k: (rows[k]["rate"], -k))
     if rows[iM]["rate"] > 0:
-        peak = f"峰值 {rows[iM]['px']}（{float(rows[iM]['rate']):+.3f}%）"
+        peak = f"峰值 {rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"
     else:
-        peak = "峰值 無（全程未獲利）"
+        peak = "峰值 無(全程未獲利)"
     ico = E.WIN if netU >= 0 else E.LOSS
     L = [f"{ico} 出場成交 {rt_head(T)}",
-         f"出場原因：{reason}",
+         f"出場原因:{reason}",
          "━━━━━━━━━━",
-         f"進場 {t_in.strftime('%H:%M:%S')} | {entry}",
-         f"出場 {x_t} | {x_level} | 持倉{hold}",
+         f"進場 {t_in.strftime('%H:%M:%S')}|{entry}",
+         f"出場 {x_t}|{x_level}|{rt_hms(tx - t0)}",
          peak,
          "━━━━━━━━━━",
-         f"毛利(率)　：{gU:+.4f} U（{grate:+.3f}%）",
-         f"手續費(率)：{feeU:+.4f} U（-{fee:.3f}%）估",
-         f"淨利(率)　：{netU:+.4f} U（{nrate:+.3f}%）{ico}",
+         f"毛利(率):{gU:+.4f} U ({grate:+.3f}%)",
+         f"手續(率):{feeU:+.4f} U (-{fee:.3f}%)",
+         f"淨利(率):{netU:+.4f} U ({nrate:+.3f}%){ico}",
          "━━━━━━━━━━"]
     L += rt_move_lines("SL", T["smv"])
     L += rt_move_lines("TP", T["tmv"])
-    if miss: L.append(f"{E.WARN} 查價失敗 {miss} 筆（沿用前一筆價格）")
+    if miss: L.append(f"{E.WARN} 查價失敗 {miss} 筆(沿用前一筆價格)")
     L.append("已回到埋伏，下一輪繼續")
+    L += rt_stats_lines(T, rt_stats_add(skey(sym, dr), tx, nrate, netU))
     msg = "\n".join(L)
     xlsx = f"{RT_DIR}/{base_name}.xlsx"
     meta = {"T": dict(T), "amb": amb, "base": base, "hit_px": hit_px, "t_in": rows[0]["t"], "tick": tick,
@@ -5269,10 +5311,10 @@ async def cmd_runtest(u, c):
                    f"緊貼 TP {pct(p['hug_tp'])}%｜SL {pct(p['hug_sl'])}%\n"
                    f"發動 TP >{pct(p['go_tp'])}%｜SL >{pct(p['go_sl'])}%\n"
                    f"━━━━━━━━━━\n"
-                   f"現價 {px} → {word} {amb}\n"
-                   f"{p['dr']}＝{RT_DESC[p['dr']]}\n"
+                   f"現價 {px}→{word} {amb}\n"
+                   f"{p['dr']}={RT_DESC[p['dr']]}\n"
                    f"每 5 分鐘重新埋伏\n"
-                   f"時間：{hhmmss()}")
+                   f"時間:{hhmmss()}")
 
 async def cmd_stopruntest(u, c):
     if not RT:
