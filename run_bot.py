@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v5.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -5163,18 +5163,22 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     hold = rt_hold_str(tx - t0)
     x_t = datetime.fromtimestamp(tx, TZ8).strftime("%H:%M:%S")
     xpx_s = rt_q(xpx, tick)
+    # v5.0：高利（原峰值）／高損（原谷底）＝Excel「最高獲利」「最大虧損」那一列（同價位取第一次出現），
+    #       跟出場依時間先後排列；最大漲幅／最大跌幅只看價格（最高價、最低價各自跟進場價比），跟做多做空無關。
     iM = max(range(len(rows)), key=lambda k: (rows[k]["rate"], -k))
-    if rows[iM]["rate"] > 0:
-        # v4.9.8：加時間 = Excel「最高獲利」那一列的時間（同價位取第一次出現）
-        peak = f"峰值 {rows[iM]['t']}|{rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"
-    else:
-        peak = "峰值 無(全程未獲利)"
     im = min(range(len(rows)), key=lambda k: (rows[k]["rate"], k))
-    if rows[im]["rate"] < 0:
-        # v4.9.8：加時間 = Excel「最大虧損」那一列的時間（同價位取第一次出現）
-        trough = f"谷底 {rows[im]['t']}|{rows[im]['px']}({float(rows[im]['rate']):+.3f}%)"
+    ev = []                                                 # (排序鍵, 文字)；「無」排在有時間的後面
+    if rows[iM]["rate"] > 0:
+        ev.append(((0, iM), f"高利 {rows[iM]['t']}|{rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"))
     else:
-        trough = "谷底 無(全程未虧損)"
+        ev.append(((1, 0), "高利 無(全程未獲利)"))
+    if rows[im]["rate"] < 0:
+        ev.append(((0, im), f"高損 {rows[im]['t']}|{rows[im]['px']}({float(rows[im]['rate']):+.3f}%)"))
+    else:
+        ev.append(((1, 1), "高損 無(全程未虧損)"))
+    hi_px = max(r["px"] for r in rows); lo_px = min(r["px"] for r in rows)
+    up_pct = (hi_px - entry) / entry * 100
+    dn_pct = (lo_px - entry) / entry * 100
     ico = E.WIN if netU >= 0 else E.LOSS
     L = [f"{ico} 出場成交 {rt_head(T)}",
          f"出場原因:{reason}",
@@ -5182,15 +5186,16 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
          f"進場 {t_in.strftime('%H:%M:%S')}|{entry}",
          # v4.9.4：初始 TP/SL（進場那一刻設定）。用全形 ＴＰ／ＳＬ，寬度跟「進場」兩個中文字一樣，TG 上才對得齊。
          f"ＴＰ {t_in.strftime('%H:%M:%S')}|{tp0}",
-         f"ＳＬ {t_in.strftime('%H:%M:%S')}|{sl0}",
-         f"出場 {x_t}|{x_level}|{rt_hms(tx - t0)}",
-         peak,
-         trough,
-         "━━━━━━━━━━",
-         f"毛利(率):{gU:+.4f} U ({grate:+.3f}%)",
-         f"手續(率):{feeU:+.4f} U (-{fee:.3f}%)",
-         f"淨利(率):{netU:+.4f} U ({nrate:+.3f}%){ico}",
-         "━━━━━━━━━━"]
+         f"ＳＬ {t_in.strftime('%H:%M:%S')}|{sl0}"]
+    L += [txt for _, txt in sorted(ev)]
+    L += [f"出場 {x_t}|{x_level}|{rt_hms(tx - t0)}",
+          f"最大漲幅 {float(up_pct):+.3f}%",
+          f"最大跌幅 {float(dn_pct):+.3f}%",
+          "━━━━━━━━━━",
+          f"毛利(率):{gU:+.4f} U ({grate:+.3f}%)",
+          f"手續(率):{feeU:+.4f} U (-{fee:.3f}%)",
+          f"淨利(率):{netU:+.4f} U ({nrate:+.3f}%){ico}",
+          "━━━━━━━━━━"]
     L += rt_move_lines("SL", T["smv"])
     L += rt_move_lines("TP", T["tmv"])
     if miss: L.append(f"{E.WARN} 查價失敗 {miss} 筆(沿用前一筆價格)")
