@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -5165,12 +5165,14 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     xpx_s = rt_q(xpx, tick)
     iM = max(range(len(rows)), key=lambda k: (rows[k]["rate"], -k))
     if rows[iM]["rate"] > 0:
-        peak = f"峰值 {rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"
+        # v4.9.8：加時間 = Excel「最高獲利」那一列的時間（同價位取第一次出現）
+        peak = f"峰值 {rows[iM]['t']}|{rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"
     else:
         peak = "峰值 無(全程未獲利)"
     im = min(range(len(rows)), key=lambda k: (rows[k]["rate"], k))
     if rows[im]["rate"] < 0:
-        trough = f"谷底 {rows[im]['px']}({float(rows[im]['rate']):+.3f}%)"
+        # v4.9.8：加時間 = Excel「最大虧損」那一列的時間（同價位取第一次出現）
+        trough = f"谷底 {rows[im]['t']}|{rows[im]['px']}({float(rows[im]['rate']):+.3f}%)"
     else:
         trough = "谷底 無(全程未虧損)"
     ico = E.WIN if netU >= 0 else E.LOSS
