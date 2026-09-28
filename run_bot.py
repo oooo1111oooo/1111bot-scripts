@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v5.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v5.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4735,16 +4735,16 @@ async def cmd_amp(u, c):
 #     SA 上方 限價賣出 → 做空（逢高空）　SB 下方 觸發賣出 → 做空（殺低）
 #   LA 與 SB 都掛在現價下方、LB 與 SA 都掛在現價上方，但持倉方向相反，TP/SL 位置也相反。
 #   （v4.9～v4.9.6 把 LA、SA 對調了：當時的 LA 實際是上方限價做空、SA 是下方限價做多。）
-#   緊貼（每 0.5 秒用查詢現價計算一次）：
+#   緊貼（v5.2 起每 0.25 秒用查詢現價計算一次，一秒 4 次）：
 #     毛利率 > SL發動條件 → SL 貼到 現價 ∓ SL緊貼點%，只進不退
 #     毛利率 > TP發動條件 → TP 貼到 現價 ± TP緊貼點%，第一次從初始TP拉過來，之後只退不進
-#   碰觸（進場、出場）：WS 每一筆成交都檢查；WS 斷線時由每 0.5 秒的 REST 查價補判斷。
+#   碰觸（進場、出場）：WS 每一筆成交都檢查；WS 斷線時由每 0.25 秒的查價補判斷。
 #   手續費無 OKX 資料，只能估：A（限價進場 maker＋市價出場 taker）0.070%、B（taker×2）0.100%。
 # v5.1：重新埋伏週期不再寫死 5m —— 每一筆 runtest 下指令當下鎖定當時的 /TF（帳戶週期），跑到停止都不變；
 #       中途改 /TF 只影響之後新下的 runtest。v5.0 以前存下來的 runtest 沒記週期 → 一律當 5m。
 RT_TF_OLD    = "5m"         # 舊存檔沒有週期時用這個
 RT_BAR       = {"3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m"}   # OKX 有原生 K 線的週期
-RT_STEP      = 0.5          # 每幾秒查價一次（一秒 2 次）：緊貼移動與 Excel 記錄都用這個節奏
+RT_STEP      = 0.25         # 每幾秒查價一次（v5.2：一秒 4 次，原 0.5 秒）：緊貼移動與 Excel 記錄都用這個節奏
 RT_FEE       = {"A": Decimal("0.070"), "B": Decimal("0.100")}   # 估計手續費率 %（來回）
 RT_MOVE_SHOW = 10           # 出場通知 SL/TP 移動清單顯示最近幾筆
 RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
@@ -4757,7 +4757,7 @@ RT_DESC = {"LA": "下方限價買入(做多)", "LB": "上方觸發買入(做多)
 RT_STATS_FILE = f"/srv/1111bot/data/runtest_stats_{ACCT}.json"   # 今日統計（台灣時間，每天 00:00 重算）
 RT_PKEYS = ("off", "tp", "sl", "hug_tp", "hug_sl", "go_tp", "go_sl", "rec")
 # v4.9.2：第 12 個參數【止損回利%】—— 還在虧損時也可以提早發動 SL 緊貼：
-#   持倉中每 0.5 秒用 OKX 查到的現價算毛利率（進場價 vs 現價），記下最大虧損%；
+#   持倉中每 0.25 秒用 OKX 查到的現價算毛利率（進場價 vs 現價），記下最大虧損%；
 #   毛利率從最大虧損% 回升 ≥ 止損回利% → SL 發動緊貼（出場原因「回升SL」）。
 #   SL 一旦發動（不論回升或獲利發動）就一路緊貼到出場，只進不退。TP 不受影響。
 
