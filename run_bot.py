@@ -126,14 +126,15 @@ def _peak_in_window(k, win=2.0):
 
 
 # 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
-TF_SEC = {"5m": 300, "6m": 360, "8m": 480, "10m": 600,
+# v5.1：加 3m（1111）。預設仍是 5m（ACCOUNT_TF）。
+TF_SEC = {"3m": 180, "5m": 300, "6m": 360, "8m": 480, "10m": 600,
           "12m": 720, "15m": 900, "20m": 1200, "25m": 1500, "30m": 1800}
 
 def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v5.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v5.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4725,7 +4726,7 @@ async def cmd_amp(u, c):
 
 # ---------- /runtest 模擬單邊交易（v4.9） ----------
 # 純模擬：只查價格，不下任何單，不碰 STRATS / 掛單 / 持倉，不影響 /run。
-# 流程：下指令當下埋伏 → 每 5 分鐘 K 線開盤用新現價重新埋伏 → 碰到埋伏價即進場
+# 流程：等下一根 TF K 線開盤 → 用那根開盤價埋伏 → 沒成交就下一根 TF 開盤重新埋伏 → 碰到埋伏價即進場
 #       → 依 TP/SL 緊貼規則移動 → 碰到 TP 或 SL 出場（沒有時間限制）
 #       → 出場通知附 Excel → 自動回到埋伏，循環到 /stopruntest。
 # v4.9 指令：/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% TP緊貼點% SL緊貼點% TP發動條件% SL發動條件%
@@ -4739,7 +4740,10 @@ async def cmd_amp(u, c):
 #     毛利率 > TP發動條件 → TP 貼到 現價 ± TP緊貼點%，第一次從初始TP拉過來，之後只退不進
 #   碰觸（進場、出場）：WS 每一筆成交都檢查；WS 斷線時由每 0.5 秒的 REST 查價補判斷。
 #   手續費無 OKX 資料，只能估：A（限價進場 maker＋市價出場 taker）0.070%、B（taker×2）0.100%。
-RT_REARM_SEC = 300          # 重新埋伏週期：固定 5 分鐘（不跟 /timeframe 變）
+# v5.1：重新埋伏週期不再寫死 5m —— 每一筆 runtest 下指令當下鎖定當時的 /TF（帳戶週期），跑到停止都不變；
+#       中途改 /TF 只影響之後新下的 runtest。v5.0 以前存下來的 runtest 沒記週期 → 一律當 5m。
+RT_TF_OLD    = "5m"         # 舊存檔沒有週期時用這個
+RT_BAR       = {"3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m"}   # OKX 有原生 K 線的週期
 RT_STEP      = 0.5          # 每幾秒查價一次（一秒 2 次）：緊貼移動與 Excel 記錄都用這個節奏
 RT_FEE       = {"A": Decimal("0.070"), "B": Decimal("0.100")}   # 估計手續費率 %（來回）
 RT_MOVE_SHOW = 10           # 出場通知 SL/TP 移動清單顯示最近幾筆
@@ -4768,7 +4772,7 @@ def rt_up(dr):
 def rt_save():
     try:
         data = [{"sym": v["sym"], "dr": v["dr"], "lev": v["lev"], "mg": str(v["mg"]), "chat": v["chat"],
-                 **{k: str(v[k]) for k in RT_PKEYS}}
+                 "tf": rt_tf(v), **{k: str(v[k]) for k in RT_PKEYS}}
                 for v in RT.values()]
         tmp = RT_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -5151,7 +5155,7 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
     finally:
         lf.close()
     T["state"] = "結算中"
-    T["next_at"] = rt_next_open(tx)                     # v4.9.6：出場後等下一根 5m 開盤
+    T["next_at"] = rt_next_open(tx, rt_tf_sec(T))       # 出場後等下一根 TF 開盤（v5.1 跟著 TF）
     kind = dr[1]
     notional = T["mg"] * T["lev"]
     grate = rt_rate(pos, entry, x_level)
@@ -5232,9 +5236,11 @@ async def rt_worker(app, key):
         iid, tick = spec["iid"], spec["tick"]
         T["iid"] = iid
         WS_WANT.add(iid)
-        # v4.9.6：所有掛單都對齊 5m K 線開盤 —— 下指令、出場、bot 重開之後，都等到下一根 5m 開盤才掛；
-        #         埋伏價用那一根 5m K 線的【開盤價】（OKX candles），跟 K 線數據完全對齊。
-        next_open = T.get("next_at") or rt_next_open(time.time())
+        # v4.9.6：所有掛單都對齊 K 線開盤 —— 下指令、出場、bot 重開之後，都等到下一根開盤才掛；
+        #         埋伏價用那一根 K 線的【開盤價】（OKX candles），跟 K 線數據完全對齊。
+        # v5.1：K 線週期 = 這筆 runtest 鎖定的 TF（不再寫死 5m）。
+        tf, tf_sec = rt_tf(T), rt_tf_sec(T)
+        next_open = T.get("next_at") or rt_next_open(time.time(), tf_sec)
         while key in RT:
             # ── 等開盤 ──
             T["amb"] = None; T["hit"] = None; T["xhit"] = None
@@ -5243,28 +5249,28 @@ async def rt_worker(app, key):
                 await asyncio.sleep(min(1.0, max(0.05, next_open - time.time())))
             if key not in RT:
                 return
-            # ── 埋伏（用這根 5m K 線的開盤價）──
-            base = await rt_candle_open(iid, next_open)
+            # ── 埋伏（用這根 TF K 線的開盤價）──
+            base = await rt_candle_open(iid, next_open, tf)
             base_t = datetime.fromtimestamp(next_open, TZ8).strftime("%H:%M:%S")
             if base is None:                          # K 線一直拿不到（極少見）→ 用當下價格，時間照實記
                 while base is None and key in RT:
                     base = await rt_px(iid)
                     if base is None: await asyncio.sleep(1)
                 base_t = hhmmss()
-                print(f"[runtest] {sym} {dr} 取不到 5m 開盤價，改用現價 {base}")
+                print(f"[runtest] {sym} {dr} 取不到 {tf} 開盤價，改用現價 {base}")
             if key not in RT:
                 return
             amb = rt_amb_price(base, dr, T["off"], tick)
             T["hit"] = None; T["xhit"] = None; T["ev"].clear()
             T["amb"] = amb; T["state"] = "埋伏中"   # 從這一刻起 WS 逐筆檢查進場
-            next_rearm = next_open + RT_REARM_SEC
+            next_rearm = next_open + tf_sec
             next_open = next_rearm                    # 沒成交 → 下一根開盤重新埋伏（不必再等）
             print(f"[runtest] {sym} {dr} 埋伏 {base_t} 開盤價{base} → {amb}")
             hit = None
             while key in RT and hit is None:
                 now_s = time.time()
                 if now_s >= next_rearm:
-                    break                            # 新的 5 分鐘 K 線 → 重新埋伏
+                    break                            # 新的一根 TF K 線 → 重新埋伏
                 await rt_wait_until(T, min(next_rearm, now_s + RT_STEP - (now_s % RT_STEP)), "hit")
                 if T.get("hit") is not None:         # WS 逐筆碰到埋伏價
                     hit = T["hit"]; break
@@ -5273,7 +5279,7 @@ async def rt_worker(app, key):
                     hit = (time.time(), px)
             if hit and key in RT:
                 await rt_hold(app, key, T, spec, amb, base, base_t, hit)
-                next_open = T.get("next_at") or rt_next_open(time.time())   # 出場後等下一根 5m 開盤
+                next_open = T.get("next_at") or rt_next_open(time.time(), tf_sec)   # 出場後等下一根 TF 開盤
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -5281,15 +5287,25 @@ async def rt_worker(app, key):
         await rt_send(app, T["chat"], f"{E.LOSS} runtest {rt_head(T)} 異常停止：{type(e).__name__}: {e}")
         RT.pop(key, None); rt_save()
 
-def rt_next_open(t):
-    """t 之後的下一根 5m K 線開盤時間（epoch 秒，嚴格大於 t）。"""
-    return (int(t) // RT_REARM_SEC + 1) * RT_REARM_SEC
+def rt_tf(T):
+    """這筆 runtest 鎖定的週期（v5.1）。舊存檔或不認得的值 → 5m。"""
+    tf = T.get("tf") or RT_TF_OLD
+    return tf if tf in TF_SEC else RT_TF_OLD
 
-async def rt_candle_open(iid, t_open):
-    """取 OKX 5m K 線在 t_open 那一根的開盤價。K 線剛開、還沒出現就每 0.5 秒重試，最多約 15 秒；
-    拿不到回 None。"""
+def rt_tf_sec(T):
+    return TF_SEC[rt_tf(T)]
+
+def rt_next_open(t, sec):
+    """t 之後的下一根 K 線開盤時間（epoch 秒，嚴格大於 t）。sec = 週期秒數（v5.1 起跟著 TF）。"""
+    return (int(t) // sec + 1) * sec
+
+async def rt_candle_open(iid, t_open, tf):
+    """取 t_open 那一根 TF K 線的開盤價。K 線剛開、還沒出現就每 0.5 秒重試，最多約 15 秒；拿不到回 None。
+    v5.1：3m/5m/15m/30m 查 OKX 原生 K 線；OKX 沒有的週期（6m/8m/10m/12m/20m/25m）查同一秒開始的
+          1m K 線 —— 同一秒開始，開盤價就是同一筆價格。"""
+    bar = RT_BAR.get(tf, "1m")
     for _ in range(30):
-        r = await pub(f"/api/v5/market/candles?instId={iid}&bar=5m&limit=3")
+        r = await pub(f"/api/v5/market/candles?instId={iid}&bar={bar}&limit=3")
         for row in (r.get("data") or []):
             try:
                 if int(row[0]) // 1000 == int(t_open):
@@ -5301,7 +5317,8 @@ async def rt_candle_open(iid, t_open):
 
 def rt_start(app, p, chat, next_at=None):
     """p = 解析好的參數 dict（sym dr lev mg off tp sl hug_tp hug_sl go_tp go_sl rec）。
-    next_at = 第一次掛單的 5m 開盤時間（下指令時算好，跟啟動訊息顯示的時間一致）。"""
+    p 另含 tf（v5.1：下指令當下的 /TF，鎖定到停止）。
+    next_at = 第一次掛單的 K 線開盤時間（下指令時算好，跟啟動訊息顯示的時間一致）。"""
     key = skey(p["sym"], p["dr"])
     RT[key] = {**p, "chat": chat, "state": "等開盤", "n": 0, "next_at": next_at,
                "ev": asyncio.Event(), "hit": None, "xhit": None}
@@ -5391,7 +5408,8 @@ async def cmd_runtest(u, c):
         spec = await get_spec(p["sym"]); px = await get_last(spec["iid"])
     except Exception:
         await reply(u, f"{E.LOSS} 找不到商品 {p['sym']}"); return
-    nxt = rt_next_open(time.time())
+    p["tf"] = rt_tf({"tf": ACCOUNT_TF})             # v5.1：鎖定下指令當下的 /TF
+    nxt = rt_next_open(time.time(), TF_SEC[p["tf"]])
     rt_start(c.application, p, u.effective_chat.id, next_at=nxt)
     await reply(u, f"{E.BOT} runtest 啟動｜{ACCT}\n"
                    f"{rt_head(p)}\n"
@@ -5402,7 +5420,7 @@ async def cmd_runtest(u, c):
                    f"━━━━━━━━━━\n"
                    f"現價 {px}\n"
                    f"{p['dr']}={RT_DESC[p['dr']]}\n"
-                   f"下一根 5m 開盤 {datetime.fromtimestamp(nxt, TZ8).strftime('%H:%M:%S')} 掛單\n"
+                   f"下一根 {p['tf']} 開盤 {datetime.fromtimestamp(nxt, TZ8).strftime('%H:%M:%S')} 掛單\n"
                    f"時間:{hhmmss()}")
 
 async def cmd_stopruntest(u, c):
@@ -5439,7 +5457,7 @@ async def rt_recover(app):
             if "lev" not in d or "rec" not in d:      # v4.9.1 以前的格式缺參數
                 old.append(f"{d.get('sym')} {d.get('dr')} {d.get('off')}%"); continue
             p = {"sym": d["sym"], "dr": d["dr"], "lev": int(d["lev"]), "mg": Decimal(d["mg"]),
-                 **{k: Decimal(d[k]) for k in RT_PKEYS}}
+                 "tf": rt_tf(d), **{k: Decimal(d[k]) for k in RT_PKEYS}}
             rt_start(app, p, d["chat"])
             names.append(rt_head(p))
         except Exception as e:
@@ -5472,16 +5490,18 @@ async def cmd_coins(u, c):
 async def cmd_timeframe(u, c):
     global ACCOUNT_TF
     if not c.args:
-        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選：" + "/".join(TF_SEC.keys()) + "\n變更：/timeframe 10m"); return
-    tf = c.args[0]
+        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選：" + "/".join(TF_SEC.keys()) + "\n變更：/tf 3m"); return
+    tf = c.args[0].lower()                          # v5.1：/tf 3M 也認得
     if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須為：" + "/".join(TF_SEC.keys())); return
     ACCOUNT_TF = tf; save_state()
-    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n（僅影響之後新建立的策略）")
+    # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
+    #       /runtest 每一筆在下指令當下鎖定週期，只有之後新下的才用新週期。
+    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/runtest 之後新下的才用 {tf}")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
         "/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% 緊貼度% TP% SL%\n"
-        f"例：/run WIFUSDT S 1x 1 1.2 0.25 0.15 6 0.8\n週期依 /timeframe（目前 {ACCOUNT_TF}）\n"
+        f"例：/run WIFUSDT S 1x 1 1.2 0.25 0.15 6 0.8\n週期依 /tf（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
@@ -5491,7 +5511,7 @@ async def cmd_menu(u, c):
         "　模擬單邊交易，碰到 TP/SL 出場（不下單，Excel 附在出場通知）\n"
         "　例：/runtest ZECUSDT LB 1x 100u 0.4 2 0.5 0.1 0.1 >0.3% >0.1% 0.4　｜不帶參數＝查看進行中\n"
         "/stopruntest 停止全部 runtest\n"
-        "/timeframe 查看/設定週期\n/coins 幣種\n"
+        "/tf 查看/設定週期（同 /timeframe）\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
         "兩單都成交時完全對沖，損益鎖死=-間距，與價格無關；\n"
@@ -5605,7 +5625,7 @@ def main():
                     ("selftest", cmd_selftest), ("log", cmd_log),
                     ("amp", cmd_amp),
                     ("runtest", cmd_runtest), ("stopruntest", cmd_stopruntest),
-                    ("timeframe", cmd_timeframe), ("coins", cmd_coins)]:
+                    (["timeframe", "tf"], cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.run_polling()
