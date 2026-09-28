@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v4.9.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v4.9.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -5352,11 +5352,8 @@ def rt_parse(a):
         p[k] = v
     if p["off"] > 20:
         return None, "埋伏點% 不可超過 20"
-    # 緊貼點% 不可大於發動條件%（等於可以：發動條件是「>」，發動當下 SL 一定已經過了進場價）
-    if p["hug_tp"] > p["go_tp"]:
-        return None, "TP緊貼點% 不可大於 TP發動條件%"
-    if p["hug_sl"] > p["go_sl"]:
-        return None, "SL緊貼點% 不可大於 SL發動條件%"
+    # v4.9.9：拿掉「緊貼點% 不可大於發動條件%」的限制（1111：以減少虧損為優先，測試要多角度產生數據）。
+    #         緊貼點% 大於發動條件% 時，SL 發動當下會在進場價下方一點，但仍比初始 SL 近，邏輯照常運作。
     return p, None
 
 def rt_status_line(v):
