@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v5.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v5.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4766,6 +4766,8 @@ RT_PKEYS = ("off", "tp", "sl", "hug_tp", "hug_sl", "go_tp", "go_sl", "rec")
 #      高利／高損、最大漲幅／最大跌幅、平均振幅都算到這一刻，跟 Excel 同一套數據（每 0.25 秒一筆）。
 #   ② /stopruntest 時持倉中的那一輪不再作廢：記錄到停止那一刻，發「停止通知」＋Excel。
 #      不算今日統計（沒有真的出場）；剛好碰到 TP/SL 正在結算的那一筆，出場通知照常發。
+# v5.4（1111 核可）：持倉通知在高利／高損後面加一行「現價 hh:mm:ss|價(毛利率)」
+#      ＝Excel 在這一刻（持倉滿 5 分鐘的那一列）的時間、當時價、毛利率。停止通知已有「停止」行，不另加。
 RT_NOTE_SEC = 300           # 持倉通知間隔（秒）：固定 5 分鐘，不跟 /TF
 RT_BG = set()               # 背景送出的訊息工作（保留參照，避免中途被回收）
 
@@ -5113,7 +5115,8 @@ def rt_agg_add(H, rows):
     H["amp"] += r["amp"]
 
 def rt_snap_lines(T, H, rows, st, word, stop=None):
-    """v5.3：持倉通知／停止通知的內容（算到這一刻）。word＝「目前」（持倉通知）或「全程」（停止通知）。"""
+    """v5.3：持倉通知／停止通知的內容（算到這一刻）。word＝「目前」（持倉通知）或「全程」（停止通知）。
+    stop＝排在高利／高損後面的那一行：停止通知是「停止 …」，持倉通知（v5.4）是「現價 …」。"""
     entry = T["entry"]
     t_in = datetime.fromtimestamp(T["t_in"], TZ8).strftime("%H:%M:%S")
     tp_t = T["tmv"][-1]["t"] if T["tmv"] else t_in       # 最後一次移動的時間；沒移動過＝進場時間
@@ -5276,7 +5279,8 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
                 k = int(i * RT_STEP // RT_NOTE_SEC); H["note"] = k + 1
                 rt_bg(rt_send(app, chat, "\n".join(
                     [f"🎯 持倉通知 {rt_head(T)}", f"持倉時間: {rt_hms(k * RT_NOTE_SEC)}(第{k}次通知)"] +
-                    rt_snap_lines(T, H, rows, st, "目前"))))
+                    rt_snap_lines(T, H, rows, st, "目前",       # v5.4：現價＝這一刻那一列（r）
+                                  stop=f"現價 {r['t']}|{r['px']}({float(r['rate']):+.3f}%)"))))
         if xout is None:
             return
         tx, xpx, why = xout
