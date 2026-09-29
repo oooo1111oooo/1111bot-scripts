@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v5.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v5.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4725,51 +4725,43 @@ async def cmd_amp(u, c):
                    f"scp 1111bot:/srv/1111bot/data/{name} ~/Downloads/")
 
 # ---------- /runtest 模擬單邊交易（v4.9） ----------
-# 純模擬：只查價格，不下任何單，不碰 STRATS / 掛單 / 持倉，不影響 /run。
-# 流程：等下一根 TF K 線開盤 → 用那根開盤價埋伏 → 沒成交就下一根 TF 開盤重新埋伏 → 碰到埋伏價即進場
-#       → 依 TP/SL 緊貼規則移動 → 碰到 TP 或 SL 出場（沒有時間限制）
-#       → 出場通知附 Excel → 自動回到埋伏，循環到 /stopruntest。
-# v4.9 指令：/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% TP緊貼點% SL緊貼點% TP發動條件% SL發動條件%
-#   方向（v4.9.7 更正）：第一個字母 L＝做多、S＝做空；第二個字母 A＝限價、B＝觸發。
-#     LA 下方 限價買入 → 做多（抄底）　　LB 上方 觸發買入 → 做多（追高）
-#     SA 上方 限價賣出 → 做空（逢高空）　SB 下方 觸發賣出 → 做空（殺低）
-#   LA 與 SB 都掛在現價下方、LB 與 SA 都掛在現價上方，但持倉方向相反，TP/SL 位置也相反。
-#   （v4.9～v4.9.6 把 LA、SA 對調了：當時的 LA 實際是上方限價做空、SA 是下方限價做多。）
-#   緊貼（v5.2 起每 0.25 秒用查詢現價計算一次，一秒 4 次）：
-#     毛利率 > SL發動條件 → SL 貼到 現價 ∓ SL緊貼點%，只進不退
-#     毛利率 > TP發動條件 → TP 貼到 現價 ± TP緊貼點%，第一次從初始TP拉過來，之後只退不進
+# v5.5（1111 核可）：/runtest 改成【雙向對沖】—— 一次埋伏兩單（先限價 A、後觸發 B），純模擬：只查價格，
+#       不下任何單，不碰 STRATS / 掛單 / 持倉，不影響 /run。
+# 指令：/runtest 商品 雙向 槓桿 保證金 埋伏點% SL緊貼% SL觸發條件%
+#   例：/runtest ZECUSDT LASB 1x 10u 0.2 0.2 >0.5
+#   雙向：LASB＝下方兩單（A＝LA 限價買入做多、B＝SB 觸發賣出做空）
+#         SALB＝上方兩單（A＝SA 限價賣出做空、B＝LB 觸發買入做多）
+#   保證金＝每一單的金額（10u → A、B 各 10u，兩單合計 20u）。
+# 規則（1111 定案）：
+#   ① 等下一根 TF K 線開盤，用開盤價 ×(1 ∓ 埋伏點%) 埋伏；沒成交就下一根開盤重新埋伏（/tf 在下指令時鎖定）。
+#   ② 碰到埋伏價 → A、B 兩單都用埋伏價進場（觸發單會滑價多少無法得知，模擬先當作一樣），互為對沖。
+#   ③ 沒有 TP、沒有初始 SL。每 0.25 秒（一秒 4 次）用查到的現價算各單毛利率：
+#      任一單毛利率 > SL觸發條件% → 這一單開始 SL 緊貼（現價 ∓ SL緊貼%，只進不退）；另一單還在虧損，不設 SL。
+#   ④ 任一單出場（碰到 SL）→ 另一單【立刻】用出場那一刻的現價設 SL（現價 ± SL緊貼%），之後一樣只進不退。
+#   ⑤ 兩單都出場＝一輪結束 → 等下一根 TF 開盤重新埋伏。出場價＝SL 價（沒有算滑價）。
 #   碰觸（進場、出場）：WS 每一筆成交都檢查；WS 斷線時由每 0.25 秒的查價補判斷。
-#   手續費無 OKX 資料，只能估：A（限價進場 maker＋市價出場 taker）0.070%、B（taker×2）0.100%。
-# v5.1：重新埋伏週期不再寫死 5m —— 每一筆 runtest 下指令當下鎖定當時的 /TF（帳戶週期），跑到停止都不變；
-#       中途改 /TF 只影響之後新下的 runtest。v5.0 以前存下來的 runtest 沒記週期 → 一律當 5m。
-RT_TF_OLD    = "5m"         # 舊存檔沒有週期時用這個
+#   手續費無 OKX 資料，只能估：A 單（限價進場 maker＋市價出場 taker）0.070%、B 單（taker×2）0.100%。
+#   Excel 取消（1111 決定）；VPS 仍留每 0.25 秒的逐筆紀錄 .log 備查（不發 TG）。
+#   持倉通知：從進場起每滿 5 分鐘一則（固定，不跟 /TF）；/stopruntest 時持倉中的發停止通知（不算今日統計）。
+#   今日統計以「一輪」為單位（A、B 兩單淨利合計），台灣時間 00:00 重算，重開不歸零。
+RT_TF_OLD    = "5m"         # 存檔沒有週期時用這個
 RT_BAR       = {"3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m"}   # OKX 有原生 K 線的週期
-RT_STEP      = 0.25         # 每幾秒查價一次（v5.2：一秒 4 次，原 0.5 秒）：緊貼移動與 Excel 記錄都用這個節奏
-RT_FEE       = {"A": Decimal("0.070"), "B": Decimal("0.100")}   # 估計手續費率 %（來回）
-RT_MOVE_SHOW = 10           # 出場通知 SL/TP 移動清單顯示最近幾筆
+RT_STEP      = 0.25         # 每幾秒查價一次（一秒 4 次）：SL 觸發判斷、緊貼移動、逐筆紀錄都用這個節奏
+RT_FEE       = {"A": Decimal("0.070"), "B": Decimal("0.100")}   # 估計手續費率 %（來回）：A＝限價單、B＝觸發單
+RT_MOVE_SHOW = 10           # 出場通知 SL 移動清單顯示最近幾筆
+RT_NOTE_SEC  = 300          # 持倉通知間隔（秒）：固定 5 分鐘，不跟 /TF
 RT_FILE      = f"/srv/1111bot/data/runtest_{ACCT}.json"
 RT_DIR       = "/srv/1111bot/data/runtest"
-RT = {}                     # key -> 參數＋狀態（見 rt_start）
-RT_DESC = {"LA": "下方限價買入(做多)", "LB": "上方觸發買入(做多)",
-           "SA": "上方限價賣出(做空)", "SB": "下方觸發賣出(做空)"}
-# v4.9.1：TG 畫面改半形、去多餘空格（1111 核可）；出場通知加「今日同幣種同方向統計」；
-#         SL/TP 移動% 改成真實移動幅度 = (這次價位 − 上一次價位) ÷ 上一次價位。
 RT_STATS_FILE = f"/srv/1111bot/data/runtest_stats_{ACCT}.json"   # 今日統計（台灣時間，每天 00:00 重算）
-RT_PKEYS = ("off", "tp", "sl", "hug_tp", "hug_sl", "go_tp", "go_sl", "rec")
-# v4.9.2：第 12 個參數【止損回利%】—— 還在虧損時也可以提早發動 SL 緊貼：
-#   持倉中每 0.25 秒用 OKX 查到的現價算毛利率（進場價 vs 現價），記下最大虧損%；
-#   毛利率從最大虧損% 回升 ≥ 止損回利% → SL 發動緊貼（出場原因「回升SL」）。
-#   SL 一旦發動（不論回升或獲利發動）就一路緊貼到出場，只進不退。TP 不受影響。
-# v5.3（1111 核可）：
-#   ① 持倉通知：從進場時間起算，每滿 5 分鐘發一則（固定 5 分鐘，不跟 /TF），出場後不再發。
-#      ＴＰ／ＳＬ＝目前價位，時間＝最後一次移動的時間（沒移動過＝進場時間）；
-#      高利／高損、最大漲幅／最大跌幅、平均振幅都算到這一刻，跟 Excel 同一套數據（每 0.25 秒一筆）。
-#   ② /stopruntest 時持倉中的那一輪不再作廢：記錄到停止那一刻，發「停止通知」＋Excel。
-#      不算今日統計（沒有真的出場）；剛好碰到 TP/SL 正在結算的那一筆，出場通知照常發。
-# v5.4（1111 核可）：持倉通知在高利／高損後面加一行「現價 hh:mm:ss|價(毛利率)」
-#      ＝Excel 在這一刻（持倉滿 5 分鐘的那一列）的時間、當時價、毛利率。停止通知已有「停止」行，不另加。
-RT_NOTE_SEC = 300           # 持倉通知間隔（秒）：固定 5 分鐘，不跟 /TF
+RT = {}                     # key -> 參數＋狀態（見 rt_start）
 RT_BG = set()               # 背景送出的訊息工作（保留參照，避免中途被回收）
+RT_PAIR = {"LASB": ("LA", "SB"), "SALB": ("SA", "LB")}          # 雙向 → (A 單, B 單)
+RT_LEG_DESC = {"LA": "下方限價買入(做多)", "SB": "下方觸發賣出(做空)",
+               "SA": "上方限價賣出(做空)", "LB": "上方觸發買入(做多)"}
+RT_PKEYS = ("off", "hug", "go")      # 埋伏點%、SL緊貼%、SL觸發條件%
+RT_SEP = "━━━━━━━━━━"
+RT_WIN, RT_LOSE = "🟢", "🔴"         # 出場：淨利 ≥0 🟢、<0 🔴（標題和淨利那行同一個）
+
 
 def rt_bg(coro):
     """背景執行（不卡住 0.25 秒的持倉迴圈）。"""
@@ -4777,13 +4769,12 @@ def rt_bg(coro):
     RT_BG.add(t); t.add_done_callback(RT_BG.discard)
     return t
 
-def rt_pos(dr):
-    """成交後持倉方向：第一個字母 L＝做多、S＝做空（LA/LB 做多，SA/SB 做空）。"""
-    return "L" if dr[0] == "L" else "S"
+def rt_t(t_epoch):
+    return datetime.fromtimestamp(t_epoch, TZ8).strftime("%H:%M:%S")
 
 def rt_up(dr):
-    """埋伏位置：LB/SA 在現價上方，LA/SB 在現價下方。"""
-    return dr in ("LB", "SA")
+    """埋伏位置：SALB 兩單在現價上方，LASB 兩單在現價下方。"""
+    return dr == "SALB"
 
 def rt_save():
     try:
@@ -4798,11 +4789,11 @@ def rt_save():
         print("[runtest] save fail", e)
 
 def _rt_round(v, tick, up):
-    """取到 tick：up=True 往上取、False 往下取（一律往遠離現價/進場價的方向取）。"""
+    """取到 tick：up=True 往上取、False 往下取（一律往遠離現價的方向取）。"""
     return (v / tick).to_integral_value(rounding=ROUND_CEILING if up else ROUND_FLOOR) * tick
 
 def rt_amb_price(px, dr, off, tick):
-    """埋伏價：LA/LB = 現價×(1+埋伏%) 往上取；SA/SB = 現價×(1-埋伏%) 往下取。"""
+    """埋伏價：SALB＝開盤價×(1+埋伏點%) 往上取；LASB＝開盤價×(1−埋伏點%) 往下取。"""
     if rt_up(dr):
         return _rt_round(px * (1 + off / 100), tick, True)
     return _rt_round(px * (1 - off / 100), tick, False)
@@ -4810,58 +4801,74 @@ def rt_amb_price(px, dr, off, tick):
 def rt_touch_amb(dr, px, amb):
     return (px >= amb) if rt_up(dr) else (px <= amb)
 
-def rt_touch_exit(pos, px, tp, sl):
-    """碰到 SL / TP 回傳 "SL" / "TP"，沒碰到回傳 None。"""
-    if pos == "L":
-        if px <= sl: return "SL"
-        if px >= tp: return "TP"
-    else:
-        if px >= sl: return "SL"
-        if px <= tp: return "TP"
-    return None
+def rt_touch_sl(pos, px, sl):
+    """碰到 SL：做多 現價 ≤ SL；做空 現價 ≥ SL。"""
+    return px <= sl if pos == "L" else px >= sl
 
 def rt_rate(pos, entry, px):
-    """毛利率 %（依持倉方向）。"""
+    """毛利率 %（依這一單做多或做空）。"""
     return ((px - entry) if pos == "L" else (entry - px)) / entry * 100
 
+def rt_sl_cand(pos, px, hug, tick):
+    """SL 緊貼價：做多＝現價×(1−SL緊貼%) 往下取；做空＝現價×(1+SL緊貼%) 往上取。"""
+    if pos == "L":
+        return _rt_round(px * (1 - hug / 100), tick, False)
+    return _rt_round(px * (1 + hug / 100), tick, True)
+
+def rt_better(pos, c, sl):
+    """只進不退：做多 SL 只能往上、做空 SL 只能往下。"""
+    return c > sl if pos == "L" else c < sl
+
+def rt_leg(n, dr):
+    """一單的狀態。n＝"A"/"B"，dr＝LA/SB/SA/LB。"""
+    return {"n": n, "dr": dr, "pos": "L" if dr[0] == "L" else "S", "kind": n,
+            "sl_px": None, "smv": [], "via": None, "fire": None, "xhit": None, "out": None}
+
+def rt_legs_open(T):
+    return [G for G in T["legs"].values() if G["out"] is None]
+
 def rt_hug(T, px, tick, t_epoch):
-    """依查詢現價做一次緊貼判斷，回傳動作文字（沒動回傳 ""）。
-    SL 發動（兩個條件先到先算，發動後一路緊貼到出場）：
-      ① 毛利率 > SL發動條件（獲利發動 → 出場原因「緊貼SL」）
-      ② 曾經虧損，且毛利率 − 最大虧損% ≥ 止損回利%（回升發動 → 出場原因「回升SL」）
-      發動後每次：候選 = 現價 ∓ SL緊貼點%，只准往獲利方向前進。
-    TP：毛利率 > TP發動條件 → 候選 = 現價 ± TP緊貼點%；第一次發動直接拉過來，之後只准往獲利方向後退。"""
-    pos, entry = T["pos"], T["entry"]
-    rate = rt_rate(pos, entry, px)
-    t = datetime.fromtimestamp(t_epoch, TZ8).strftime("%H:%M:%S")
+    """每 0.25 秒一次（③）：還沒設 SL 的單，毛利率 > SL觸發條件% → 設 SL（📍觸發點）；
+    已設 SL 的單 → 候選價比現在的 SL 好就移過去（只進不退）。回傳動作文字（逐筆紀錄用）。"""
+    t = rt_t(t_epoch)
     acts = []
-    if rate < T["worst"]:
-        T["worst"] = rate                                    # 最大虧損%（查詢現價算的毛利率）
-    fired = ""
-    if T["sl_via"] is None:
-        if rate > T["go_sl"]:
-            T["sl_via"] = "獲利"
-        elif T["worst"] < 0 and rate - T["worst"] >= T["rec"]:
-            T["sl_via"] = "回升"; fired = "SL回升發動"
-    if T["sl_via"] is not None:
-        if pos == "L":
-            c = _rt_round(px * (1 - T["hug_sl"] / 100), tick, False); better = c > T["sl_px"]
-        else:
-            c = _rt_round(px * (1 + T["hug_sl"] / 100), tick, True);  better = c < T["sl_px"]
-        if better:
-            T["smv"].append({"t": t, "v": c, "v0": T["sl_px"], "px": px}); T["sl_px"] = c
-            acts.append(fired or "SL緊貼")
-        elif fired:
-            acts.append(fired)
-    if rate > T["go_tp"]:
-        if pos == "L":
-            c = _rt_round(px * (1 + T["hug_tp"] / 100), tick, True);  better = c > T["tp_px"]
-        else:
-            c = _rt_round(px * (1 - T["hug_tp"] / 100), tick, False); better = c < T["tp_px"]
-        if (not T["tp_on"] and c != T["tp_px"]) or (T["tp_on"] and better):
-            T["tmv"].append({"t": t, "v": c, "v0": T["tp_px"], "px": px}); T["tp_px"] = c; acts.append("TP緊貼")
-        T["tp_on"] = True
+    for G in rt_legs_open(T):
+        if G["xhit"] is not None:                 # 已碰到 SL、等結算，不再移動
+            continue
+        c = rt_sl_cand(G["pos"], px, T["hug"], tick)
+        if G["sl_px"] is None:
+            rate = rt_rate(G["pos"], T["entry"], px)
+            if rate > T["go"]:
+                G["via"] = "觸發"; G["fire"] = rate
+                G["smv"].append({"t": t, "v": c, "v0": None}); G["sl_px"] = c
+                acts.append(f"{G['n']}單SL觸發")
+        elif rt_better(G["pos"], c, G["sl_px"]):
+            G["smv"].append({"t": t, "v": c, "v0": G["sl_px"]}); G["sl_px"] = c
+            acts.append(f"{G['n']}單SL緊貼")
     return "+".join(acts)
+
+def rt_leg_pnl(T, G):
+    """一單的毛利／手續費／淨利（出場價＝SL 價）。"""
+    notional = T["mg"] * T["lev"]
+    grate = rt_rate(G["pos"], T["entry"], G["out"]["px"])
+    gU = notional * grate / 100
+    fee = RT_FEE[G["kind"]]
+    feeU = -notional * fee / 100
+    netU = gU + feeU
+    return {"grate": grate, "gU": gU, "fee": fee, "feeU": feeU, "netU": netU, "nrate": netU / notional * 100}
+
+def rt_leg_exit(T, G, tx, tick_px, level):
+    """一單碰到 SL 出場（出場價＝碰到的那個 SL 價）。④ 另一單【立刻】用出場那一刻的現價設 SL（只進不退）。"""
+    G["out"] = {"t": tx, "px": level, "hit_px": tick_px}
+    G["out"]["pnl"] = rt_leg_pnl(T, G)
+    t = rt_t(tx)
+    for O in rt_legs_open(T):
+        c = rt_sl_cand(O["pos"], tick_px, T["hug"], T["tick"])
+        if O["sl_px"] is None:
+            O["via"] = f"{G['n']}單出場後"
+            O["smv"].append({"t": t, "v": c, "v0": None}); O["sl_px"] = c
+        elif O["xhit"] is None and rt_better(O["pos"], c, O["sl_px"]):
+            O["smv"].append({"t": t, "v": c, "v0": O["sl_px"]}); O["sl_px"] = c
 
 def rt_on_tick(iid, px):
     """WS 每一筆成交都會呼叫：只做「碰觸」判斷並叫醒 worker，不做任何計算或送單。"""
@@ -4873,21 +4880,37 @@ def rt_on_tick(iid, px):
             if st == "埋伏中" and T.get("hit") is None and T.get("amb") is not None:
                 if rt_touch_amb(T["dr"], px, T["amb"]):
                     T["hit"] = (time.time(), px); T["ev"].set()
-            elif st == "持倉中" and T.get("xhit") is None:
-                why = rt_touch_exit(T["pos"], px, T["tp_px"], T["sl_px"])
-                if why:
-                    T["xhit"] = (time.time(), px, why); T["ev"].set()
+            elif st == "持倉中":
+                for G in T["legs"].values():
+                    if (G["out"] is None and G["xhit"] is None and G["sl_px"] is not None
+                            and rt_touch_sl(G["pos"], px, G["sl_px"])):
+                        G["xhit"] = (time.time(), px, G["sl_px"]); T["ev"].set()   # 記下碰到當時的 SL 價
         except Exception:
             pass
 
 async def rt_wait_until(T, t_target, flag):
-    """等到指定時間，或 WS 碰觸事件先到就提早醒。flag = "hit"（埋伏中看進場）或 "xhit"（持倉中看出場）。"""
+    """埋伏中：等到指定時間，或 WS 碰到埋伏價（T[flag]）先到就提早醒。"""
     while True:
         if T.get(flag) is not None:
             return
         rem = t_target - time.time()
         if rem <= 0:
             await asyncio.sleep(0)      # 落後時也要讓出執行權，不可空轉
+            return
+        try:
+            await asyncio.wait_for(T["ev"].wait(), rem)
+        except asyncio.TimeoutError:
+            pass
+        T["ev"].clear()
+
+async def rt_wait_x(T, t_target):
+    """持倉中：等到指定時間，或 WS 碰到任一單的 SL 先到就提早醒。"""
+    while True:
+        if any(G["xhit"] is not None for G in rt_legs_open(T)):
+            return
+        rem = t_target - time.time()
+        if rem <= 0:
+            await asyncio.sleep(0)
             return
         try:
             await asyncio.wait_for(T["ev"].wait(), rem)
@@ -4904,7 +4927,7 @@ async def rt_send(app, chat, text):
 
 async def rt_px(iid):
     """runtest 查價：WS 逐筆報價優先（不吃 REST 額度），沒有就走 REST，REST 失敗重試一次；
-    再失敗但 WS 有最後成交價就用它。全部失敗才回 None（該筆記為查價失敗）。"""
+    再失敗但 WS 有最後成交價就用它。全部失敗才回 None（該筆沿用前一筆價格）。"""
     WS_WANT.add(iid)
     for _ in range(2):
         try:
@@ -4928,13 +4951,12 @@ def rt_hold_str(sec):
     return f"{sec // 3600}時{sec % 3600 // 60:02d}分{sec % 60:02d}秒"
 
 def rt_hms(sec):
-    """持倉時間 hh:mm:ss（出場通知用）。"""
+    """時間長度 hh:mm:ss。"""
     sec = int(sec)
     return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
 
 def rt_stats_add(key, t_epoch, nrate, netU):
-    """記一筆出場到今日統計（台灣時間；換日自動清空），回傳今天這個 key 的全部紀錄。
-    存成檔案，bot 重開不會歸零。"""
+    """記一輪到今日統計（台灣時間；換日自動清空），回傳今天這個 key 的全部紀錄。存成檔案，bot 重開不會歸零。"""
     day = datetime.fromtimestamp(t_epoch, TZ8).strftime("%Y-%m-%d")
     try:
         data = json.load(open(RT_STATS_FILE)) if os.path.exists(RT_STATS_FILE) else {}
@@ -4957,434 +4979,332 @@ def rt_stats_lines(T, lst):
     ns = [Decimal(x["n"]) for x in lst]
     us = [Decimal(x["u"]) for x in lst]
     win = sum(1 for v in ns if v > 0)
-    return ["━━━━━━━━━━",
-            f"📊 今日 {T['sym']} {T['dr']} 統計(共{len(ns)}場)",
+    return [RT_SEP,
+            f"📊 今日 {T['sym']} {T['dr']} 統計(共{len(ns)}輪)",
             f"勝 {win}｜負 {len(ns) - win}",
             f"累計淨利 {sum(us):+.4f} U ({sum(ns):+.3f}%)",
             f"最佳淨利 {max(ns):+.3f}%",
             f"最差淨利 {min(ns):+.3f}%"]
 
-def rt_p1(v):
-    """參數顯示：2 → "2.0"、0.5 → "0.5"、0.25 → "0.25"。"""
-    s = pct(v)
-    return s if "." in s else s + ".0"
-
 def rt_head(T):
     return f"{T['sym']} {T['dr']} {T['lev']}x {pct(T['mg'])}u"
 
-def rt_cmd_text(T):
-    return (f"/runtest {T['sym']} {T['dr']} {T['lev']}x {pct(T['mg'])}u {pct(T['off'])} {pct(T['tp'])} "
-            f"{pct(T['sl'])} {pct(T['hug_tp'])} {pct(T['hug_sl'])} >{pct(T['go_tp'])}% >{pct(T['go_sl'])}% "
-            f"{pct(T['rec'])}")
+def rt_row(T, t_epoch, px, st, act):
+    """一筆紀錄（每 0.25 秒一筆，加上進場／出場／停止那一刻）。st 存目前最高價、最低價。
+    amp＝最高振幅%＝(最高價−最低價)÷進場價，也就是持倉通知的「最大振幅」。"""
+    entry = T["entry"]
+    px = rt_q(px, T["tick"])
+    if px > st["hi"]: st["hi"] = px
+    if px < st["lo"]: st["lo"] = px
+    return {"t": rt_t(t_epoch), "px": px, "amp": (st["hi"] - st["lo"]) / entry * 100,
+            "sa": T["legs"]["A"]["sl_px"], "sb": T["legs"]["B"]["sl_px"], "act": act}
 
-def rt_move_lines(name, mv):
-    L = [f"{name}移動 {len(mv)} 次"]
+RT_LOG_HEAD = "筆,時間,進場價,當時價,最高振幅%,A毛利率%,B毛利率%,A單SL,B單SL,動作\n"
+
+def rt_log_line(T, r, k):
+    """逐筆紀錄檔（.log）的一行。"""
+    en = T["entry"]; A, B = T["legs"]["A"], T["legs"]["B"]
+    sa = "" if r["sa"] is None else r["sa"]
+    sb = "" if r["sb"] is None else r["sb"]
+    return (f"{k},{r['t']},{en},{r['px']},{float(r['amp']):.6f},{float(rt_rate(A['pos'], en, r['px'])):.6f},"
+            f"{float(rt_rate(B['pos'], en, r['px'])):.6f},{sa},{sb},{r['act']}\n")
+
+def rt_agg_add(H, rows):
+    """每加一筆就累計一次（不必每次重掃全部紀錄）：
+    iHi／iLo＝最高價／最低價第一次出現的那一列（同價位取第一次）；amp＝所有列「最大振幅」合計（÷筆數＝平均振幅）。"""
+    k = len(rows) - 1; r = rows[k]
+    if k == 0:
+        H["iHi"] = 0; H["iLo"] = 0; H["amp"] = r["amp"]; return
+    if r["px"] > rows[H["iHi"]]["px"]: H["iHi"] = k
+    if r["px"] < rows[H["iLo"]]["px"]: H["iLo"] = k
+    H["amp"] += r["amp"]
+
+def rt_hilo_lines(pos, entry, rows, iHi, iLo, word):
+    """高利／高損（依這一單做多或做空；同價位取第一次；依時間先後，「無」排後面）。
+    做多：高利＝最高價、高損＝最低價；做空：高利＝最低價、高損＝最高價。"""
+    iP, iN = (iHi, iLo) if pos == "L" else (iLo, iHi)
+    ev = []
+    rp = rt_rate(pos, entry, rows[iP]["px"])
+    if rp > 0:
+        ev.append(((0, iP), f"高利 {rows[iP]['t']}|{rows[iP]['px']}({float(rp):+.3f}%)"))
+    else:
+        ev.append(((1, 0), f"高利 無({word}未獲利)"))
+    rn = rt_rate(pos, entry, rows[iN]["px"])
+    if rn < 0:
+        ev.append(((0, iN), f"高損 {rows[iN]['t']}|{rows[iN]['px']}({float(rn):+.3f}%)"))
+    else:
+        ev.append(((1, 1), f"高損 無({word}未虧損)"))
+    return [x for _, x in sorted(ev)]
+
+def rt_updn_lines(entry, rows, iHi, iLo):
+    """最大漲幅／最大跌幅（只看價格：最高價、最低價各自跟進場價比；依時間先後，「無」排後面）。"""
+    ev = []
+    hp, lp = rows[iHi]["px"], rows[iLo]["px"]
+    if hp > entry:
+        ev.append(((0, iHi), f"最大漲幅 {rows[iHi]['t']}|{hp}({float((hp - entry) / entry * 100):+.3f}%)"))
+    else:
+        ev.append(((1, 0), "最大漲幅 無"))
+    if lp < entry:
+        ev.append(((0, iLo), f"最大跌幅 {rows[iLo]['t']}|{lp}({float((lp - entry) / entry * 100):+.3f}%)"))
+    else:
+        ev.append(((1, 1), "最大跌幅 無"))
+    return [x for _, x in sorted(ev)]
+
+def rt_sl_now(G):
+    """目前的 SL：時間＝最後一次移動的時間。"""
+    if G["sl_px"] is None:
+        return "ＳＬ 未設"
+    return f"ＳＬ {G['smv'][-1]['t']}|{G['sl_px']}"
+
+def rt_move_lines(mv):
+    """SL 移動：第一筆（開始緊貼）標 📍；其後括號＝真實移動幅度＝(這次 − 上一次) ÷ 上一次。"""
+    L = [f"SL移動 {len(mv)} 次"]
     for m in mv[-RT_MOVE_SHOW:]:
-        # 真實移動幅度：(這次價位 − 上一次價位) ÷ 上一次價位；往上 +、往下 −
-        L.append(f"{m['t']}|{m['v']} ({(m['v'] - m['v0']) / m['v0'] * 100:+.3f}%)")
+        if m["v0"] is None:
+            L.append(f"{m['t']}|{m['v']} 📍")
+        else:
+            L.append(f"{m['t']}|{m['v']} ({(m['v'] - m['v0']) / m['v0'] * 100:+.3f}%)")
     if len(mv) > RT_MOVE_SHOW:
         L.append(f"(顯示最近{RT_MOVE_SHOW}筆,共{len(mv)}筆)")
     return L
 
-def rt_build_excel(path, meta, rows):
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.comments import Comment
-    F = "Arial"; fb = Font(name=F, bold=True); fn = Font(name=F)
-    T = meta["T"]; pos = T["pos"]; up = rt_up(T["dr"]); kind = T["dr"][1]
-    wb = Workbook(); ws = wb.active; ws.title = "runtest"
-    ws["A1"] = f"{rt_cmd_text(T)}　{ACCT}"
-    ws["A1"].font = Font(name=F, bold=True, size=13)
-    word = {"LA": "下方限價買入＝做多", "LB": "上方觸發買入＝做多",
-            "SA": "上方限價賣出＝做空", "SB": "下方觸發賣出＝做空"}[T["dr"]]
-    ws["A2"] = (f"{'觸發價' if kind == 'B' else '限價'} {meta['amb']}（{word}；埋伏時現價 {meta['base']} × "
-                f"(1{'+' if up else '-'}{pct(T['off'])}%)）　進場時間 {meta['t_in']}　進場時價 {meta['hit_px']}　"
-                f"名目本金 {pct(meta['notional'])}U（{pct(T['mg'])}u × {T['lev']}x）　"
-                f"記錄至{'停止' if meta.get('stop') else '出場'}（每 {RT_STEP} 秒一筆，共 {len(rows)} 筆）　純模擬")
-    tps, sls = ("+", "-") if pos == "L" else ("-", "+")
-    ws["A3"] = (f"初始TP {meta['tp0']}（{tps}{pct(T['tp'])}%）　初始SL {meta['sl0']}（{sls}{pct(T['sl'])}%）　"
-                f"緊貼規則：毛利率 >{pct(T['go_sl'])}% → SL 貼現價 {pct(T['hug_sl'])}%（只進不退）；"
-                f"毛利率 >{pct(T['go_tp'])}% → TP 貼現價 {pct(T['hug_tp'])}%（只退不進）；"
-                f"止損回利：從最大虧損回升 ≥{pct(T['rec'])}% → SL 提早發動緊貼")
-    ws["A2"].font = fn; ws["A3"].font = fn
-    n = len(rows)
-    iM = max(range(n), key=lambda i: (rows[i]["rate"], -i))
-    im = min(range(n), key=lambda i: (rows[i]["rate"], i))
-    has_g = rows[iM]["rate"] > 0; has_r = rows[im]["rate"] < 0
-    g = sum(1 for r in rows if r["rate"] > 0); rd = sum(1 for r in rows if r["rate"] < 0)
-    fee = RT_FEE[kind]
-    fdesc = "限價進場 maker＋市價出場 taker" if kind == "A" else "觸發進場＋市價出場，taker×2"
-    x = meta["x"]
-    if meta.get("stop"):
-        # v5.3：/stopruntest 停止（未出場）：沒有真的出場，不算手續費與淨利，只寫停止時毛利(率)。
-        summ = [("模擬出場", f"未出場(/stopruntest 停止)｜{x['t']}｜當時價 {x['px']}｜持倉{x['hold']}"),
-                ("停止時毛利(率)", f"{x['gU']:+.4f} U（{x['grate']:+.4f}%）")]
+def rt_exit_head(T, G, rows, iHi, iLo):
+    """出場通知的共同部分（這一單）：標題 → 出場原因 → 進場／ＳＬ／高利高損／出場 → 毛利手續淨利 → SL移動。"""
+    p = G["out"]["pnl"]; ico = RT_WIN if p["netU"] >= 0 else RT_LOSE
+    reason = "緊貼SL" if G["via"] == "觸發" else f"緊貼SL({G['via']})"
+    m0 = G["smv"][0]
+    if G["via"] == "觸發":           # 括號＝觸發那一刻的毛利率，📍＝觸發點
+        sl1 = f"ＳＬ {m0['t']}|{m0['v']}({float(G['fire']):+.3f}%)📍"
     else:
-        summ = [("模擬出場", f"{x['reason']}｜{x['t']}｜{x['px']}（出場時價 {x['hit_px']}）｜持倉{x['hold']}"),
-                ("出場毛利(率)", f"{x['gU']:+.4f} U（{x['grate']:+.4f}%）"),
-                ("估計手續費(率)", f"{x['feeU']:+.4f} U（-{fee:.3f}%，{fdesc}）"),
-                ("估計淨利(率)", f"{x['netU']:+.4f} U（{x['nrate']:+.4f}%）")]
-    summ += [("最高獲利（峰值）", f"{float(rows[iM]['rate']):+.4f}%（{rows[iM]['t']}｜{rows[iM]['px']}）" if has_g else "無（全程未獲利）"),
-            ("最大虧損", f"{float(rows[im]['rate']):+.4f}%（{rows[im]['t']}｜{rows[im]['px']}）" if has_r else "無（全程未虧損）"),
-            ("SL移動 / TP移動", f"{len(T['smv'])} 次 / {len(T['tmv'])} 次"),
-            ("最終振幅", f"{float(rows[-1]['amp']):.4f}%"),
-            ("總折返次數", f"{rows[-1]['flip']} 次"),
-            ("綠燈筆數 / 紅燈筆數 / 平盤筆數", f"{g} / {rd} / {n - g - rd}")]
-    if meta.get("miss"):
-        summ.append(("查價失敗筆數", f"{meta['miss']} 筆（該筆沿用前一筆價格）"))
-    for k, (a, v) in enumerate(summ):
-        ws.cell(5 + k, 1, a).font = fb; ws.cell(5 + k, 3, v).font = fn
-    hr = 5 + len(summ) + 1
-    top = hr + 1
-    # v4.9.5：「燈號」改名「損益燈號」（跟進場價比），新增「漲跌燈號」（跟上一筆比），後面的欄位往右移一欄。
-    ws.cell(hr - 1, 13, "名目本金(U)").font = fb
-    ws.cell(hr - 1, 14, float(meta["notional"])).font = Font(name=F, color="0000FF")
-    H = ["幣種", "時間", "進場價", "當時價", "最高振幅%", "平均振幅%", "差異振幅%", "毛利價", "毛利率", "損益燈號", "漲跌燈號",
-         "折返次數", "毛利(U)", "當時TP", "當時SL", "動作"]
-    for j, h in enumerate(H, 1):
-        c = ws.cell(hr, j, h)
-        c.font = Font(name=F, bold=True, color="FFFFFF")
-        c.fill = PatternFill("solid", fgColor="404040" if j <= 12 else "1F4E79")
-        c.alignment = Alignment(horizontal="center")
-    ws.cell(hr, 13).comment = Comment("M～P 欄：核對 TP/SL 緊貼有沒有照規則動。", "1111bot")
-    GF = PatternFill("solid", fgColor="C6EFCE"); RF = PatternFill("solid", fgColor="FFC7CE")
-    YF = PatternFill("solid", fgColor="FFEB9C")
-    thin = Side(style="thin", color="BBBBBB")
-    dec = max(0, -meta["tick"].as_tuple().exponent)
-    pxf = "0" if dec == 0 else "0." + "0" * dec
-    pf = '0.0000"%"'
-    fmts = [None, None, pxf, pxf, pf, pf, pf, "+" + pxf + ";-" + pxf + ";" + pxf,
-            '+0.0000"%";-0.0000"%";0.0000"%"', None, None, "0", "+0.0000;-0.0000;0.0000", pxf, pxf, None]
-    for i, r in enumerate(rows):
-        rr = top + i
-        # 平均振幅% = 逐列累加平均（跟 AVERAGE(E$top:E列) 數字完全一樣，但列數很多時不會拖慢 Excel）
-        favg = f"=E{rr}" if i == 0 else f"=F{rr-1}+(E{rr}-F{rr-1})/(ROW()-{top - 1})"
-        vals = [T["sym"], r["t"], float(meta["amb"]), float(r["px"]), float(r["amp"]),
-                favg, f"=E{rr}-F{rr}", float(r["gp"]), float(r["rate"]), r["light"], r["move"], r["flip"],
-                f"=I{rr}/100*$N${hr - 1}",
-                float(r["tp"]) if r["tp"] is not None else None,
-                float(r["sl"]) if r["sl"] is not None else None, r["act"] or None]
-        for j, v in enumerate(vals, 1):
-            c = ws.cell(rr, j, v); c.font = fn; c.border = Border(bottom=thin)
-            if fmts[j - 1]: c.number_format = fmts[j - 1]
-            if j in (1, 2, 10, 11, 12, 16): c.alignment = Alignment(horizontal="center")
-            if has_g and i == iM: c.fill = GF
-            if has_r and i == im: c.fill = RF
-            if i == n - 1: c.fill = YF
-    ws.freeze_panes = ws.cell(top, 1)
-    for col, w in zip("ABCDEFGHIJKLMNOP", [12, 10, 11, 11, 13, 13, 13, 10, 12, 11, 11, 9, 11, 11, 11, 12]):
-        ws.column_dimensions[col].width = w
-    wb.save(path)
-    return {"iM": iM, "has_g": has_g}
+        sl1 = f"ＳＬ {m0['t']}|{m0['v']}({G['via']})"
+    x = G["out"]
+    L = [f"{ico} {G['n']}單出場 {rt_head(T)}",
+         f"出場原因:{reason}",
+         RT_SEP,
+         f"進場 {rt_t(T['t_in'])}|{T['entry']}",
+         sl1]
+    L += rt_hilo_lines(G["pos"], T["entry"], rows, iHi, iLo, "全程")
+    L += [f"出場 {rt_t(x['t'])}|{x['px']}|{rt_hms(x['t'] - T['t_in'])}⏱️",
+          RT_SEP,
+          f"毛利(率):{p['gU']:+.4f} U ({p['grate']:+.3f}%)",
+          f"手續(率):{p['feeU']:+.4f} U (-{p['fee']:.3f}%)",
+          f"淨利(率):{p['netU']:+.4f} U ({p['nrate']:+.3f}%){ico}",
+          RT_SEP]
+    L += rt_move_lines(G["smv"])
+    return L
 
-def rt_row(T, t_epoch, px, st, act):
-    """一筆紀錄。st 存最高/最低/上一燈號/折返次數/上一筆價格。
-    損益燈號（light）：跟進場價比，賺 🟢／虧 🔴／平 ⚪；折返次數照它算。
-    漲跌燈號（move）：跟上一筆比，漲 🟢／跌 🔴／沒動 ⚪（第一筆固定 ⚪），跟做多做空無關。"""
-    entry, pos = T["entry"], T["pos"]
-    px = rt_q(px, T["tick"])
-    if px > st["hi"]: st["hi"] = px
-    if px < st["lo"]: st["lo"] = px
-    amp = (st["hi"] - st["lo"]) / entry * 100
-    gp = (px - entry) if pos == "L" else (entry - px)
-    rate = gp / entry * 100
-    light = "🟢" if gp > 0 else ("🔴" if gp < 0 else "⚪")
-    if st["last"] is not None and light != st["last"]: st["flip"] += 1
-    st["last"] = light
-    pv = st.get("prev")
-    move = "⚪" if pv is None or px == pv else ("🟢" if px > pv else "🔴")
-    st["prev"] = px
-    t = datetime.fromtimestamp(t_epoch, TZ8).strftime("%H:%M:%S")
-    return {"t": t, "px": px, "amp": amp, "gp": gp, "rate": rate, "light": light, "move": move, "flip": st["flip"],
-            "tp": T["tp_px"], "sl": T["sl_px"], "act": act}
+def rt_first_exit_lines(T, G, rows, H):
+    """第一單出場通知：最後是另一單目前狀態＋(A單出場|B單持倉)。"""
+    L = rt_exit_head(T, G, rows, H["iHi"], H["iLo"])
+    op = rt_legs_open(T)
+    if op:
+        O = op[0]
+        L += [RT_SEP,
+              f"{O['n']}單 持倉中 毛利率 {float(rt_rate(O['pos'], T['entry'], G['out']['hit_px'])):+.3f}%",
+              rt_sl_now(O),
+              f"({G['n']}單出場|{O['n']}單持倉)"]
+    return L
 
-def rt_log_line(entry, r, k):
-    """逐筆紀錄檔（.log）的一行。"""
-    return (f"{k},{r['t']},{entry},{r['px']},{float(r['amp']):.6f},{r['gp']},{float(r['rate']):.6f},"
-            f"{r['light']},{r['move']},{r['flip']},{r['tp']},{r['sl']},{r['act']}\n")
+def rt_final_lines(T, G, rows, H, t_end, stats):
+    """第二單出場通知（整輪結算）：這一單 → 整輪 A/B/合計淨利、最大漲幅跌幅、重新埋伏 → 今日統計 → (A|B單都出場,進行下一輪)。"""
+    L = rt_exit_head(T, G, rows, H["iHi"], H["iLo"])
+    A, B = T["legs"]["A"]["out"]["pnl"], T["legs"]["B"]["out"]["pnl"]
+    sU = A["netU"] + B["netU"]; sN = A["nrate"] + B["nrate"]
+    ico = RT_WIN if sU >= 0 else RT_LOSE
+    L += [RT_SEP,
+          f"整輪 持倉{rt_hms(t_end - T['t_in'])}",
+          f"A單 淨利 {A['netU']:+.4f} U ({A['nrate']:+.3f}%)",
+          f"B單 淨利 {B['netU']:+.4f} U ({B['nrate']:+.3f}%)",
+          f"合計 淨利 {sU:+.4f} U ({sN:+.3f}%){ico}"]
+    L += rt_updn_lines(T["entry"], rows, H["iHi"], H["iLo"])
+    if H.get("miss"):
+        L.append(f"{E.WARN} 查價失敗 {H['miss']} 筆(沿用前一筆價格)")
+    L.append(f"等到 {rt_t(T['next_at'])} 重新埋伏")
+    L += stats
+    L.append("(A|B單都出場,進行下一輪)")
+    return L
 
-def rt_agg_add(H, rows):
-    """v5.3：每加一筆就累計一次（持倉通知／停止通知用，不必每次重掃全部紀錄）：
-    高利＝最高毛利率那一列、高損＝最低毛利率那一列（同價位取第一次，跟出場通知、Excel 一樣）；
-    amp＝所有列「最高振幅%」合計（÷筆數＝Excel「平均振幅%」在這一刻的值）。"""
-    k = len(rows) - 1; r = rows[k]
-    if k == 0:
-        H["iM"] = 0; H["im"] = 0; H["amp"] = r["amp"]; return
-    if r["rate"] > rows[H["iM"]]["rate"]: H["iM"] = k
-    if r["rate"] < rows[H["im"]]["rate"]: H["im"] = k
-    H["amp"] += r["amp"]
-
-def rt_snap_lines(T, H, rows, st, word, stop=None):
-    """v5.3：持倉通知／停止通知的內容（算到這一刻）。word＝「目前」（持倉通知）或「全程」（停止通知）。
-    stop＝排在高利／高損後面的那一行：停止通知是「停止 …」，持倉通知（v5.4）是「現價 …」。"""
-    entry = T["entry"]
-    t_in = datetime.fromtimestamp(T["t_in"], TZ8).strftime("%H:%M:%S")
-    tp_t = T["tmv"][-1]["t"] if T["tmv"] else t_in       # 最後一次移動的時間；沒移動過＝進場時間
-    sl_t = T["smv"][-1]["t"] if T["smv"] else t_in
-    L = [f"進場 {t_in}|{entry}",
-         f"ＴＰ {tp_t}|{T['tp_px']}",
-         f"ＳＬ {sl_t}|{T['sl_px']}"]
-    iM, im = H["iM"], H["im"]
-    ev = []                                                 # (排序鍵, 文字)；依時間先後，「無」排在後面
-    if rows[iM]["rate"] > 0:
-        ev.append(((0, iM), f"高利 {rows[iM]['t']}|{rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"))
-    else:
-        ev.append(((1, 0), f"高利 無({word}未獲利)"))
-    if rows[im]["rate"] < 0:
-        ev.append(((0, im), f"高損 {rows[im]['t']}|{rows[im]['px']}({float(rows[im]['rate']):+.3f}%)"))
-    else:
-        ev.append(((1, 1), f"高損 無({word}未虧損)"))
-    L += [txt for _, txt in sorted(ev)]
-    if stop:
-        L.append(stop)
-    up_pct = (st["hi"] - entry) / entry * 100               # 只看價格：最高價、最低價各自跟進場價比
-    dn_pct = (st["lo"] - entry) / entry * 100
-    L += [f"最大漲幅 {float(up_pct):+.3f}%",
-          f"最大跌幅 {float(dn_pct):+.3f}%",
+def rt_note_lines(T, H, rows, k):
+    """持倉通知（每滿 5 分鐘）：高利／高損用 A 單的毛利率算；兩單各自的現價毛利率與 SL；最大振幅、平均振幅。"""
+    en = T["entry"]; r = rows[-1]
+    L = [f"🎯 持倉通知 {rt_head(T)}",
+         f"⏰持倉時間 {rt_hms(k * RT_NOTE_SEC)}(第{k}次通知)",
+         f"進場 {rt_t(T['t_in'])}|{en}"]
+    L += rt_hilo_lines(T["legs"]["A"]["pos"], en, rows, H["iHi"], H["iLo"], "目前")
+    for G in T["legs"].values():
+        if G["out"] is not None:
+            x = G["out"]
+            L.append(f"{G['n']}單 已出場 {rt_t(x['t'])}|{x['px']}({float(x['pnl']['grate']):+.3f}%)")
+        else:
+            L += [f"{G['n']}單 {r['t']}|{r['px']}({float(rt_rate(G['pos'], en, r['px'])):+.3f}%)", rt_sl_now(G)]
+    L += [f"最大振幅 {float(r['amp']):.3f}%",
           f"平均振幅 {float(H['amp'] / len(rows)):.3f}%"]
     return L
 
-async def rt_send_xlsx(app, chat, msg, xlsx, fname):
-    """文字＋Excel：短訊息當附檔說明；太長先發文字再發檔案（跟出場通知同一套）。"""
-    short = len(msg.encode("utf-16-le")) // 2 <= 1000      # TG 附檔說明上限 1024
-    try:
-        if not short:
-            await rt_send(app, chat, msg)
-        with open(xlsx, "rb") as f:
-            await app.bot.send_document(chat, f, filename=fname, caption=msg if short else None)
-    except Exception as e:
-        print("[runtest] send_document fail", e)
-        await rt_send(app, chat, (msg + "\n" if short else "") +
-                      f"{E.WARN} TG 傳檔失敗，下載：scp 1111bot:{xlsx} ~/Downloads/")
+def rt_stop_lines(T, S, ts):
+    """停止通知（/stopruntest 時持倉中）：最後一筆＝停止那一刻。不算今日統計。"""
+    rows = S["rows"]; r = rows[-1]; en = T["entry"]
+    L = [f"🛑 停止通知 {rt_head(T)}",
+         f"持倉時間: {rt_hms(ts - T['t_in'])}(未出場)",
+         f"進場 {rt_t(T['t_in'])}|{en}"]
+    L += rt_updn_lines(en, rows, S["iHi"], S["iLo"])
+    L.append(f"停止 {r['t']}|{r['px']}")
+    for G in S["legs"].values():
+        if G["out"] is not None:
+            x = G["out"]
+            L.append(f"{G['n']}單 已出場 {rt_t(x['t'])}|{x['px']}({float(x['pnl']['grate']):+.3f}%)")
+        else:
+            L += [f"{G['n']}單 {G['dr']} 停止時毛利率 {float(rt_rate(G['pos'], en, r['px'])):+.3f}%", rt_sl_now(G)]
+    L += [f"最大振幅 {float(r['amp']):.3f}%",
+          f"平均振幅 {float(S['amp'] / len(rows)):.3f}%"]
+    if S.get("miss"):
+        L.append(f"{E.WARN} 查價失敗 {S['miss']} 筆(沿用前一筆價格)")
+    return L
 
 def rt_hold_snap(T):
-    """v5.3：按下 /stopruntest 當下的持倉資料複本（紀錄、最高最低價、累計值），之後不會再被改動。"""
-    H = dict(T["hold"])
-    H["rows"] = list(H["rows"]); H["st"] = dict(H["st"])
-    return H
+    """按下 /stopruntest 當下的持倉資料複本（紀錄、最高最低價、累計值、兩單狀態），之後不會再被改動。"""
+    S = dict(T["hold"])
+    S["rows"] = list(S["rows"]); S["st"] = dict(S["st"])
+    S["legs"] = {n: dict(G, smv=list(G["smv"])) for n, G in T["legs"].items()}
+    return S
 
-async def rt_stop_report(app, T, ts, H):
-    """v5.3：/stopruntest 時持倉中的那一輪：記錄到停止那一刻 → 停止通知＋Excel。不算今日統計。
-    H 是 rt_hold_snap 取的複本；最後補一筆「停止」（當時價），Excel 標黃色。"""
-    rows = H["rows"]; st = H["st"]; chat = T["chat"]
+async def rt_stop_report(app, T, ts, S):
+    """/stopruntest 時持倉中的那一輪：記錄到停止那一刻 → 停止通知。不算今日統計。"""
+    rows = S["rows"]; chat = T["chat"]
     try:
         t = T.get("task")
         if t and not t.done():
             await asyncio.wait([t], timeout=3)            # 等原本的持倉迴圈收尾（逐筆紀錄檔關好）再補「停止」那一筆
         px = await rt_px(T["iid"])
         if px is None:
-            px = rows[-1]["px"]; H["miss"] += 1
-        r = rt_row(T, ts, px, st, "停止")
-        rows.append(r); rt_agg_add(H, rows)
+            px = rows[-1]["px"]; S["miss"] = S.get("miss", 0) + 1
+        r = rt_row(T, ts, px, S["st"], "停止")
+        rows.append(r); rt_agg_add(S, rows)
         try:
-            if os.path.exists(H["log"]):
-                with open(H["log"], "a") as lf:
-                    lf.write(rt_log_line(T["entry"], r, len(rows)))
+            if os.path.exists(S["log"]):
+                with open(S["log"], "a") as lf:
+                    lf.write(rt_log_line(T, r, len(rows)))
         except Exception as e:
             print("[runtest] stop log fail", e)
-        notional = T["mg"] * T["lev"]
-        grate = r["rate"]
-        gU = notional * grate / 100
-        hold_s = ts - T["t_in"]
-        L = [f"🛑 停止通知 {rt_head(T)}",
-             f"持倉時間: {rt_hms(hold_s)}(未出場)"]
-        L += rt_snap_lines(T, H, rows, st, "全程", stop=f"停止 {r['t']}|{r['px']}({float(grate):+.3f}%)")
-        if H["miss"]: L.append(f"{E.WARN} 查價失敗 {H['miss']} 筆(沿用前一筆價格)")
-        msg = "\n".join(L)
-        xlsx = f"{RT_DIR}/{H['base_name']}.xlsx"
-        meta = {"T": dict(T), "amb": H["amb"], "base": H["base"], "hit_px": H["hit_px"], "t_in": rows[0]["t"],
-                "tick": T["tick"], "miss": H["miss"], "tp0": H["tp0"], "sl0": H["sl0"], "notional": notional,
-                "stop": True, "x": {"t": r["t"], "px": r["px"], "hold": rt_hold_str(hold_s), "gU": gU, "grate": grate}}
-        try:
-            await asyncio.get_running_loop().run_in_executor(None, rt_build_excel, xlsx, meta, rows)
-        except Exception as e:
-            await rt_send(app, chat, msg + f"\n{E.LOSS} Excel 產生失敗：{type(e).__name__}: {e}\n逐筆紀錄仍保留在 {H['log']}")
-            return
-        await rt_send_xlsx(app, chat, msg, xlsx, f"runtest.{T['sym']}.{T['dr']}.{pct(T['off'])}.{H['day']}.xlsx")
+        await rt_send(app, chat, "\n".join(rt_stop_lines(T, S, ts)))
     except Exception as e:
         print("[runtest] stop report fail", type(e).__name__, e)
         await rt_send(app, chat, f"{E.LOSS} 停止通知 {rt_head(T)} 產生失敗：{type(e).__name__}: {e}")
 
 async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
-    """已碰到埋伏價：以埋伏價進場，依緊貼規則移動 TP/SL，碰到就出場。沒有時間限制。"""
+    """已碰到埋伏價：A、B 兩單都用埋伏價進場，依 ③④ 設 SL／緊貼，兩單都出場＝一輪結束。沒有時間限制。"""
     sym, dr, chat = T["sym"], T["dr"], T["chat"]
     iid, tick = spec["iid"], spec["tick"]
     t0, hit_px = hit
     hit_px = rt_q(hit_px, tick)
-    pos = rt_pos(dr)
     entry = amb
-    if pos == "L":
-        tp0 = _rt_round(entry * (1 + T["tp"] / 100), tick, True)
-        sl0 = _rt_round(entry * (1 - T["sl"] / 100), tick, False)
-    else:
-        tp0 = _rt_round(entry * (1 - T["tp"] / 100), tick, False)
-        sl0 = _rt_round(entry * (1 + T["sl"] / 100), tick, True)
-    T.update({"pos": pos, "entry": entry, "tick": tick, "tp_px": tp0, "sl_px": sl0, "tp_on": False,
-              "smv": [], "tmv": [], "hit": None, "xhit": None, "t_in": t0,
-              "worst": Decimal(0), "sl_via": None})
+    a, b = RT_PAIR[dr]
+    T.update({"entry": entry, "tick": tick, "t_in": t0, "hit": None,
+              "legs": {"A": rt_leg("A", a), "B": rt_leg("B", b)}})
     T["ev"].clear()
     T["state"] = "持倉中"          # 從這一刻起 WS 逐筆檢查出場
     os.makedirs(RT_DIR, exist_ok=True)
     t_in = datetime.fromtimestamp(t0, TZ8)
-    stamp = t_in.strftime("%Y%m%d_%H%M%S")
-    base_name = f"runtest.{ACCT}.{sym}.{dr}.{pct(T['off'])}.{stamp}"
-    log_path = f"{RT_DIR}/{base_name}.log"
-    tps, sls = ("+", "-") if pos == "L" else ("-", "+")
-    st = {"hi": entry, "lo": entry, "last": None, "flip": 0}
-    rows = [rt_row(T, t0, entry, st, "")]          # 第 1 筆 = 進場那一刻（當時價 = 進場價）
-    # v5.3：持倉中的資料放進 T["hold"]，/stopruntest 時用來產生停止通知＋Excel；H 也累計高利/高損/振幅合計。
-    H = {"rows": rows, "st": st, "amb": amb, "base": base, "hit_px": hit_px, "tp0": tp0, "sl0": sl0,
-         "base_name": base_name, "log": log_path, "day": t_in.strftime("%Y%m%d"), "miss": 0, "note": 1}
+    base_name = f"runtest.{ACCT}.{sym}.{dr}.{pct(T['off'])}.{t_in.strftime('%Y%m%d_%H%M%S')}"
+    st = {"hi": entry, "lo": entry}
+    rows = [rt_row(T, t0, entry, st, "進場")]          # 第 1 筆 = 進場那一刻（當時價 = 進場價）
+    H = {"rows": rows, "st": st, "log": f"{RT_DIR}/{base_name}.log", "miss": 0, "note": 1}
     rt_agg_add(H, rows)
     T["hold"] = H
-    on = lambda: RT.get(key) is T                 # v5.3：確認這一筆還在跑（停止後重下同幣同方向也不會混在一起）
+    on = lambda: RT.get(key) is T                 # 確認這一筆還在跑（停止後重下同幣同方向也不會混在一起）
+    A, B = T["legs"]["A"], T["legs"]["B"]
+    word = lambda G: "做多" if G["pos"] == "L" else "做空"
     await rt_send(app, chat,
-        f"{E.ENTRY} 進場成交 {rt_head(T)}\n"
-        f"━━━━━━━━━━\n"
+        f"🔔 進場成交 {rt_head(T)}\n"
+        f"{RT_SEP}\n"
         f"查詢 {base_t}|{base}\n"
         f"進場 {t_in.strftime('%H:%M:%S')}|{entry}|🔍{hit_px}\n"
-        f"初始TP {tp0}({tps}{rt_p1(T['tp'])}%)\n"
-        f"初始SL {sl0}({sls}{rt_p1(T['sl'])}%)\n"
-        f"━━━━━━━━━━\n"
+        f"A單 {A['dr']} {word(A)} {entry}\n"
+        f"B單 {B['dr']} {word(B)} {entry}\n"
+        f"ＳＬ 未設(毛利率 >{pct(T['go'])}% 才緊貼)\n"
+        f"{RT_SEP}\n"
         f"時間:{hhmmss()}")
-    prev = entry; miss = 0; i = 0; xout = None
-    lf = open(log_path, "w")
-    lf.write("筆,時間,進場價,當時價,最高振幅%,毛利價,毛利率%,損益燈號,漲跌燈號,折返次數,當時TP,當時SL,動作\n")
+    prev = entry; i = 0; end = []
+    lf = open(H["log"], "w")
+    lf.write(RT_LOG_HEAD)
+    lf.write(rt_log_line(T, rows[0], 1))
 
-    def _log(r, k):
-        lf.write(rt_log_line(entry, r, k))
-    _log(rows[0], 1)
+    def _add(r):
+        rows.append(r); rt_agg_add(H, rows)
+        lf.write(rt_log_line(T, r, len(rows)))
+        if len(rows) % 120 == 0: lf.flush()
+        T["n"] = len(rows)
+
+    def _exit(G, tx, tick_px, level):
+        """G 碰到 SL 出場 → 另一單立刻設 SL → 記一筆 → 第一單出場就背景發通知；兩單都出場就結束這一輪。"""
+        rt_leg_exit(T, G, tx, rt_q(tick_px, tick), level)
+        _add(rt_row(T, tx, tick_px, st, f"{G['n']}單出場"))
+        if rt_legs_open(T):
+            rt_bg(rt_send(app, chat, "\n".join(rt_first_exit_lines(T, G, rows, H))))
+        else:
+            end.append((tx, G))
+
     try:
         while on():
             i = max(i + 1, int((time.time() - t0) / RT_STEP))   # 落後（查價慢）就跳到現在，時間戳不失真
-            await rt_wait_until(T, t0 + i * RT_STEP, "xhit")
-            if T.get("xhit") is not None:                    # WS 逐筆碰到 TP/SL（停止當下剛好碰到的也照常出場）
-                tx, xpx, why = T["xhit"]
-                xout = (tx, xpx, why); break
+            tr = t0 + i * RT_STEP
+            while not end:
+                await rt_wait_x(T, tr)
+                xs = [G for G in rt_legs_open(T) if G["xhit"] is not None]
+                if not xs:
+                    break
+                for G in xs:                                    # WS 逐筆碰到 SL（出場價＝碰到當時的 SL 價）
+                    tx, xpx, lvl = G["xhit"]
+                    _exit(G, tx, xpx, lvl)
+            if end:
+                break
             if not on():
                 return
             px = await rt_px(iid)
             if px is None:
-                px = prev; miss += 1; H["miss"] = miss
+                px = prev; H["miss"] += 1
             prev = px
-            why = rt_touch_exit(pos, px, T["tp_px"], T["sl_px"])   # WS 斷線時由查價補判斷
-            if why:
-                xout = (time.time(), px, why); break
-            act = rt_hug(T, px, tick, t0 + i * RT_STEP)
-            r = rt_row(T, t0 + i * RT_STEP, px, st, act)
-            rows.append(r); _log(r, len(rows)); rt_agg_add(H, rows)
-            if len(rows) % 120 == 0: lf.flush()
-            T["n"] = len(rows)
-            if i * RT_STEP >= H["note"] * RT_NOTE_SEC:       # v5.3：每滿 5 分鐘一則持倉通知（背景送出，不卡迴圈）
+            hitx = False
+            for G in rt_legs_open(T):                           # WS 斷線時由查價補判斷
+                if G["xhit"] is None and G["sl_px"] is not None and rt_touch_sl(G["pos"], px, G["sl_px"]):
+                    _exit(G, time.time(), px, G["sl_px"]); hitx = True
+            if end:
+                break
+            if hitx:
+                continue
+            act = rt_hug(T, px, tick, tr)
+            _add(rt_row(T, tr, px, st, act))
+            if i * RT_STEP >= H["note"] * RT_NOTE_SEC:          # 每滿 5 分鐘一則持倉通知（背景送出，不卡迴圈）
                 k = int(i * RT_STEP // RT_NOTE_SEC); H["note"] = k + 1
-                rt_bg(rt_send(app, chat, "\n".join(
-                    [f"🎯 持倉通知 {rt_head(T)}", f"持倉時間: {rt_hms(k * RT_NOTE_SEC)}(第{k}次通知)"] +
-                    rt_snap_lines(T, H, rows, st, "目前",       # v5.4：現價＝這一刻那一列（r）
-                                  stop=f"現價 {r['t']}|{r['px']}({float(r['rate']):+.3f}%)"))))
-        if xout is None:
-            return
-        tx, xpx, why = xout
-        if why == "SL":
-            x_level = T["sl_px"]
-            reason = ("回升SL" if T["sl_via"] == "回升" else "緊貼SL") if T["smv"] else "靜態SL"
-        else:
-            x_level = T["tp_px"]; reason = "緊貼TP" if T["tmv"] else "靜態TP"
-        r = rt_row(T, tx, xpx, st, "出場")
-        rows.append(r); _log(r, len(rows))
+                rt_bg(rt_send(app, chat, "\n".join(rt_note_lines(T, H, rows, k))))
     finally:
         lf.close()
-    T["state"] = "結算中"
-    T.pop("hold", None)                                  # v5.3：已出場，持倉資料不再需要（釋放記憶體）
-    T["next_at"] = rt_next_open(tx, rt_tf_sec(T))       # 出場後等下一根 TF 開盤（v5.1 跟著 TF）
-    kind = dr[1]
-    notional = T["mg"] * T["lev"]
-    grate = rt_rate(pos, entry, x_level)
-    gU = notional * grate / 100
-    fee = RT_FEE[kind]
-    feeU = -notional * fee / 100
-    netU = gU + feeU
-    nrate = netU / notional * 100
-    hold = rt_hold_str(tx - t0)
-    x_t = datetime.fromtimestamp(tx, TZ8).strftime("%H:%M:%S")
-    xpx_s = rt_q(xpx, tick)
-    # v5.0：高利（原峰值）／高損（原谷底）＝Excel「最高獲利」「最大虧損」那一列（同價位取第一次出現），
-    #       跟出場依時間先後排列；最大漲幅／最大跌幅只看價格（最高價、最低價各自跟進場價比），跟做多做空無關。
-    iM = max(range(len(rows)), key=lambda k: (rows[k]["rate"], -k))
-    im = min(range(len(rows)), key=lambda k: (rows[k]["rate"], k))
-    ev = []                                                 # (排序鍵, 文字)；「無」排在有時間的後面
-    if rows[iM]["rate"] > 0:
-        ev.append(((0, iM), f"高利 {rows[iM]['t']}|{rows[iM]['px']}({float(rows[iM]['rate']):+.3f}%)"))
-    else:
-        ev.append(((1, 0), "高利 無(全程未獲利)"))
-    if rows[im]["rate"] < 0:
-        ev.append(((0, im), f"高損 {rows[im]['t']}|{rows[im]['px']}({float(rows[im]['rate']):+.3f}%)"))
-    else:
-        ev.append(((1, 1), "高損 無(全程未虧損)"))
-    hi_px = max(r["px"] for r in rows); lo_px = min(r["px"] for r in rows)
-    up_pct = (hi_px - entry) / entry * 100
-    dn_pct = (lo_px - entry) / entry * 100
-    ico = E.WIN if netU >= 0 else E.LOSS
-    L = [f"{ico} 出場成交 {rt_head(T)}",
-         f"出場原因:{reason}",
-         "━━━━━━━━━━",
-         f"進場 {t_in.strftime('%H:%M:%S')}|{entry}",
-         # v4.9.4：初始 TP/SL（進場那一刻設定）。用全形 ＴＰ／ＳＬ，寬度跟「進場」兩個中文字一樣，TG 上才對得齊。
-         f"ＴＰ {t_in.strftime('%H:%M:%S')}|{tp0}",
-         f"ＳＬ {t_in.strftime('%H:%M:%S')}|{sl0}"]
-    L += [txt for _, txt in sorted(ev)]
-    L += [f"出場 {x_t}|{x_level}|{rt_hms(tx - t0)}",
-          f"最大漲幅 {float(up_pct):+.3f}%",
-          f"最大跌幅 {float(dn_pct):+.3f}%",
-          "━━━━━━━━━━",
-          f"毛利(率):{gU:+.4f} U ({grate:+.3f}%)",
-          f"手續(率):{feeU:+.4f} U (-{fee:.3f}%)",
-          f"淨利(率):{netU:+.4f} U ({nrate:+.3f}%){ico}",
-          "━━━━━━━━━━"]
-    L += rt_move_lines("SL", T["smv"])
-    L += rt_move_lines("TP", T["tmv"])
-    if miss: L.append(f"{E.WARN} 查價失敗 {miss} 筆(沿用前一筆價格)")
-    L.append(f"等到 {datetime.fromtimestamp(T['next_at'], TZ8).strftime('%H:%M:%S')} 重新埋伏")
-    L += rt_stats_lines(T, rt_stats_add(skey(sym, dr), tx, nrate, netU))
-    msg = "\n".join(L)
-    xlsx = f"{RT_DIR}/{base_name}.xlsx"
-    meta = {"T": dict(T), "amb": amb, "base": base, "hit_px": hit_px, "t_in": rows[0]["t"], "tick": tick,
-            "miss": miss, "tp0": tp0, "sl0": sl0, "notional": notional,
-            "x": {"reason": reason, "t": x_t, "px": x_level, "hit_px": xpx_s, "hold": hold,
-                  "gU": gU, "grate": grate, "feeU": feeU, "netU": netU, "nrate": nrate}}
-    try:
-        await asyncio.get_running_loop().run_in_executor(None, rt_build_excel, xlsx, meta, rows)
-    except Exception as e:
-        await rt_send(app, chat, msg + f"\n{E.LOSS} Excel 產生失敗：{type(e).__name__}: {e}\n逐筆紀錄仍保留在 {log_path}")
+    if not end:
         return
-    fname = f"runtest.{sym}.{dr}.{pct(T['off'])}.{t_in.strftime('%Y%m%d')}.xlsx"
-    short = len(msg.encode("utf-16-le")) // 2 <= 1000      # TG 附檔說明上限 1024
-    try:
-        if not short:
-            await rt_send(app, chat, msg)
-        with open(xlsx, "rb") as f:
-            await app.bot.send_document(chat, f, filename=fname, caption=msg if short else None)
-    except Exception as e:
-        print("[runtest] send_document fail", e)
-        await rt_send(app, chat, (msg + "\n" if short else "") +
-                      f"{E.WARN} TG 傳檔失敗，下載：scp 1111bot:{xlsx} ~/Downloads/")
+    t_end, G = end[-1]
+    T["state"] = "結算中"
+    T.pop("hold", None)                                         # 已出場，持倉資料不再需要（釋放記憶體）
+    T["next_at"] = rt_next_open(t_end, rt_tf_sec(T))            # 兩單都出場後等下一根 TF 開盤
+    A, B = T["legs"]["A"]["out"]["pnl"], T["legs"]["B"]["out"]["pnl"]
+    stats = rt_stats_lines(T, rt_stats_add(skey(sym, dr), t_end, A["nrate"] + B["nrate"], A["netU"] + B["netU"]))
+    await rt_send(app, chat, "\n".join(rt_final_lines(T, G, rows, H, t_end, stats)))
 
 async def rt_worker(app, key):
     T = RT[key]
     sym, dr = T["sym"], T["dr"]
-    on = lambda: RT.get(key) is T               # v5.3：確認這一筆還在跑（停止後重下同幣同方向不會混在一起）
+    on = lambda: RT.get(key) is T               # 確認這一筆還在跑（停止後重下同幣同方向不會混在一起）
     try:
         spec = await get_spec(sym)
         iid, tick = spec["iid"], spec["tick"]
         T["iid"] = iid
         WS_WANT.add(iid)
-        # v4.9.6：所有掛單都對齊 K 線開盤 —— 下指令、出場、bot 重開之後，都等到下一根開盤才掛；
-        #         埋伏價用那一根 K 線的【開盤價】（OKX candles），跟 K 線數據完全對齊。
-        # v5.1：K 線週期 = 這筆 runtest 鎖定的 TF（不再寫死 5m）。
+        # 所有掛單都對齊 K 線開盤 —— 下指令、出場、bot 重開之後，都等到下一根開盤才掛；
+        # 埋伏價用那一根 K 線的【開盤價】（OKX candles），K 線週期＝這筆 runtest 鎖定的 TF。
         tf, tf_sec = rt_tf(T), rt_tf_sec(T)
         next_open = T.get("next_at") or rt_next_open(time.time(), tf_sec)
         while on():
             # ── 等開盤 ──
-            T["amb"] = None; T["hit"] = None; T["xhit"] = None
+            T["amb"] = None; T["hit"] = None
             T["next_at"] = next_open; T["state"] = "等開盤"
             while on() and time.time() < next_open:
                 await asyncio.sleep(min(1.0, max(0.05, next_open - time.time())))
@@ -5402,7 +5322,7 @@ async def rt_worker(app, key):
             if not on():
                 return
             amb = rt_amb_price(base, dr, T["off"], tick)
-            T["hit"] = None; T["xhit"] = None; T["ev"].clear()
+            T["hit"] = None; T["ev"].clear()
             T["amb"] = amb; T["state"] = "埋伏中"   # 從這一刻起 WS 逐筆檢查進場
             next_rearm = next_open + tf_sec
             next_open = next_rearm                    # 沒成交 → 下一根開盤重新埋伏（不必再等）
@@ -5420,7 +5340,7 @@ async def rt_worker(app, key):
                     hit = (time.time(), px)
             if hit and on():
                 await rt_hold(app, key, T, spec, amb, base, base_t, hit)
-                next_open = T.get("next_at") or rt_next_open(time.time(), tf_sec)   # 出場後等下一根 TF 開盤
+                next_open = T.get("next_at") or rt_next_open(time.time(), tf_sec)   # 兩單都出場後等下一根 TF 開盤
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -5430,7 +5350,7 @@ async def rt_worker(app, key):
             RT.pop(key, None); rt_save()
 
 def rt_tf(T):
-    """這筆 runtest 鎖定的週期（v5.1）。舊存檔或不認得的值 → 5m。"""
+    """這筆 runtest 鎖定的週期。沒記或不認得的值 → 5m。"""
     tf = T.get("tf") or RT_TF_OLD
     return tf if tf in TF_SEC else RT_TF_OLD
 
@@ -5438,13 +5358,13 @@ def rt_tf_sec(T):
     return TF_SEC[rt_tf(T)]
 
 def rt_next_open(t, sec):
-    """t 之後的下一根 K 線開盤時間（epoch 秒，嚴格大於 t）。sec = 週期秒數（v5.1 起跟著 TF）。"""
+    """t 之後的下一根 K 線開盤時間（epoch 秒，嚴格大於 t）。sec = 週期秒數。"""
     return (int(t) // sec + 1) * sec
 
 async def rt_candle_open(iid, t_open, tf):
     """取 t_open 那一根 TF K 線的開盤價。K 線剛開、還沒出現就每 0.5 秒重試，最多約 15 秒；拿不到回 None。
-    v5.1：3m/5m/15m/30m 查 OKX 原生 K 線；OKX 沒有的週期（6m/8m/10m/12m/20m/25m）查同一秒開始的
-          1m K 線 —— 同一秒開始，開盤價就是同一筆價格。"""
+    3m/5m/15m/30m 查 OKX 原生 K 線；OKX 沒有的週期（6m/8m/10m/12m/20m/25m）查同一秒開始的
+    1m K 線 —— 同一秒開始，開盤價就是同一筆價格。"""
     bar = RT_BAR.get(tf, "1m")
     for _ in range(30):
         r = await pub(f"/api/v5/market/candles?instId={iid}&bar={bar}&limit=3")
@@ -5458,53 +5378,50 @@ async def rt_candle_open(iid, t_open, tf):
     return None
 
 def rt_start(app, p, chat, next_at=None):
-    """p = 解析好的參數 dict（sym dr lev mg off tp sl hug_tp hug_sl go_tp go_sl rec）。
-    p 另含 tf（v5.1：下指令當下的 /TF，鎖定到停止）。
+    """p = 解析好的參數 dict（sym dr lev mg off hug go），另含 tf（下指令當下的 /TF，鎖定到停止）。
     next_at = 第一次掛單的 K 線開盤時間（下指令時算好，跟啟動訊息顯示的時間一致）。"""
     key = skey(p["sym"], p["dr"])
     RT[key] = {**p, "chat": chat, "state": "等開盤", "n": 0, "next_at": next_at,
-               "ev": asyncio.Event(), "hit": None, "xhit": None}
+               "ev": asyncio.Event(), "hit": None}
     RT[key]["task"] = asyncio.create_task(rt_worker(app, key))
     rt_save()
 
-# v4.9.3：用法畫面與「進行中」清單改版（1111 核可），去掉中文字與空格；v4.9.6 起 🎯 持倉中｜💡 埋伏中｜⏳ 等開盤。
-RT_USAGE = (f"{E.BOT} 用法：\n"
-            f"/runtest 商品 方向 槓桿 保證金\n"
-            f"/runtest ZECUSDT LB 1x 100u\n"
-            f"埋伏點% TP點% SL點%\n"
-            f"0.8 1.0 1.0\n"
-            f"TP緊貼點% SL緊貼點%\n"
-            f"0.2 0.15\n"
-            f"TP發動條件% SL發動條件% 止損回利%\n"
-            f">0.4% >0.2% 0.5\n"
-            f"LA 下方限價買入(做多)\n"
-            f"LB 上方觸發買入(做多)\n"
-            f"SA 上方限價賣出(做空)\n"
-            f"SB 下方觸發賣出(做空)\n"
-            f"\n"
-            f"全部停止：/stopruntest")
+RT_USAGE = ("📝 用法：\n"
+            "/runtest 商品 雙向 槓桿 保證金\n"
+            "/runtest ZECUSDT LASB 1x 10u\n"
+            "埋伏點% SL緊貼% SL觸發條件%\n"
+            "0.2 0.2 >0.5\n"
+            "LASB 下方兩單\n"
+            "A=LA限價買入(做多)\n"
+            "B=SB觸發賣出(做空)\n"
+            "SALB 上方兩單\n"
+            "A=SA限價賣出(做空)\n"
+            "B=LB觸發買入(做多)\n"
+            "保證金是每一單的金額\n"
+            "\n"
+            "全部停止：/stopruntest")
 
 def rt_parse(a):
-    """解析 12 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
-    if len(a) != 12:
-        return None, f"參數數量錯誤（需12個，收到{len(a)}個）"
+    """解析 7 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
+    if len(a) != 7:
+        return None, f"參數數量錯誤（需7個，收到{len(a)}個）"
     p = {"sym": a[0].upper(), "dr": a[1].upper()}
-    if p["dr"] not in RT_DESC:
-        return None, "方向須是 LA / LB / SA / SB"
+    if p["dr"] not in RT_PAIR:
+        return None, "雙向須是 LASB 或 SALB"
     m = re.fullmatch(r"(\d+)[xX]", a[2])
     if not m or not (1 <= int(m.group(1)) <= 125):
         return None, "槓桿須是整數加 x（例 1x）"
     p["lev"] = int(m.group(1))
     m = re.fullmatch(r"(\d+(?:\.\d+)?)[uU]", a[3])
     if not m or Decimal(m.group(1)) <= 0:
-        return None, "保證金須是數字加 u（例 100u）"
+        return None, "保證金須是數字加 u（例 10u）"
     p["mg"] = Decimal(m.group(1))
-    names = ["埋伏點%", "TP點%", "SL點%", "TP緊貼點%", "SL緊貼點%", "TP發動條件%", "SL發動條件%", "止損回利%"]
+    names = ["埋伏點%", "SL緊貼%", "SL觸發條件%"]
     for k, nm, raw in zip(RT_PKEYS, names, a[4:]):
         s = raw.strip()
-        if k in ("go_tp", "go_sl"):
+        if k == "go":
             if not s.startswith(">"):
-                return None, f"{nm} 前面要加 >（例 >0.3%）"
+                return None, f"{nm} 前面要加 >（例 >0.5）"
             s = s[1:]
         s = s.rstrip("%")
         try:
@@ -5516,15 +5433,16 @@ def rt_parse(a):
         p[k] = v
     if p["off"] > 20:
         return None, "埋伏點% 不可超過 20"
-    # v4.9.9：拿掉「緊貼點% 不可大於發動條件%」的限制（1111：以減少虧損為優先，測試要多角度產生數據）。
-    #         緊貼點% 大於發動條件% 時，SL 發動當下會在進場價下方一點，但仍比初始 SL 近，邏輯照常運作。
     return p, None
 
 def rt_status_line(v):
-    """🎯 持倉中：進場價｜持倉時間　💡 埋伏中：掛單價　⏳ 等開盤：預計掛單時間（v4.9.6）。"""
+    """🎯 持倉中：進場價｜持倉時間｜哪幾單還在　💡 埋伏中：掛單價　⏳ 等開盤：預計掛單時間。"""
     st = v.get("state")
-    if st == "持倉中":
-        return f"🎯{v['sym']} {v['dr']}|{v.get('entry', '-')}|{rt_hms(time.time() - v.get('t_in', time.time()))}"
+    if st == "持倉中" and v.get("legs"):
+        op = [G["n"] for G in rt_legs_open(v)]
+        w = "兩單持倉" if len(op) == 2 else (f"{op[0]}單持倉" if op else "結算中")
+        return (f"🎯{v['sym']} {v['dr']}|{v.get('entry', '-')}|"
+                f"{rt_hms(time.time() - v.get('t_in', time.time()))}|{w}")
     if st == "埋伏中":
         return f"💡{v['sym']} {v['dr']}|{v.get('amb', '-')}"
     na = v.get("next_at")
@@ -5550,43 +5468,42 @@ async def cmd_runtest(u, c):
         spec = await get_spec(p["sym"]); px = await get_last(spec["iid"])
     except Exception:
         await reply(u, f"{E.LOSS} 找不到商品 {p['sym']}"); return
-    p["tf"] = rt_tf({"tf": ACCOUNT_TF})             # v5.1：鎖定下指令當下的 /TF
+    p["tf"] = rt_tf({"tf": ACCOUNT_TF})             # 鎖定下指令當下的 /TF
     nxt = rt_next_open(time.time(), TF_SEC[p["tf"]])
     rt_start(c.application, p, u.effective_chat.id, next_at=nxt)
-    await reply(u, f"{E.BOT} runtest 啟動｜{ACCT}\n"
+    a_dr, b_dr = RT_PAIR[p["dr"]]
+    await reply(u, f"📣 runtest 啟動｜{ACCT}\n"
                    f"{rt_head(p)}\n"
-                   f"━━━━━━━━━━\n"
-                   f"埋伏 {pct(p['off'])}%｜TP {pct(p['tp'])}%｜SL {pct(p['sl'])}%\n"
-                   f"緊貼 TP {pct(p['hug_tp'])}%｜SL {pct(p['hug_sl'])}%\n"
-                   f"發動 TP >{pct(p['go_tp'])}%｜SL >{pct(p['go_sl'])}%｜回升 {pct(p['rec'])}%\n"
-                   f"━━━━━━━━━━\n"
+                   f"{RT_SEP}\n"
+                   f"埋伏點 {pct(p['off'])}%\n"
+                   f"SL緊貼 {pct(p['hug'])}%｜SL觸發條件 >{pct(p['go'])}%\n"
+                   f"{RT_SEP}\n"
                    f"現價 {px}\n"
-                   f"{p['dr']}={RT_DESC[p['dr']]}\n"
+                   f"A單 {a_dr}={RT_LEG_DESC[a_dr]}\n"
+                   f"B單 {b_dr}={RT_LEG_DESC[b_dr]}\n"
+                   f"每單 {pct(p['mg'])}u,兩單合計 {pct(p['mg'] * 2)}u\n"
                    f"下一根 {p['tf']} 開盤 {datetime.fromtimestamp(nxt, TZ8).strftime('%H:%M:%S')} 掛單\n"
                    f"時間:{hhmmss()}")
 
 async def cmd_stopruntest(u, c):
     if not RT:
         await reply(u, f"{E.BOT} 目前沒有進行中的 runtest"); return
-    L = [f"{E.BOT} runtest 全部停止｜{ACCT}"]
+    L = [f"🚫 runtest 全部停止｜{ACCT}"]
     first = True
     ts = time.time(); rep = []
     for key in list(RT.keys()):
         v = RT.pop(key)
         st = v.get("state")
-        # v5.3：剛好碰到 TP/SL（結算中，或已碰到還沒結算）→ 不打斷，出場通知＋Excel 照常發
-        settle = st == "結算中" or (st == "持倉中" and v.get("xhit") is not None)
-        if settle:
-            note = "（結算中）"
-        elif st == "持倉中" and v.get("hold"):
-            # v5.3：持倉中不再作廢 → 記錄到停止這一刻，另發停止通知＋Excel
-            note = f"（持倉中 {rt_hold_str(ts - v.get('t_in', ts))}，Excel另發）"
-            rep.append((v, rt_hold_snap(v)))
-        elif st == "持倉中":
-            note = f"（持倉中 {rt_hold_str(ts - v.get('t_in', ts))}，作廢）"
+        settle = st == "結算中"                         # 兩單剛出場、正在發出場通知 → 不打斷，照常發完
+        if st == "持倉中":
+            mark = f"⏱️{rt_hms(ts - v.get('t_in', ts))}"
+            if v.get("hold"):
+                rep.append((v, rt_hold_snap(v)))         # 持倉中 → 另發停止通知
+        elif st == "埋伏中":
+            mark = "💡"
         else:
-            note = f"（{st}）"
-        L.append(("已取消：" if first else "　　　　") + f"{rt_head(v)}{note}")
+            mark = "⏳"
+        L.append(("已取消：" if first else "　　　　") + f"{rt_head(v)} {mark}")
         first = False
         t = v.get("task")
         if t and not settle: t.cancel()
@@ -5595,12 +5512,12 @@ async def cmd_stopruntest(u, c):
     try:
         await reply(u, "\n".join(L))
     finally:
-        for v, H in rep:                                  # 先發停止清單，再各自發停止通知＋Excel
-            rt_bg(rt_stop_report(c.application, v, ts, H))
+        for v, S in rep:                                  # 先發停止清單，再各自發停止通知
+            rt_bg(rt_stop_report(c.application, v, ts, S))
 
 async def rt_recover(app):
     """重開後恢復 runtest 清單：一律回到埋伏狀態（重開當下正在持倉的那一輪作廢）。
-    v4.8 以前的舊格式（只有 商品/方向/埋伏%）參數不足，無法恢復，會通知重新下指令。"""
+    v5.4 以前的舊格式（單向 LA/LB/SA/SB）無法恢復，會通知用新格式重新下指令。"""
     try:
         if not os.path.exists(RT_FILE): return
         data = json.load(open(RT_FILE))
@@ -5609,7 +5526,7 @@ async def rt_recover(app):
     names = []; old = []
     for d in data:
         try:
-            if "lev" not in d or "rec" not in d:      # v4.9.1 以前的格式缺參數
+            if d.get("dr") not in RT_PAIR or any(k not in d for k in RT_PKEYS):
                 old.append(f"{d.get('sym')} {d.get('dr')} {d.get('off')}%"); continue
             p = {"sym": d["sym"], "dr": d["dr"], "lev": int(d["lev"]), "mg": Decimal(d["mg"]),
                  "tf": rt_tf(d), **{k: Decimal(d[k]) for k in RT_PKEYS}}
@@ -5619,7 +5536,7 @@ async def rt_recover(app):
             print("[runtest] recover fail", d, e)
     if not data:
         return
-    if old and not names:
+    if old:
         rt_save()                                   # 清掉舊格式，避免每次重開都提示
     L = []
     if names:
@@ -5662,9 +5579,9 @@ async def cmd_menu(u, c):
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
-        "/runtest 商品 方向 槓桿 保證金 埋伏點% TP點% SL點% TP緊貼點% SL緊貼點% TP發動條件% SL發動條件% 止損回利%\n"
-        "　模擬單邊交易，碰到 TP/SL 出場（不下單，Excel 附在出場通知）\n"
-        "　例：/runtest ZECUSDT LB 1x 100u 0.4 2 0.5 0.1 0.1 >0.3% >0.1% 0.4　｜不帶參數＝查看進行中\n"
+        "/runtest 商品 雙向 槓桿 保證金 埋伏點% SL緊貼% SL觸發條件%\n"
+        "　模擬雙向對沖（LASB/SALB），兩單同價進場，SL緊貼出場（不下單）\n"
+        "　例：/runtest ZECUSDT LASB 1x 10u 0.2 0.2 >0.5　｜不帶參數＝查看進行中\n"
         "/stopruntest 停止全部 runtest\n"
         "/tf 查看/設定週期（同 /timeframe）\n/coins 幣種\n"
         "━━━━━━━━━━\n"
@@ -5717,7 +5634,7 @@ async def _post_init(app):
             BotCommand("apitest", "實盤API探測(會下真單)"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅報表 Excel"),
-            BotCommand("runtest", "模擬單邊交易（TP/SL緊貼）"),
+            BotCommand("runtest", "模擬雙向對沖（SL緊貼）"),
             BotCommand("stopruntest", "停止全部runtest"),
             BotCommand("stopall", "停全部"),
             BotCommand("stop", "停指定"),
