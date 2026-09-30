@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v6.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4066,6 +4066,10 @@ async def cmd_selftest(u, c):
 #   中位振幅＝全部振幅由小排到大取正中間；根數是雙數時取中間兩個的平均（2000 根＝第 1000、1001 根的平均）。
 #   v6.6：最高價和現價之間多一行 ⬆️ 現價到最高價的距離%＝(最高價−現價)÷現價；現價和最低價之間多一行
 #         ⬇️ 現價到最低價的距離%＝(最低價−現價)÷現價（帶正負號，3 位小數，兩行右對齊）；標題改 ⚡️。
+#   v6.7：平均振幅、中位振幅後面加「最高振幅÷它」的倍數（小數兩位）；⬆️⬇️ 拿掉正負號
+#         （⬆️＝現價要漲多少才到最高價、⬇️＝現價要跌多少才到最低價；只有現價已經在區間外時那一行才是負數）；
+#         最低價下面加「區　間」＝⬆️% ＋ ⬇️%，後面是「區間÷最高振幅」的倍數。
+#         倍數和區間都用畫面上顯示的數字算（1111 自己按計算機會一樣），倍數四捨五入到小數兩位。
 #   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。
 #   /tf 不是 OKX 原生週期（6m 8m 10m 12m 20m 25m）→ 用能整除的最大原生週期（1m/3m/5m/15m/30m）合成，
 #   邊界跟 bot 其他地方一樣以整點（epoch）對齊，湊不滿一整根的丟掉（只用完整、已收線的 K 線）。
@@ -4187,23 +4191,33 @@ async def cmd_amp(u, c):
         await reply(u, f"{E.LOSS} {sym} 查無K線資料"); return
     S = amp_stats(kl, AMP_N)
     q = lambda v: str(Decimal(str(v)).quantize(tick))
-    a1, a2, a3 = _amp_right([f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"])
+    sA, sV, sM = f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"
+    a1, a2, a3 = _amp_right([sA, sV, sM])
     p1, p2, p3 = _amp_right([q(S["hi"]), q(last), q(S["lo"])])
-    d1, d2 = _amp_right([f"{(S['hi'] - last) / last * 100:+.3f}", f"{(S['lo'] - last) / last * 100:+.3f}"])   # v6.6
+    def rx(a, b):                                    # v6.7：倍數＝畫面上的 a ÷ 畫面上的 b，四捨五入到小數兩位
+        a, b = Decimal(a), Decimal(b)
+        return str((a / b).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if b else "-"
+    r2, r3 = _amp_right([rx(sA, sV), rx(sA, sM)])
+    up = Decimal(f"{(S['hi'] - last) / last * 100:.3f}")   # 現價要漲多少才到最高價（負＝已經衝過最高價）
+    dn = Decimal(f"{(last - S['lo']) / last * 100:.3f}")   # 現價要跌多少才到最低價（負＝已經跌破最低價）
+    up = up if up else Decimal("0.000"); dn = dn if dn else Decimal("0.000")   # 不要出現 -0.000
+    rg = up + dn                                     # 區間＝兩個 % 相加（＝(最高價−最低價)÷現價）
+    d1, d2 = _amp_right([f"{up:.3f}", f"{dn:.3f}"])
     cnt = f"{S['n']}根" + ("" if S["n"] >= AMP_N else "(OKX只有這些)")
     L = [f"\u26a1\ufe0f 振幅分析｜{ACCT}",
          f"{sym}｜{tf}｜{cnt}",
          f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
          "━━━━━━━━━━",
          f"最高振幅 {a1}%｜{_amp_t(S['tA'])}",
-         f"平均振幅 {a2}%",
-         f"中位振幅 {a3}%",
+         f"平均振幅 {a2}%｜{r2}倍",
+         f"中位振幅 {a3}%｜{r3}倍",
          "━━━━━━━━━━",
          f"最高價 {p1}｜{_amp_t(S['tH'])}",
          f"\u2b06\ufe0f {d1}%",
          f"現\u3000價 {p2}｜{_amp_t(t_now * 1000)}",
          f"\u2b07\ufe0f {d2}%",
          f"最低價 {p3}｜{_amp_t(S['tL'])}",
+         f"區\u3000間 {rg:.3f}%｜{rx(f'{rg:.3f}', sA)}倍",
          "━━━━━━━━━━",
          f"時間:{hhmmss()}"]
     await reply(u, "\n".join(L))
