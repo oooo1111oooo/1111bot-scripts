@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v6.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -3723,368 +3723,6 @@ async def cmd_tune(u, c):
             await reply(u, "\n".join(block))
 
 
-# ---------- /apitest API 探測（純診斷，完全不碰交易邏輯） ----------
-def _brief(r, keys=None):
-    """把 OKX 回應壓成一行：code / msg / data[0] 的重點欄位。"""
-    try:
-        c = r.get("code"); m = (r.get("msg") or "").strip()
-        d = (r.get("data") or [{}])
-        d0 = d[0] if d else {}
-        sc = d0.get("sCode"); sm = (d0.get("sMsg") or "").strip()
-        out = f"code={c}"
-        if m: out += f" msg={m[:140]}"
-        if sc not in (None, ""): out += f" sCode={sc}"
-        if sm: out += f" sMsg={sm[:140]}"
-        if keys:
-            for k in keys:
-                if d0.get(k) not in (None, ""):
-                    out += f" {k}={d0.get(k)}"
-        return out
-    except Exception as e:
-        return f"<解析失敗 {type(e).__name__}>"
-
-
-async def _apitest_probe(say, sym, spec, d, path):
-    """對「一條進場路徑」做完整探測。
-    path = "limit"（A單路徑）或 "trigger"（B單路徑）——
-    這兩條路徑生成的 OCO 行為不同（trigger 的不能 amend，錯誤碼 51506），
-    只測其中一條等於測不到真正的問題。
-    d = "L" / "S"，多空的 SL 方向相反，也必須各測各的。"""
-    iid  = spec["iid"]; tick = spec["tick"]; sz = spec["minsz"]
-    ps   = "long" if d == "L" else "short"
-    open_side  = "buy"  if d == "L" else "sell"
-    close_side = "sell" if d == "L" else "buy"
-    px = await get_last(iid)
-    created = {"ord": None}
-    oco_id = None
-
-    # ── 開倉 ──
-    if d == "L":
-        tp_px = align(px * Decimal("1.05"), tick, "S")
-        sl_px = align(px * Decimal("0.95"), tick, "L")
-    else:
-        tp_px = align(px * Decimal("0.95"), tick, "L")
-        sl_px = align(px * Decimal("1.05"), tick, "S")
-    attach = [{"tpTriggerPx": str(tp_px), "tpOrdPx": "-1",
-               "slTriggerPx": str(sl_px), "slOrdPx": "-1"}]
-
-    if path == "limit":
-        # 掛在對自己不利的一側 → 立刻成交
-        lim = align(px * (Decimal("1.002") if d == "L" else Decimal("0.998")), tick,
-                    "S" if d == "L" else "L")
-        say(f"  掛限價 {open_side} @{lim}（現價 {px}）TP {tp_px} SL {sl_px}")
-        r = await api("POST", "/api/v5/trade/order", {
-            "instId": iid, "tdMode": "isolated", "side": open_side, "posSide": ps,
-            "ordType": "limit", "px": str(lim), "sz": str(sz),
-            "clOrdId": "t" + uuid.uuid4().hex[:14], "attachAlgoOrds": attach})
-        say(f"  {_brief(r, ['ordId'])}")
-        created["ord"] = (r.get("data") or [{}])[0].get("ordId")
-    else:
-        # 【v4.0.1】觸發單改成【追價】，不再賭方向。
-        # OKX 觸發單一定要「價格真的走到觸發價」才會成交，掛在上方等漲、
-        # 下方等跌。所以不管掛哪一側，都在賭接下來幾十秒往哪走 ——
-        # v4.0.0 量了 3 秒動能就押一次，兩次都押錯（SUIUSDT 第4組：
-        # 押跌，結果那 46 秒漲了 6 檔；換邊押漲，結果又不動了）。
-        #
-        # 追價的作法：每 8 秒撤掉重掛一次，永遠掛在【當下現價 ±1 檔】，
-        # 方向取最近一次的漲跌。價格只要動 1 檔就成交，而且每 8 秒重新
-        # 對準一次，不會像固定掛單那樣被行情走開就再也追不上。
-        # SUIUSDT 那 46 秒走了 6 檔 —— 用追價早就成交好幾次了。
-        async def _place_trg(ref, go_up, note):
-            t = align(ref + tick if go_up else ref - tick, tick,
-                      "S" if go_up else "L")
-            rr = await api("POST", "/api/v5/trade/order-algo", {
-                "instId": iid, "tdMode": "isolated", "side": open_side, "posSide": ps,
-                "ordType": "trigger", "sz": str(sz), "triggerPx": str(t),
-                "orderPx": "-1", "triggerPxType": "last",
-                "algoClOrdId": "b" + uuid.uuid4().hex[:14], "attachAlgoOrds": attach})
-            say(f"  掛觸發 {open_side} @{t}（現價 {ref}，{note}）　{_brief(rr, ['algoId'])}")
-            return rr, (rr.get("data") or [{}])[0].get("algoId")
-
-        say(f"  追價模式：每 8 秒對準現價重掛一次，只需價格動 1 檔")
-        r = {"code": "0"}; trg_aid = None; pos = None; waited = 0
-        prev = px
-        for attempt in range(1, 9):                 # 最多 8 次 ≈ 64 秒
-            ref = await get_last(iid)
-            up  = (ref >= prev); prev = ref
-            if trg_aid:
-                await cancel_frame(iid, trg_aid)
-            r, trg_aid = await _place_trg(ref, up, f"第{attempt}次 追{'漲' if up else '跌'}")
-            if r.get("code") != "0":
-                say(f"  {E.LOSS} 下單失敗，本路徑略過")
-                return None, created
-            t0 = time.time()
-            while time.time() - t0 < 8:
-                await asyncio.sleep(2)
-                _ok, pos = await okx_pos_ex(iid, ps, force=True)
-                if pos: break
-            waited += int(time.time() - t0)
-            if pos:
-                break
-        if not pos:
-            if trg_aid:
-                await cancel_frame(iid, trg_aid)
-            say(f"  {E.LOSS} 追價 8 次共 {waited} 秒仍沒吃到倉 —— "
-                f"該幣種此刻幾乎不動，本路徑略過（不是 API 問題）")
-            return None, created
-
-    if path == "limit":
-        if r.get("code") != "0":
-            say(f"  {E.LOSS} 下單失敗，本路徑略過")
-            return None, created
-        t0 = time.time(); pos = None
-        while time.time() - t0 < 6:
-            await asyncio.sleep(2)
-            _ok, pos = await okx_pos_ex(iid, ps, force=True)
-            if pos: break
-        waited = int(time.time() - t0)
-        if not pos:
-            say(f"  {E.LOSS} 等 {waited} 秒仍沒吃到倉，本路徑略過")
-            return None, created
-    entry_px = Decimal(str(pos.get("avgPx") or px))
-    say(f"  ✅ 成交 avgPx={entry_px} 張數={pos.get('pos')}（等待 {waited} 秒）")
-
-    # ── 自動生成的 algo 單 ──
-    say("  自動生成的 algo 單：")
-    found = 0
-    for ot in ("oco", "conditional", "move_order_stop", "trigger"):
-        rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-        for o in (rr.get("data") or []):
-            if o.get("posSide") != ps:
-                continue
-            found += 1
-            say(f"    [{ot}] algoId={o.get('algoId')} ordType={o.get('ordType')} "
-                f"reduceOnly={o.get('reduceOnly')}")
-            say(f"          sz={o.get('sz')} tp={o.get('tpTriggerPx')} sl={o.get('slTriggerPx')}")
-            if ot in ("oco", "conditional") and not oco_id:
-                oco_id = o.get("algoId")
-    if not found:
-        say("    （查不到）")
-
-    # 【v3.7.3】amend 測試拆成「安全」與「邊界」兩段，中間隔著其他測試。
-    # 原因：上次 S 方向「等於現價」那一筆 OKX 回 code=0 然後倉位就沒了
-    # ——SL 貼到現價不是被拒，是當場觸發成交。倉位一死，後面全部測不到。
-    # 所以危險的兩檔（等於現價／越界）一律擺到最後面。
-    async def _amend_try(label, off=None, pct=None):
-        """回傳 True=持倉還在可以繼續；False=倉位已被打掉。
-        off = 檔數偏移（邊界測試用）；pct = 百分比偏移（安全側用）。"""
-        cur  = await get_last(iid)
-        if pct is not None:
-            raw = cur * (Decimal("1") - pct) if d == "L" else cur * (Decimal("1") + pct)
-        else:
-            raw = cur + tick * off
-        t_sl = align(raw, tick, "S" if d == "L" else "L")
-        rr = await api("POST", "/api/v5/trade/amend-algos",
-                       [{"instId": iid, "algoId": oco_id, "newSlTriggerPx": str(t_sl)}])
-        say(f"    {label:12} 現價={cur} SL={t_sl}　{_brief(rr)}")
-        await asyncio.sleep(1.2)
-        _ok, _p = await okx_pos_ex(iid, ps, force=True)
-        if not _p:
-            say("    ⚠️ 此筆之後持倉消失 → 該 SL 是「立刻觸發成交」而非「被拒絕」")
-            return False
-        return True
-
-    # ── 第一段：安全側 ──
-    # 【v4.0】距離改用【百分比】，不再用檔數。
-    # v3.13 實測：SUIUSDT「安全側5檔」= 0.053%，正常行情 1 秒就走完，
-    # 倉位當場被掃掉，後面的測試全部作廢（第3組就是這樣掛掉的）。
-    # 這一段的目的只是回答「這條路徑的 OCO 能不能 amend」，
-    # 距離遠近完全不影響那個答案，所以拉遠到不會被雜訊碰到。
-    say("  amend-algos 測試（安全側 0.3% / 0.15%，遠到不會被行情掃到）：")
-    alive = True
-    if not oco_id:
-        say("    （無 OCO 可測）")
-    else:
-        for pc, label in ((Decimal("0.003"), "安全側0.3%"),
-                          (Decimal("0.0015"), "安全側0.15%")):
-            alive = await _amend_try(label, pct=pc)
-            if not alive: break
-    if not alive:
-        return ps, created
-
-    # ── 換單測試（現行 B 單的修法）──
-    if path == "trigger":
-        say("  換單測試（掛自己的 OCO 取代自動那張）：")
-        n_tp, n_sl = (tp_px, sl_px)
-        rr = await api("POST", "/api/v5/trade/order-algo", {
-            "instId": iid, "tdMode": "isolated", "side": close_side, "posSide": ps,
-            "ordType": "oco", "sz": str(sz),
-            "tpTriggerPx": str(n_tp), "tpOrdPx": "-1",
-            "slTriggerPx": str(n_sl), "slOrdPx": "-1",
-            "clOrdId": "y" + uuid.uuid4().hex[:14]})
-        say(f"    掛新 OCO（舊的還在）　{_brief(rr, ['algoId'])}")
-        new_id = (rr.get("data") or [{}])[0].get("algoId")
-        if new_id:
-            cur = await get_last(iid)
-            t_sl = cur - tick * 5 if d == "L" else cur + tick * 5
-            r2 = await api("POST", "/api/v5/trade/amend-algos",
-                           [{"instId": iid, "algoId": new_id, "newSlTriggerPx": str(t_sl)}])
-            say(f"    amend 新 OCO SL={t_sl}　{_brief(r2)}　"
-                f"{'✅ 可改（換單修法有效）' if (r2.get('data') or [{}])[0].get('sCode') == '0' else '❌ 不可改'}")
-
-    # ── 原生移動止損 ──
-    # 【v3.7.3】新增 activePx（啟動價）測試。沒有啟動價，移動止損一掛上去就生效，
-    # 進場後往SL方向走 0.1% 就被掃掉 —— 直接違反「往SL方向不動，有對沖單保護」。
-    # 有啟動價才等於 hug_sl 的「峰值 ≥ 進場價×(1+F) 才啟動」。所以先測有啟動價的。
-    act = align(entry_px * (Decimal("1") + HUG_FIXED if d == "L" else Decimal("1") - HUG_FIXED),
-                tick, "S" if d == "L" else "L")
-    say(f"  move_order_stop 原生移動止損（進場 {entry_px}）：")
-    say(f"    ① 帶啟動價 activePx={act}（進場價 {'+' if d == 'L' else '−'}0.1%）")
-    hit = None
-    for ratio in ("0.001", "0.002", "0.005", "0.01"):
-        rr = await api("POST", "/api/v5/trade/order-algo", {
-            "instId": iid, "tdMode": "isolated", "side": close_side, "posSide": ps,
-            "ordType": "move_order_stop", "sz": str(sz), "callbackRatio": ratio,
-            "activePx": str(act), "reduceOnly": "true",
-            "algoClOrdId": "m" + uuid.uuid4().hex[:14]})
-        say(f"      callbackRatio={ratio:6} {_brief(rr, ['algoId'])}")
-        if rr.get("code") == "0":
-            hit = ratio; break
-        await asyncio.sleep(0.5)
-    if not hit:
-        say("    ② 不帶啟動價（退而求其次，確認是啟動價被拒還是比例被拒）")
-        for ratio in ("0.001", "0.002", "0.005", "0.01"):
-            rr = await api("POST", "/api/v5/trade/order-algo", {
-                "instId": iid, "tdMode": "isolated", "side": close_side, "posSide": ps,
-                "ordType": "move_order_stop", "sz": str(sz), "callbackRatio": ratio,
-                "algoClOrdId": "m" + uuid.uuid4().hex[:14]})
-            say(f"      callbackRatio={ratio:6} {_brief(rr, ['algoId'])}")
-            if rr.get("code") == "0":
-                hit = ratio + "（無啟動價）"; break
-            await asyncio.sleep(0.5)
-    if not hit:
-        rr = await api("POST", "/api/v5/trade/order-algo", {
-            "instId": iid, "tdMode": "isolated", "side": close_side, "posSide": ps,
-            "ordType": "move_order_stop", "sz": str(sz),
-            "callbackSpread": str(tick * 10),
-            "algoClOrdId": "m" + uuid.uuid4().hex[:14]})
-        say(f"      callbackSpread={tick*10}　{_brief(rr, ['algoId'])}")
-        if rr.get("code") == "0":
-            hit = "spread"
-    say(f"    → {'✅ 可用，最小 ' + hit if hit else '❌ 全部被拒'}")
-
-    # ── 共存 ── 【v3.7.3】改列清單，不只數總數：上次 S 方向數到 1 張，
-    # 光看數字看不出是「OCO 被擠掉」還是「移動止損沒掛上」。
-    say("  同倉位 algo 清單：")
-    tot = 0
-    for ot in ("oco", "conditional", "move_order_stop", "trigger"):
-        rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-        for o in (rr.get("data") or []):
-            if o.get("posSide") != ps: continue
-            tot += 1
-            say(f"    [{ot}] algoId={o.get('algoId')} sz={o.get('sz')} "
-                f"sl={o.get('slTriggerPx')} tp={o.get('tpTriggerPx')} "
-                f"cbRatio={o.get('callbackRatio')} activePx={o.get('activePx')}")
-    if not tot: say("    （一張都沒有）")
-    say(f"  → 共 {tot} 張　{'✅ OCO 與移動止損可共存' if tot >= 2 else '❌ 無法共存（後掛的擠掉前面那張）'}")
-
-    # ── 最後一段：SL 邊界（會把倉位打掉，所以擺最後）──
-    # 【這題決定 #23 死鎖怎麼修】緊貼算出來的 SL 越過現價時，
-    # 到底是「被 OKX 拒絕」還是「立刻成交出場」？
-    # 前者要找最近的合法價位，後者表示「直接平倉」才是正解。
-    say("  amend-algos 測試（邊界，可能當場觸發出場）：")
-    if not oco_id:
-        say("    （無 OCO 可測）")
-    else:
-        for off, label in ([(0, "等於現價"), (1, "越界1檔")] if d == "L"
-                           else [(0, "等於現價"), (-1, "越界1檔")]):
-            if not await _amend_try(label, off): break
-    return ps, created
-
-
-async def _apitest_clean(say, iid, ps, created):
-    """清掉這條路徑建立的一切，並驗證歸零。"""
-    try:
-        if created.get("ord"):
-            await api("POST", "/api/v5/trade/cancel-order",
-                      {"instId": iid, "ordId": created["ord"]})
-        # 【v3.7.3】先平倉、再看剩下什麼 —— 這樣才答得出「倉位平掉後，
-        # 那些 algo 單會不會自動消失」。舊版先撤單再平倉，等於把答案擦掉了。
-        # 沒有自動消失 = 殘單會卡住下一場的淨場檢查，必須在腳本裡主動撤。
-        if ps:
-            ok, pos = await okx_pos_ex(iid, ps, force=True)
-            if pos:
-                rr = await api("POST", "/api/v5/trade/order", {
-                    "instId": iid, "tdMode": "isolated",
-                    "side": "sell" if ps == "long" else "buy", "posSide": ps,
-                    "ordType": "market", "sz": str(pos.get("pos")),
-                    "clOrdId": "z" + uuid.uuid4().hex[:14]})
-                say(f"  平測試倉 {pos.get('pos')} 張　{_brief(rr)}")
-                await asyncio.sleep(3)
-            left = []
-            for ot in ("oco", "conditional", "move_order_stop", "trigger"):
-                rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-                left += [f"{ot}:{o.get('algoId')}" for o in (rr.get("data") or [])
-                         if o.get("posSide") == ps]
-            say(f"  平倉後殘留 algo {len(left)} 張 → "
-                + ("✅ 會自動消失，不必額外撤" if not left
-                   else f"⚠️ 不會自動消失，必須主動撤：{'、'.join(left[:4])}"))
-        for ot in ("oco", "conditional", "move_order_stop", "trigger"):
-            rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-            ids = [{"instId": iid, "algoId": o["algoId"]}
-                   for o in (rr.get("data") or []) if o.get("algoId")]
-            if ids:
-                await api("POST", "/api/v5/trade/cancel-algos", ids)
-        ok, p2 = await okx_pos_ex(iid, ps or "long", force=True)
-        _o, _a = await list_all_orders(iid)
-        # 【v3.7.3】list_all_orders 只看 ALGO_TYPES=('trigger','oco')，
-        # 看不到 move_order_stop。清場驗證自己把四種都數一遍，否則會謊報乾淨。
-        extra = 0
-        for ot in ("oco", "conditional", "move_order_stop", "trigger"):
-            rr = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-            extra += len(rr.get("data") or [])
-        clean = (not p2) and not _o and extra == 0
-        say(f"  清場：持倉{'無' if not p2 else '【仍有！】'}｜限價單 {len(_o)} 張｜"
-            f"algo（四型全查）{extra} 張　"
-            f"{'✅ 已清空' if clean else '⚠️ 未清空，請手動檢查 OKX'}")
-        return clean
-    except Exception as ex:
-        say(f"  {E.LOSS} 清場失敗：{type(ex).__name__}: {ex} ← 請立刻手動到 OKX 檢查")
-        return False
-
-
-async def _apitest_run(u, sym, dirs):
-    """對指定方向、兩條進場路徑各做一次完整探測。"""
-    L = []
-    def say(s): L.append(s); print("[apitest]", s)
-
-    spec = await get_spec(sym)
-    iid  = spec["iid"]
-    px   = await get_last(iid)
-    notional = spec["minsz"] * spec["ctval"] * px
-    say(f"幣種 {sym}｜{iid}")
-    say(f"現價 {px}｜tick {spec['tick']}｜最小張數 {spec['minsz']}｜名目 ≈{notional:.4f} USDT")
-    say(f"測試方向 {'／'.join(dirs)}　×　兩條路徑（限價=A單、觸發=B單）")
-    say("")
-    if notional > 5:
-        say(f"{E.LOSS} 最小名目 {notional:.2f} USDT > 5，拒絕執行（成本過高）")
-        return L
-
-    say("【0】orders-algo-pending 各 ordType 是否受理（唯讀）")
-    for ot in ("trigger", "oco", "conditional", "move_order_stop", "twap"):
-        r = await api("GET", f"/api/v5/trade/orders-algo-pending?instId={iid}&ordType={ot}")
-        say(f"  {ot:16} {_brief(r)}｜筆數={len(r.get('data') or [])}")
-    say("")
-
-    n = 0
-    for d in dirs:
-        for path, pname in (("limit", "A單路徑：限價單"), ("trigger", "B單路徑：觸發單")):
-            n += 1
-            say(f"【{n}】{pname}　方向 {E.dir_word(d)}")
-            ps = None; created = {}
-            try:
-                ps, created = await _apitest_probe(say, sym, spec, d, path)
-            except Exception as ex:
-                say(f"  {E.LOSS} 探測中斷：{type(ex).__name__}: {ex}")
-            finally:
-                await _apitest_clean(say, iid, ps, created or {})
-            say("")
-
-    say(f"【{n+1}】程式現用的涵蓋範圍")
-    say(f"  ALGO_TYPES = {ALGO_TYPES}　← cancel_all_orders / list_all_orders 只看這些")
-    return L
-
-
 # ---------- /selftest 緊貼決策情境表 ----------
 # 緊貼規則是一個純函式 sl_decide()，不碰網路、不碰持倉，
 # 所以可以在正式機上直接餵情境進去，當場看它每一種怎麼決定。
@@ -4395,9 +4033,7 @@ async def cmd_check(u, c):
              "/check api　 API用量與錯誤碼",
              "/check log　 原始輸出（/check 100 = 最近100行）",
              "/check rule　規則自檢 18 項",
-             "/check data　歷史交易數據（可加幣種、天數）",
-             "",
-             "實盤探測 OKX 行為 → /apitest（會下真單，需閒置帳戶）"]
+             "/check data　歷史交易數據（可加幣種、天數）"]
     await _reply_long(u, head, body, tail)
 
 
@@ -4417,312 +4053,144 @@ async def cmd_selftest(u, c):
                       _selftest_lines(), [f"時間：{hhmmss()}　（新入口：/check rule）"])
 
 
-async def cmd_apitest(u, c):
-    """/apitest 幣種 [L|S|LS] —— 用最小張數實測 OKX API，把原始回應印出來。
-    純診斷：不碰 loop、不碰 frame_mover、不碰任何出場邏輯。"""
-    global CHAT_ID; CHAT_ID = u.effective_chat.id
-    a = c.args or []
-    if not a:
-        await reply(u, f"{E.BOT} 用法：/apitest 幣種 [L|S|LS]\n"
-                       f"例：/apitest WIFUSDT L　（只測多）\n"
-                       f"　　/apitest WIFUSDT S　（只測空）\n"
-                       f"　　/apitest WIFUSDT LS　（多空都測，約 8 分鐘）\n"
-                       f"每個方向都會測【限價單】和【觸發單】兩條路徑，測完自動清場。")
-        return
-    sym = a[0].upper()
-    want = (a[1].upper() if len(a) > 1 else "L")
-    dirs = [x for x in ("L", "S") if x in want] or ["L"]
-
-    for k in (skey(sym, "L"), skey(sym, "S")):
-        if k in STRATS and STRATS[k].get("pair_state", "idle") != "idle":
-            await reply(u, f"{E.BOT} {E.LOSS} 本帳戶 {sym} 有策略在運行，"
-                           f"請換一個閒置帳戶跑，或先 /stop {sym}")
-            return
-    try:
-        spec = await get_spec(sym)
-    except Exception:
-        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
-    _, p1 = await okx_pos_ex(spec["iid"], "long", force=True)
-    _, p2 = await okx_pos_ex(spec["iid"], "short", force=True)
-    if p1 or p2:
-        await reply(u, f"{E.BOT} {E.LOSS} 本帳戶 {sym} 已有持倉，拒絕執行（避免誤動你的倉）")
-        return
-
-    await reply(u, f"{E.BOT} 🔬 開始探測 {sym}　方向 {'／'.join(dirs)}\n"
-                   f"每個方向測【限價單】+【觸發單】兩條路徑\n"
-                   f"最小張數，測完自動清場，約 {len(dirs)*3} 分鐘\n"
-                   f"（觸發單用追價模式，每 8 秒對準現價重掛，單組最多 70 秒）")
-    lines = await _apitest_run(u, sym, dirs)
-    await _reply_long(u, [f"{E.BOT} 🔬 API 探測 {sym}　{VERSION}"], lines,
-                      [f"時間：{hhmmss()}"])
+# ---------- /amp 振幅分析（v6.3：不產生 Excel，直接回 TG） ----------
+# v6.3（1111 核可）：/amp 幣種 —— 用當下的 /tf 抓最近 2000 根已收線 K 線（OKX 不到 2000 根就用有的），回：
+#   最高振幅（哪一根）、平均振幅、最高價（哪一根）、現價（查詢當下）、最低價（哪一根）。
+#   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。
+#   /tf 不是 OKX 原生週期（6m 8m 10m 12m 20m 25m）→ 用能整除的最大原生週期（1m/3m/5m/15m/30m）合成，
+#   邊界跟 bot 其他地方一樣以整點（epoch）對齊，湊不滿一整根的丟掉（只用完整、已收線的 K 線）。
+AMP_N = 2000                 # 要分析幾根
+AMP_NATIVE = (30, 15, 5, 3, 1)   # OKX 原生分鐘週期（大→小）
 
 
-# ---------- /amp 振幅報表（Excel + Email） ----------
-AMP_MAX = 110000     # 單次最多抓幾根（支援整年 5m ≈ 105,120 根）
-AMP_YEAR_BARS = 12 * 24 * 365  # 整年 5m 根數 = 105,120
-AMP_BINS = [Decimal(str(x)) for x in
-            ("0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9","1.0","1.2","1.5",
-             "2.0","2.5","3.0","3.5","4.0","5.0")]
-
-AMP_THRESHOLDS = [
-    ("≥ 0.1%", 0.001), ("≥ 0.2%", 0.002), ("≥ 0.3%", 0.003),
-    ("≥ 0.4%", 0.004), ("≥ 0.5%", 0.005), ("≥ 0.6%", 0.006),
-    ("≥ 0.7%", 0.007), ("≥ 0.8%", 0.008), ("≥ 0.9%", 0.009),
-    ("≥ 1.0%", 0.01),  ("≥ 1.2%", 0.012), ("≥ 1.5%", 0.015),
-    ("≥ 2.0%", 0.02),  ("≥ 2.5%", 0.025), ("≥ 3.0%", 0.03),
-    ("≥ 3.5%", 0.035), ("≥ 4.0%", 0.04),  ("≥ 5.0%", 0.05),
-]
-
-
-async def amp_fetch_page(iid, after, ep):
-    """抓一頁 K 線（新->舊，只含已收線）。回傳 (list, 下一個ep, 是否到盡頭)。"""
-    q = f"/api/v5/market/{ep}?instId={iid}&bar=5m&limit=300"
-    if after:
-        q += f"&after={after}"
-    r = await pub(q)
+async def amp_fetch_page(iid, after, ep, bar):
+    """抓一頁 K 線（新->舊，只含已收線）。candles 只有最近約 1440 根，抓完改 history-candles 續抓。
+    回傳 (list, 下一個ep, 是否到盡頭, 這一頁最舊那一根的時間＝下一頁從這裡往前抓)。
+    OKX 回錯誤（多半是太快被限流）→ 等一下重試，最多 3 次。"""
+    lim = 300 if ep == "candles" else 100
+    q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit={lim}" + (f"&after={after}" if after else "")
+    r = {}
+    for i in range(3):
+        r = await pub(q)
+        if r.get("code") == "0":
+            break
+        await asyncio.sleep(1.0 + i)
+    if r.get("code") != "0":
+        raise RuntimeError(f"OKX K線查詢失敗 {r.get('code')} {r.get('msg')}")
     batch = r.get("data") or []
-    if r.get("code") != "0" or not batch:
+    if not batch:
         if ep == "candles" and after:
-            return [], "history-candles", False      # candles 僅近期，改歷史端點續抓
-        return [], ep, True                          # OKX 沒有更早資料（多半是該幣上市日）
+            return [], "history-candles", False, after   # candles 僅近期，改歷史端點續抓
+        return [], ep, True, after                   # OKX 沒有更早資料（多半是該幣上市日）
+    oldest = str(min(int(c[0]) for c in batch))
     out = []
     for c in batch:
         try:
             if len(c) >= 9 and str(c[8]) != "1":
-                continue
+                continue                             # 還沒收線的那一根不要
             out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
                         "l": Decimal(c[3]), "c": Decimal(c[4])})
         except Exception:
             continue
-    if not out:
-        return [], ep, True
     out.sort(key=lambda x: x["ts"], reverse=True)
-    return out, ep, False
+    return out, ep, False, oldest
 
 
-async def amp_stream_build(sym, iid, tick, years, path, notify_cb=None):
-    """【全程串流】邊抓邊算邊寫：記憶體只留當前一頁(300根)+一個跨頁接縫值。
-    OKX 回傳新->舊，直接照此序寫 Excel（最新在上），省去暫存檔與二次讀寫。
-    振幅/漲跌幅需要「前一根收盤」=同頁的下一根；跨頁時以 pending 暫存一根等下頁補算。
-    回傳 dict: rows / newest_ts / oldest_ts / want_days / short（資料不足）。
-    """
-    from openpyxl import Workbook
-    from openpyxl.cell import WriteOnlyCell
-    from openpyxl.styles import Font, Alignment, PatternFill, Color
-    from openpyxl.utils import get_column_letter
-
-    FONT = "蘋方-繁 標準體"
-    TINT = 0.7999816888943144
-    f_blue = PatternFill("solid", fgColor=Color(theme=6, tint=TINT, type="theme"))
-    f_orng = PatternFill("solid", fgColor=Color(theme=9, tint=TINT, type="theme"))
-    f_grn  = PatternFill("solid", fgColor=Color(theme=6, tint=0.6, type="theme"))
-    f_red  = PatternFill("solid", fgColor=Color(theme=9, tint=0.6, type="theme"))
-    hdr = Font(name=FONT, bold=True, size=11)
-    dat = Font(name=FONT, size=11)
-    lft = Alignment(horizontal="left")
-    cen = Alignment(horizontal="center")
-
-    dp = max(0, -tick.as_tuple().exponent)
-    pfmt = "0" if dp == 0 else "0." + "0" * dp
-    P4, P4N, P2 = "0.0000%", "0.0000%;[Red]\\-0.0000%", "0.00%"
-
-    wb = Workbook(write_only=True)
-    ws = wb.create_sheet(title=sym)
-    for ci, w in {1: 4.4, 2: 12.8, 3: 6.8, 4: 16.8, 5: 11.4, 6: 6.8, 7: 11.2,
-                  11: 13.6, 12: 12.2, 13: 13.0, 14: 9.4, 15: 12.2, 16: 9.0,
-                  17: 12.2, 18: 3.0, 19: 9.4, 20: 12.2, 21: 9.0, 22: 12.2,
-                  23: 3.0, 24: 16.0, 25: 6.8, 26: 13.0, 27: 3.0, 28: 16.0,
-                  29: 6.8, 30: 13.0, 31: 3.0, 32: 16.0, 33: 6.8, 34: 13.0,
-                  35: 3.0, 36: 16.0, 37: 6.8, 38: 13.0}.items():
-        ws.column_dimensions[get_column_letter(ci)].width = w
-    ws.freeze_panes = "B3"
-
-    def C(v, font=dat, fmt=None, align=None, fill=None):
-        c = WriteOnlyCell(ws, value=v)
-        c.font = font
-        if fmt:   c.number_format = fmt
-        if align: c.alignment = align
-        if fill:  c.fill = fill
-        return c
-
-    def blank_row():
-        return [None] * 37
-
-    # row1：分析表總數（串流無法回頭改，故用整欄 COUNT）
-    r1 = blank_row()
-    for col, f in ((24, "=COUNT($O:$O)"), (28, "=COUNT($Q:$Q)"),
-                   (32, "=COUNT($S:$S)"), (36, "=COUNT($U:$U)")):
-        r1[col - 1] = C(f, font=hdr)
-    ws.append(r1)
-
-    # row2：主欄標頭 + 分析表標頭
-    heads = ["幣種", "週期", "日期", "時間", "漲跌", "開", "高", "低", "收",
-             "漲跌幅%", "振幅%", "ABS(振幅%-漲跌幅%)", "開到高", "開到高%",
-             "開到低", "開到低%", "收到高", "收到高%", "收到低", "收到低%"]
-    fills = [f_blue] * 16 + [f_grn] * 4
-    r2 = blank_row()
-    for ci, (h, fl) in enumerate(zip(heads, fills), start=2):
-        r2[ci - 1] = C(h, font=hdr, align=cen, fill=fl)
-    for col, lb, fl in ((23, "開到高%門檻", f_blue), (24, "根數", f_blue), (25, "佔比", f_blue),
-                        (27, "開到低%門檻", f_orng), (28, "根數", f_orng), (29, "佔比", f_orng),
-                        (31, "收到高%門檻", f_grn),  (32, "根數", f_grn),  (33, "佔比", f_grn),
-                        (35, "收到低%門檻", f_red),  (36, "根數", f_red),  (37, "佔比", f_red)):
-        r2[col - 1] = C(lb, font=hdr, align=lft, fill=fl)
-    ws.append(r2)
-
-    want_days  = 365 * years
-    horizon_ms = want_days * 86400 * 1000
-    newest_ts = oldest_ts = None
-    rows = 0
-    pending = None
-    after, ep = "", "candles"
-    short = False
-
-    for page in range(years * 500 + 100):
-        page_k, ep, done = await amp_fetch_page(iid, after, ep)
+async def amp_klines(iid, tf, n):
+    """回傳最近 n+1 根（多一根當第一根的前收）已收線的 tf K 線（舊->新）；OKX 不夠就回有的。"""
+    tfm = TF_SEC[tf] // 60
+    bm = next(m for m in AMP_NATIVE if tfm % m == 0)
+    bar, k, tfms = f"{bm}m", tfm // bm, TF_SEC[tf] * 1000
+    need = (n + 2) * k                               # 原生根數（多抓一組，最新那組可能還沒收完）
+    base = {}; after, ep = "", "candles"
+    for _ in range(need // 100 + 30):
+        page, ep, done, after = await amp_fetch_page(iid, after, ep, bar)
         if done:
-            short = True              # OKX 已無更早資料
             break
-        if not page_k:
-            continue
-
-        if newest_ts is None:
-            newest_ts = page_k[0]["ts"]
-
-        work = ([pending] if pending else []) + page_k
-        pending = work[-1]            # 本頁最舊一根，留待下一頁當它的前收
-        stop = False
-
-        for i in range(len(work) - 1):
-            k = work[i]
-            if (newest_ts - k["ts"]) > horizon_ms:
-                stop = True           # 已達要求年限
-                break
-            prev_c = work[i + 1]["c"]
-            ts_i = k["ts"]
-            dt = datetime.fromtimestamp(ts_i / 1000, TZ8)
-            o, h, lo, cl = float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"])
-            pc = float(prev_c) or o
-            chg = (cl - pc) / pc if pc else 0
-            amp = (h - lo) / pc if pc else 0
-            h2o, l2o = h - o, o - lo
-            h2c, c2l = h - cl, cl - lo
-            row = blank_row()
-            vals = [sym, "5m", dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S"),
-                    (E.KLINE_UP if cl >= o else E.KLINE_DOWN),
-                    o, h, lo, cl, chg, amp, abs(amp - chg),
-                    round(h2o, dp), (h2o / o if o else 0),
-                    round(l2o, dp), (l2o / o if o else 0),
-                    round(h2c, dp), (h2c / cl if cl else 0),
-                    round(c2l, dp), (c2l / cl if cl else 0)]
-            fmts = [None, None, None, None, None,
-                    pfmt, pfmt, pfmt, pfmt, P4N, P4, P4,
-                    pfmt, P4, pfmt, P4, pfmt, P4, pfmt, P4]
-            for ci, (v, fm) in enumerate(zip(vals, fmts), start=2):
-                row[ci - 1] = C(v, fmt=fm)
-
-            # 前 18 列資料同時帶出右側門檻分析表（串流只能一次寫完一列）
-            if rows < len(AMP_THRESHOLDS):
-                lb, dv = AMP_THRESHOLDS[rows]
-                tr = rows + 3
-                for lab_c, cnt_c, pct_c, src in ((23, 24, 25, "O"), (27, 28, 29, "Q"),
-                                                 (31, 32, 33, "S"), (35, 36, 37, "U")):
-                    row[lab_c - 1] = C(lb, align=lft)
-                    row[cnt_c - 1] = C(f'=COUNTIF(${src}:${src},">={dv}")')
-                    ltr = get_column_letter(cnt_c)
-                    row[pct_c - 1] = C(f"={ltr}{tr}/{ltr}$1", fmt=P2)
-
-            ws.append(row)
-            oldest_ts = ts_i
-            rows += 1
-
-        if stop:
+        for x in page:
+            base[x["ts"]] = x
+        if len(base) >= need:
             break
-        after = str(min(x["ts"] for x in page_k))
-        if notify_cb and page and page % 60 == 0:
-            await notify_cb(rows, oldest_ts)
-        await asyncio.sleep(0.05)     # 同時讓出控制權，移動SL不受影響
+        await asyncio.sleep(0.12 if ep == "history-candles" else 0.06)   # 不要打太快（OKX 限流）
+    if k == 1:
+        return sorted(base.values(), key=lambda x: x["ts"])[-(n + 1):]
+    grp = {}
+    for x in base.values():
+        grp.setdefault(x["ts"] // tfms, []).append(x)
+    out = []
+    for g, L in grp.items():
+        if len(L) != k:
+            continue                                 # 不完整（還沒收完或 OKX 缺資料）
+        L.sort(key=lambda x: x["ts"])
+        out.append({"ts": g * tfms, "o": L[0]["o"], "h": max(x["h"] for x in L),
+                    "l": min(x["l"] for x in L), "c": L[-1]["c"]})
+    out.sort(key=lambda x: x["ts"])
+    return out[-(n + 1):]
 
-    wb.save(path)
-    return {"rows": rows, "newest_ts": newest_ts, "oldest_ts": oldest_ts,
-            "want_days": want_days, "short": short}
+
+def amp_stats(kl, n):
+    """kl＝舊->新。回傳分析用的根數與各項數字（同數值取第一次出現的那一根）。"""
+    if len(kl) > n:
+        prev, rows = kl[0]["c"], kl[1:]
+    else:
+        prev, rows = kl[0]["o"], kl
+    amps = []
+    for x in rows:
+        amps.append((x["h"] - x["l"]) / prev * 100 if prev else Decimal(0))
+        prev = x["c"]
+    iA = max(range(len(rows)), key=lambda i: (amps[i], -i))
+    iH = max(range(len(rows)), key=lambda i: (rows[i]["h"], -i))
+    iL = min(range(len(rows)), key=lambda i: (rows[i]["l"], i))
+    return {"rows": rows, "n": len(rows), "amax": amps[iA], "tA": rows[iA]["ts"], "aavg": sum(amps) / len(amps),
+            "hi": rows[iH]["h"], "tH": rows[iH]["ts"], "lo": rows[iL]["l"], "tL": rows[iL]["ts"]}
+
+
+def _amp_t(ms):
+    return datetime.fromtimestamp(ms / 1000, TZ8).strftime("%m/%d %H:%M")
+
+
+def _amp_right(ss):
+    """同一欄右對齊：位數不夠的前面補數字寬的空白。"""
+    w = max(len(x) for x in ss)
+    return ["\u2007" * (w - len(x)) + x for x in ss]
 
 
 async def cmd_amp(u, c):
-    """原K 振幅分析報表（全程串流，記憶體友善）。
-    用法：/amp <幣種> <往回年數 1~3>
-    例：/amp BTCUSDT 1  → 從OKX最新一根往回抓 365 天
-    以「往回 N 年」取代指定年份：各幣上市日不同，往回抓永遠從有資料處開始，
-    抓不滿會明確回報實際天數與最早日期，不會卡住。TF 固定 5m。
-    """
-    fmt = (f"{E.BOT} 用法：/amp <幣種> <往回年數>\n"
-           f"例：/amp BTCUSDT 1\n"
-           f"年數只接受 1~3（1=365天, 2=730天, 3=1095天）\n"
-           f"TF 固定 5m，產生 Excel 寄到信箱")
-    if not c.args or len(c.args) != 2:
-        await reply(u, fmt); return
+    """/amp 幣種 —— 依目前 /tf 抓最近 2000 根 K 線，回最高振幅／平均振幅／最高價／現價／最低價。"""
+    tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
+    if not c.args or len(c.args) != 1:
+        await reply(u, f"{E.BOT} 用法：/amp 幣種\n例：/amp ZECUSDT\n依目前 /tf（{tf}）查近{AMP_N}根K線"); return
     sym = c.args[0].upper()
-    try:
-        years = int(c.args[1])
-        if years not in (1, 2, 3):
-            raise ValueError
-    except (ValueError, TypeError):
-        await reply(u, f"{E.LOSS} 年數只接受 1、2、3\n{fmt}"); return
-
-    days = 365 * years
-    est  = 288 * days
-    await reply(u, f"{E.BOT} 振幅分析報表中…\n"
-                   f"幣種：{sym}｜TF：5m\n"
-                   f"範圍：從OKX最新一根往回 {days} 天（約{est}根）\n"
-                   f"全程串流寫入，不影響進行中的策略\n"
-                   f"時間：{hhmmss()}")
     try:
         spec = await get_spec(sym)
     except Exception:
         await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
-
-    day  = now8().strftime("%Y%m%d")
-    name = f"OKX.{sym}.5m.{years}Y.{day}.xlsx"
-    path = f"/srv/1111bot/data/{name}"
-
-    async def _progress(rows, oldest_ts):
-        if oldest_ts:
-            od = datetime.fromtimestamp(oldest_ts / 1000, TZ8).strftime("%Y-%m-%d")
-            print(f"[amp] {sym} 已寫 {rows} 根，最舊 {od}")
-
+    iid, tick = spec["iid"], spec["tick"]
     try:
-        info = await amp_stream_build(sym, spec["iid"], spec["tick"], years, path,
-                                      notify_cb=_progress)
+        kl = await amp_klines(iid, tf, AMP_N)
+        last = await get_last(iid); t_now = time.time()
     except Exception as e:
-        await reply(u, f"{E.LOSS} 產生失敗：{type(e).__name__}: {e}"); return
-
-    rows = info["rows"]
-    if not rows:
-        await reply(u, f"{E.LOSS} {sym} 查無資料"); return
-
-    nts, ots = info["newest_ts"], info["oldest_ts"]
-    ndt = datetime.fromtimestamp(nts / 1000, TZ8).strftime("%Y-%m-%d") if nts else "-"
-    odt = datetime.fromtimestamp(ots / 1000, TZ8).strftime("%Y-%m-%d") if ots else "-"
-    got_days = int((nts - ots) / 86400000) + 1 if (nts and ots) else 0
-
-    short_note = ""
-    if info["short"] or got_days < days - 2:
-        short_note = (f"\n{E.WARN} 資料不足：要求 {days} 天，實際 {got_days} 天\n"
-                      f"OKX 最早只到 {odt}（多半是該幣上市日）")
-
-    try:
-        mb = os.path.getsize(path) / 1024 / 1024
-        size_s = f"{mb:.1f} MB"
-    except Exception:
-        size_s = "-"
-    await reply(u, f"{E.BOT} {E.OK} {sym} 振幅報表已產生\n"
-                   f"範圍：{odt} ~ {ndt}（{got_days} 天）\n"
-                   f"根數：{rows}｜大小：{size_s}\n"
-                   f"檔名：{name}\n"
-                   f"時間：{hhmmss()}{short_note}\n"
-                   f"━━━━━━━━━━\n"
-                   f"下載（Mac 終端機執行）：\n"
-                   f"scp 1111bot:/srv/1111bot/data/{name} ~/Downloads/")
+        await reply(u, f"{E.LOSS} 振幅分析失敗：{type(e).__name__}: {e}"); return
+    if not kl:
+        await reply(u, f"{E.LOSS} {sym} 查無K線資料"); return
+    S = amp_stats(kl, AMP_N)
+    q = lambda v: str(Decimal(str(v)).quantize(tick))
+    a1, a2 = _amp_right([f"{S['amax']:.3f}", f"{S['aavg']:.3f}"])
+    p1, p2, p3 = _amp_right([q(S["hi"]), q(last), q(S["lo"])])
+    cnt = f"{S['n']}根" + ("" if S["n"] >= AMP_N else "(OKX只有這些)")
+    L = [f"📐 振幅分析｜{ACCT}",
+         f"{sym}｜{tf}｜{cnt}",
+         f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
+         "━━━━━━━━━━",
+         f"最高振幅 {a1}%｜{_amp_t(S['tA'])}",
+         f"平均振幅 {a2}%",
+         "━━━━━━━━━━",
+         f"最高價 {p1}｜{_amp_t(S['tH'])}",
+         f"現　價 {p2}｜{_amp_t(t_now * 1000)}",
+         f"最低價 {p3}｜{_amp_t(S['tL'])}",
+         "━━━━━━━━━━",
+         f"時間:{hhmmss()}"]
+    await reply(u, "\n".join(L))
 
 # ---------- /runtest 模擬單邊交易（v4.9） ----------
 # v5.5（1111 核可）：/runtest 改成【雙向對沖】—— 一次埋伏兩單（先限價 A、後觸發 B），純模擬：只查價格，
@@ -5749,8 +5217,7 @@ async def cmd_menu(u, c):
         "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
-        "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
-        "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
+        "/amp 幣種　近2000根K線振幅分析（依 /tf）\n"
         "/runtest 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
         "　模擬雙向對沖（LASB/SALB），兩單同價進場，前單、後單各自SL緊貼出場（不下單）；$＝查詢價，$價錢＝自訂價（只跑一輪）\n"
         "　例：/runtest ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02　｜不帶參數＝查看進行中\n"
@@ -5803,9 +5270,8 @@ async def _post_init(app):
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "當日戰報"),
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
-            BotCommand("apitest", "實盤API探測(會下真單)"),
             BotCommand("coins", "幣種"),
-            BotCommand("amp", "振幅報表 Excel"),
+            BotCommand("amp", "振幅分析（近2000根K線）"),
             BotCommand("runtest", "模擬雙向對沖（前單＋後單SL緊貼）"),
             BotCommand("stopruntest", "停止全部runtest"),
             BotCommand("stopall", "停全部"),
@@ -5865,7 +5331,7 @@ def main():
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
                     ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
                     ("summary", cmd_summary), ("tune", cmd_tune),
-                    ("check", cmd_check), ("apitest", cmd_apitest),
+                    ("check", cmd_check),
                     ("selftest", cmd_selftest), ("log", cmd_log),
                     ("amp", cmd_amp),
                     ("runtest", cmd_runtest), ("stopruntest", cmd_stopruntest),
