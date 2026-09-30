@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v5.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v5.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4728,10 +4728,13 @@ async def cmd_amp(u, c):
 # v5.5（1111 核可）：/runtest 改成【雙向對沖】—— 一次埋伏兩單（先限價 A、後觸發 B），純模擬：只查價格，
 #       不下任何單，不碰 STRATS / 掛單 / 持倉，不影響 /run。
 # v5.6（1111 核可）：① 不再跟 TF：下指令就用現價掛單，掛著等到碰到才進場（不重掛）；兩單都出場後立刻用現價重新掛單。
-#                    ② 第一單出場後，剩下那單改用固定 0.01% 緊貼（RT_HUG2），立刻設 SL，只進不退直到出場。
+#                    ② （v5.7 已改）第一單出場後剩下那單改用固定 0.01% 緊貼。
 #                    ③ 模擬 SL 被拒絕：每次設／移 SL 要過 RT_LAT（送單時間）才生效，這段時間內已有成交越過新 SL
 #                       → 被拒絕，SL 留在原位（跟 OKX 一樣），下一次（0.25 秒後）用新現價再送。
 #                    ④ 出場滑價：出場價＝碰到 SL 的那一筆成交價（不再用 SL 價）。
+# v5.7（1111 核可）：前單出場後，後單不立刻設 SL；每 0.25 秒算「兩單合計淨利率」（前單實際淨利率＋後單現價毛利率扣手續費），
+#                    > 0.05%（RT_GO2）才開始緊貼，距離＝SL緊貼% 參數（跟前單同一個），只進不退直到出場。
+#                    （前單出場那一刻合計約 −0.17%＝兩單手續費，所以價格要從前單出場價往後單方向再走約 0.22% 才會開始。）
 # 指令：/runtest 商品 雙向 槓桿 保證金 埋伏點% SL緊貼% SL觸發條件%
 #   例：/runtest ZECUSDT LASB 1x 10u 0.2 0.2 >0.5
 #   雙向：LASB＝下方兩單（A＝LA 限價買入做多、B＝SB 觸發賣出做空）
@@ -4742,7 +4745,7 @@ async def cmd_amp(u, c):
 #   ② 碰到埋伏價 → A、B 兩單都用埋伏價進場（觸發單會滑價多少無法得知，模擬先當作一樣），互為對沖。
 #   ③ 沒有 TP、沒有初始 SL。每 0.25 秒（一秒 4 次）用查到的現價算各單毛利率：
 #      任一單毛利率 > SL觸發條件% → 這一單開始 SL 緊貼（現價 ∓ SL緊貼%，只進不退）；另一單還在虧損，不設 SL。
-#   ④ 任一單出場 → 另一單【立刻】用出場那一刻的現價設 SL（現價 ± 0.01%），之後每 0.25 秒用 0.01% 緊貼，只進不退。
+#   ④ 任一單出場 → 另一單（後單）等兩單合計淨利率 > 0.05% 才開始緊貼（現價 ± SL緊貼%），只進不退；之前沒有 SL。
 #   ⑤ 兩單都出場＝一輪結束 → 立刻用現價重新掛單。
 #   碰觸（進場、出場、SL 被拒）：WS 每一筆成交都檢查；WS 斷線時由每 0.25 秒的查價補判斷。
 #   手續費無 OKX 資料，只能估：A 單（限價進場 maker＋市價出場 taker）0.070%、B 單（taker×2）0.100%。
@@ -4750,7 +4753,7 @@ async def cmd_amp(u, c):
 #   持倉通知：從進場起每滿 5 分鐘一則；/stopruntest 時持倉中的發停止通知（不算今日統計）。
 #   今日統計以「一輪」為單位（A、B 兩單淨利合計），台灣時間 00:00 重算，重開不歸零。
 RT_STEP      = 0.25         # 每幾秒查價一次（一秒 4 次）：SL 觸發判斷、緊貼移動、逐筆紀錄都用這個節奏
-RT_HUG2      = Decimal("0.01")   # v5.6：第一單出場後，剩下那單的緊貼距離 %（1111 定的固定值）
+RT_GO2       = Decimal("0.05")   # v5.7：前單出場後，兩單合計淨利率超過這個 % 後單才開始緊貼（1111 定的固定值）
 RT_LAT       = 0.018        # v5.6：送單時間（秒）＝VPS 到 OKX 實測平均 18 ms（2026-09-30 量 20 次：14～27 ms）
 RT_FEE       = {"A": Decimal("0.070"), "B": Decimal("0.100")}   # 估計手續費率 %（來回）：A＝限價單、B＝觸發單
 RT_MOVE_SHOW = 10           # 出場通知 SL 移動清單顯示最近幾筆（移動＋被拒一起算）
@@ -4839,11 +4842,22 @@ def rt_better(pos, c, sl):
 
 def rt_leg(n, dr):
     """一單的狀態。n＝"A"/"B"，dr＝LA/SB/SA/LB。
-    mode：None＝還沒開始緊貼；"觸發"／"A單出場後"／"B單出場後"＝緊貼中（via 同義，出場原因用）。
-    hd＝緊貼距離 %；sl_px＝目前生效的 SL；pend＝送出中、還沒生效的 SL；smv＝SL 紀錄（移動＋被拒）。"""
+    mode：None＝還沒開始緊貼；"毛利"＝自己毛利率 > SL觸發條件% 開始；"合計"＝後單在兩單合計淨利率 > 0.05% 開始。
+    post：前單出場後這一單就是後單，記「A單出場後」／「B單出場後」（出場原因用）。
+    sl_px＝目前生效的 SL；pend＝送出中、還沒生效的 SL；smv＝SL 紀錄（移動＋被拒）；fire＝📍 那一刻的毛利率或合計淨利率。"""
     return {"n": n, "dr": dr, "pos": "L" if dr[0] == "L" else "S", "kind": n,
-            "mode": None, "via": None, "hd": None, "sl_px": None, "pend": None, "smv": [],
+            "mode": None, "post": None, "sl_px": None, "pend": None, "smv": [],
             "fire": None, "xhit": None, "out": None}
+
+def rt_sum_net(T, px, legs=None):
+    """兩單合計淨利率 %：已出場的用實際淨利率；還在持倉的用現價毛利率扣掉它的手續費（限價 0.070%、觸發 0.100%）。"""
+    s = Decimal(0)
+    for G in (legs or T["legs"]).values():
+        if G["out"] is not None:
+            s += G["out"]["pnl"]["nrate"]
+        else:
+            s += rt_rate(G["pos"], T["entry"], px) - RT_FEE[G["kind"]]
+    return s
 
 def rt_legs_open(T):
     return [G for G in T["legs"].values() if G["out"] is None]
@@ -4862,13 +4876,15 @@ def rt_settle(T, G, now):
         G["smv"].append({"t": p["t"], "v": p["v"], "rej": p["rej"]})
         T.setdefault("acts", []).append(f"{G['n']}單SL被拒")
         return
-    if G["sl_px"] is None and G["mode"] == "觸發":
-        G["fire"] = p["rate"]                      # 📍 那一刻的毛利率
+    if G["sl_px"] is None:
+        G["fire"] = p["rate"]                      # 📍 那一刻的毛利率（後單＝合計淨利率）
     G["smv"].append({"t": p["t"], "v": p["v"], "v0": G["sl_px"]}); G["sl_px"] = p["v"]
 
 def rt_hug(T, px, tick, t_epoch, now):
-    """每 0.25 秒一次（③）：還沒開始緊貼的單，毛利率 > SL觸發條件% → 開始緊貼（距離＝SL緊貼%）；
-    緊貼中的單 → 候選價比目前 SL 好（或還沒有 SL）就送出（只進不退）。回傳動作文字（逐筆紀錄用）。"""
+    """每 0.25 秒一次：還沒開始緊貼的單 ——
+      前單（另一單還在）：毛利率 > SL觸發條件% → 開始緊貼；
+      後單（另一單已出場）：兩單合計淨利率 > 0.05% → 開始緊貼（v5.7）。
+    緊貼中的單 → 候選價（現價 ∓ SL緊貼%）比目前 SL 好（或還沒有 SL）就送出（只進不退）。回傳動作文字（逐筆紀錄用）。"""
     t = rt_t(t_epoch)
     acts = T.pop("acts", [])
     for G in rt_legs_open(T):
@@ -4879,13 +4895,19 @@ def rt_hug(T, px, tick, t_epoch, now):
             continue
         rate = rt_rate(G["pos"], T["entry"], px)
         if G["mode"] is None:
-            if rate <= T["go"]:
-                continue
-            G["mode"] = G["via"] = "觸發"; G["hd"] = T["hug"]
+            if G["post"] is None:
+                if rate <= T["go"]:
+                    continue
+                G["mode"] = "毛利"
+            else:
+                if rt_sum_net(T, px) <= RT_GO2:
+                    continue
+                G["mode"] = "合計"
             acts.append(f"{G['n']}單SL觸發")
-        c = rt_sl_cand(G["pos"], px, G["hd"], tick)
+        val = rate if G["mode"] == "毛利" else rt_sum_net(T, px)
+        c = rt_sl_cand(G["pos"], px, T["hug"], tick)
         if G["sl_px"] is None or rt_better(G["pos"], c, G["sl_px"]):
-            rt_sl_send(G, c, t, now, rate)
+            rt_sl_send(G, c, t, now, val)
             acts.append(f"{G['n']}單SL送出")
     return "+".join(acts)
 
@@ -4901,23 +4923,16 @@ def rt_leg_pnl(T, G):
 
 def rt_leg_exit(T, G, tx, fill, level, now):
     """一單碰到 SL 出場：出場價＝碰到的那一筆成交價（fill），level＝當時生效的 SL。
-    ④ 剩下那單【立刻】改用 0.01% 緊貼，用出場那一刻的現價送出 SL（一樣可能被拒絕）。"""
+    v5.7：剩下那單變成後單，不立刻設 SL，等兩單合計淨利率 > 0.05% 才開始緊貼（見 rt_hug）。"""
     if G["pend"] is not None:                     # 自己送出中的 SL：越過了就記被拒，其餘作廢
         if G["pend"]["rej"] is not None:
             G["smv"].append({"t": G["pend"]["t"], "v": G["pend"]["v"], "rej": G["pend"]["rej"]})
         G["pend"] = None
     G["out"] = {"t": tx, "px": fill, "sl": level}
     G["out"]["pnl"] = rt_leg_pnl(T, G)
-    t = rt_t(tx)
     for O in rt_legs_open(T):
-        O["hd"] = RT_HUG2
-        if O["mode"] is None:
-            O["mode"] = O["via"] = f"{G['n']}單出場後"
-        if O["xhit"] is not None or O["pend"] is not None:
-            continue
-        c = rt_sl_cand(O["pos"], fill, RT_HUG2, T["tick"])
-        if O["sl_px"] is None or rt_better(O["pos"], c, O["sl_px"]):
-            rt_sl_send(O, c, t, now)
+        if O["post"] is None:
+            O["post"] = f"{G['n']}單出場後"
 
 def rt_on_tick(iid, px):
     """WS 每一筆成交都會呼叫：只做「碰觸」判斷（進場、SL 被拒、出場）並叫醒 worker，不做任何計算或送單。"""
@@ -5118,7 +5133,13 @@ def rt_sl_now(G):
     if G["smv"] and "rej" in G["smv"][-1]:
         m = G["smv"][-1]
         return f"ＳＬ {m['t']}|{m['v']} ❌被拒🔍{m['rej']}"
+    if G["post"] is not None and G["mode"] is None:     # v5.7：後單等合計淨利率
+        return f"ＳＬ 未設(合計淨利 >{RT_GO2}% 才緊貼)"
     return "ＳＬ 未設"
+
+def rt_sum_line(T, px, legs=None):
+    """v5.7：一單已出場時顯示兩單合計淨利率（看後單離開始緊貼還差多少）。"""
+    return f"合計淨利 {float(rt_sum_net(T, px, legs)):+.3f}%"
 
 def rt_move_lines(mv):
     """SL 移動：📍＝第一次生效（開始緊貼）；(±x%)＝這次移動幅度；❌被拒🔍x＝送出途中已有成交 x 越過，SL 留在原位。"""
@@ -5138,12 +5159,12 @@ def rt_move_lines(mv):
 def rt_exit_head(T, G, rows, iHi, iLo):
     """出場通知的共同部分（這一單）：標題 → 出場原因 → 進場／ＳＬ／高利高損／出場／滑價 → 毛利手續淨利 → SL移動。"""
     p = G["out"]["pnl"]; ico = RT_WIN if p["netU"] >= 0 else RT_LOSE
-    reason = "緊貼SL" if G["via"] == "觸發" else f"緊貼SL({G['via']})"
+    reason = "緊貼SL" + (f"({G['post']})" if G["post"] else "")
     m0 = rt_acc(G["smv"])[0]
-    if G["via"] == "觸發":           # 括號＝觸發（第一次生效）那一刻的毛利率，📍＝觸發點
-        sl1 = f"ＳＬ {m0['t']}|{m0['v']}({float(G['fire']):+.3f}%)📍"
+    if G["mode"] == "合計":           # 括號＝開始緊貼（第一次生效）那一刻的合計淨利率／毛利率，📍＝觸發點
+        sl1 = f"ＳＬ {m0['t']}|{m0['v']}(合計{float(G['fire']):+.3f}%)📍"
     else:
-        sl1 = f"ＳＬ {m0['t']}|{m0['v']}({G['via']})"
+        sl1 = f"ＳＬ {m0['t']}|{m0['v']}({float(G['fire']):+.3f}%)📍"
     x = G["out"]
     slip = rt_rate(G["pos"], T["entry"], x["px"]) - rt_rate(G["pos"], T["entry"], x["sl"])
     L = [f"{ico} {G['n']}單出場 {rt_head(T)}",
@@ -5171,6 +5192,7 @@ def rt_first_exit_lines(T, G, rows, iHi, iLo):
         L += [RT_SEP,
               f"{O['n']}單 持倉中 毛利率 {float(rt_rate(O['pos'], T['entry'], G['out']['px'])):+.3f}%",
               rt_sl_now(O),
+              rt_sum_line(T, G["out"]["px"]),
               f"({G['n']}單出場|{O['n']}單持倉)"]
     return L
 
@@ -5205,6 +5227,8 @@ def rt_note_lines(T, H, rows, k):
             L.append(f"{G['n']}單 已出場 {rt_t(x['t'])}|{x['px']}({float(x['pnl']['grate']):+.3f}%)")
         else:
             L += [f"{G['n']}單 {r['t']}|{r['px']}({float(rt_rate(G['pos'], en, r['px'])):+.3f}%)", rt_sl_now(G)]
+    if any(G["out"] is not None for G in T["legs"].values()):
+        L.append(rt_sum_line(T, r["px"]))
     L += [f"最大振幅 {float(r['amp']):.3f}%",
           f"平均振幅 {float(H['amp'] / len(rows)):.3f}%"]
     return L
@@ -5223,6 +5247,8 @@ def rt_stop_lines(T, S, ts):
             L.append(f"{G['n']}單 已出場 {rt_t(x['t'])}|{x['px']}({float(x['pnl']['grate']):+.3f}%)")
         else:
             L += [f"{G['n']}單 {G['dr']} 停止時毛利率 {float(rt_rate(G['pos'], en, r['px'])):+.3f}%", rt_sl_now(G)]
+    if any(G["out"] is not None for G in S["legs"].values()):
+        L.append(rt_sum_line(T, r["px"], S["legs"]))
     L += [f"最大振幅 {float(r['amp']):.3f}%",
           f"平均振幅 {float(S['amp'] / len(rows)):.3f}%"]
     if S.get("miss"):
@@ -5512,7 +5538,8 @@ async def cmd_runtest(u, c):
                    f"{RT_SEP}\n"
                    f"埋伏點 {pct(p['off'])}%\n"
                    f"SL緊貼 {pct(p['hug'])}%｜SL觸發條件 >{pct(p['go'])}%\n"
-                   f"第二單緊貼 {pct(RT_HUG2)}%\n"
+                   f"後單SL觸發 合計淨利 >{RT_GO2}%\n"
+                   f"後單SL緊貼 {pct(p['hug'])}%\n"
                    f"{RT_SEP}\n"
                    f"現價 {px}\n"
                    f"A單 {a_dr}={RT_LEG_DESC[a_dr]}\n"
