@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v6.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -3114,6 +3114,7 @@ async def _to(app, chat, stamp):
     if p and p["t"] == stamp:
         k = p.get("kind", "run")
         del PENDING[chat]
+        k = "stop all" if k == "stopall" else k      # v6.4：/stopall 併進 /stop all
         await notify(app, chat, f"{E.BOT} /{k} 逾時未確認，已取消")
 
 async def cmd_confirm(u, c):
@@ -3144,11 +3145,16 @@ async def cmd_confirm(u, c):
     cnt = sum(1 for t in TASKS.values() if t and not t.done())
     await reply(u, f"{E.BOT} {E.OK} 已確認，{p['sym']} {E.dir_word(p['dir'])} 啟動\n運行中策略：{cnt} 個")
 
-# 撤單部分 stopall / stop：一切以查詢交易所為主，DB 只是確認後的資料回補而已
+# 撤單部分 stop all / stop：一切以查詢交易所為主，DB 只是確認後的資料回補而已
+# v6.4（1111 核可）：/stopall 拿掉，改成 /stop all（大小寫都可以），行為跟原本 /stopall 完全一樣。
 async def cmd_stop(u, c):
     a = c.args
     if not a:
-        await reply(u, f"{E.BOT} 用法：/stop ETHUSDT"); return
+        await reply(u, f"{E.BOT} 用法：\n"
+                       f"/stop 商品　停指定幣種（例 /stop ETHUSDT）\n"
+                       f"/stop all　 停全部策略+清殘單"); return
+    if a[0].lower() == "all":
+        await cmd_stopall(u, c); return
     sym = a[0].upper()
     try:
         spec = await get_spec(sym)
@@ -3206,6 +3212,7 @@ async def do_stop(u, sym, iid):
     await reply(u, msg)
 
 async def cmd_stopall(u, c):
+    """/stop all（v6.4 起沒有 /stopall 指令，由 cmd_stop 轉過來）。"""
     alive = [k for k, s in STRATS.items() if s.get("pair_state","idle") != "idle"]
     if not alive:
         await reply(u, f"{E.BOT} 目前無運行中策略"); return
@@ -3255,7 +3262,7 @@ async def do_stopall(u):
     pos_count = len(positions)
     r_msg = await api("GET", "/api/v5/trade/orders-pending")
     final_pending = len(r_msg.get("data") or [])
-    msg = f"{E.BOT} 已執行 /stopall\n掛單數：{final_pending}｜持倉數：{pos_count}"
+    msg = f"{E.BOT} 已執行 /stop all\n掛單數：{final_pending}｜持倉數：{pos_count}"
     if positions:
         msg += "\n━━━━━━━━━━\n持倉清單（請手動平倉）："
         for i, p in enumerate(positions, 1):
@@ -5214,7 +5221,7 @@ async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
         "/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% 緊貼度% TP% SL%\n"
         f"例：/run WIFUSDT S 1x 1 1.2 0.25 0.15 6 0.8\n週期依 /tf（目前 {ACCOUNT_TF}）\n"
-        "/confirm 確認啟動\n/stop 商品 方向\n/stopall 停全部+清殘單\n"
+        "/confirm 確認啟動\n/stop 商品　停指定幣種\n/stop all　停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/amp 幣種　近2000根K線振幅分析（依 /tf）\n"
@@ -5274,8 +5281,7 @@ async def _post_init(app):
             BotCommand("amp", "振幅分析（近2000根K線）"),
             BotCommand("runtest", "模擬雙向對沖（前單＋後單SL緊貼）"),
             BotCommand("stopruntest", "停止全部runtest"),
-            BotCommand("stopall", "停全部"),
-            BotCommand("stop", "停指定"),
+            BotCommand("stop", "停指定｜all＝停全部"),
             BotCommand("run", "建立策略"),
             BotCommand("timeframe", "週期"),
             BotCommand("menu", "說明")]
@@ -5329,7 +5335,7 @@ def main():
            .pool_timeout(30.0).get_updates_read_timeout(40.0)
            .get_updates_connect_timeout(30.0).build())
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
-                    ("stop", cmd_stop), ("stopall", cmd_stopall), ("status", cmd_status),
+                    ("stop", cmd_stop), ("status", cmd_status),
                     ("summary", cmd_summary), ("tune", cmd_tune),
                     ("check", cmd_check),
                     ("selftest", cmd_selftest), ("log", cmd_log),
