@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v6.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4070,6 +4070,9 @@ async def cmd_selftest(u, c):
 #         （⬆️＝現價要漲多少才到最高價、⬇️＝現價要跌多少才到最低價；只有現價已經在區間外時那一行才是負數）；
 #         最低價下面加「區　間」＝⬆️% ＋ ⬇️%，後面是「區間÷最高振幅」的倍數。
 #         倍數和區間都用畫面上顯示的數字算（1111 自己按計算機會一樣），倍數四捨五入到小數兩位。
+#   v6.8：/amp 不帶參數 —— 照 /coins 的幣種順序（有啟用的、照字母排），一個幣種一頁，算好一個就先送；
+#         標題後面加頁碼（例 1/16）；查不到的那一頁寫「查詢失敗，跳下一個」；進行中再按 /amp 會回進行到第幾個。
+#         在背景跑，不會卡住其他指令。
 #   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。
 #   /tf 不是 OKX 原生週期（6m 8m 10m 12m 20m 25m）→ 用能整除的最大原生週期（1m/3m/5m/15m/30m）合成，
 #   邊界跟 bot 其他地方一樣以整點（epoch）對齊，湊不滿一整根的丟掉（只用完整、已收線的 K 線）。
@@ -4171,24 +4174,21 @@ def _amp_right(ss):
     return ["\u2007" * (w - len(x)) + x for x in ss]
 
 
-async def cmd_amp(u, c):
-    """/amp 幣種 —— 依目前 /tf 抓最近 2000 根 K 線，回最高振幅／平均振幅／中位振幅／最高價／現價／最低價。"""
-    tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
-    if not c.args or len(c.args) != 1:
-        await reply(u, f"{E.BOT} 用法：/amp 幣種\n例：/amp ZECUSDT\n依目前 /tf（{tf}）查近{AMP_N}根K線"); return
-    sym = c.args[0].upper()
+AMP_RUN = {"on": False, "i": 0, "n": 0, "task": None}   # v6.8：/amp 進行中（避免重複跑）
+
+
+async def amp_page(sym, tf, head):
+    """一個幣種一頁：成功回完整畫面；查不到回「查詢失敗，跳下一個」。"""
     try:
         spec = await get_spec(sym)
-    except Exception:
-        await reply(u, f"{E.LOSS} 找不到商品 {sym}"); return
-    iid, tick = spec["iid"], spec["tick"]
-    try:
+        iid, tick = spec["iid"], spec["tick"]
         kl = await amp_klines(iid, tf, AMP_N)
         last = await get_last(iid); t_now = time.time()
     except Exception as e:
-        await reply(u, f"{E.LOSS} 振幅分析失敗：{type(e).__name__}: {e}"); return
+        print("[amp] fail", sym, type(e).__name__, e)
+        return f"{head}\n💥 {sym} 查詢失敗，跳下一個"
     if not kl:
-        await reply(u, f"{E.LOSS} {sym} 查無K線資料"); return
+        return f"{head}\n💥 {sym} 查無K線資料，跳下一個"
     S = amp_stats(kl, AMP_N)
     q = lambda v: str(Decimal(str(v)).quantize(tick))
     sA, sV, sM = f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"
@@ -4204,7 +4204,7 @@ async def cmd_amp(u, c):
     rg = up + dn                                     # 區間＝兩個 % 相加（＝(最高價−最低價)÷現價）
     d1, d2 = _amp_right([f"{up:.3f}", f"{dn:.3f}"])
     cnt = f"{S['n']}根" + ("" if S["n"] >= AMP_N else "(OKX只有這些)")
-    L = [f"\u26a1\ufe0f 振幅分析｜{ACCT}",
+    L = [head,
          f"{sym}｜{tf}｜{cnt}",
          f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
          "━━━━━━━━━━",
@@ -4220,7 +4220,37 @@ async def cmd_amp(u, c):
          f"區\u3000間 {rg:.3f}%｜{rx(f'{rg:.3f}', sA)}倍",
          "━━━━━━━━━━",
          f"時間:{hhmmss()}"]
-    await reply(u, "\n".join(L))
+    return "\n".join(L)
+
+
+async def _amp_all(u, tf, syms):
+    """背景跑：照 /coins 的順序一個幣種一頁，算好一個就先送（不卡住其他指令）。"""
+    n = len(syms)
+    try:
+        for i, sym in enumerate(syms, 1):
+            AMP_RUN["i"] = i
+            head = f"\u26a1\ufe0f 振幅分析｜{ACCT}｜{i}/{n}"
+            try:
+                page = await amp_page(sym, tf, head)
+            except Exception as e:                   # 萬一算的時候出錯，也只影響這一頁
+                print("[amp] page fail", sym, type(e).__name__, e)
+                page = f"{head}\n💥 {sym} 查詢失敗，跳下一個"
+            await reply(u, page)
+    finally:
+        AMP_RUN["on"] = False
+
+
+async def cmd_amp(u, c):
+    """/amp（v6.8 起不帶參數）—— 依目前 /tf，照 /coins 的幣種順序，每個幣種抓最近 2000 根 K 線，一個幣種一頁。
+    打了參數（例 /amp ZECUSDT）也一樣跑全部，參數不理。"""
+    tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
+    if AMP_RUN["on"]:
+        await reply(u, f"{E.BOT} 振幅分析進行中（{AMP_RUN['i']}/{AMP_RUN['n']}），請等跑完"); return
+    syms = sorted([s["symbol"] for s in SYMS if s["enabled"]])      # 跟 /coins 同一份清單、同一個順序
+    if not syms:
+        await reply(u, f"{E.BOT} /coins 沒有啟用的幣種"); return
+    AMP_RUN.update(on=True, i=0, n=len(syms))
+    AMP_RUN["task"] = asyncio.create_task(_amp_all(u, tf, syms))
 
 # ---------- /runtest 模擬單邊交易（v4.9） ----------
 # v5.5（1111 核可）：/runtest 改成【雙向對沖】—— 一次埋伏兩單（先限價 A、後觸發 B），純模擬：只查價格，
@@ -5247,7 +5277,7 @@ async def cmd_menu(u, c):
         "/confirm 確認啟動\n/stop 商品　停指定幣種\n/stop all　停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
-        "/amp 幣種　近2000根K線振幅分析（依 /tf）\n"
+        "/amp　全部幣種近2000根K線振幅分析（依 /tf，照 /coins 順序一頁一個）\n"
         "/runtest 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
         "　模擬雙向對沖（LASB/SALB），兩單同價進場，前單、後單各自SL緊貼出場（不下單）；$＝查詢價，$價錢＝自訂價（只跑一輪）\n"
         "　例：/runtest ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02　｜不帶參數＝查看進行中\n"
@@ -5301,7 +5331,7 @@ async def _post_init(app):
             BotCommand("summary", "當日戰報"),
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
             BotCommand("coins", "幣種"),
-            BotCommand("amp", "振幅分析（近2000根K線）"),
+            BotCommand("amp", "振幅分析（全部幣種，近2000根K線）"),
             BotCommand("runtest", "模擬雙向對沖（前單＋後單SL緊貼）"),
             BotCommand("stopruntest", "停止全部runtest"),
             BotCommand("stop", "停指定｜all＝停全部"),
