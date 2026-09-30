@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v6.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4064,6 +4064,8 @@ async def cmd_selftest(u, c):
 # v6.3（1111 核可）：/amp 幣種 —— 用當下的 /tf 抓最近 2000 根已收線 K 線（OKX 不到 2000 根就用有的），回：
 #   最高振幅（哪一根）、平均振幅、中位振幅（v6.5）、最高價（哪一根）、現價（查詢當下）、最低價（哪一根）。
 #   中位振幅＝全部振幅由小排到大取正中間；根數是雙數時取中間兩個的平均（2000 根＝第 1000、1001 根的平均）。
+#   v6.6：最高價和現價之間多一行 ⬆️ 現價到最高價的距離%＝(最高價−現價)÷現價；現價和最低價之間多一行
+#         ⬇️ 現價到最低價的距離%＝(最低價−現價)÷現價（帶正負號，3 位小數，兩行右對齊）；標題改 ⚡️。
 #   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。
 #   /tf 不是 OKX 原生週期（6m 8m 10m 12m 20m 25m）→ 用能整除的最大原生週期（1m/3m/5m/15m/30m）合成，
 #   邊界跟 bot 其他地方一樣以整點（epoch）對齊，湊不滿一整根的丟掉（只用完整、已收線的 K 線）。
@@ -4187,8 +4189,9 @@ async def cmd_amp(u, c):
     q = lambda v: str(Decimal(str(v)).quantize(tick))
     a1, a2, a3 = _amp_right([f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"])
     p1, p2, p3 = _amp_right([q(S["hi"]), q(last), q(S["lo"])])
+    d1, d2 = _amp_right([f"{(S['hi'] - last) / last * 100:+.3f}", f"{(S['lo'] - last) / last * 100:+.3f}"])   # v6.6
     cnt = f"{S['n']}根" + ("" if S["n"] >= AMP_N else "(OKX只有這些)")
-    L = [f"📐 振幅分析｜{ACCT}",
+    L = [f"\u26a1\ufe0f 振幅分析｜{ACCT}",
          f"{sym}｜{tf}｜{cnt}",
          f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
          "━━━━━━━━━━",
@@ -4197,7 +4200,9 @@ async def cmd_amp(u, c):
          f"中位振幅 {a3}%",
          "━━━━━━━━━━",
          f"最高價 {p1}｜{_amp_t(S['tH'])}",
-         f"現　價 {p2}｜{_amp_t(t_now * 1000)}",
+         f"\u2b06\ufe0f {d1}%",
+         f"現\u3000價 {p2}｜{_amp_t(t_now * 1000)}",
+         f"\u2b07\ufe0f {d2}%",
          f"最低價 {p3}｜{_amp_t(S['tL'])}",
          "━━━━━━━━━━",
          f"時間:{hhmmss()}"]
