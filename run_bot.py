@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v6.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4745,6 +4745,17 @@ async def cmd_amp(u, c):
 #   例：/runtest ZECUSDT LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02
 #   ・前單：毛利率 > 前單毛利率% → SL 先設在 進場價±前單毛利率%，生效後用前單SL緊貼% 緊貼（只往獲利方向移動），直到出場。
 #   ・後單：同 v5.9（毛利率 > 後單毛利率% → SL 先設在 進場價±後單毛利率%，再用後單SL緊貼% 緊貼）。
+# v6.1（1111 核可）：
+#   ・自訂價（可不填）：商品後面加 $價錢，例 /runtest ZECUSDT $1404.20 LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02
+#     埋伏價＝$價錢 ×(1 ∓ 埋伏點%)（取代查詢的現價）。自訂價只跑一輪：兩單都出場就結束，不自動循環（1111 手動的保護機制）。
+#     現價已經越過埋伏價（LASB 現價 ≤ 埋伏價、SALB 現價 ≥ 埋伏價）→ 先等價格回到另一邊才掛單（避免一掛就成交）。
+#     $價錢跟現價差超過 20% 不接受（防打錯）。
+#   ・防呆：同一個帳戶的 /runtest，同一幣種只能一組（LASB 或 SALB 擇一，有沒有 $ 都一樣），避免併倉。
+#   ・畫面對齊（1111：「以後設計畫面要考慮對齊」）：同一欄的數字用一樣的小數位數（至少 2 位）。
+# v6.2（1111）：$ 改成必填的第 2 個參數：只打 $＝用查詢價掛單（跟以前一樣自動循環）；$價錢＝用這個價錢掛單（只跑一輪）。
+#   /runtest 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%
+#   例：/runtest ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02（查詢價）
+#       /runtest ZECUSDT $1450.22 SALB 1x 10u 0.1 >1.0 >0.05 0.25 0.02（自訂價）
 # 指令：/runtest 商品 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%
 #   例：/runtest ZECUSDT LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02
 #   雙向：LASB＝下方兩單（A＝LA 限價買入做多、B＝SB 觸發賣出做空）
@@ -4809,7 +4820,8 @@ def rt_up(dr):
 def rt_save():
     try:
         data = [{"sym": v["sym"], "dr": v["dr"], "lev": v["lev"], "mg": str(v["mg"]), "chat": v["chat"],
-                 **{k: str(v[k]) for k in RT_PKEYS}}
+                 **{k: str(v[k]) for k in RT_PKEYS},
+                 **({"fpx": str(v["fpx"])} if v.get("fpx") is not None else {})}
                 for v in RT.values()]
         tmp = RT_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -5079,8 +5091,25 @@ def rt_stats_lines(T, lst):
             f"最佳淨利 {max(ns):+.3f}%",
             f"最差淨利 {min(ns):+.3f}%"]
 
+def rt_name(T):
+    """商品＋雙向；自訂價的那組中間多一個 $價錢（跟指令一樣的順序）。"""
+    fp = T.get("fpx")
+    return f"{T['sym']} ${fp} {T['dr']}" if fp is not None else f"{T['sym']} {T['dr']}"
+
 def rt_head(T):
-    return f"{T['sym']} {T['dr']} {T['lev']}x {pct(T['mg'])}u"
+    return f"{rt_name(T)} {T['lev']}x {pct(T['mg'])}u"
+
+def rt_p2(v):
+    """% 參數顯示：至少 2 位小數（1.0 → 1.00、0.025 → 0.025），畫面上下對齊用。"""
+    d = max(2, -v.normalize().as_tuple().exponent)
+    return f"{v:.{d}f}"
+
+def rt_cols(vals):
+    """同一欄的數字對齊：小數位數取最多的那個（至少 2 位），整數位數不同時前面補數字寬的空白。"""
+    d = max([2] + [-v.normalize().as_tuple().exponent for v in vals])
+    ss = [f"{v:.{d}f}" for v in vals]
+    w = max(len(x) for x in ss)
+    return ["\u2007" * (w - len(x)) + x for x in ss]
 
 def rt_row(T, t_epoch, px, st, act):
     """一筆紀錄（每 0.25 秒一筆，加上進場／出場／停止那一刻）。st 存目前最高價、最低價。
@@ -5154,7 +5183,7 @@ def rt_sl_now(T, G):
         m = G["smv"][-1]
         return f"ＳＬ {m['t']}|{m['v']} ❌被拒🔍{m['rej']}"
     if G["post"] is not None and G["mode"] is None:     # v5.9：後單等自己的毛利率 > 後單毛利率%
-        return f"ＳＬ 未設(毛利率 >{pct(T['go2'])}% 才緊貼)"
+        return f"ＳＬ 未設(毛利率 >{rt_p2(T['go2'])}% 才緊貼)"
     return "ＳＬ 未設"
 
 def rt_sum_line(T, px, legs=None):
@@ -5214,7 +5243,8 @@ def rt_first_exit_lines(T, G, rows, iHi, iLo):
     return L
 
 def rt_final_lines(T, G, rows, H, t_end, stats):
-    """第二單出場通知（整輪結算）：這一單 → 整輪 A/B/合計淨利、最大漲幅跌幅 → 今日統計 → (A|B單都出場,繼續掛單)。"""
+    """第二單出場通知（整輪結算）：這一單 → 整輪 A/B/合計淨利、最大漲幅跌幅 → 今日統計 → 最後一行
+    (A|B單都出場,繼續掛單)；自訂價只跑一輪 → (A|B單都出場,自訂價結束,不再掛單)。"""
     L = rt_exit_head(T, G, rows, H["iHi"], H["iLo"])
     A, B = T["legs"]["A"]["out"]["pnl"], T["legs"]["B"]["out"]["pnl"]
     sU = A["netU"] + B["netU"]; sN = A["nrate"] + B["nrate"]
@@ -5228,7 +5258,7 @@ def rt_final_lines(T, G, rows, H, t_end, stats):
     if H.get("miss"):
         L.append(f"{E.WARN} 查價失敗 {H['miss']} 筆(沿用前一筆價格)")
     L += stats
-    L.append("(A|B單都出場,繼續掛單)")
+    L.append("(A|B單都出場,自訂價結束,不再掛單)" if T.get("fpx") is not None else "(A|B單都出場,繼續掛單)")
     return L
 
 def rt_note_lines(T, H, rows, k):
@@ -5333,7 +5363,7 @@ async def rt_hold(app, key, T, spec, amb, base, base_t, hit):
              f"進場 {t_in.strftime('%H:%M:%S')}|{entry}|🔍{hit_px}\n"
              f"A單 {A['dr']} {word(A)} {entry}\n"
              f"B單 {B['dr']} {word(B)} {entry}\n"
-             f"ＳＬ 未設(毛利率 >{pct(T['go1'])}% 才設)\n"
+             f"ＳＬ 未設(毛利率 >{rt_p2(T['go1'])}% 才設)\n"
              f"{RT_SEP}\n"
              f"時間:{hhmmss()}")
     rt_chain(T, lambda: rt_send(app, chat, etext))
@@ -5425,6 +5455,7 @@ async def rt_worker(app, key):
         while on():
             # ── 掛單：查現價 → 埋伏價（v5.6：不等 K 線，立刻掛；下指令那一次用啟動畫面顯示的那個價）──
             T["amb"] = None; T["hit"] = None; T["state"] = "掛單中"
+            fp = T.get("fpx")                       # v6.1：自訂價（沒有＝None，用查詢的現價）
             first = T.pop("first", None)
             if first:
                 base, base_t, amb = first
@@ -5436,7 +5467,18 @@ async def rt_worker(app, key):
                 if not on():
                     return
                 base = rt_q(base, tick); base_t = hhmmss()
-                amb = rt_amb_price(base, dr, T["off"], tick)
+                amb = rt_amb_price(fp if fp is not None else base, dr, T["off"], tick)
+            if fp is not None and rt_touch_amb(dr, base, amb):
+                # v6.1：自訂價，現價已經越過埋伏價（真的下單會一掛就成交）→ 先等價格回到另一邊才掛
+                T["amb"] = amb; T["state"] = "等回價"
+                print(f"[runtest] {rt_name(T)} 等回價 {base_t} 現價{base} → {amb}")
+                while on():
+                    await asyncio.sleep(RT_STEP)
+                    px = await rt_px(iid)
+                    if px is not None and not rt_touch_amb(dr, px, amb):
+                        base = rt_q(px, tick); base_t = hhmmss(); break
+                if not on():
+                    return
             T["hit"] = None; T["ev"].clear()
             T["amb"] = amb; T["state"] = "埋伏中"   # 從這一刻起 WS 逐筆檢查進場；一直掛著直到碰到
             print(f"[runtest] {sym} {dr} 掛單 {base_t} 現價{base} → {amb}")
@@ -5451,6 +5493,10 @@ async def rt_worker(app, key):
                     hit = (time.time(), px)
             if hit and on():
                 await rt_hold(app, key, T, spec, amb, base, base_t, hit)   # 兩單都出場後回到上面，立刻重新掛單
+                if fp is not None:                   # v6.1：自訂價只跑一輪 → 兩單都出場就結束（停止的話已經不在清單）
+                    if on():
+                        RT.pop(key, None); rt_save()
+                    return
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -5460,7 +5506,7 @@ async def rt_worker(app, key):
             RT.pop(key, None); rt_save()
 
 def rt_start(app, p, chat, first=None):
-    """p = 解析好的參數 dict（sym dr lev mg off go1 go2 hug1 hug2）。
+    """p = 解析好的參數 dict（sym dr lev mg off go1 go2 hug1 hug2，自訂價 fpx 沒有就是 None）。
     first = (現價, 時間, 埋伏價)：下指令時算好、啟動畫面顯示的那一組，第一次掛單就用它（重開恢復時沒有，會重新查）。"""
     key = skey(p["sym"], p["dr"])
     RT[key] = {**p, "chat": chat, "state": "掛單中", "n": 0, "first": first,
@@ -5469,10 +5515,14 @@ def rt_start(app, p, chat, first=None):
     rt_save()
 
 RT_USAGE = ("📝 用法：\n"
-            "/runtest 商品 雙向 槓桿 保證金\n"
-            "/runtest ZECUSDT LASB 1x 10u\n"
+            "/runtest 商品 $ 雙向 槓桿 保證金\n"
+            "/runtest ZECUSDT $ LASB 1x 10u\n"
             "埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
             "0.1 >1.0 >0.05 0.25 0.02\n"
+            "$ 一定要打:\n"
+            "$＝用查詢價掛單(自動循環)\n"
+            "$價錢＝用這個價錢掛單(只跑一輪)\n"
+            "/runtest ZECUSDT $1450.22 SALB 1x 10u ...\n"
             "LASB 下方兩單\n"
             "A=LA限價買入(做多)\n"
             "B=SB觸發賣出(做空)\n"
@@ -5481,14 +5531,30 @@ RT_USAGE = ("📝 用法：\n"
             "B=LB觸發買入(做多)\n"
             "保證金是每一單的金額\n"
             "前單毛利率、後單毛利率前面一定要加 >\n"
+            "同一幣種只能一組(避免併倉)\n"
             "\n"
             "全部停止：/stopruntest")
 
 def rt_parse(a):
-    """解析 9 個參數（v6.0）。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
-    if len(a) != 9:
-        return None, f"參數數量錯誤（需9個，收到{len(a)}個）"
-    p = {"sym": a[0].upper(), "dr": a[1].upper()}
+    """解析 10 個參數（v6.2：第 2 個一定是 $ 或 $價錢）。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。
+    $＝用查詢價掛單（fpx=None）；$價錢＝自訂價（fpx=價錢，只跑一輪）。"""
+    a = list(a)
+    if a and "$" in a[0] and not a[0].startswith("$"):          # ZECUSDT$1450.22、ZECUSDT$（沒空格）也認得
+        a[0:1] = [a[0][:a[0].index("$")], a[0][a[0].index("$"):]]
+    if len(a) >= 2 and not a[1].startswith("$"):
+        return None, "商品後面要打 $（查詢價）或 $價錢（例 $1450.22）"
+    if len(a) != 10:
+        return None, f"參數數量錯誤（需10個，收到{len(a)}個）"
+    if any(x.startswith("$") for x in a[2:]):
+        return None, "$ 要放在商品後面（例 /runtest ZECUSDT $ LASB …）"
+    fpx = None
+    if a[1] != "$":
+        m = re.fullmatch(r"\$(\d+(?:\.\d+)?)", a[1].replace(",", ""))
+        if not m or Decimal(m.group(1)) <= 0:
+            return None, f"自訂價格式錯誤：{a[1]}（例 $1450.22，查詢價只打 $）"
+        fpx = Decimal(m.group(1))
+    del a[1]
+    p = {"sym": a[0].upper(), "dr": a[1].upper(), "fpx": fpx}
     if p["dr"] not in RT_PAIR:
         return None, "雙向須是 LASB 或 SALB"
     m = re.fullmatch(r"(\d+)[xX]", a[2])
@@ -5523,16 +5589,18 @@ def rt_parse(a):
     return p, None
 
 def rt_status_line(v):
-    """🎯 持倉中：進場價｜持倉時間｜哪幾單還在　💡 埋伏中：掛單價　⏳ 掛單中（查價中，一下子就好）。"""
-    st = v.get("state")
+    """🎯 持倉中：進場價｜持倉時間｜哪幾單還在　💡 埋伏中：掛單價　⏳ 掛單中（查價中，一下子就好）／等回價（自訂價）。"""
+    st = v.get("state"); nm = rt_name(v)
     if st == "持倉中" and v.get("legs"):
         op = [G["n"] for G in rt_legs_open(v)]
         w = "兩單持倉" if len(op) == 2 else (f"{op[0]}單持倉" if op else "結算中")
-        return (f"🎯{v['sym']} {v['dr']}|{v.get('entry', '-')}|"
+        return (f"🎯{nm}|{v.get('entry', '-')}|"
                 f"{rt_hms(time.time() - v.get('t_in', time.time()))}|{w}")
     if st == "埋伏中":
-        return f"💡{v['sym']} {v['dr']}|{v.get('amb', '-')}"
-    return f"⏳{v['sym']} {v['dr']}|-"
+        return f"💡{nm}|{v.get('amb', '-')}"
+    if st == "等回價":
+        return f"⏳{nm}|等價格回到 {v.get('amb', '-')} " + ("下方" if rt_up(v["dr"]) else "上方")
+    return f"⏳{nm}|-"
 
 async def cmd_runtest(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
@@ -5547,29 +5615,43 @@ async def cmd_runtest(u, c):
     p, err = rt_parse(a)
     if err:
         await reply(u, f"{E.BOT} {err}\n{RT_USAGE}"); return
-    key = skey(p["sym"], p["dr"])
-    if key in RT:
-        await reply(u, f"{E.WARN} {p['sym']} {p['dr']} 已經在跑 runtest\n要換參數請先 /stopruntest"); return
+    same = [v for v in RT.values() if v["sym"] == p["sym"]]
+    if same:                                     # v6.1 防呆：同一幣種只能一組（LASB 或 SALB 擇一），避免併倉
+        await reply(u, f"{E.WARN} {p['sym']} 已經有 {same[0]['dr']} 在跑 runtest\n"
+                       f"同一帳戶同一幣種只能一組(避免併倉)\n"
+                       f"要換請先 /stopruntest"); return
     try:
         spec = await get_spec(p["sym"]); px = rt_q(await get_last(spec["iid"]), spec["tick"])
     except Exception:
         await reply(u, f"{E.LOSS} 找不到商品 {p['sym']}"); return
-    amb = rt_amb_price(px, p["dr"], p["off"], spec["tick"])       # v5.6：立刻用現價掛單
+    fp = p["fpx"]
+    if fp is not None and abs(fp - px) / px * 100 > 20:          # v6.1 防呆：自訂價打錯
+        await reply(u, f"⁉️ ${fp} 跟現價 {px} 差超過 20%,\n⁉️ 請確認價錢"); return
+    amb = rt_amb_price(px if fp is None else fp, p["dr"], p["off"], spec["tick"])   # v5.6：立刻掛單（v6.1：有自訂價就用自訂價）
     rt_start(c.application, p, u.effective_chat.id, first=(px, hhmmss(), amb))
     a_dr, b_dr = RT_PAIR[p["dr"]]
-    await reply(u, f"📣 runtest 啟動｜{ACCT}\n"
-                   f"{rt_head(p)}\n"
-                   f"{RT_SEP}\n"
-                   f"埋伏點 {pct(p['off'])}%\n"
-                   f"前單毛利率 >{pct(p['go1'])}% → SL 先設 +{pct(p['go1'])}%,再緊貼 {pct(p['hug1'])}%\n"
-                   f"後單毛利率 >{pct(p['go2'])}% → SL 先設 +{pct(p['go2'])}%,再緊貼 {pct(p['hug2'])}%\n"
-                   f"{RT_SEP}\n"
-                   f"現價 {px}\n"
-                   f"A單 {a_dr}={RT_LEG_DESC[a_dr]}\n"
-                   f"B單 {b_dr}={RT_LEG_DESC[b_dr]}\n"
-                   f"每單 {pct(p['mg'])}u,兩單合計 {pct(p['mg'] * 2)}u\n"
-                   f"立即掛單 埋伏價 {amb}\n"
-                   f"時間:{hhmmss()}")
+    g1, g2 = rt_cols([p["go1"], p["go2"]]); h1, h2 = rt_cols([p["hug1"], p["hug2"]])   # 兩行上下對齊
+    L = [f"📣 runtest 啟動｜{ACCT}",
+         rt_head(p),
+         RT_SEP,
+         f"埋伏點 {pct(p['off'])}%",
+         f"前單毛利率 >{g1}% | SL+{g1}% | 貼 {h1}%",
+         f"後單毛利率 >{g2}% | SL+{g2}% | 貼 {h2}%",
+         RT_SEP,
+         f"現價 {px}"]
+    if fp is not None:
+        L.append(f"自訂價 ${fp}")
+    L += [f"A單 {a_dr}={RT_LEG_DESC[a_dr]}",
+          f"B單 {b_dr}={RT_LEG_DESC[b_dr]}",
+          f"每單 {pct(p['mg'])}u,兩單合計 {pct(p['mg'] * 2)}u"]
+    if fp is not None and rt_touch_amb(p["dr"], px, amb):         # 現價已經越過埋伏價 → 先等價格回到另一邊
+        up = rt_up(p["dr"])
+        L += [f"埋伏價 {amb}(現價已在{'上方' if up else '下方'})",
+              f"等價格{'跌回' if up else '漲回'} {amb} {'下方' if up else '上方'}才掛單"]
+    else:
+        L.append(f"立即掛單 埋伏價 {amb}")
+    L.append(f"時間:{hhmmss()}")
+    await reply(u, "\n".join(L))
 
 async def cmd_stopruntest(u, c):
     if not RT:
@@ -5608,26 +5690,31 @@ async def rt_recover(app):
         data = json.load(open(RT_FILE))
     except Exception as e:
         print("[runtest] recover read fail", e); return
-    names = []; old = []
+    names = []; old = []; dup = []
     for d in data:
         try:
             if d.get("dr") not in RT_PAIR or any(k not in d for k in RT_PKEYS):
                 old.append(f"{d.get('sym')} {d.get('dr')} {d.get('off')}%"); continue
             p = {"sym": d["sym"], "dr": d["dr"], "lev": int(d["lev"]), "mg": Decimal(d["mg"]),
-                 **{k: Decimal(d[k]) for k in RT_PKEYS}}
+                 **{k: Decimal(d[k]) for k in RT_PKEYS},
+                 "fpx": Decimal(d["fpx"]) if d.get("fpx") else None}
+            if any(v["sym"] == p["sym"] for v in RT.values()):      # v6.1：同一幣種只能一組
+                dup.append(rt_head(p)); continue
             rt_start(app, p, d["chat"])
             names.append(rt_head(p))
         except Exception as e:
             print("[runtest] recover fail", d, e)
     if not data:
         return
-    if old:
-        rt_save()                                   # 清掉舊格式，避免每次重開都提示
+    if old or dup:
+        rt_save()                                   # 清掉舊格式／同幣種第二組，避免每次重開都提示
     L = []
     if names:
         L += [f"{E.BOT} runtest 已自動恢復（bot 重開）"] + names + ["全部回到埋伏；重開當下若有持倉中的那一輪已作廢"]
     if old:
         L += [f"{E.WARN} 以下是舊版 runtest，參數格式已改，無法自動恢復，請用新格式重新下指令："] + old
+    if dup:
+        L += [f"{E.WARN} 同一幣種只能一組(避免併倉)，以下沒有恢復："] + dup
     L.append(f"時間：{hhmmss()}")
     await rt_send(app, data[0]["chat"], "\n".join(L))
 
@@ -5664,9 +5751,9 @@ async def cmd_menu(u, c):
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/apitest 幣種 [L|S|LS]　API 探測（限價+觸發兩條路徑，自動清場）\n"
         "/amp 幣種 年份  整年5m振幅報表 Excel 寄信\n"
-        "/runtest 商品 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
-        "　模擬雙向對沖（LASB/SALB），兩單同價進場，前單、後單各自SL緊貼出場（不下單）\n"
-        "　例：/runtest ZECUSDT LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02　｜不帶參數＝查看進行中\n"
+        "/runtest 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
+        "　模擬雙向對沖（LASB/SALB），兩單同價進場，前單、後單各自SL緊貼出場（不下單）；$＝查詢價，$價錢＝自訂價（只跑一輪）\n"
+        "　例：/runtest ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02　｜不帶參數＝查看進行中\n"
         "/stopruntest 停止全部 runtest\n"
         "/tf 查看/設定週期（同 /timeframe）\n/coins 幣種\n"
         "━━━━━━━━━━\n"
