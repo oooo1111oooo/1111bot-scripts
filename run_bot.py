@@ -134,7 +134,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v6.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4280,6 +4280,7 @@ async def cmd_amp(u, c):
 #     $價錢跟現價差超過 20% 不接受（防打錯）。
 #   ・防呆：同一個帳戶的 /runtest，同一幣種只能一組（LASB 或 SALB 擇一，有沒有 $ 都一樣），避免併倉。
 #   ・畫面對齊（1111：「以後設計畫面要考慮對齊」）：同一欄的數字用一樣的小數位數（至少 2 位）。
+# v6.9（1111 核可）：持倉通知加「現價」行、分段空白列、拿掉 A單／B單下面的 ＳＬ 行，加「建議 在其他帳戶做LASB在(高損價)」。
 # v6.2（1111）：$ 改成必填的第 2 個參數：只打 $＝用查詢價掛單（跟以前一樣自動循環）；$價錢＝用這個價錢掛單（只跑一輪）。
 #   /runtest 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%
 #   例：/runtest ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02（查詢價）
@@ -4789,19 +4790,34 @@ def rt_final_lines(T, G, rows, H, t_end, stats):
     L.append("(A|B單都出場,自訂價結束,不再掛單)" if T.get("fpx") is not None else "(A|B單都出場,繼續掛單)")
     return L
 
+def rt_suggest(T, rows, H):
+    """v6.9：持倉通知的「建議」—— 同一個雙向，價錢＝高損那個價（A單方向虧最多的那一刻：LASB＝最低價、SALB＝最高價）。
+    同一帳戶再下同一幣種會併倉，所以寫明「在其他帳戶」。A單還沒虧損過（高損＝無）→ 建議 無。"""
+    posA = T["legs"]["A"]["pos"]
+    iN = H["iLo"] if posA == "L" else H["iHi"]
+    if rt_rate(posA, T["entry"], rows[iN]["px"]) < 0:
+        return f"建議 在其他帳戶做{T['dr']}在{rows[iN]['px']}"
+    return "建議 無(A單未虧損)"
+
 def rt_note_lines(T, H, rows, k):
-    """持倉通知（v5.9：每滿一個 /tf，進場那一刻的 /tf）：高利／高損用 A 單的毛利率算；兩單各自的現價毛利率與 SL；最大振幅、平均振幅。"""
-    en = T["entry"]; r = rows[-1]
+    """持倉通知（每滿一個 /tf，進場那一刻的 /tf）。v6.9（1111 核可）畫面：
+    標題、持倉時間 ／ 空白 ／ 進場、現價（A單方向的毛利率）、高利、高損 ／ 空白 ／ A單、B單（不顯示 SL）、建議 ／ 空白 ／
+    合計淨利（一單出場後才有）、最大振幅、平均振幅。高利／高損／現價都用 A 單的毛利率算。"""
+    en = T["entry"]; r = rows[-1]; posA = T["legs"]["A"]["pos"]
     L = [f"🎯 持倉通知 {rt_head(T)}",
          f"⏰持倉時間 {rt_hms(k * H['nsec'])}(第{k}次通知)",
-         f"進場 {rt_t(T['t_in'])}|{en}"]
-    L += rt_hilo_lines(T["legs"]["A"]["pos"], en, rows, H["iHi"], H["iLo"], "目前")
+         "",
+         f"進場 {rt_t(T['t_in'])}|{en}",
+         f"現價 {r['t']}|{r['px']}({float(rt_rate(posA, en, r['px'])):+.3f}%)"]
+    L += rt_hilo_lines(posA, en, rows, H["iHi"], H["iLo"], "目前")
+    L.append("")
     for G in T["legs"].values():
         if G["out"] is not None:
             x = G["out"]
             L.append(f"{G['n']}單 已出場 {rt_t(x['t'])}|{x['px']}({float(x['pnl']['grate']):+.3f}%)")
         else:
-            L += [f"{G['n']}單 {r['t']}|{r['px']}({float(rt_rate(G['pos'], en, r['px'])):+.3f}%)", rt_sl_now(T, G)]
+            L.append(f"{G['n']}單 {r['t']}|{r['px']}({float(rt_rate(G['pos'], en, r['px'])):+.3f}%)")
+    L += [rt_suggest(T, rows, H), ""]
     if any(G["out"] is not None for G in T["legs"].values()):
         L.append(rt_sum_line(T, r["px"]))
     L += [f"最大振幅 {float(r['amp']):.3f}%",
