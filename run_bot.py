@@ -126,15 +126,15 @@ def _peak_in_window(k, win=2.0):
 
 
 # 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
-# v5.1：加 3m（1111）。預設仍是 5m（ACCOUNT_TF）。
-TF_SEC = {"3m": 180, "5m": 300, "6m": 360, "8m": 480, "10m": 600,
+# v5.1：加 3m（1111）。v7.0：加 1m、2m（1111）。預設仍是 5m（ACCOUNT_TF）。
+TF_SEC = {"1m": 60, "2m": 120, "3m": 180, "5m": 300, "6m": 360, "8m": 480, "10m": 600,
           "12m": 720, "15m": 900, "20m": 1200, "25m": 1500, "30m": 1800}
 
 def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v6.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v7.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -2827,7 +2827,7 @@ async def startup_recover(app):
 
 # ---------- TG 指令 ----------
 # ---------- K 線 / 振幅（/amp 用） ----------
-NATIVE_BARS = {"3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1H"}
+NATIVE_BARS = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1H"}
 
 async def get_klines(iid, bar, limit=300):
     """只取已收線（confirm=1）的 K 線，回傳舊->新。"""
@@ -4076,7 +4076,13 @@ async def cmd_selftest(u, c):
 #   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。
 #   /tf 不是 OKX 原生週期（6m 8m 10m 12m 20m 25m）→ 用能整除的最大原生週期（1m/3m/5m/15m/30m）合成，
 #   邊界跟 bot 其他地方一樣以整點（epoch）對齊，湊不滿一整根的丟掉（只用完整、已收線的 K 線）。
-AMP_N = 2000                 # 要分析幾根
+AMP_N = 2000                 # 要分析幾根（5m 以上）
+AMP_DAYS = 7                 # v7.0：5m 以下的週期改成看滿 7 天（1m 10080 根、2m 5040 根、3m 3360 根）
+
+
+def amp_n(tf):
+    """v7.0（1111 核可）：不管 /tf 設多少都至少看滿 7 天 —— 5m 以上照舊 2000 根（5m 約 7 天），5m 以下抓 7 天的根數。"""
+    return AMP_N if TF_SEC[tf] >= 300 else AMP_DAYS * 86400 // TF_SEC[tf]
 AMP_NATIVE = (30, 15, 5, 3, 1)   # OKX 原生分鐘週期（大→小）
 
 
@@ -4182,14 +4188,15 @@ async def amp_page(sym, tf, head):
     try:
         spec = await get_spec(sym)
         iid, tick = spec["iid"], spec["tick"]
-        kl = await amp_klines(iid, tf, AMP_N)
+        n = amp_n(tf)
+        kl = await amp_klines(iid, tf, n)
         last = await get_last(iid); t_now = time.time()
     except Exception as e:
         print("[amp] fail", sym, type(e).__name__, e)
         return f"{head}\n💥 {sym} 查詢失敗，跳下一個"
     if not kl:
         return f"{head}\n💥 {sym} 查無K線資料，跳下一個"
-    S = amp_stats(kl, AMP_N)
+    S = amp_stats(kl, n)
     q = lambda v: str(Decimal(str(v)).quantize(tick))
     sA, sV, sM = f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"
     a1, a2, a3 = _amp_right([sA, sV, sM])
@@ -4203,7 +4210,7 @@ async def amp_page(sym, tf, head):
     up = up if up else Decimal("0.000"); dn = dn if dn else Decimal("0.000")   # 不要出現 -0.000
     rg = up + dn                                     # 區間＝兩個 % 相加（＝(最高價−最低價)÷現價）
     d1, d2 = _amp_right([f"{up:.3f}", f"{dn:.3f}"])
-    cnt = f"{S['n']}根" + ("" if S["n"] >= AMP_N else "(OKX只有這些)")
+    cnt = f"{S['n']}根" + ("" if S["n"] >= n else "(OKX只有這些)")
     L = [head,
          f"{sym}｜{tf}｜{cnt}",
          f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
@@ -4241,7 +4248,7 @@ async def _amp_all(u, tf, syms):
 
 
 async def cmd_amp(u, c):
-    """/amp（v6.8 起不帶參數）—— 依目前 /tf，照 /coins 的幣種順序，每個幣種抓最近 2000 根 K 線，一個幣種一頁。
+    """/amp（v6.8 起不帶參數）—— 依目前 /tf，照 /coins 的幣種順序，每個幣種抓最近 2000 根 K 線（v7.0：5m 以下看滿 7 天），一個幣種一頁。
     打了參數（例 /amp ZECUSDT）也一樣跑全部，參數不理。"""
     tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
     if AMP_RUN["on"]:
@@ -4281,6 +4288,7 @@ async def cmd_amp(u, c):
 #   ・防呆：同一個帳戶的 /runtest，同一幣種只能一組（LASB 或 SALB 擇一，有沒有 $ 都一樣），避免併倉。
 #   ・畫面對齊（1111：「以後設計畫面要考慮對齊」）：同一欄的數字用一樣的小數位數（至少 2 位）。
 # v6.9（1111 核可）：持倉通知加「現價」行、分段空白列、拿掉 A單／B單下面的 ＳＬ 行，加「建議 在其他帳戶做LASB在(高損價)」。
+# v7.0（1111）：指令改名 /runt、/stoprunt（舊名 /runtest、/stopruntest 照樣能用，只是選單不再顯示）。
 # v6.2（1111）：$ 改成必填的第 2 個參數：只打 $＝用查詢價掛單（跟以前一樣自動循環）；$價錢＝用這個價錢掛單（只跑一輪）。
 #   /runtest 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%
 #   例：/runtest ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02（查詢價）
@@ -5059,14 +5067,14 @@ def rt_start(app, p, chat, first=None):
     rt_save()
 
 RT_USAGE = ("📝 用法：\n"
-            "/runtest 商品 $ 雙向 槓桿 保證金\n"
-            "/runtest ZECUSDT $ LASB 1x 10u\n"
+            "/runt 商品 $ 雙向 槓桿 保證金\n"
+            "/runt ZECUSDT $ LASB 1x 10u\n"
             "埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
             "0.1 >1.0 >0.05 0.25 0.02\n"
             "$ 一定要打:\n"
             "$＝用查詢價掛單(自動循環)\n"
             "$價錢＝用這個價錢掛單(只跑一輪)\n"
-            "/runtest ZECUSDT $1450.22 SALB 1x 10u ...\n"
+            "/runt ZECUSDT $1450.22 SALB 1x 10u ...\n"
             "LASB 下方兩單\n"
             "A=LA限價買入(做多)\n"
             "B=SB觸發賣出(做空)\n"
@@ -5077,7 +5085,7 @@ RT_USAGE = ("📝 用法：\n"
             "前單毛利率、後單毛利率前面一定要加 >\n"
             "同一幣種只能一組(避免併倉)\n"
             "\n"
-            "全部停止：/stopruntest")
+            "全部停止：/stoprunt")
 
 def rt_parse(a):
     """解析 10 個參數（v6.2：第 2 個一定是 $ 或 $價錢）。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。
@@ -5090,7 +5098,7 @@ def rt_parse(a):
     if len(a) != 10:
         return None, f"參數數量錯誤（需10個，收到{len(a)}個）"
     if any(x.startswith("$") for x in a[2:]):
-        return None, "$ 要放在商品後面（例 /runtest ZECUSDT $ LASB …）"
+        return None, "$ 要放在商品後面（例 /runt ZECUSDT $ LASB …）"
     fpx = None
     if a[1] != "$":
         m = re.fullmatch(r"\$(\d+(?:\.\d+)?)", a[1].replace(",", ""))
@@ -5163,7 +5171,7 @@ async def cmd_runtest(u, c):
     if same:                                     # v6.1 防呆：同一幣種只能一組（LASB 或 SALB 擇一），避免併倉
         await reply(u, f"{E.WARN} {p['sym']} 已經有 {same[0]['dr']} 在跑 runtest\n"
                        f"同一帳戶同一幣種只能一組(避免併倉)\n"
-                       f"要換請先 /stopruntest"); return
+                       f"要換請先 /stoprunt"); return
     try:
         spec = await get_spec(p["sym"]); px = rt_q(await get_last(spec["iid"]), spec["tick"])
     except Exception:
@@ -5284,7 +5292,7 @@ async def cmd_timeframe(u, c):
     ACCOUNT_TF = tf; save_state()
     # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
     #       v5.6：/runtest 不再跟 /tf（下指令就用現價掛單）；v5.9：/runtest 的持倉通知間隔跟 /tf（下一次進場起）。
-    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/runtest 持倉通知：下一次進場起每 {tf} 一則")
+    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/runt 持倉通知：下一次進場起每 {tf} 一則")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
@@ -5293,12 +5301,12 @@ async def cmd_menu(u, c):
         "/confirm 確認啟動\n/stop 商品　停指定幣種\n/stop all　停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
-        "/amp　全部幣種近2000根K線振幅分析（依 /tf，照 /coins 順序一頁一個）\n"
-        "/runtest 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
+        "/amp　全部幣種K線振幅分析（依 /tf；5m以上2000根、5m以下看滿7天；照 /coins 順序一頁一個）\n"
+        "/runt 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
         "　模擬雙向對沖（LASB/SALB），兩單同價進場，前單、後單各自SL緊貼出場（不下單）；$＝查詢價，$價錢＝自訂價（只跑一輪）\n"
-        "　例：/runtest ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02　｜不帶參數＝查看進行中\n"
-        "/stopruntest 停止全部 runtest\n"
-        "/tf 查看/設定週期（同 /timeframe）\n/coins 幣種\n"
+        "　例：/runt ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02　｜不帶參數＝查看進行中\n"
+        "/stoprunt 停止全部 runt\n"
+        "/tf 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
         "兩單都成交時完全對沖，損益鎖死=-間距，與價格無關；\n"
@@ -5347,12 +5355,12 @@ async def _post_init(app):
             BotCommand("summary", "當日戰報"),
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
             BotCommand("coins", "幣種"),
-            BotCommand("amp", "振幅分析（全部幣種，近2000根K線）"),
-            BotCommand("runtest", "模擬雙向對沖（前單＋後單SL緊貼）"),
-            BotCommand("stopruntest", "停止全部runtest"),
+            BotCommand("amp", "振幅分析（全部幣種，至少7天K線）"),
+            BotCommand("runt", "模擬雙向對沖（前單＋後單SL緊貼）"),
+            BotCommand("stoprunt", "停止全部runt"),
             BotCommand("stop", "停指定｜all＝停全部"),
             BotCommand("run", "建立策略"),
-            BotCommand("timeframe", "週期"),
+            BotCommand("tf", "週期"),
             BotCommand("menu", "說明")]
     # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
     # 只刪 Default 會被舊清單蓋住，導致左下 Menu 卡在舊版）
@@ -5409,8 +5417,8 @@ def main():
                     ("check", cmd_check),
                     ("selftest", cmd_selftest), ("log", cmd_log),
                     ("amp", cmd_amp),
-                    ("runtest", cmd_runtest), ("stopruntest", cmd_stopruntest),
-                    (["timeframe", "tf"], cmd_timeframe), ("coins", cmd_coins)]:
+                    (["runt", "runtest"], cmd_runtest), (["stoprunt", "stopruntest"], cmd_stopruntest),   # v7.0：/runt /stoprunt（舊名照樣能用）
+                    (["tf", "timeframe"], cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.run_polling()
