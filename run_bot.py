@@ -126,15 +126,14 @@ def _peak_in_window(k, win=2.0):
 
 
 # 原K 專用時間框架（皆整除 60 分鐘，起訖時刻自然對齊整點）
-# v5.1：加 3m（1111）。v7.0：加 1m、2m（1111）。預設仍是 5m（ACCOUNT_TF）。
-TF_SEC = {"1m": 60, "2m": 120, "3m": 180, "5m": 300, "6m": 360, "8m": 480, "10m": 600,
-          "12m": 720, "15m": 900, "20m": 1200, "25m": 1500, "30m": 1800}
+# v5.1：加 3m（1111）。v7.0：加 1m、2m。v7.1：只留 1m/3m/5m/10m/15m/30m（1111）。預設仍是 5m（ACCOUNT_TF）。
+TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v7.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v7.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -2793,6 +2792,8 @@ async def startup_recover(app):
     except Exception as e:
         print("讀存檔失敗", e); return
     CHAT_ID = data.get("chat"); ACCOUNT_TF = data.get("tf", "5m"); STATS = data.get("stats", {})
+    if ACCOUNT_TF not in TF_SEC:                     # v7.1：存檔裡是已拿掉的週期（例 8m）→ 回到 5m
+        ACCOUNT_TF = "5m"
     saved = data.get("strats", [])
     if not saved:
         print("存檔無策略"); return
@@ -4076,13 +4077,13 @@ async def cmd_selftest(u, c):
 #   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。
 #   /tf 不是 OKX 原生週期（6m 8m 10m 12m 20m 25m）→ 用能整除的最大原生週期（1m/3m/5m/15m/30m）合成，
 #   邊界跟 bot 其他地方一樣以整點（epoch）對齊，湊不滿一整根的丟掉（只用完整、已收線的 K 線）。
-AMP_N = 2000                 # 要分析幾根（5m 以上）
-AMP_DAYS = 7                 # v7.0：5m 以下的週期改成看滿 7 天（1m 10080 根、2m 5040 根、3m 3360 根）
+AMP_DAYS = {"1m": 7, "3m": 7, "5m": 14, "10m": 14, "15m": 30, "30m": 30}   # v7.1（1111）：每個週期看幾天
 
 
 def amp_n(tf):
-    """v7.0（1111 核可）：不管 /tf 設多少都至少看滿 7 天 —— 5m 以上照舊 2000 根（5m 約 7 天），5m 以下抓 7 天的根數。"""
-    return AMP_N if TF_SEC[tf] >= 300 else AMP_DAYS * 86400 // TF_SEC[tf]
+    """v7.1（1111）：1m/3m 看一週、5m/10m 看兩週、15m/30m 看一個月（30 天），根數＝天數÷週期：
+    1m 10080、3m 3360、5m 4032、10m 2016、15m 2880、30m 1440。"""
+    return AMP_DAYS.get(tf, 7) * 86400 // TF_SEC[tf]
 AMP_NATIVE = (30, 15, 5, 3, 1)   # OKX 原生分鐘週期（大→小）
 
 
@@ -4248,7 +4249,7 @@ async def _amp_all(u, tf, syms):
 
 
 async def cmd_amp(u, c):
-    """/amp（v6.8 起不帶參數）—— 依目前 /tf，照 /coins 的幣種順序，每個幣種抓最近 2000 根 K 線（v7.0：5m 以下看滿 7 天），一個幣種一頁。
+    """/amp（v6.8 起不帶參數）—— 依目前 /tf，照 /coins 的幣種順序，每個幣種抓一段 K 線（v7.1：天數見 AMP_DAYS），一個幣種一頁。
     打了參數（例 /amp ZECUSDT）也一樣跑全部，參數不理。"""
     tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
     if AMP_RUN["on"]:
@@ -5301,7 +5302,7 @@ async def cmd_menu(u, c):
         "/confirm 確認啟動\n/stop 商品　停指定幣種\n/stop all　停全部+清殘單\n"
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
-        "/amp　全部幣種K線振幅分析（依 /tf；5m以上2000根、5m以下看滿7天；照 /coins 順序一頁一個）\n"
+        "/amp　全部幣種K線振幅分析（依 /tf；1m/3m看7天、5m/10m看14天、15m/30m看30天；照 /coins 順序一頁一個）\n"
         "/runt 商品 $ 雙向 槓桿 保證金 埋伏點% 前單毛利率% 後單毛利率% 前單SL緊貼% 後單SL緊貼%\n"
         "　模擬雙向對沖（LASB/SALB），兩單同價進場，前單、後單各自SL緊貼出場（不下單）；$＝查詢價，$價錢＝自訂價（只跑一輪）\n"
         "　例：/runt ZECUSDT $ LASB 1x 10u 0.1 >1.0 >0.05 0.25 0.02　｜不帶參數＝查看進行中\n"
@@ -5355,7 +5356,7 @@ async def _post_init(app):
             BotCommand("summary", "當日戰報"),
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
             BotCommand("coins", "幣種"),
-            BotCommand("amp", "振幅分析（全部幣種，至少7天K線）"),
+            BotCommand("amp", "振幅分析（全部幣種，依/tf看7～30天）"),
             BotCommand("runt", "模擬雙向對沖（前單＋後單SL緊貼）"),
             BotCommand("stoprunt", "停止全部runt"),
             BotCommand("stop", "停指定｜all＝停全部"),
