@@ -48,7 +48,7 @@ from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
 import httpx
-from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeChat, ForceReply
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 sys.path.insert(0, "/srv/1111bot")
 from app.core import emoji as E
@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v7.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v7.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4579,13 +4579,13 @@ def rt_parse(a):
     """解析 3 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
     a = [x.strip() for x in a]
     if len(a) != 3:
-        return None, f"參數數量錯誤（需3個，收到{len(a)}個）"
+        return None, f"參數數量錯誤(需3個,收到{len(a)}個)"
     p = {"sym": a[0].upper()}
     if not p["sym"].endswith("USDT") or len(p["sym"]) <= 4:
-        return None, f"商品格式錯誤：{a[0]}（例 WLDUSDT）"
+        return None, f"商品格式錯誤:{a[0]}(例 WLDUSDT)"
     m = re.fullmatch(r"(\d+(?:\.\d+)?)%", a[1])
     if not m:
-        return None, "埋伏要加 %（例 0.5%）"
+        return None, "埋伏要加 %(例 0.5%)"
     p["off"] = Decimal(m.group(1))
     if p["off"] <= 0:
         return None, "埋伏須大於 0"
@@ -4593,7 +4593,7 @@ def rt_parse(a):
         return None, "埋伏不可超過 20%"
     m = re.fullmatch(r"(\d+)次?", a[2])
     if not m or not (1 <= int(m.group(1)) <= 4):
-        return None, "每秒次數只能 1～4（例 2）"
+        return None, "每秒次數只能 1～4(例 2)"
     p["rate"] = int(m.group(1))
     return p, None
 
@@ -4604,26 +4604,35 @@ def rt_status_line(T):
 def rt_running():
     return ["進行中："] + ([rt_status_line(T) for T in RT.values()] or ["目前沒有進行中的 test"])
 
+RT_ASK_TEST = ("📝 請輸入 /test 參數(直接打參數,不用打 /test)\n"
+               "商品 埋伏% 每秒次數\n"
+               "例:WLDUSDT 0.5% 2\n"
+               "每秒次數 1～4")
+RT_RETRY_TEST = "請重新輸入 /test 參數:\n商品 埋伏% 每秒次數\n例:WLDUSDT 0.5% 2"
+
 async def cmd_test(u, c):
+    """v7.5：沒帶參數 → 先告訴你參數怎麼打，再等你輸入；打錯 → 回錯誤原因，繼續等你重打。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args or []
     if not a:
-        await reply(u, "\n".join([RT_USAGE, ""] + rt_running())); return
+        await ask(u, "test", cmd_test, "\n".join([RT_ASK_TEST, RT_SEP] + [x.replace("：", ":") for x in rt_running()]
+                                                  + [ASK_CANCEL]), "WLDUSDT 0.5% 2"); return
+    retry = lambda msg: ask(u, "test", cmd_test, f"{msg}\n{RT_RETRY_TEST}", "WLDUSDT 0.5% 2")
     p, err = rt_parse(a)
     if err:
-        await reply(u, f"{E.BOT} {err}\n{RT_USAGE}"); return
+        await retry(f"{E.WARN} {err}"); return
     if rt_key(p) in RT:
-        await reply(u, f"{E.WARN} {p['sym']} LS 埋伏{rt_p2(p['off'])}% 每秒{p['rate']}次 已經在跑\n"
-                       f"參數完全一樣的不能重複\n要換請先 /stoptest {p['sym']}"); return
+        await retry(f"{E.WARN} {p['sym']} LS 埋伏{rt_p2(p['off'])}% 每秒{p['rate']}次 已經在跑\n"
+                    f"參數完全一樣的不能重複(要換請先 /stoptest {p['sym']})"); return
     try:
         spec = await get_spec(p["sym"])
     except Exception:
-        await reply(u, f"{E.LOSS} 找不到商品 {p['sym']}"); return
+        await retry(f"{E.LOSS} 找不到商品 {p['sym']}"); return
     tick = spec["tick"]
     try:
         px0 = rt_q(await get_last(spec["iid"]), tick)
     except Exception:
-        await reply(u, f"{E.LOSS} 查不到 {p['sym']} 現價,請稍後再試"); return
+        await retry(f"{E.LOSS} 查不到 {p['sym']} 現價,請稍後再試"); return
     if rt_key(p) in RT:                                   # 查價途中又打了一次一樣的
         return
     T = rt_new(p, spec, u.effective_chat.id)
@@ -4637,17 +4646,22 @@ async def cmd_test(u, c):
                               f"掛Ｌ單 {rt_q(legs['L']['px'], tick)}"]))
 
 async def cmd_stoptest(u, c):
+    """v7.5：沒帶參數 → 列出進行中，等你輸入幣種或 all；幣種沒在跑 → 繼續等你重打。"""
     a = c.args or []
+    if not RT:
+        await reply(u, f"{E.BOT} 目前沒有進行中的 test"); return
+    run_lines = [x.replace("：", ":") for x in rt_running()]
     if not a:
-        await reply(u, "\n".join(["📝 停止：/stoptest 幣種 或 /stoptest all", ""] + rt_running())); return
+        await ask(u, "stoptest", cmd_stoptest, "\n".join(["📝 請輸入要停止的幣種,或 all"] + run_lines + [ASK_CANCEL]),
+                  "WLDUSDT 或 all"); return
     w = a[0].strip().upper()
     if w == "ALL":
         keys = list(RT.keys()); title = f"🚫 test 全部停止｜{ACCT}"
     else:
         keys = [k for k, T in RT.items() if T["sym"] == w]; title = f"🚫 test 停止｜{ACCT}"
     if not keys:
-        msg = f"{E.BOT} 目前沒有進行中的 test" if w == "ALL" else f"{E.WARN} {w} 沒有在跑 test"
-        await reply(u, "\n".join([msg, ""] + rt_running())); return
+        await ask(u, "stoptest", cmd_stoptest, "\n".join([f"{E.WARN} {w} 沒有在跑 test", "請重新輸入要停止的幣種,或 all"]
+                                                          + run_lines), "WLDUSDT 或 all"); return
     L = [title]
     ts = time.time()
     for key in keys:
@@ -4768,10 +4782,12 @@ async def cmd_coins(u, c):
 
 async def cmd_timeframe(u, c):
     global ACCOUNT_TF
-    if not c.args:
-        await reply(u, f"{E.BOT} 目前週期：{ACCOUNT_TF}\n可選：" + "/".join(TF_SEC.keys()) + "\n變更：/tf 3m"); return
+    if not c.args:                                  # v7.5：先顯示目前週期，等你直接輸入新週期
+        await ask(u, "tf", cmd_timeframe, f"{E.BOT} 目前週期:{ACCOUNT_TF}\n可選:" + "/".join(TF_SEC.keys())
+                  + "\n要改請直接輸入週期(例 3m),不改就不用理", "3m"); return
     tf = c.args[0].lower()                          # v5.1：/tf 3M 也認得
-    if tf not in TF_SEC: await reply(u, f"{E.BOT} 週期須為：" + "/".join(TF_SEC.keys())); return
+    if tf not in TF_SEC:
+        await ask(u, "tf", cmd_timeframe, f"{E.WARN} 週期須為:" + "/".join(TF_SEC.keys()) + "\n請重新輸入週期(例 3m)", "3m"); return
     ACCOUNT_TF = tf; save_state()
     # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
     #       v7.4：/test 的埋伏通知間隔跟 /tf（下一則起）。
@@ -4817,6 +4833,72 @@ async def cmd_menu(u, c):
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
+
+# ---------- 指令輸入引導（v7.5，1111 核可） ----------
+# 手機點選單裡的指令會直接送出、沒辦法帶參數。現在：需要參數的指令（/run /stop /test /stoptest /tf）沒帶參數時，
+# 先回「參數怎麼打」，鍵盤自動跳出（ForceReply，輸入框有灰色範例），1111 直接打參數送出即可（不用再打指令）。
+# 打錯 → 回錯誤原因，繼續等他重打。打「取消」或點任何其他指令就不等了；5 分鐘沒輸入自動取消。
+# 一次打完整（/test WLDUSDT 0.5% 2）照樣能用。等待狀態只在記憶體裡，bot 重開就清掉。
+WAIT = {}                   # chat_id -> {"cmd": 指令名, "fn": 收到參數後要呼叫的函式, "t": 開始等的時間}
+WAIT_SEC = 300              # 5 分鐘沒輸入 → 自動取消
+ASK_CANCEL = "(取消:打「取消」或點其他指令)"
+
+async def ask(u, name, fn, text, hint):
+    """回一則說明，鍵盤自動跳出（輸入框灰色範例＝hint），然後等 1111 直接打參數。"""
+    WAIT[u.effective_chat.id] = {"cmd": name, "fn": fn, "t": time.time()}
+    for i in range(2):
+        try:
+            await u.message.reply_text(text, reply_markup=ForceReply(input_field_placeholder=hint[:64])); return
+        except Exception as e:
+            print("ask fail", i, type(e).__name__, e); await asyncio.sleep(2)
+
+async def wait_clear(u, c):
+    """任何指令一進來就先取消正在等的參數（那個指令自己需要的話會再開始等）。"""
+    if u.effective_chat:
+        WAIT.pop(u.effective_chat.id, None)
+
+async def on_text(u, c):
+    """不是指令的文字：正在等參數 → 當成那個指令的參數；沒在等 → 提示先點指令。"""
+    chat = u.effective_chat.id
+    w = WAIT.pop(chat, None)
+    txt = (u.message.text or "").strip()
+    if not w or time.time() - w["t"] > WAIT_SEC:
+        await reply(u, f"{E.BOT} 沒有在等你輸入參數,請先點指令(/menu)"); return
+    if txt in ("取消", "cancel", "CANCEL"):
+        await reply(u, f"{E.BOT} 已取消"); return
+    c.args = txt.split()
+    await w["fn"](u, c)
+
+RUN_ASK = ("📝 請輸入 /run 參數(直接打參數,不用打 /run)\n"
+           "商品 方向 槓桿 保證金 A單埋伏% 兩單間距% 緊貼度% TP% SL%\n"
+           "例:WIFUSDT S 1x 1 1.2 0.25 0.15 6 0.8\n"
+           "共9個參數,方向只能 L 或 S\n" + ASK_CANCEL)
+RUN_HINT = "WIFUSDT S 1x 1 1.2 0.25 0.15 6 0.8"
+STOP_ASK = "📝 請輸入要停止的幣種,或 all\n(輸入後一樣要按 /confirm 確認)\n" + ASK_CANCEL
+STOP_HINT = "ETHUSDT 或 all"
+
+async def cmd_run_w(u, c):
+    """/run 外層：沒帶參數 → 先問；參數打錯（沒有產生待確認的預覽）→ 繼續等你重打。/run 本身不動。"""
+    chat = u.effective_chat.id
+    if not (c.args or []):
+        await ask(u, "run", cmd_run_w, RUN_ASK, RUN_HINT); return
+    p0 = PENDING.get(chat)
+    await cmd_run(u, c)
+    p1 = PENDING.get(chat)
+    if p1 is None or p1 is p0:
+        await ask(u, "run", cmd_run_w, "↩️ 請重新輸入 /run 參數(直接打參數,不用打 /run)\n" + ASK_CANCEL, RUN_HINT)
+
+async def cmd_stop_w(u, c):
+    """/stop 外層：沒帶參數 → 先問；幣種打錯（沒有產生待確認）→ 繼續等你重打。/stop 本身不動。"""
+    chat = u.effective_chat.id
+    a = c.args or []
+    if not a:
+        await ask(u, "stop", cmd_stop_w, STOP_ASK, STOP_HINT); return
+    p0 = PENDING.get(chat)
+    await cmd_stop(u, c)
+    p1 = PENDING.get(chat)
+    if (p1 is None or p1 is p0) and a[0].lower() != "all":
+        await ask(u, "stop", cmd_stop_w, "↩️ 請重新輸入要停止的幣種,或 all\n" + ASK_CANCEL, STOP_HINT)
 
 # ---------- 每日自動 summary ----------
 class _M:
@@ -4894,8 +4976,9 @@ def main():
            .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0)
            .pool_timeout(30.0).get_updates_read_timeout(40.0)
            .get_updates_connect_timeout(30.0).build())
-    for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run), ("confirm", cmd_confirm),
-                    ("stop", cmd_stop), ("status", cmd_status),
+    app.add_handler(MessageHandler(filters.COMMAND, wait_clear), group=-1)    # v7.5：點任何指令 → 取消正在等的參數
+    for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run_w), ("confirm", cmd_confirm),   # v7.5：/run /stop 沒參數先問
+                    ("stop", cmd_stop_w), ("status", cmd_status),
                     ("summary", cmd_summary), ("tune", cmd_tune),
                     ("check", cmd_check),
                     ("selftest", cmd_selftest), ("log", cmd_log),
@@ -4905,6 +4988,7 @@ def main():
                     (["tf", "timeframe"], cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, on_text))   # v7.5：直接打參數
     app.run_polling()
 
 if __name__ == "__main__":
