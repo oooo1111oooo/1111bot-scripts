@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v8.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v8.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4872,7 +4872,8 @@ async def rt_recover(app):
 #      → 等 60 秒（v8.1）→ 用現價重新來過。
 #   ⑤ 每一個 /tf：持倉中發持倉通知（對齊初始單進場時間）；埋伏中發埋伏通知（對齊這一輪的初次）。
 #   ⑥ 手續費（模擬）：0.07%＝限價進場 0.02%（maker）＋市價出場 0.05%（taker）。
-#      淨損益率＝淨損益 ÷ 這些單的名目價值合計（保證金×槓桿），跟毛利率同一個算法。
+#      每一單：淨損益率＝淨損益 ÷ 這一單的名目價值（保證金×槓桿），跟毛利率同一個算法。
+#      合計（持倉中、本日已實現、本日結算）：v8.4 起 % 和 U 都是各單直接相加（1111：0.16%＋0.12%＝0.28%，不是平均）。
 #      淨損益＝毛損益 − 手續費 ＋ 資金費（v8.2；資金費＋收、−付）。持倉中＝假設現在用市價平倉。
 #   ⑧ 資金費（模擬，v8.2）：每 60 秒查 OKX /public/funding-rate（結算前 15 秒內再查一次）；到結算時間，
 #      結算前就進場、還沒出場的單：資金費＝數量×現價×費率（費率正：多單付、空單收；負：空單付、多單收）。
@@ -4959,9 +4960,13 @@ def rn_pad(vals):
 def rn_notional(T, n=1):
     return T["amt"] * T["lev"] * n
 
-def rn_rate(T, u, n):
-    """淨損益率（%）＝淨損益 ÷ n 單的名目價值。"""
-    return u / rn_notional(T, n) * 100 if n else Decimal(0)
+def rn_q2(v):
+    """% 照畫面取到 0.01%（合計＝各單畫面上的數字直接相加）。"""
+    return Decimal(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def rn_q4(v):
+    """U 照畫面取到 0.0001U。"""
+    return Decimal(v).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 def rn_money(T, p, px):
     """以 px 出場（市價）時的 毛利U、手續費U、淨損益U 與對應的 %（以名目價值＝保證金×槓桿為基準）。"""
@@ -4974,19 +4979,30 @@ def rn_money(T, p, px):
             "gu": gross_u, "feeu": fee_u, "netu": net_u, "fu": fu, "fund": fu / notional * 100, "fn": p.get("fn", 0)}
 
 def rn_acc():
-    """一組損益累計：單數、名目價值合計、毛損益U、淨損益U、資金費U（＋收、−付）、資金費次數。"""
-    return {"n": 0, "nt": Decimal(0), "gu": Decimal(0), "u": Decimal(0), "fu": Decimal(0), "fn": 0}
+    """一組損益合計（v8.4，1111：合計＝各單相加，例 0.16%＋0.12%＝0.28%）：
+    單數、毛損益%／淨損益%／資金費% 各單相加（各單先照畫面取到 0.01%）、毛損益U／淨損益U／資金費U 各單相加（先取到 0.0001U）、資金費次數。"""
+    z = Decimal(0)
+    return {"n": 0, "gp": z, "np": z, "fp": z, "gu": z, "u": z, "fu": z, "fn": 0}
 
-def rn_acc_add(a, nt, gu, u, fu=Decimal(0), fn=0):
-    a["n"] += 1; a["nt"] += nt; a["gu"] += gu; a["u"] += u; a["fu"] += fu; a["fn"] += fn
+def rn_acc_add(a, m):
+    """m＝rn_money 的結果（一單）。"""
+    a["n"] += 1
+    a["gp"] += rn_q2(m["g"]); a["np"] += rn_q2(m["net"]); a["fp"] += rn_q2(m["fund"])
+    a["gu"] += rn_q4(m["gu"]); a["u"] += rn_q4(m["netu"]); a["fu"] += rn_q4(m["fu"]); a["fn"] += m["fn"]
 
 def rn_acc_load(x):
     x = x or {}
-    return {"n": int(x.get("n", 0)), "nt": Decimal(x.get("nt", "0")), "gu": Decimal(x.get("gu", "0")),
-            "u": Decimal(x.get("u", "0")), "fu": Decimal(x.get("fu", "0")), "fn": int(x.get("fn", 0))}
+    D0 = lambda k: Decimal(x.get(k, "0"))
+    a = {"n": int(x.get("n", 0)), "gu": D0("gu"), "u": D0("u"), "fu": D0("fu"), "fn": int(x.get("fn", 0))}
+    if "gp" in x:
+        a.update({"gp": D0("gp"), "np": D0("np"), "fp": D0("fp")})
+    else:                                            # v8.2～v8.3 的記錄只有 U 和名目價值合計：每單名目價值一樣 → 各單 % 相加＝U ÷ 一單名目價值
+        k = Decimal(a["n"]) / D0("nt") * 100 if D0("nt") else Decimal(0)
+        a.update({"gp": a["gu"] * k, "np": a["u"] * k, "fp": a["fu"] * k})
+    return a
 
 def rn_acc_dump(a):
-    return {"n": a["n"], "nt": str(a["nt"]), "gu": str(a["gu"]), "u": str(a["u"]), "fu": str(a["fu"]), "fn": a["fn"]}
+    return {k: (v if isinstance(v, int) else str(v)) for k, v in a.items()}
 
 def rn_today(t=None):
     """本日＝台灣時間（UTC+8）00:00～24:00。"""
@@ -5001,20 +5017,18 @@ def rn_done(T, p, m):
     T["st"]["n"] += 1
     T["st"]["u"] += m["netu"]
     T["st"]["gu"] += m["gu"]
-    nt = rn_notional(T)
-    rn_acc_add(rn_day(T["sym"], p["side"], rn_today(p["out"][0])), nt, m["gu"], m["netu"], m["fu"], m["fn"])
+    rn_acc_add(rn_day(T["sym"], p["side"], rn_today(p["out"][0])), m)
     T["rnd"].append({"side": p["side"], "lvl": p["lvl"], "ent": p["ent"], "t_in": p["t_in"],
                      "t_out": p["out"][0], "net": m["net"], "netu": m["netu"], "gu": m["gu"], "fu": m["fu"], "why": p["out"][2]})
 
-def rn_pl(title, nt, gu, nu, fu=Decimal(0), fn=0):
-    """損益一段（v8.2）：標題＋毛損益、淨損益（% 與 U 各自對齊；%＝÷ 這些單的名目價值合計）。
+def rn_pl(title, a):
+    """損益一段：標題＋毛損益、淨損益（% 與 U 各自對齊）。a＝rn_acc 格式的合計。
+    v8.4（1111）：% 與 U 都是各單直接相加（原本 % 是 ÷ 名目價值合計＝平均，兩單 0.16%、0.12% 會顯示 0.14%）。
     有結算過資金費（fn > 0）才多一行資金費（＋收、−付；淨損益已含）。"""
-    r = lambda u: u / nt * 100 if nt else Decimal(0)
-    names = ["毛損益", "資金費", "淨損益"] if fn else ["毛損益", "淨損益"]
-    vals = [gu, fu, nu] if fn else [gu, nu]
-    a = rn_pad([rn_sp(r(v)) for v in vals])
-    b = rn_pad([rn_su(v) for v in vals])
-    return [title] + [f"{n} {x}|{y}" for n, x, y in zip(names, a, b)]
+    rows = [("毛損益", a["gp"], a["gu"])] + ([("資金費", a["fp"], a["fu"])] if a["fn"] else []) + [("淨損益", a["np"], a["u"])]
+    x = rn_pad([rn_sp(r[1]) for r in rows])
+    y = rn_pad([rn_su(r[2]) for r in rows])
+    return [title] + [f"{r[0]} {p}|{q}" for r, p, q in zip(rows, x, y)]
 
 def rn_pl_side(T, side, px):
     """同一方向：持倉中(未實現)、本日已實現（沒有的那段不列）。v8.2：1111 定案只看本日，不列累計。
@@ -5022,13 +5036,13 @@ def rn_pl_side(T, side, px):
     L = []
     live = [p for p in T["pos"] if p["side"] == side and not p["out"]]
     if live and px is not None:
-        ms = [rn_money(T, p, px) for p in live]
-        sm = lambda k: sum((m[k] for m in ms), Decimal(0))
-        L += rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", rn_notional(T, len(live)),
-                   sm("gu"), sm("netu"), sm("fu"), sum(m["fn"] for m in ms))
+        a = rn_acc()
+        for p in live:
+            rn_acc_add(a, rn_money(T, p, px))
+        L += rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)
     d = ((RN_DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     if d and d["n"]:
-        L += rn_pl(f"{side} 本日已實現 {d['n']}單", d["nt"], d["gu"], d["u"], d["fu"], d["fn"])
+        L += rn_pl(f"{side} 本日已實現 {d['n']}單", d)
     return L
 
 def rn_pl_secs(T, px, sides=("L", "S")):
@@ -5047,7 +5061,7 @@ def rn_day_lines(T, d):
     for s in ("L", "S"):
         a = day.get(s)
         if a and a["n"]:
-            L += [RT_SEP] + rn_pl(f"{s} 本日已實現 {a['n']}單", a["nt"], a["gu"], a["u"], a["fu"], a["fn"])
+            L += [RT_SEP] + rn_pl(f"{s} 本日已實現 {a['n']}單", a)
     if not any((day.get(s) or {}).get("n") for s in ("L", "S")):
         L += [RT_SEP, "本日沒有出場的單"]
     live = [p for p in T["pos"] if not p["out"]]
@@ -5571,8 +5585,8 @@ def rn_status_line(T):
     px = T.get("px_last")
     s = f"💡{rn_par(T)}|持倉 {rt_hms(time.time() - T['h0'])}|{len(live)}單"
     if px:
-        nu = sum((rn_money(T, p, px)["netu"] for p in live), Decimal(0))
-        s += f"|持倉中淨損益 {rn_sp(rn_rate(T, nu, len(live)))}"
+        nr = sum((rn_q2(rn_money(T, p, px)["net"]) for p in live), Decimal(0))   # v8.4：各單相加
+        s += f"|持倉中淨損益 {rn_sp(nr)}"
     return s
 
 def rn_status_blocks():
