@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v8.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v8.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4871,8 +4871,10 @@ async def rt_recover(app):
 #        SL、TP 送出後過 RT_LAT 才生效；生效後逐筆成交價碰到就出場，出場價＝那一筆成交價（含滑價）。往虧損走就一直抱著。
 #   ④ 初始單出場 → 撤掉這一邊還沒成交的層單；已持倉的層單照自己的 SL/TP 走完；全部出場 → 本輪結束
 #      → 等 60 秒（v8.1）→ 用現價重新來過。
-#   ⑤ 每一個 /tf：持倉中發持倉通知（對齊初始單進場時間）；埋伏中發埋伏通知（對齊這一輪的初次）。
-#      兩種通知都有資金費率兩行（v8.5）；/status 當下向 OKX 查資金費率（v8.5）。
+#   ⑤ 通知（v8.6，1111）：有事件發生才通知——進場成交、出場通知、本輪結束、資金費結算、00:00 本日結算。
+#      不再每個 /tf 發持倉通知／埋伏通知；/status 隨時看（持倉中＝持倉通知、埋伏中＝埋伏通知的內容，
+#      都有資金費率兩行，/status 當下向 OKX 查，v8.5）。/test1 的埋伏通知不變（照 /tf）。
+#      L0/S0 掛上去之後不改價、不重掛，等到一邊成交（1111 2026-10-05：維持現狀）。
 #   ⑥ 手續費（模擬）：0.07%＝限價進場 0.02%（maker）＋市價出場 0.05%（taker）。
 #      每一單：淨損益率＝淨損益 ÷ 這一單的名目價值（保證金×槓桿），跟毛利率同一個算法。
 #      合計（持倉中、本日已實現、本日結算）：v8.4 起 % 和 U 都是各單直接相加（1111：0.16%＋0.12%＝0.28%，不是平均）。
@@ -5420,7 +5422,7 @@ def rn_wait_lines(T, px):
     return L
 
 def rn_note_lines(T, px, now, fund=None):
-    """每個 /tf 一則：持倉中＝持倉通知；埋伏中＝埋伏通知。都有資金費率兩行（v8.5：埋伏通知也有）。
+    """/status 用（v8.6 起不再每個 /tf 自動發）：持倉中＝持倉通知；埋伏中＝埋伏通知。都有資金費率兩行。
     fund＝/status 當下查到的資金費率行；沒給就用 bot 每 60 秒查到的。"""
     tick = T["tick"]
     fl = rn_fund_line(T) if fund is None else fund
@@ -5579,11 +5581,7 @@ async def rn_worker(app, key):
                     if not p["out"]:
                         rn_rule(T, p, px, time.time())
                 rn_layers(T, px, time.time())
-            iv = TF_SEC.get(ACCOUNT_TF, 300)
-            if now - T["note_last"] >= iv:                 # 每一個 /tf 一則
-                base = T["h0"] if (T["h0"] is not None and T["pos"]) else T["t0"]
-                T["note_last"] = T["note_last"] + iv if now - T["note_last"] < 2 * iv else rt_note_base(base)
-                send("\n".join(rn_note_lines(T, px, now)))
+            # v8.6（1111）：不再每個 /tf 發持倉通知／埋伏通知，有事件才通知；狀態用 /status 查。
             if time.time() >= T["save_t"]:
                 T["save_t"] = time.time() + RT_SAVE_SEC
                 rn_save()
@@ -5870,7 +5868,7 @@ async def cmd_timeframe(u, c):
     ACCOUNT_TF = tf; save_state()
     # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
     #       v7.4：/test 的埋伏通知間隔跟 /tf（下一則起）。
-    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/test1 埋伏通知：下一則起每 {tf} 一則\n/runt 持倉／埋伏通知：下一則起每 {tf} 一則")
+    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/test1 埋伏通知：下一則起每 {tf} 一則")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
@@ -5888,7 +5886,7 @@ async def cmd_menu(u, c):
         "/runt 商品 槓桿 保證金 初始埋伏點%\n"
         "　佈局（模擬，不下單）：初始單 L0/S0 在現價上下「初始埋伏點%」限價埋伏，不改價；一邊成交撤另一邊。"
         "L0/S0 虧損就掛同方向 L1/S1，L1/S1 也虧損就掛 L2/S2…最多 L9/S9；每一層離上一層 0.5%。"
-        "每一單最高毛利率 >0.20% 才設 SL＝最高−0.10%、TP＝最高+0.20%，之後一起往獲利移動；某一層出場撤掉比它深的掛單，L0/S0 出場撤掉沒成交的單，全部出場後等 60 秒重新來過（每個 /tf 持倉通知，/status 隨時看）。"
+        "每一單最高毛利率 >0.20% 才設 SL＝最高−0.10%、TP＝最高+0.20%，之後一起往獲利移動；某一層出場撤掉比它深的掛單，L0/S0 出場撤掉沒成交的單，全部出場後等 60 秒重新來過（有事件才通知，狀態用 /status 看）。"
         "損益分持倉中／本日已實現（L、S 分開，台灣時間換日）；資金費照 OKX 費率模擬計入\n"
         "　例：/runt WLDUSDT 1X 1U 0.2%　｜可同時跑多個幣種｜同幣種只能一組\n"
         "/stoprunt 幣種｜all　停止指定幣種／全部 runt\n"
