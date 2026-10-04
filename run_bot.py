@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v8.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v8.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4281,7 +4281,7 @@ async def cmd_amp(u, c):
     AMP_RUN.update(on=True, i=0, n=len(syms))
     AMP_RUN["task"] = asyncio.create_task(_amp_all(u, tf, syms))
 
-# ---------- /test 插針測試：模擬（v7.4） ----------
+# ---------- /test1 插針測試：模擬（v7.4；v8.3 /test、/stoptest 改名 /test1、/stoptest1） ----------
 # v7.4（1111 2026-10-04 核可）：/runt、/stoprunt 改名 /test、/stoptest，參數簡化，成交後自動重新掛單一直跑。
 #   完全不下單、只查價格，OKX 上不會出現任何單子。（v7.3 的 /runt 模擬、v7.2 真實掛單版、v7.1 以前的雙向對沖模擬都拿掉。）
 # 目的：測每種幣的插針速度 —— 單子每次查價都跟著現價移動，只有在一次查價的間隔內一口氣走完埋伏距離的針才會成交，
@@ -4575,7 +4575,7 @@ async def rt_worker(app, key):
         if RT.get(key) is T:
             RT.pop(key, None)
         rt_save()
-        await rt_send(app, T["chat"], f"{E.LOSS} test 異常停止 {rt_head(T)}\n{rt_par(T)}\n"
+        await rt_send(app, T["chat"], f"{E.LOSS} test1 異常停止 {rt_head(T)}\n{rt_par(T)}\n"
                                       f"{type(e).__name__}: {e}\n時間:{hhmmss()}")
 
 def rt_start(app, T):
@@ -4584,8 +4584,8 @@ def rt_start(app, T):
     rt_save()
 
 RT_USAGE = ("📝 用法：\n"
-            "/test 商品 埋伏% 每秒次數\n"
-            "/test WLDUSDT 0.5% 2\n"
+            "/test1 商品 埋伏% 每秒次數\n"
+            "/test1 WLDUSDT 0.5% 2\n"
             "大小寫皆可\n"
             "埋伏要加 %\n"
             "每秒次數 1～4(每秒查價、改價幾次)\n"
@@ -4594,7 +4594,7 @@ RT_USAGE = ("📝 用法：\n"
             "可同時跑多個幣種\n"
             "參數完全一樣的不能重複\n"
             "\n"
-            "停止：/stoptest 幣種 或 /stoptest all")
+            "停止：/stoptest1 幣種 或 /stoptest1 all")
 
 def rt_parse(a):
     """解析 3 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
@@ -4623,28 +4623,28 @@ def rt_status_line(T):
             f"{rt_hms(time.time() - T['t0'])}|改價 {T['n']} 次")
 
 def rt_running():
-    return ["進行中："] + ([rt_status_line(T) for T in RT.values()] or ["目前沒有進行中的 test"])
+    return ["進行中："] + ([rt_status_line(T) for T in RT.values()] or ["目前沒有進行中的 test1"])
 
-RT_ASK_TEST = ("📝 請輸入 /test 參數(直接打參數,不用打 /test)\n"
+RT_ASK_TEST = ("📝 請輸入 /test1 參數(直接打參數,不用打 /test1)\n"
                "商品 埋伏% 每秒次數\n"
                "例:WLDUSDT 0.5% 2\n"
                "每秒次數 1～4")
-RT_RETRY_TEST = "請重新輸入 /test 參數:\n商品 埋伏% 每秒次數\n例:WLDUSDT 0.5% 2"
+RT_RETRY_TEST = "請重新輸入 /test1 參數:\n商品 埋伏% 每秒次數\n例:WLDUSDT 0.5% 2"
 
 async def cmd_test(u, c):
     """v7.5：沒帶參數 → 先告訴你參數怎麼打，再等你輸入；打錯 → 回錯誤原因，繼續等你重打。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args or []
     if not a:
-        await ask(u, "test", cmd_test, "\n".join([RT_ASK_TEST, RT_SEP] + [x.replace("：", ":") for x in rt_running()]
+        await ask(u, "test1", cmd_test, "\n".join([RT_ASK_TEST, RT_SEP] + [x.replace("：", ":") for x in rt_running()]
                                                   + [ASK_CANCEL]), "WLDUSDT 0.5% 2"); return
-    retry = lambda msg: ask(u, "test", cmd_test, f"{msg}\n{RT_RETRY_TEST}", "WLDUSDT 0.5% 2")
+    retry = lambda msg: ask(u, "test1", cmd_test, f"{msg}\n{RT_RETRY_TEST}", "WLDUSDT 0.5% 2")
     p, err = rt_parse(a)
     if err:
         await retry(f"{E.WARN} {err}"); return
     if rt_key(p) in RT:
         await retry(f"{E.WARN} {p['sym']} LS 埋伏{rt_p2(p['off'])}% 每秒{p['rate']}次 已經在跑\n"
-                    f"參數完全一樣的不能重複(要換請先 /stoptest {p['sym']})"); return
+                    f"參數完全一樣的不能重複(要換請先 /stoptest1 {p['sym']})"); return
     try:
         spec = await get_spec(p["sym"])
     except Exception:
@@ -4661,7 +4661,7 @@ async def cmd_test(u, c):
     rt_round(T, time.time(), px0)
     rt_start(c.application, T)
     legs = T["legs"]
-    await reply(u, "\n".join([f"📣 test 啟動｜{ACCT}", rt_head(T), rt_par(T),
+    await reply(u, "\n".join([f"📣 test1 啟動｜{ACCT}", rt_head(T), rt_par(T),
                               f"掛Ｓ單 {rt_q(legs['S']['px'], tick)}",
                               f"現　價 {px0}",
                               f"掛Ｌ單 {rt_q(legs['L']['px'], tick)}"]))
@@ -4670,18 +4670,18 @@ async def cmd_stoptest(u, c):
     """v7.5：沒帶參數 → 列出進行中，等你輸入幣種或 all；幣種沒在跑 → 繼續等你重打。"""
     a = c.args or []
     if not RT:
-        await reply(u, f"{E.BOT} 目前沒有進行中的 test"); return
+        await reply(u, f"{E.BOT} 目前沒有進行中的 test1"); return
     run_lines = [x.replace("：", ":") for x in rt_running()]
     if not a:
-        await ask(u, "stoptest", cmd_stoptest, "\n".join(["📝 請輸入要停止的幣種,或 all"] + run_lines + [ASK_CANCEL]),
+        await ask(u, "stoptest1", cmd_stoptest, "\n".join(["📝 請輸入要停止的幣種,或 all"] + run_lines + [ASK_CANCEL]),
                   "WLDUSDT 或 all"); return
     w = a[0].strip().upper()
     if w == "ALL":
-        keys = list(RT.keys()); title = f"🚫 test 全部停止｜{ACCT}"
+        keys = list(RT.keys()); title = f"🚫 test1 全部停止｜{ACCT}"
     else:
-        keys = [k for k, T in RT.items() if T["sym"] == w]; title = f"🚫 test 停止｜{ACCT}"
+        keys = [k for k, T in RT.items() if T["sym"] == w]; title = f"🚫 test1 停止｜{ACCT}"
     if not keys:
-        await ask(u, "stoptest", cmd_stoptest, "\n".join([f"{E.WARN} {w} 沒有在跑 test", "請重新輸入要停止的幣種,或 all"]
+        await ask(u, "stoptest1", cmd_stoptest, "\n".join([f"{E.WARN} {w} 沒有在跑 test1", "請重新輸入要停止的幣種,或 all"]
                                                           + run_lines), "WLDUSDT 或 all"); return
     L = [title]
     ts = time.time()
@@ -4696,10 +4696,58 @@ async def cmd_stoptest(u, c):
     L.append(f"時間:{hhmmss()}")
     await reply(u, "\n".join(L))
 
+# ---------- /test2 價格階梯（v8.3，1111 設計中） ----------
+# 指令：/test2 幣種　例：/test2 WLDUSDT（只查現價、列出價格，不掛單、不下單、不跑迴圈）。
+# 畫面（1111 定案：跟 /runt 同方向，價格由高到低）：S9～S0／現價／L0～L9。
+#   S0、L0 離現價 0.5%，之後每一層離上一層 0.5%（S 往上取 tick、L 往下取 tick，往離現價遠的方向）。
+T2_STEP = Decimal("0.5")
+T2_N    = 10                       # S0～S9、L0～L9
+T2_HINT = "WLDUSDT"
+T2_ASK  = "📝 請輸入 /test2 幣種(直接打幣種,不用打 /test2)\n例:WLDUSDT"
+
+def t2_ladder(px, tick):
+    """S0～S9、L0～L9 的價格：從現價開始，每一層＝上一層 ±0.5%。"""
+    S, L = [], []
+    s = l = px
+    for _ in range(T2_N):
+        s = rt_amb(s, "S", T2_STEP, tick); l = rt_amb(l, "L", T2_STEP, tick)
+        S.append(s); L.append(l)
+    return S, L
+
+def t2_lines(sym, px, tick):
+    S, L = t2_ladder(px, tick)
+    out = [f"📣 test2｜{ACCT}", sym, RT_SEP]
+    out += [f"S{i} {rt_q(S[i], tick)}" for i in range(T2_N - 1, -1, -1)]
+    out += [f"現價 {rt_q(px, tick)}"]
+    out += [f"L{i} {rt_q(L[i], tick)}" for i in range(T2_N)]
+    return out + [RT_SEP, f"時間:{hhmmss()}"]
+
+async def cmd_test2(u, c):
+    """沒帶參數 → 先問幣種；打錯 → 回錯誤原因，繼續等你重打。"""
+    a = c.args or []
+    if not a:
+        await ask(u, "test2", cmd_test2, f"{T2_ASK}\n{ASK_CANCEL}", T2_HINT); return
+    retry = lambda msg: ask(u, "test2", cmd_test2, f"{msg}\n請重新輸入 /test2 幣種(例 WLDUSDT)", T2_HINT)
+    if len(a) != 1:
+        await retry(f"{E.WARN} 參數數量錯誤(需1個,收到{len(a)}個)"); return
+    sym = a[0].strip().upper()
+    if not sym.endswith("USDT") or len(sym) <= 4:
+        await retry(f"{E.WARN} 商品格式錯誤:{a[0]}(例 WLDUSDT)"); return
+    try:
+        spec = await get_spec(sym)
+    except Exception:
+        await retry(f"{E.LOSS} 找不到商品 {sym}"); return
+    tick = spec["tick"]
+    try:
+        px = rt_q(await get_last(spec["iid"]), tick)
+    except Exception:
+        await retry(f"{E.LOSS} 查不到 {sym} 現價,請稍後再試"); return
+    await reply(u, "\n".join(t2_lines(sym, px, tick)))
+
 async def cmd_runt_renamed(u, c):
-    """v7.4：/runt、/stoprunt（及舊名 /runtest、/stopruntest）已改名。"""
-    await reply(u, f"{E.BOT} 已改名：\n/test 商品 埋伏% 每秒次數\n例：/test WLDUSDT 0.5% 2\n"
-                   f"停止：/stoptest 幣種 或 /stoptest all")
+    """舊名提示：v7.4 /runtest、/stopruntest；v8.3 /test、/stoptest → /test1、/stoptest1。"""
+    await reply(u, f"{E.BOT} 已改名：\n/test1 商品 埋伏% 每秒次數\n例：/test1 WLDUSDT 0.5% 2\n"
+                   f"停止：/stoptest1 幣種 或 /stoptest1 all")
 
 async def rt_v72_cleanup(app):
     """v7.2（OKX 真實掛單版）若曾部署過：撤掉它存檔裡的單（只撤這些 ordId，不碰持倉），回報後把存檔改名。"""
@@ -4745,7 +4793,7 @@ async def rt_recover(app):
             print("[test] old file fail", fp, e)
     if old and chat_old:
         await rt_send(app, chat_old, "\n".join([f"{E.WARN} 舊版 runt 已停用,以下沒有恢復:"] + old +
-                                               ["新指令：/test 商品 埋伏% 每秒次數", f"時間:{hhmmss()}"]))
+                                               ["新指令：/test1 商品 埋伏% 每秒次數", f"時間:{hhmmss()}"]))
     try:
         if not os.path.exists(RT_FILE):
             return
@@ -4779,7 +4827,7 @@ async def rt_recover(app):
     rt_save()
     L = []
     if names:
-        L += [f"{E.BOT} test 已自動恢復(bot 重開)"] + names
+        L += [f"{E.BOT} test1 已自動恢復(bot 重開)"] + names
         L += ["用現價重新框住,繼續埋伏(初次不變)", "關機期間沒有看盤"]
     if bad:
         L += [f"{E.WARN} 以下查不到現價,沒有恢復,請重新下指令:"] + bad
@@ -5098,7 +5146,8 @@ def rn_fund_line(T):
     f = T.get("fund") or {}
     if f.get("t") is None or f.get("rate") is None:
         return []
-    return [f"💰資金費率 {rn_sp4(f['rate'] * 100)}({'多付空' if f['rate'] > 0 else ('空付多' if f['rate'] < 0 else '不收付')})|下次 {rt_t(f['t'])[:5]}"]
+    return [f"💰資金費率 {rn_sp4(f['rate'] * 100)}({'多付空' if f['rate'] > 0 else ('空付多' if f['rate'] < 0 else '不收付')})",
+            f"下次付費時間 {rt_t(f['t'])[:5]}"]            # v8.3（1111）：分兩行
 
 def rn_pos(T, side, lvl, ent, t, px_hit):
     """一張單成交 → 一個持倉（各自獨立：自己的進場價、SL/TP、最高/最低毛利率）。"""
@@ -5772,7 +5821,7 @@ async def cmd_timeframe(u, c):
     ACCOUNT_TF = tf; save_state()
     # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
     #       v7.4：/test 的埋伏通知間隔跟 /tf（下一則起）。
-    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/test 埋伏通知：下一則起每 {tf} 一則\n/runt 持倉／埋伏通知：下一則起每 {tf} 一則")
+    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/test1 埋伏通知：下一則起每 {tf} 一則\n/runt 持倉／埋伏通知：下一則起每 {tf} 一則")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
@@ -5782,10 +5831,11 @@ async def cmd_menu(u, c):
         "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/amp　全部幣種K線振幅分析（依 /tf；1m/3m看7天、5m/10m看14天、15m/30m看30天；照 /coins 順序一頁一個）\n"
-        "/test 商品 埋伏% 每秒次數(1～4)\n"
+        "/test1 商品 埋伏% 每秒次數(1～4)\n"
         "　插針測試（模擬，不下單）：L 在現價下方、S 在上方框住現價，每秒查價、改價N次，逐筆成交價碰到就算成交；一邊成交立刻撤另一邊，通知後馬上重新掛單一直跑\n"
-        "　例：/test WLDUSDT 0.5% 2　｜可同時跑多個幣種｜不帶參數＝查看進行中\n"
-        "/stoptest 幣種｜all　停止指定幣種／全部 test\n"
+        "　例：/test1 WLDUSDT 0.5% 2　｜可同時跑多個幣種｜不帶參數＝查看進行中\n"
+        "/stoptest1 幣種｜all　停止指定幣種／全部 test1\n"
+        "/test2 幣種　價格階梯（只查價，不掛單）：S9～S0／現價／L0～L9，每一層離上一層 0.5%\n"
         "/runt 商品 槓桿 保證金 初始埋伏點%\n"
         "　佈局（模擬，不下單）：初始單 L0/S0 在現價上下「初始埋伏點%」限價埋伏，不改價；一邊成交撤另一邊。"
         "L0/S0 虧損就掛同方向 L1/S1，L1/S1 也虧損就掛 L2/S2…最多 L9/S9；每一層離上一層 0.5%。"
@@ -5823,9 +5873,9 @@ async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
 
 # ---------- 指令輸入引導（v7.5，1111 核可；v8.2 改） ----------
-# 手機點選單裡的指令會直接送出、沒辦法帶參數。現在：需要參數的指令（/run /stop /test /stoptest /runt /stoprunt /tf）沒帶參數時，
+# 手機點選單裡的指令會直接送出、沒辦法帶參數。現在：需要參數的指令（/run /stop /test1 /stoptest1 /test2 /runt /stoprunt /tf）沒帶參數時，
 # 先回「參數怎麼打」，鍵盤自動跳出（ForceReply，輸入框有灰色範例），1111 直接打參數送出即可（不用再打指令）。
-# 打錯 → 回錯誤原因，繼續等他重打。點任何其他指令就不等了。一次打完整（/test WLDUSDT 0.5% 2）照樣能用。
+# 打錯 → 回錯誤原因，繼續等他重打。點任何其他指令就不等了。一次打完整（/test1 WLDUSDT 0.5% 2）照樣能用。
 # 等待狀態只在記憶體裡，bot 重開就清掉。
 # v8.2（1111）：60 秒沒輸入就自動取消，不用打「取消」；逾時會發一行「已自動取消」順便收掉回覆列
 #   （以前 ForceReply 沒人回就一直掛著，每次點進聊天室都跳出「回覆…」）。
@@ -5938,8 +5988,9 @@ async def _post_init(app):
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅分析（全部幣種，依/tf看7～30天）"),
-            BotCommand("test", "插針測試（模擬，不下單）"),
-            BotCommand("stoptest", "停止test｜幣種或all"),
+            BotCommand("test1", "插針測試（模擬，不下單）"),
+            BotCommand("stoptest1", "停止test1｜幣種或all"),
+            BotCommand("test2", "價格階梯（只查價）"),
             BotCommand("runt", "佈局（模擬，不下單）"),
             BotCommand("stoprunt", "停止runt｜幣種或all"),
             BotCommand("stop", "停指定｜all＝停全部"),
@@ -6003,9 +6054,10 @@ def main():
                     ("check", cmd_check),
                     ("selftest", cmd_selftest), ("log", cmd_log),
                     ("amp", cmd_amp),
-                    ("test", cmd_test), ("stoptest", cmd_stoptest),          # v7.4：/runt /stoprunt 改名 /test /stoptest
+                    ("test1", cmd_test), ("stoptest1", cmd_stoptest),        # v8.3：/test /stoptest 改名 /test1 /stoptest1
+                    ("test2", cmd_test2),                                    # v8.3：價格階梯（只查價）
                     ("runt", cmd_runt), ("stoprunt", cmd_stoprunt),          # v7.6／v7.7：/runt＝佈局（模擬）
-                    (["runtest", "stopruntest"], cmd_runt_renamed),          # 舊名 → 提示已改名
+                    (["runtest", "stopruntest", "test", "stoptest"], cmd_runt_renamed),   # 舊名 → 提示已改名
                     (["tf", "timeframe"], cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
