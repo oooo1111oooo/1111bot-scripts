@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v7.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v7.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -384,6 +384,8 @@ def _ws_push_px(iid, px):
     WS_PX[iid] = (d, time.time())
     if RT:
         rt_on_tick(iid, d)      # 【v7.4】/test 模擬：逐筆成交價碰到掛單價＝成交
+    if RN:
+        rn_on_tick(iid, d)      # 【v7.6】/runt 模擬：逐筆成交價判斷成交、SL/TP 出場
     for S in list(STRATS.values()):
         try:
             if S.get("spec", {}).get("iid") != iid or S.get("pair_state", "idle") == "idle":
@@ -4767,6 +4769,589 @@ async def rt_recover(app):
         await rt_send(app, chat0, "\n".join(L))
 
 
+# ---------- /runt 佈局策略：第一層（模擬，v7.6） ----------
+# v7.6（1111 2026-10-04 核可）：新的 /runt＝新「佈局模式」的第一層。模擬＝BOT 自己模擬、只查價格，完全不下單。
+#   將來移轉到 /run 才是真實下單；到時候損益、手續費一律向 OKX 查詢，不得自行計算（1111 最嚴格的要求）。
+#   （v7.4 起 /test 是另一個指令，不受影響。）
+# 指令：/runt 商品 槓桿 委託金額　　例：/runt WLDUSDT 1X 1U（槓桿一定要有 X、委託金額一定要有 U）
+#   沒有方向參數：L1、S1 一起掛（框住現價）。埋伏 0.2%、每秒查價 4 次都是固定常數，不是參數。
+#   同一帳戶同一幣種只能一組（避免併倉）；可同時跑多個幣種。
+# 停止：/stoprunt 幣種、/stoprunt all。
+# 規則（1111 定案）：
+#   ① 下指令就取價：L1 限價掛在 現價×(1−0.2%)（往下取 tick）、S1 掛在 現價×(1+0.2%)（往上取 tick）。
+#      不帶 TP/SL，掛了就不改價（距離短，很快會碰到一邊）。
+#   ② 成交＝OKX 逐筆成交價碰到掛單價（L：≤、S：≥），進場價＝掛單價。一邊成交 → 先撤掉另一邊
+#      （送單時間 RT_LAT 內反向也被碰到 → 兩張都成交，各自照規則走）。
+#   ③ 撤完反向單才開始判斷進場單的毛利率（每 0.25 秒查價一次；毛利率＝價格漲跌%，不乘槓桿）：
+#        毛利率 > 0.07% → 設 SL 0.07%（保本）、TP 0.20%。
+#        最高毛利率 > 0.17% → SL、TP 一起移動：SL＝最高毛利率 −0.10%、TP＝最高毛利率 +0.20%，只往獲利方向移動。
+#        （最高毛利率＝每次查價查到的最高；1111 核可的對照表：+0.10%→SL 0.07%/TP 0.20%、+0.18%→0.08%/0.38%、+0.30%→0.20%/0.50%）
+#   ④ SL、TP 送出後過了 RT_LAT 才生效；生效後逐筆成交價碰到就出場，出場價＝碰到的那一筆成交價（含滑價）。
+#   ⑤ 往虧損走：不補單（1111：補單策略先取消），一直抱著。第一層只有獲利出場。
+#   ⑥ 出場 → 出場通知 → 馬上用現價重新部署第一層，一直循環到 /stoprunt。
+#   ⑦ 每一個 /tf：持倉中發持倉通知（對齊進場時間）；埋伏中發埋伏通知（對齊這一輪的初次）。
+#   ⑧ 手續費（模擬）：0.07%＝限價進場 0.02%（maker）＋市價出場 0.05%（taker），OKX 一般用戶費率。
+#   ⑨ bot 重開：持倉接著跑（SL/TP 不變，關機期間沒有看盤）；埋伏中的用重開當下的現價重新部署。
+RN_OFF     = Decimal("0.2")    # 埋伏 0.2%（固定）
+RN_STEP    = 0.25              # 每秒查價 4 次（固定）
+RN_BE      = Decimal("0.07")   # 毛利率 > 0.07% → SL 設在 0.07%（保本）
+RN_TP0     = Decimal("0.20")   #                   同時 TP 設在 0.20%
+RN_MOVE    = Decimal("0.17")   # 最高毛利率 > 0.17% → SL、TP 一起移動
+RN_SL_GAP  = Decimal("0.10")   # 移動時 SL＝最高毛利率 −0.10%
+RN_TP_GAP  = Decimal("0.20")   # 移動時 TP＝最高毛利率 +0.20%
+RN_FEE_IN  = Decimal("0.02")   # 手續費 0.07%＝限價進場 0.02%
+RN_FEE_OUT = Decimal("0.05")   #              ＋市價出場 0.05%
+RN_FILE    = f"/srv/1111bot/data/runtlayer_{ACCT}.json"   # 不可用 runt_{ACCT}.json（那是 v7.2 撤單保險會讀的檔）
+RN = {}                        # 幣種 -> 參數＋狀態（見 rn_new）
+RN_FW = {"L": "Ｌ１", "S": "Ｓ１"}   # 畫面上用全形（上下行對齊）
+RN_NAME = {"L": "L1", "S": "S1"}
+RN_SL_WAIT = "ＳＬ 未設(毛利率 >0.07% 才設)"
+
+
+def rn_head(T):
+    return f"{T['sym']} {pct(T['lev'])}X {pct(T['amt'])}U"
+
+def rn_g(side, ent, px):
+    """毛利率（%）＝價格漲跌%，不乘槓桿。"""
+    if side == "L":
+        return (px / ent - 1) * 100
+    return (1 - px / ent) * 100
+
+def rn_lvl(side, ent, g, tick):
+    """毛利率 g% 對應的價格，往獲利方向取 tick（保本線一定 ≥ 0.07%）。"""
+    if side == "L":
+        return align(ent * (1 + g / 100), tick, "S")
+    return align(ent * (1 - g / 100), tick, "L")
+
+def rn_sp(v):
+    """帶正負號、2 位小數的 %：+0.12%、-0.07%。"""
+    v = Decimal(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{'-' if v < 0 else '+'}{abs(v):.2f}%"
+
+def rn_su(v):
+    """帶正負號、4 位小數的 U。"""
+    v = Decimal(v).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    return f"{'-' if v < 0 else '+'}{abs(v):.4f}U"
+
+def rn_pad(vals):
+    """同一欄靠右對齊：前面補數字寬的空白（U+2007）。"""
+    w = max(len(v) for v in vals)
+    return [" " * (w - len(v)) + v for v in vals]
+
+def rn_money(T, p, px):
+    """以 px 出場（市價）時的 毛利U、手續費U、淨損益U 與對應的 %（以委託金額×槓桿＝名目價值為基準）。"""
+    notional = T["amt"] * T["lev"]
+    gross_u = p["qty"] * ((px - p["ent"]) if p["side"] == "L" else (p["ent"] - px))
+    fee_u = notional * RN_FEE_IN / 100 + p["qty"] * px * RN_FEE_OUT / 100
+    net_u = gross_u - fee_u
+    return {"g": rn_g(p["side"], p["ent"], px), "fee": fee_u / notional * 100, "net": net_u / notional * 100,
+            "gu": gross_u, "feeu": fee_u, "netu": net_u}
+
+def rn_pos(T, side, ent, t, px_hit):
+    """一張單成交 → 一個持倉（各自獨立：自己的進場價、SL/TP、最高/最低毛利率）。"""
+    g0 = rn_g(side, ent, px_hit)
+    return {"side": side, "ent": ent, "t_in": t, "qty": T["amt"] * T["lev"] / ent,
+            "sl": None, "tp": None, "sl_g": None, "tp_g": None, "pend": None,
+            "t_arm": None, "arm_px": None, "n_mv": 0, "hi": None,
+            "mfe": max(g0, Decimal(0)), "mae": min(g0, Decimal(0)), "told": False, "out": None}
+
+def rn_round(T, t0, px0):
+    """開始新的一輪：取價 → L1、S1 埋伏（不帶 TP/SL，不改價）。"""
+    T.update({"t0": t0, "px0": px0, "cxl_due": None, "nxt": 0.0, "note_last": rt_note_base(t0),
+              "legs": {s: {"side": s, "px": rt_amb(px0, s, RN_OFF, T["tick"]), "fill": None, "dead": False}
+                       for s in ("S", "L")}})
+
+def rn_new(p, spec, chat):
+    return {**p, "key": p["sym"], "chat": chat, "iid": spec["iid"], "tick": spec["tick"],
+            "ev": asyncio.Event(), "done": False, "rest_t": 0.0, "save_t": time.time() + RT_SAVE_SEC,
+            "pos": [], "legs": {}, "cxl_due": None, "px_last": None,
+            "st": {"n": 0, "win": 0, "u": Decimal(0)}}
+
+def rn_touch(T, px, t):
+    """一筆價格（WS 逐筆成交價，或 WS 斷線時的查價）在時刻 t 檢查：掛單成交、SL/TP 出場。"""
+    if T["done"]:
+        return
+    for g in (T.get("legs") or {}).values():
+        if g["fill"] or g["dead"]:
+            continue
+        if T["cxl_due"] is not None and t >= T["cxl_due"]:
+            g["dead"] = True; continue
+        if (g["side"] == "L" and px <= g["px"]) or (g["side"] == "S" and px >= g["px"]):
+            g["fill"] = (t, g["px"], px)
+            T["pos"].append(rn_pos(T, g["side"], g["px"], t, px))
+            if T["cxl_due"] is None:
+                T["cxl_due"] = t + RT_LAT                 # 反向單過了送單時間才撤掉
+            T["ev"].set()
+    for p in T["pos"]:
+        if p["out"]:
+            continue
+        gg = rn_g(p["side"], p["ent"], px)
+        if gg > p["mfe"]:
+            p["mfe"] = gg
+        if gg < p["mae"]:
+            p["mae"] = gg
+        if p["pend"] and t >= p["pend"][4]:                # SL/TP 過了送單時間才生效
+            p["sl"], p["tp"], p["sl_g"], p["tp_g"] = p["pend"][:4]; p["pend"] = None
+        if p["sl"] is None:
+            continue
+        isL = p["side"] == "L"
+        if (isL and px >= p["tp"]) or (not isL and px <= p["tp"]):
+            p["out"] = (t, px, "TP")
+        elif (isL and px <= p["sl"]) or (not isL and px >= p["sl"]):
+            p["out"] = (t, px, "SL(移動)" if p["sl_g"] > RN_BE else "SL(保本)")
+        if p["out"]:
+            T["ev"].set()
+
+def rn_on_tick(iid, px):
+    """WS 逐筆成交價（由 _ws_push_px 呼叫）。"""
+    t = time.time()
+    for T in list(RN.values()):
+        if T.get("iid") == iid:
+            rn_touch(T, px, t)
+
+def rn_rule(T, p, px, now):
+    """每次查價（0.25 秒）判斷一次：保本設定、SL/TP 一起移動（只往獲利方向）。"""
+    g = rn_g(p["side"], p["ent"], px)
+    if p["hi"] is None or g > p["hi"]:
+        p["hi"] = g                                        # 最高毛利率（查價查到的）
+    sl_g, tp_g = (p["pend"][2], p["pend"][3]) if p["pend"] else (p["sl_g"], p["tp_g"])
+    new_sl, new_tp = sl_g, tp_g
+    if sl_g is None:
+        if g <= RN_BE:
+            return
+        new_sl, new_tp = RN_BE, RN_TP0                     # 毛利率 > 0.07% → SL 0.07%、TP 0.20%
+        p["t_arm"] = now
+    if p["hi"] > RN_MOVE:                                  # 最高毛利率 > 0.17% → 一起移動
+        new_sl = max(new_sl, p["hi"] - RN_SL_GAP)
+        new_tp = max(new_tp, p["hi"] + RN_TP_GAP)
+    if sl_g is not None and new_sl == sl_g and new_tp == tp_g:
+        return
+    tick = T["tick"]
+    sl_px = rn_lvl(p["side"], p["ent"], new_sl, tick)
+    tp_px = rn_lvl(p["side"], p["ent"], new_tp, tick)
+    if sl_g is None:
+        p["arm_px"] = sl_px
+    else:
+        p["n_mv"] += 1
+    p["pend"] = (sl_px, tp_px, new_sl, new_tp, now + RT_LAT)
+
+def rn_cur_sltp(p):
+    """畫面用：最新決定的 SL/TP（剛送出還沒生效的也算）。"""
+    if p["pend"]:
+        return p["pend"][0], p["pend"][1], p["pend"][2], p["pend"][3]
+    return p["sl"], p["tp"], p["sl_g"], p["tp_g"]
+
+def rn_tag(ps):
+    sides = {p["side"] for p in ps}
+    if len(sides) == 2:
+        return "L1S1"
+    return "L1(S1)" if "L" in sides else "(L1)S1"
+
+def rn_fill_lines(T, ps):
+    """進場成交通知。"""
+    tick = T["tick"]
+    ps = sorted(ps, key=lambda p: p["side"])               # 兩張都成交時 L1 在前
+    two = len(ps) == 2
+    L = [f"{E.ENTRY} 進場成交 {T['sym']} {rn_tag(ps)} {pct(T['lev'])}X {pct(T['amt'])}U",
+         RT_SEP,
+         f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"]
+    for p in ps:
+        L.append(f"進場 {rt_t(p['t_in'])}|{rt_q(p['ent'], tick)}" + (f"({RN_FW[p['side']]})" if two else ""))
+    L += [f"埋伏 {rt_hold_str(min(p['t_in'] for p in ps) - T['t0'])}",
+          RT_SEP,
+          RN_SL_WAIT,
+          f"時間:{hhmmss()}"]
+    return L
+
+def rn_exit_lines(T, p, others):
+    """出場通知。others＝這一輪還沒出場的持倉數。"""
+    tick = T["tick"]
+    t, px, why = p["out"]
+    m = rn_money(T, p, px)
+    gs, fs, ns = rn_pad([rn_sp(m["g"]), rn_sp(-m["fee"]), rn_sp(m["net"])])
+    gu, fu, nu = rn_pad([rn_su(m["gu"]), rn_su(-m["feeu"]), rn_su(m["netu"])])
+    hi, lo = rn_pad([rn_sp(p["mfe"]), rn_sp(p["mae"])])
+    L = [f"{E.pnl_emoji(m['netu'])} 出場 {T['sym']} {RN_NAME[p['side']]} {pct(T['lev'])}X {pct(T['amt'])}U|{why}",
+         RT_SEP,
+         f"進場 {rt_t(p['t_in'])}|{rt_q(p['ent'], tick)}"]
+    if p["t_arm"]:
+        L.append(f"保本 {rt_t(p['t_arm'])}|{rt_q(p['arm_px'], tick)}")
+    L += [f"出場 {rt_t(t)}|{rt_q(px, tick)}",
+          f"持倉 {rt_hold_str(t - p['t_in'])}|SL移動 {p['n_mv']} 次",
+          RT_SEP,
+          f"最高毛利率 {hi}",
+          f"最低毛利率 {lo}",
+          RT_SEP,
+          f"毛利率 {gs}|{gu}",
+          f"手續費 {fs}|{fu}",
+          f"淨損益 {ns}|{nu}",
+          RT_SEP,
+          f"累計 出場 {T['st']['n']} 次|淨損益 {rn_su(T['st']['u'])}",
+          f"時間:{hhmmss()}",
+          "(還有持倉,等它出場)" if others else "(第一層出場,重新埋伏)"]
+    return L
+
+def rn_pos_lines(T, p, px, now):
+    """持倉中的一張單（持倉通知、/stoprunt 共用）。"""
+    tick = T["tick"]
+    m = rn_money(T, p, px)
+    gs, ns = rn_pad([rn_sp(m["g"]), rn_sp(m["net"])])
+    gu, nu = rn_pad([rn_su(m["gu"]), rn_su(m["netu"])])
+    hi, lo = rn_pad([rn_sp(p["mfe"]), rn_sp(p["mae"])])
+    L = [f"⏰{RN_FW[p['side']]}持倉 {rt_hms(now - p['t_in'])}",
+         f"進場 {rt_t(p['t_in'])}|{rt_q(p['ent'], tick)}",
+         f"現價 {rt_t(now)}|{rt_q(px, tick)}",
+         f"毛利率 {gs}|{gu}",
+         f"淨損益 {ns}|{nu}",
+         f"最高毛利率 {hi}",
+         f"最低毛利率 {lo}"]
+    sl, tp, sl_g, tp_g = rn_cur_sltp(p)
+    if sl is None:
+        L.append(RN_SL_WAIT)
+    else:
+        a, b = rn_pad([rn_sp(sl_g), rn_sp(tp_g)])
+        L += [f"ＳＬ {rt_q(sl, tick)}|{a}", f"ＴＰ {rt_q(tp, tick)}|{b}"]
+    return L
+
+def rn_wait_lines(T, px, now):
+    """埋伏中（三行：S1 在上、現價、L1 在下）。"""
+    tick = T["tick"]
+    legs = T.get("legs") or {}
+    L = []
+    if "S" in legs:
+        L.append(f"掛Ｓ１ {rt_q(legs['S']['px'], tick)}")
+    L.append(f"現　價 {rt_q(px, tick)}")
+    if "L" in legs:
+        L.append(f"掛Ｌ１ {rt_q(legs['L']['px'], tick)}")
+    return L
+
+def rn_note_lines(T, px, now):
+    """每個 /tf 一則：持倉中＝持倉通知；埋伏中＝埋伏通知。"""
+    tick = T["tick"]
+    live = [p for p in T["pos"] if not p["out"]]
+    if live:
+        L = [f"📣持倉通知 {rn_head(T)}"]
+        for i, p in enumerate(sorted(live, key=lambda p: p["side"])):
+            if i:
+                L.append(RT_SEP)
+            L += rn_pos_lines(T, p, px, now)
+        return L
+    return [f"📣埋伏通知 {rn_head(T)}",
+            f"⏰埋伏時間 {rt_hms(now - T['t0'])}",
+            f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"] + rn_wait_lines(T, px, now)
+
+def rn_note_t0(T):
+    """持倉通知對齊進場時間；埋伏通知對齊這一輪的初次。"""
+    live = [p["t_in"] for p in T["pos"] if not p["out"]]
+    return min(live) if live else T["t0"]
+
+def rn_save():
+    try:
+        def P(p):
+            sl, tp, sl_g, tp_g = rn_cur_sltp(p)               # 存檔時剛送出的 SL/TP 一律當作已生效
+            s = lambda v: None if v is None else str(v)
+            return {"side": p["side"], "ent": str(p["ent"]), "t_in": p["t_in"], "qty": str(p["qty"]),
+                    "sl": s(sl), "tp": s(tp), "sl_g": s(sl_g), "tp_g": s(tp_g),
+                    "t_arm": p["t_arm"], "arm_px": s(p["arm_px"]), "n_mv": p["n_mv"], "hi": s(p["hi"]),
+                    "mfe": str(p["mfe"]), "mae": str(p["mae"])}
+        data = [{"sym": T["sym"], "lev": str(T["lev"]), "amt": str(T["amt"]), "chat": T["chat"],
+                 "t0": T["t0"], "px0": str(T["px0"]), "pos": [P(p) for p in T["pos"] if not p["out"]],
+                 "st": {"n": T["st"]["n"], "win": T["st"]["win"], "u": str(T["st"]["u"])}}
+                for T in RN.values() if not T.get("done")]
+        os.makedirs(os.path.dirname(RN_FILE), exist_ok=True)
+        tmp = RN_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, RN_FILE)
+    except Exception as e:
+        print("[runt] save fail", e)
+
+async def rn_wait_px(T, on):
+    px = None
+    while on() and px is None:
+        px = await rt_px(T)
+        if px is None:
+            await asyncio.sleep(0.2)
+    return px
+
+async def rn_worker(app, key):
+    """一組 runt 的迴圈：每 0.25 秒查價一次、判斷規則；成交、出場由 rn_touch（WS 逐筆）判斷。"""
+    T = RN[key]
+    on = lambda: RN.get(key) is T and not T["done"]
+    try:
+        WS_WANT.add(T["iid"])
+        while on():
+            now = time.time()
+            if now < T["nxt"] and not T["ev"].is_set():
+                try:
+                    await asyncio.wait_for(T["ev"].wait(), timeout=T["nxt"] - now)
+                except asyncio.TimeoutError:
+                    pass
+            T["ev"].clear()
+            if not on():
+                return
+            if T["legs"] and T["cxl_due"] is not None:     # 有單成交 → 等反向單撤掉（RT_LAT）→ 進場通知 → 開始判斷毛利率
+                rem = T["cxl_due"] - time.time()
+                if rem > 0:
+                    await asyncio.sleep(rem + 0.005)
+                    if not on():
+                        return
+                T["legs"] = {}
+                new = [p for p in T["pos"] if not p["told"]]
+                for p in new:
+                    p["told"] = True
+                if new:
+                    txt = "\n".join(rn_fill_lines(T, new))
+                    print(f"[runt] 進場成交 {key} " + " ".join(f"{p['side']}@{p['ent']}" for p in new))
+                    rt_chain(T, lambda t=txt: rt_send(app, T["chat"], t))
+                T["note_last"] = rt_note_base(rn_note_t0(T))
+                rn_save()
+                continue
+            outs = [p for p in T["pos"] if p["out"]]
+            if outs:                                       # 出場 → 出場通知；全部出場 → 馬上用現價重新部署第一層
+                for p in outs:
+                    T["pos"].remove(p)
+                    m = rn_money(T, p, p["out"][1])
+                    T["st"]["n"] += 1
+                    T["st"]["win"] += 1 if m["netu"] > 0 else 0
+                    T["st"]["u"] += m["netu"]
+                    txt = "\n".join(rn_exit_lines(T, p, len(T["pos"])))
+                    print(f"[runt] 出場 {key} {p['side']} {p['out'][2]} @{p['out'][1]} 淨{m['netu']}")
+                    rt_chain(T, lambda t=txt: rt_send(app, T["chat"], t))
+                if not T["pos"]:
+                    px = await rn_wait_px(T, on)
+                    if not on():
+                        return
+                    rn_round(T, time.time(), rt_q(px, T["tick"]))
+                else:
+                    T["note_last"] = rt_note_base(rn_note_t0(T))
+                rn_save()
+                continue
+            now = time.time()
+            if now < T["nxt"]:
+                continue
+            T["nxt"] = now + RN_STEP - (now % RN_STEP)
+            px = await rt_px(T)
+            if px is None or not on():
+                continue
+            T["px_last"] = px
+            rn_touch(T, px, time.time())                    # WS 斷線時靠查價判斷（WS 正常時逐筆已判斷過，重複不影響）
+            if T["ev"].is_set():
+                continue
+            if not T["legs"]:                              # 反向單撤掉之後才判斷毛利率
+                for p in T["pos"]:
+                    if not p["out"]:
+                        rn_rule(T, p, px, time.time())
+            iv = TF_SEC.get(ACCOUNT_TF, 300)
+            if now - T["note_last"] >= iv:                 # 每一個 /tf 一則
+                T["note_last"] = T["note_last"] + iv if now - T["note_last"] < 2 * iv else rt_note_base(rn_note_t0(T))
+                txt = "\n".join(rn_note_lines(T, px, now))
+                rt_chain(T, lambda t=txt: rt_send(app, T["chat"], t))
+            if time.time() >= T["save_t"]:
+                T["save_t"] = time.time() + RT_SAVE_SEC
+                rn_save()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print("[runt] worker fail", key, type(e).__name__, e)
+        T["done"] = True
+        if RN.get(key) is T:
+            RN.pop(key, None)
+        rn_save()
+        await rt_send(app, T["chat"], f"{E.LOSS} runt 異常停止 {rn_head(T)}\n{type(e).__name__}: {e}\n時間:{hhmmss()}")
+
+def rn_start(app, T):
+    RN[T["key"]] = T
+    T["task"] = asyncio.create_task(rn_worker(app, T["key"]))
+    rn_save()
+
+def rn_status_line(T):
+    live = sorted([p for p in T["pos"] if not p["out"]], key=lambda p: p["side"])
+    if not live:
+        return f"💡{rn_head(T)}|埋伏中 {rt_hms(time.time() - T['t0'])}"
+    px = T.get("px_last")
+    s = []
+    for p in live:
+        g = f"|毛利率 {rn_sp(rn_g(p['side'], p['ent'], px))}" if px else ""
+        s.append(f"{RN_FW[p['side']]}持倉 {rt_hms(time.time() - p['t_in'])}{g}")
+    return f"💡{rn_head(T)}|" + "|".join(s)
+
+def rn_running():
+    return ["進行中:"] + ([rn_status_line(T) for T in RN.values()] or ["目前沒有進行中的 runt"])
+
+RN_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"
+          "商品 槓桿 委託金額\n"
+          "例:WLDUSDT 1X 1U\n"
+          "槓桿要加 X,委託金額要加 U")
+RN_RETRY = "請重新輸入 /runt 參數:\n商品 槓桿 委託金額\n例:WLDUSDT 1X 1U"
+RN_HINT = "WLDUSDT 1X 1U"
+
+def rn_parse(a):
+    """解析 3 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
+    a = [x.strip() for x in a]
+    if len(a) != 3:
+        return None, f"參數數量錯誤(需3個,收到{len(a)}個)"
+    p = {"sym": a[0].upper()}
+    if not p["sym"].endswith("USDT") or len(p["sym"]) <= 4:
+        return None, f"商品格式錯誤:{a[0]}(例 WLDUSDT)"
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)[xX]", a[1])
+    if not m:
+        return None, "槓桿要加 X(例 1X)"
+    p["lev"] = Decimal(m.group(1))
+    if p["lev"] < 1:
+        return None, "槓桿不可小於 1X"
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)[uU]", a[2])
+    if not m:
+        return None, "委託金額要加 U(例 1U)"
+    p["amt"] = Decimal(m.group(1))
+    if p["amt"] <= 0:
+        return None, "委託金額須大於 0"
+    return p, None
+
+async def cmd_runt(u, c):
+    """沒帶參數 → 先告訴你參數怎麼打，再等你輸入；打錯 → 回錯誤原因，繼續等你重打。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    a = c.args or []
+    if not a:
+        await ask(u, "runt", cmd_runt, "\n".join([RN_ASK, RT_SEP] + rn_running() + [ASK_CANCEL]), RN_HINT); return
+    retry = lambda msg: ask(u, "runt", cmd_runt, f"{msg}\n{RN_RETRY}", RN_HINT)
+    p, err = rn_parse(a)
+    if err:
+        await retry(f"{E.WARN} {err}"); return
+    if p["sym"] in RN:
+        await retry(f"{E.WARN} {p['sym']} 已經在跑 runt\n同一帳戶同一幣種只能一組(避免併倉)\n"
+                    f"要換請先 /stoprunt {p['sym']}"); return
+    try:
+        spec = await get_spec(p["sym"])
+    except Exception:
+        await retry(f"{E.LOSS} 找不到商品 {p['sym']}"); return
+    if p["lev"] > spec["maxlev"]:
+        await retry(f"{E.WARN} {p['sym']} 槓桿最高 {pct(spec['maxlev'])}X"); return
+    tick = spec["tick"]
+    try:
+        px0 = rt_q(await get_last(spec["iid"]), tick)
+    except Exception:
+        await retry(f"{E.LOSS} 查不到 {p['sym']} 現價,請稍後再試"); return
+    if p["sym"] in RN:                                     # 查價途中又打了一次
+        return
+    T = rn_new(p, spec, u.effective_chat.id)
+    rn_round(T, time.time(), px0)
+    rn_start(c.application, T)
+    await reply(u, "\n".join([f"📣 runt 啟動｜{ACCT}", rn_head(T),
+                              f"第一層 埋伏{rt_p2(RN_OFF)}% 每秒4次",
+                              f">{rt_p2(RN_BE)}% 設SL {rt_p2(RN_BE)}%|TP {rt_p2(RN_TP0)}%",
+                              f">{rt_p2(RN_MOVE)}% SL、TP 一起移動"] + rn_wait_lines(T, px0, time.time())))
+
+async def cmd_stoprunt(u, c):
+    """沒帶參數 → 列出進行中，等你輸入幣種或 all；幣種沒在跑 → 繼續等你重打。"""
+    a = c.args or []
+    if not RN:
+        await reply(u, f"{E.BOT} 目前沒有進行中的 runt"); return
+    run_lines = rn_running()
+    if not a:
+        await ask(u, "stoprunt", cmd_stoprunt, "\n".join(["📝 請輸入要停止的幣種,或 all"] + run_lines + [ASK_CANCEL]),
+                  "WLDUSDT 或 all"); return
+    w = a[0].strip().upper()
+    if w == "ALL":
+        keys = list(RN.keys()); title = f"🚫 runt 全部停止｜{ACCT}"
+    else:
+        keys = [k for k in RN if k == w]; title = f"🚫 runt 停止｜{ACCT}"
+    if not keys:
+        await ask(u, "stoprunt", cmd_stoprunt, "\n".join([f"{E.WARN} {w} 沒有在跑 runt", "請重新輸入要停止的幣種,或 all"]
+                                                          + run_lines), "WLDUSDT 或 all"); return
+    L = [title]
+    now = time.time()
+    for i, key in enumerate(keys):
+        T = RN.get(key)
+        if T is None:
+            continue
+        T["done"] = True
+        tk = T.get("task")
+        if tk:
+            tk.cancel()
+        RN.pop(key, None)
+        if i:
+            L.append(RT_SEP)
+        L.append(rn_head(T))
+        live = sorted([p for p in T["pos"] if not p["out"]], key=lambda p: p["side"])
+        px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
+        if not live:
+            L.append(f"埋伏中 {rt_hms(now - T['t0'])}|已停止")
+        for p in live:
+            if px is None:
+                L.append(f"{RN_FW[p['side']]}持倉 {rt_hms(now - p['t_in'])}|未出場")
+            else:
+                L += rn_pos_lines(T, p, px, now)
+        for p in [p for p in T["pos"] if p["out"]]:        # 停止那一刻剛好出場、還沒發通知的：算進累計
+            m = rn_money(T, p, p["out"][1])
+            T["st"]["n"] += 1
+            T["st"]["win"] += 1 if m["netu"] > 0 else 0
+            T["st"]["u"] += m["netu"]
+            L.append(f"{RN_FW[p['side']]}剛出場 {p['out'][2]}|淨損益 {rn_sp(m['net'])}|{rn_su(m['netu'])}")
+        L.append(f"累計 出場 {T['st']['n']} 次|淨損益 {rn_su(T['st']['u'])}")
+    rn_save()
+    L.append(f"時間:{hhmmss()}")
+    await reply(u, "\n".join(L))
+
+async def rn_recover(app):
+    """重開後恢復：持倉接著跑（SL/TP 不變，關機期間沒有看盤）；埋伏中的用重開當下的現價重新部署。"""
+    try:
+        if not os.path.exists(RN_FILE):
+            return
+        data = json.load(open(RN_FILE))
+    except Exception as e:
+        print("[runt] recover read fail", e); return
+    names = []; bad = []; chat0 = None
+    D = lambda v: None if v is None else Decimal(v)
+    for d in data:
+        try:
+            chat0 = chat0 or d.get("chat")
+            p = {"sym": d["sym"], "lev": Decimal(d["lev"]), "amt": Decimal(d["amt"])}
+            if p["sym"] in RN:
+                continue
+            spec = await get_spec(p["sym"])
+            T = rn_new(p, spec, d["chat"])
+            st = d.get("st") or {}
+            T["st"] = {"n": int(st.get("n", 0)), "win": int(st.get("win", 0)), "u": Decimal(st.get("u", "0"))}
+            pos = []
+            for x in d.get("pos") or []:
+                pos.append({"side": x["side"], "ent": Decimal(x["ent"]), "t_in": float(x["t_in"]), "qty": Decimal(x["qty"]),
+                            "sl": D(x.get("sl")), "tp": D(x.get("tp")), "sl_g": D(x.get("sl_g")), "tp_g": D(x.get("tp_g")),
+                            "pend": None, "t_arm": x.get("t_arm"), "arm_px": D(x.get("arm_px")), "n_mv": int(x.get("n_mv", 0)),
+                            "hi": D(x.get("hi")), "mfe": Decimal(x.get("mfe", "0")), "mae": Decimal(x.get("mae", "0")),
+                            "told": True, "out": None})
+            if pos:                                        # 持倉：接著跑
+                T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "pos": pos, "legs": {},
+                          "cxl_due": None, "nxt": 0.0})
+                T["note_last"] = rt_note_base(rn_note_t0(T))
+                rn_start(app, T)
+                names.append(f"{rn_head(T)}|" + "、".join(f"{RN_FW[x['side']]}持倉" for x in pos))
+                continue
+            px = None
+            for i in range(3):                             # 埋伏中：用重開當下的現價重新部署
+                try:
+                    px = await get_last(spec["iid"]); break
+                except Exception:
+                    await asyncio.sleep(1)
+            if px is None:
+                bad.append(rn_head(T)); continue
+            rn_round(T, time.time(), rt_q(px, spec["tick"]))
+            rn_start(app, T)
+            names.append(f"{rn_head(T)}|用現價重新埋伏")
+        except Exception as e:
+            print("[runt] recover fail", d, type(e).__name__, e)
+            bad.append(f"{d.get('sym')}")
+    rn_save()
+    L = []
+    if names:
+        L += [f"{E.BOT} runt 已自動恢復(bot 重開)"] + names + ["持倉的 SL/TP 不變,關機期間沒有看盤"]
+    if bad:
+        L += [f"{E.WARN} 以下沒有恢復,請重新下指令:"] + bad
+    if L and chat0:
+        L.append(f"時間:{hhmmss()}")
+        await rt_send(app, chat0, "\n".join(L))
+
+
 async def cmd_coins(u, c):
     on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
@@ -4791,7 +5376,7 @@ async def cmd_timeframe(u, c):
     ACCOUNT_TF = tf; save_state()
     # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
     #       v7.4：/test 的埋伏通知間隔跟 /tf（下一則起）。
-    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/test 埋伏通知：下一則起每 {tf} 一則")
+    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/test 埋伏通知：下一則起每 {tf} 一則\n/runt 持倉／埋伏通知：下一則起每 {tf} 一則")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
@@ -4805,6 +5390,11 @@ async def cmd_menu(u, c):
         "　插針測試（模擬，不下單）：L 在現價下方、S 在上方框住現價，每秒查價、改價N次，逐筆成交價碰到就算成交；一邊成交立刻撤另一邊，通知後馬上重新掛單一直跑\n"
         "　例：/test WLDUSDT 0.5% 2　｜可同時跑多個幣種｜不帶參數＝查看進行中\n"
         "/stoptest 幣種｜all　停止指定幣種／全部 test\n"
+        "/runt 商品 槓桿 委託金額\n"
+        "　佈局第一層（模擬，不下單）：L1、S1 在現價上下 0.2% 限價埋伏，不改價；一邊成交撤另一邊；"
+        "毛利率 >0.07% 設SL 0.07%、TP 0.20%，>0.17% SL、TP 一起移動；獲利出場後馬上重新埋伏，虧損就一直抱著（每個 /tf 持倉通知）\n"
+        "　例：/runt WLDUSDT 1X 1U　｜可同時跑多個幣種｜同幣種只能一組\n"
+        "/stoprunt 幣種｜all　停止指定幣種／全部 runt\n"
         "/tf 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
@@ -4923,6 +5513,8 @@ async def _post_init(app):
             BotCommand("amp", "振幅分析（全部幣種，依/tf看7～30天）"),
             BotCommand("test", "插針測試（模擬，不下單）"),
             BotCommand("stoptest", "停止test｜幣種或all"),
+            BotCommand("runt", "佈局第一層（模擬，不下單）"),
+            BotCommand("stoprunt", "停止runt｜幣種或all"),
             BotCommand("stop", "停指定｜all＝停全部"),
             BotCommand("run", "建立策略"),
             BotCommand("tf", "週期"),
@@ -4956,6 +5548,7 @@ async def _post_init(app):
     asyncio.create_task(ws_private_task())
     await startup_recover(app)
     await rt_recover(app)
+    await rn_recover(app)     # v7.6：/runt 佈局第一層
     for S in STRATS.values():
         try:
             if S.get("pair_state", "idle") != "idle":
@@ -4984,7 +5577,8 @@ def main():
                     ("selftest", cmd_selftest), ("log", cmd_log),
                     ("amp", cmd_amp),
                     ("test", cmd_test), ("stoptest", cmd_stoptest),          # v7.4：/runt /stoprunt 改名 /test /stoptest
-                    (["runt", "runtest", "stoprunt", "stopruntest"], cmd_runt_renamed),   # 舊名 → 提示已改名
+                    ("runt", cmd_runt), ("stoprunt", cmd_stoprunt),          # v7.6：新的 /runt＝佈局第一層（模擬）
+                    (["runtest", "stopruntest"], cmd_runt_renamed),          # 舊名 → 提示已改名
                     (["tf", "timeframe"], cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
