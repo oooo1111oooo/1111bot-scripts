@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v8.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v8.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -3381,13 +3381,14 @@ def _skip_note(S, top=4):
 async def cmd_status(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     # v8.1（1111）：/status 跟 /runt 的持倉通知一樣（/tf 設很長時也能隨時看）。/run 有在跑才顯示原本 /run 的內容。
-    rn_blocks = rn_status_blocks()
+    # v8.5（1111）：不管有沒有進場，每個幣種都當下向 OKX 查資金費率顯示；沒有在跑＝「目前沒有進行中的幣種」。
+    rn_blocks = rn_status_blocks(await rn_status_fund())
     if not [s for s in STRATS.values() if s.get("pair_state", "idle") != "idle"]:
         L = [f"📊 status｜{ACCT}"]
         for b in rn_blocks:
             L += [RT_SEP] + b
         if not rn_blocks:
-            L += ["目前沒有進行中的 runt"]
+            L += [RT_SEP, "目前沒有進行中的幣種"]
         L += [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]
         await reply(u, "\n".join(L)); return
     posr = await api("GET", "/api/v5/account/positions")
@@ -4871,6 +4872,7 @@ async def rt_recover(app):
 #   ④ 初始單出場 → 撤掉這一邊還沒成交的層單；已持倉的層單照自己的 SL/TP 走完；全部出場 → 本輪結束
 #      → 等 60 秒（v8.1）→ 用現價重新來過。
 #   ⑤ 每一個 /tf：持倉中發持倉通知（對齊初始單進場時間）；埋伏中發埋伏通知（對齊這一輪的初次）。
+#      兩種通知都有資金費率兩行（v8.5）；/status 當下向 OKX 查資金費率（v8.5）。
 #   ⑥ 手續費（模擬）：0.07%＝限價進場 0.02%（maker）＋市價出場 0.05%（taker）。
 #      每一單：淨損益率＝淨損益 ÷ 這一單的名目價值（保證金×槓桿），跟毛利率同一個算法。
 #      合計（持倉中、本日已實現、本日結算）：v8.4 起 % 和 U 都是各單直接相加（1111：0.16%＋0.12%＝0.28%，不是平均）。
@@ -5155,13 +5157,35 @@ def rn_fund_settle(T, px):
           f"時間:{hhmmss()}"]
     return L
 
+def rn_fund_fmt(rate, t, note=None):
+    """資金費率兩行（v8.3，1111 指定格式）；note＝查詢失敗時的說明。"""
+    L = [f"💰資金費率 {rn_sp4(rate * 100)}({'多付空' if rate > 0 else ('空付多' if rate < 0 else '不收付')})",
+         f"下次付費時間 {rt_t(t)[:5]}"]
+    return L + ([note] if note else [])
+
 def rn_fund_line(T):
-    """持倉通知用：目前資金費率、下次結算時間。"""
+    """持倉通知、埋伏通知用：bot 每 60 秒查到的資金費率、下次結算時間（還沒查到就不列）。"""
     f = T.get("fund") or {}
     if f.get("t") is None or f.get("rate") is None:
         return []
-    return [f"💰資金費率 {rn_sp4(f['rate'] * 100)}({'多付空' if f['rate'] > 0 else ('空付多' if f['rate'] < 0 else '不收付')})",
-            f"下次付費時間 {rt_t(f['t'])[:5]}"]            # v8.3（1111）：分兩行
+    return rn_fund_fmt(f["rate"], f["t"])
+
+async def rn_fund_now(T):
+    """v8.5 /status：當下向 OKX 查資金費率（公開資料）。只拿來顯示，不改 bot 結算資金費用的資料（避免剛好在結算那一刻錯過結算）。
+    OKX 沒回應 → 用 bot 最近一次查到的，註明幾點查的；連那個都沒有 → 查詢失敗。"""
+    try:
+        r = await asyncio.wait_for(pub(f"/api/v5/public/funding-rate?instId={T['iid']}"), 5)
+        d = r["data"][0]
+        rate, t = Decimal(d["fundingRate"]), int(d["fundingTime"]) / 1000
+        if t < time.time() and d.get("nextFundingTime"):    # OKX 剛結算完、還沒換到下一期 → 下次＝再下一期
+            t = int(d["nextFundingTime"]) / 1000
+        return rn_fund_fmt(rate, t)
+    except Exception as e:
+        print("[runt] status funding fail", T.get("sym"), type(e).__name__, e)
+    f = T.get("fund") or {}
+    if f.get("t") is not None and f.get("rate") is not None:
+        return rn_fund_fmt(f["rate"], f["t"], f"(OKX 沒回應,這是 {rt_t(f['qt'])} 查到的)")
+    return ["💰資金費率 查詢失敗,稍後再試"]
 
 def rn_pos(T, side, lvl, ent, t, px_hit):
     """一張單成交 → 一個持倉（各自獨立：自己的進場價、SL/TP、最高/最低毛利率）。"""
@@ -5395,17 +5419,19 @@ def rn_wait_lines(T, px):
         L.append(f"掛L0 {rt_q(legs['L']['px'], tick)}")
     return L
 
-def rn_note_lines(T, px, now):
-    """每個 /tf 一則：持倉中＝持倉通知；埋伏中＝埋伏通知。"""
+def rn_note_lines(T, px, now, fund=None):
+    """每個 /tf 一則：持倉中＝持倉通知；埋伏中＝埋伏通知。都有資金費率兩行（v8.5：埋伏通知也有）。
+    fund＝/status 當下查到的資金費率行；沒給就用 bot 每 60 秒查到的。"""
     tick = T["tick"]
+    fl = rn_fund_line(T) if fund is None else fund
     if T["h0"] is not None and any(not p["out"] for p in T["pos"]):
         return ([f"📣持倉通知 {rn_head(T)}",
-                 f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, tick)}"] + rn_fund_line(T)
+                 f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, tick)}"] + fl
                 + [RT_SEP] + rn_book(T, px)
                 + rn_pl_secs(T, px))   # v8.2：L、S 各自 持倉中／本日已實現
-    return [f"📣埋伏通知 {rn_head(T)}",
-            f"⏰埋伏時間 {rt_hms(now - T['t0'])}",
-            f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"] + rn_wait_lines(T, px)
+    return ([f"📣埋伏通知 {rn_head(T)}",
+             f"⏰埋伏時間 {rt_hms(now - T['t0'])}"] + fl
+            + [f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"] + rn_wait_lines(T, px))
 
 def rn_save():
     try:
@@ -5589,20 +5615,29 @@ def rn_status_line(T):
         s += f"|持倉中淨損益 {rn_sp(nr)}"
     return s
 
-def rn_status_blocks():
-    """/status（v8.1）：每個 /runt 幣種一段，內容跟持倉通知／埋伏通知一樣；等待 60 秒中的寫剩幾秒。"""
+def rn_status_blocks(fund=None):
+    """/status（v8.1）：每個 /runt 幣種一段，內容跟持倉通知／埋伏通知一樣；等待 60 秒中的寫剩幾秒。
+    v8.5：每一段都有資金費率兩行（fund＝幣種 -> /status 當下向 OKX 查到的行）。"""
     out = []
     now = time.time()
-    for T in RN.values():
+    fund = fund or {}
+    for key, T in list(RN.items()):
+        fl = fund[key] if key in fund else rn_fund_line(T)
         if T.get("wait_until"):
-            out.append([f"⏳{rn_par(T)}", f"本輪結束,剩 {max(0, int(T['wait_until'] - now))} 秒重新埋伏"])
+            out.append([f"⏳{rn_par(T)}", f"本輪結束,剩 {max(0, int(T['wait_until'] - now))} 秒重新埋伏"] + fl)
             continue
         px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
         if px is None:
-            out.append([f"💡{rn_par(T)}", "查價中"])
+            out.append([f"💡{rn_par(T)}", "查價中"] + fl)
             continue
-        out.append(rn_note_lines(T, px, now))
+        out.append(rn_note_lines(T, px, now, fl))
     return out
+
+async def rn_status_fund():
+    """v8.5：/status 當下，所有 /runt 幣種一起向 OKX 查資金費率。"""
+    keys = list(RN.keys())
+    res = await asyncio.gather(*[rn_fund_now(RN[k]) for k in keys], return_exceptions=True)
+    return {k: r for k, r in zip(keys, res) if isinstance(r, list)}
 
 def rn_running():
     return ["進行中:"] + ([rn_status_line(T) for T in RN.values()] or ["目前沒有進行中的 runt"])
