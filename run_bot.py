@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v9.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v10.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -518,10 +518,56 @@ def csize(m, lev, px, cv, lot):
 
 # ---------- Telegram（旁路：永不阻塞交易） ----------
 _BG = set()
+TG_LIM = 3800      # v10.0（1111）：Telegram 單則上限 4096 字，超過整則被拒收（o2222o 組數多時 /status 沒有回應）→ 每則最多 3800 字，太長自動分頁
+TG_SEP = "━━━━━━━━━━"
+
+def tg_pack(title, blocks, tail=(), lim=TG_LIM):
+    """v10.0：把一段一段（blocks＝每段幾行）整段裝進每一頁，不把同一段切開（一段本身就超過才逐行切）；
+    分成兩頁以上時，每頁標題後面加 (1/N)，tail（例：時間）放最後一頁。"""
+    budget = lim - len(title) - 10
+    size = lambda ls: sum(len(x) + 1 for x in ls)
+    pages, cur = [], []
+    for b in blocks:
+        b = list(b)
+        while size(b) > budget:                            # 一段就超過：逐行切
+            if cur:
+                pages.append(cur); cur = []
+            k, n = 0, 0
+            while k < len(b) and n + len(b[k]) + 1 <= budget:
+                n += len(b[k]) + 1; k += 1
+            k = max(k, 1)
+            pages.append(b[:k]); b = b[k:]
+        if cur and size(cur) + size(b) > budget:
+            pages.append(cur); cur = []
+        cur += b
+    tail = list(tail)
+    if cur and size(cur) + size(tail) > budget:
+        pages.append(cur); cur = []
+    cur += tail
+    pages.append(cur)
+    if len(pages) == 1:
+        return ["\n".join([title] + pages[0])]
+    return ["\n".join([f"{title}({i}/{len(pages)})"] + p) for i, p in enumerate(pages, 1)]
+
+def tg_split(t, lim=TG_LIM):
+    """v10.0：一則太長 → 第一行當標題，在分隔線（━━━）處切成好幾頁；不長就原樣一則。"""
+    if len(t) <= lim:
+        return [t]
+    lines = t.split("\n")
+    segs, cur = [], []
+    for ln in lines[1:]:
+        if ln == TG_SEP and cur:
+            segs.append(cur); cur = [ln]
+        else:
+            cur.append(ln)
+    if cur:
+        segs.append(cur)
+    return tg_pack(lines[0], segs, (), lim)
 
 async def _send_bg(app, chat, t):
     try:
-        await app.bot.send_message(chat, t)
+        for part in tg_split(t):                           # v10.0：太長分頁
+            await app.bot.send_message(chat, part)
     except Exception as e:
         print("notify fail", type(e).__name__, e)
 
@@ -534,7 +580,14 @@ async def notify(app, chat, t):
 
 async def reply(u, t):
     """指令回覆：失敗重試一次，再失敗只記錄，不拋出。
-    v8.2：之前有「等你輸入」的回覆列（ForceReply）還沒收掉、現在也沒在等 → 這則回覆順便把它收掉。"""
+    v8.2：之前有「等你輸入」的回覆列（ForceReply）還沒收掉、現在也沒在等 → 這則回覆順便把它收掉。
+    v10.0：超過 Telegram 上限就自動分頁，一頁一則依序送。"""
+    ok = True
+    for part in tg_split(t):
+        ok = await _reply1(u, part) and ok
+    return ok
+
+async def _reply1(u, t):
     ec = getattr(u, "effective_chat", None)                 # 每日 summary 的假 Update 沒有 effective_chat
     chat = ec.id if ec else None
     clr = chat is not None and chat in FR_OPEN and chat not in WAIT
@@ -3382,13 +3435,10 @@ async def cmd_status(u, c):
     # v8.5（1111）：不管有沒有進場，每個幣種都當下向 OKX 查資金費率顯示；沒有在跑＝「目前沒有進行中的幣種」。
     rn_blocks = rn_status_blocks(await rn_status_fund())
     if not [s for s in STRATS.values() if s.get("pair_state", "idle") != "idle"]:
-        L = [f"📊 status｜{ACCT}"]
-        for b in rn_blocks:
-            L += [RT_SEP] + b
-        if not rn_blocks:
-            L += [RT_SEP, "目前沒有進行中的幣種"]
-        L += [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]
-        await reply(u, "\n".join(L)); return
+        blocks = [[RT_SEP] + b for b in rn_blocks] or [[RT_SEP, "目前沒有進行中的幣種"]]
+        for part in tg_pack(f"📊 status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]):   # v10.0：太長分頁，一組不切開
+            await reply(u, part)
+        return
     posr = await api("GET", "/api/v5/account/positions")
     pe = await api("GET", "/api/v5/trade/orders-pending")
     bal = await api("GET", "/api/v5/account/balance")
@@ -4143,11 +4193,12 @@ def rt_amb(px, side, off, tick):
 
 
 async def rt_send(app, chat, text):
-    for i in range(2):
-        try:
-            await app.bot.send_message(chat, text); return
-        except Exception as e:
-            print("[test] tg fail", i, e); await asyncio.sleep(2)
+    for part in tg_split(text):                            # v10.0：太長分頁
+        for i in range(2):
+            try:
+                await app.bot.send_message(chat, part); break
+            except Exception as e:
+                print("[runt] tg fail", i, e); await asyncio.sleep(2)
 
 def rt_chain(T, fn):
     """同一組 test 的 TG 訊息排隊依序送出，不卡住迴圈、也不會先後顛倒。fn＝沒有參數的 async 函式。"""
@@ -4283,6 +4334,8 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v10.0（1111 2026-10-06）：Telegram 單則上限 4096 字，o2222o 組數多時 /status 超過上限整則被拒收（沒有回應）→
+#     所有回覆、通知、00:00 自動 /summary：超過 3800 字自動分頁，每頁標題加 (1/N)；/status、/stoprunt 以組為單位，不把同一組切開。
 #   v9.9（1111 2026-10-06）：浮動槓桿加 YX（L0 2X、L1 4X…L9 20X）、ZX（L0 5X、L1 10X…L9 50X），幣種最高槓桿要 ≥20X／≥50X 才能用；
 #     T["xx"]＝倍數（0 固定、1 XX、2 YX、5 ZX；舊存檔 true＝XX）。ZX 照做法 A，L7（40X）成交後再跌約 0.36% 就整個方向強平，L8、L9 碰不到（1111 知道）。
 #     /coins 改成 幣種｜最小保證金(1X)｜最大槓桿。
@@ -5689,13 +5742,8 @@ async def cmd_stoprunt(u, c):
         title = f"🚫 runt 停止／🚦 最後一輪｜{ACCT}"
     else:
         title = f"🚫 runt {'全部停止' if allk else '停止'}｜{ACCT}"
-    L = [title]
-    for i, b in enumerate(B):
-        if i:
-            L.append(RT_SEP)
-        L += b
-    L.append(f"時間:{hhmmss()}")
-    await reply(u, "\n".join(L))
+    for part in tg_pack(title, [([RT_SEP] if i else []) + b for i, b in enumerate(B)], [f"時間:{hhmmss()}"]):   # v10.0：太長分頁
+        await reply(u, part)
 
 async def rn_recover(app):
     """重開後恢復：持倉、層單掛單接著跑（關機期間沒有看盤）；埋伏中的用重開當下的現價重新來過。
@@ -6027,7 +6075,8 @@ async def job_summary(ctx):
     d = (now8() - timedelta(minutes=5)).strftime("%Y-%m-%d")
     try:
         for m in await rn_sum_msgs(d, full=True):
-            await ctx.bot.send_message(chat, "\n".join(m))
+            for part in tg_split("\n".join(m)):           # v10.0：太長分頁
+                await ctx.bot.send_message(chat, part)
     except Exception as e: print("auto summary fail", e)
 
 # ---------- 啟動 ----------
