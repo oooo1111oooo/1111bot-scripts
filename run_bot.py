@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v9.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v9.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4846,6 +4846,11 @@ async def rt_recover(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v9.4（1111 2026-10-05 定案）：/stoprunt 幣種 方向（LS 兩邊、L 只停多、S 只停空，方向一定要打）、/stoprunt all（全部幣種、兩邊）。
+#     每一個要停的方向：沒有進場 → 馬上停止（還沒成交的 L0/S0 撤掉）；有進場 → 🚦 最後一輪（這一輪照常作戰、層單照掛，
+#     那一邊全部出場後「🚦 L 策略結束」，等 300 秒後只掛另一邊）。另一個方向照常一輪接一輪。
+#     T["dir"]＝還在跑的方向，T["last"]＝🚦 最後一輪的方向（v9.3 是 True/False）；兩個方向都停＝整個幣種（🚦WLDUSDT，跟 v9.3 一樣）。
+#     畫面：單向 🚦 標在那一邊每一張單前面（🚦L0、🚦L3），標題方向照列（WLDUSDT LS），/status 多一行「🚦L 最後一輪,全部出場後只剩 S」。
 #   v9.3（1111 2026-10-05 定案）：
 #     • /runt 幣種 方向 槓桿 保證金 初始埋伏點%：方向 LS＝兩邊、L＝只做多、S＝只做空；
 #       槓桿 1X～100X＝每一層都一樣；XX＝L0 1X、L1 2X…L9 10X（只有槓桿跟著層數加，每一層保證金一樣；幣種最高槓桿 <10X 擋下）。
@@ -4869,7 +4874,7 @@ async def rt_recover(app):
 # 指令：/runt 幣種 方向 槓桿 保證金 初始埋伏點%　　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX 1U 0.5%
 #   方向 LS／L／S；槓桿一定要有 X（或 XX）、保證金一定要有 U、初始埋伏點一定要有 %。（v9.2 以前沒有方向參數）
 #   同一帳戶同一幣種只能一組（避免併倉）；可同時跑多個幣種。
-# 停止：/stoprunt 幣種、/stoprunt all（有持倉＝🚦 最後一輪，v9.3）。
+# 停止：/stoprunt 幣種 方向、/stoprunt all（有持倉＝🚦 最後一輪，v9.3；方向 v9.4）。
 # 規則（1111 定案）：
 #   ① 初始單：取價 → 上下各距離「初始埋伏點%」限價掛單（L 在下、S 在上），不帶 TP/SL，掛了不改價。
 #      成交＝逐筆成交價碰到掛單價，進場價＝掛單價。一邊成交 → 先撤掉另一邊（RT_LAT 內反向也被碰到 → 兩張都成交，各自一條線）。
@@ -4935,9 +4940,25 @@ RN = {}                        # 幣種 -> 參數＋狀態（見 rn_new）
 RN_SL_WAIT = "SL 未設(毛利率 >0.20% 才設)"
 
 
+def rn_ls(x):
+    """L、S 照固定順序排好：'SL'→'LS'。"""
+    return "".join(c for c in "LS" if c in (x or ""))
+
+def rn_whole(T):
+    """v9.4：整個幣種都是最後一輪（兩個方向都停了，只剩持倉在打）。T["dir"]＝還在跑（會開新的一輪）的方向。"""
+    return not T.get("dir", "LS")
+
+def rn_dirs(T):
+    """v9.4：畫面上的方向＝還在跑的方向＋🚦 最後一輪的方向。"""
+    return rn_ls((T.get("dir", "LS") or "") + (T.get("last") or ""))
+
+def rn_mk(T, side):
+    """v9.4：只有一個方向 🚦 時，標在那一邊每一張單前面（🚦L0、🚦L3）；整個幣種 🚦 標在幣種前面。"""
+    return "🚦" if not rn_whole(T) and side in (T.get("last") or "") else ""
+
 def rn_sym(T):
-    """v9.3：最後一輪（/stoprunt 時有持倉）幣種前面加 🚦。"""
-    return f"🚦{T['sym']}" if T.get("last") else T["sym"]
+    """v9.3：最後一輪（/stoprunt 時有持倉）幣種前面加 🚦。v9.4：只有整個幣種（兩個方向都停）才標在幣種前面。"""
+    return f"🚦{T['sym']}" if rn_whole(T) else T["sym"]
 
 def rn_lev(T, lvl):
     """v9.3：這一層的槓桿。XX＝第 n 層 n+1 倍（L0 1X、L1 2X…L9 10X）；否則每一層一樣。每一層保證金都一樣。"""
@@ -4981,14 +5002,14 @@ async def rn_mmr(spec):
     return RN_MMR_DEF
 
 def rn_head(T):
-    return f"{rn_sym(T)} {T.get('dir', 'LS')} {rn_levs(T)} {pct(T['amt'])}U"
+    return f"{rn_sym(T)} {rn_dirs(T)} {rn_levs(T)} {pct(T['amt'])}U"
 
 def rn_par(T):
     return f"{rn_head(T)} 埋伏{rt_p2(T['off'])}%"
 
 def rn_nm(T, side, lvl):
-    """畫面上的名稱（v7.9：一律半形）：初始單 L0/S0，層單 L1～L9/S1～S9。"""
-    return f"{side}{lvl}"
+    """畫面上的名稱（v7.9：一律半形）：初始單 L0/S0，層單 L1～L9/S1～S9。v9.4：單向 🚦 → 🚦L3。"""
+    return f"{rn_mk(T, side)}{side}{lvl}"
 
 def rn_title(side, lvl):
     """標題上的名稱（同 rn_nm）。"""
@@ -5226,7 +5247,7 @@ async def rn_sum_msgs(d, full=False):
         for p in live:
             m = rn_money(T, p, px)
             rn_acc_add(hold.setdefault((T["sym"], p["side"]), rn_acc()), m)
-            rows.append((rn_sym(T), p["side"], p["lvl"], rn_q2(m["net"]), rn_q4(m["netu"]), p["t_in"]))   # v9.3：🚦
+            rows.append((rn_sym(T), rn_mk(T, p["side"]) + p["side"], p["lvl"], rn_q2(m["net"]), rn_q4(m["netu"]), p["t_in"]))   # v9.3／v9.4：🚦
     def tot(accs):
         a = rn_acc()
         for x in accs:
@@ -5419,7 +5440,7 @@ def rn_new(p, spec, chat):
     return {**p, "key": p["sym"], "chat": chat, "iid": spec["iid"], "tick": spec["tick"],
             "ev": asyncio.Event(), "done": False, "rest_t": 0.0, "save_t": time.time() + RT_SAVE_SEC,
             "pos": [], "legs": {}, "ords": [], "rnd": [], "init": {}, "h0": None, "cxl_due": None, "px_last": None,
-            "wait_until": None, "last": False, "dir": p.get("dir", "LS"), "xx": p.get("xx", False), "mmr": p.get("mmr"),
+            "wait_until": None, "last": "", "dir": p.get("dir", "LS"), "xx": p.get("xx", False), "mmr": p.get("mmr"),
             "st": {"r": 0, "n": 0, "u": Decimal(0), "gu": Decimal(0)}, "day": rn_today(),
             "fund": {"t": None, "rate": None, "q": 0.0, "qt": 0.0, "last": None, "busy": False}}
 
@@ -5548,8 +5569,8 @@ def rn_fill_lines(T, ps):
     tick = T["tick"]
     ps = sorted(ps, key=lambda p: p["side"])               # 兩張都成交時 L 在前
     sides = {p["side"] for p in ps}
-    if T.get("dir", "LS") != "LS":                         # v9.3：單向只有一張初始單
-        tag = f"{T['dir']}0"
+    if T.get("dir", "LS") != "LS" and len(sides) == 1:     # v9.3：單向只有一張初始單
+        tag = f"{ps[0]['side']}0"
     else:
         tag = "L0S0" if len(sides) == 2 else ("L0(S0)" if "L" in sides else "(L0)S0")
     two = len(ps) == 2
@@ -5568,7 +5589,7 @@ def rn_lay_fill_lines(T, p):
     """層單進場成交通知：列出這一邊目前持倉中的單（初始單＋各層）。"""
     tick = T["tick"]
     held = sorted([q for q in T["pos"] if q["side"] == p["side"] and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
-    L = [f"{E.ENTRY} 進場成交 {rn_sym(T)} {rn_title(p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U",
+    L = [f"{E.ENTRY} 進場成交 {rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U",
          RT_SEP]
     L += [f"{rn_nm(T, q['side'], q['lvl'])} {rt_t(q['t_in'])}|{rt_q(q['ent'], tick)}" for q in held]
     L += [RT_SEP, RN_SL_WAIT, f"時間:{hhmmss()}"]
@@ -5582,7 +5603,7 @@ def rn_exit_lines(T, p, m, tail):
     pc = rn_pad([rn_sp(m["g"]), rn_sp(-m["fee"])] + ([rn_sp(m["fund"])] if m["fn"] else []) + [rn_sp(m["net"])])
     us = rn_pad([rn_su(m["gu"]), rn_su(-m["feeu"])] + ([rn_su(m["fu"])] if m["fn"] else []) + [rn_su(m["netu"])])
     hi, lo = rn_pad([rn_sp(p["mfe"]), rn_sp(p["mae"])])
-    L = [f"{E.pnl_emoji(m['netu'])} 出場通知 {rn_sym(T)} {rn_title(p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U",
+    L = [f"{E.pnl_emoji(m['netu'])} 出場通知 {rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U",
          RT_SEP,
          f"進場 {rt_t(p['t_in'])}|{rt_q(p['ent'], tick)}"]
     if p["t_arm"]:
@@ -5603,7 +5624,7 @@ def rn_exit_lines(T, p, m, tail):
         for q in live:
             mq = rn_money(T, q, px)
             rn_acc_add(a, mq)
-            rows.append(f"{rn_sym(T)} {side}{q['lvl']} {rn_sp(rn_q2(mq['net']))}|{rn_su(rn_q4(mq['netu']))}")
+            rows.append(f"{rn_sym(T)} {rn_nm(T, side, q['lvl'])} {rn_sp(rn_q2(mq['net']))}|{rn_su(rn_q4(mq['netu']))}")
         hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)
     d = ((RN_DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []
@@ -5619,13 +5640,20 @@ def rn_end_lines(T):
     a = rn_pad([rn_sp(r["net"]) for r in rows])
     b = rn_pad([rn_su(r["netu"]) for r in rows])
     u = sum((r["netu"] for r in rows), Decimal(0))
-    last = T.get("last")
-    head = f"🚦 策略結束 {T['sym']} {T.get('dir', 'LS')} {rn_levs(T)} {pct(T['amt'])}U" if last else f"{E.pnl_emoji(u)} 本輪結束 {rn_head(T)}"
+    whole, last = rn_whole(T), T.get("last") or ""
+    if whole:                                              # v9.3：整個幣種 🚦 打完
+        head = f"🚦 策略結束 {T['sym']} {rn_dirs(T)} {rn_levs(T)} {pct(T['amt'])}U"
+        tail = "(這一輪全部出場,策略結束)"
+    elif last:                                             # v9.4：只有一個方向 🚦 打完，另一個方向照常
+        head = f"🚦 {last} 策略結束 {T['sym']} {rn_levs(T)} {pct(T['amt'])}U"
+        tail = f"({last} 全部出場,{last} 策略結束;{RN_WAIT}秒後只掛 {'、'.join(x + '0' for x in T['dir'])})"
+    else:
+        head = f"{E.pnl_emoji(u)} 本輪結束 {rn_head(T)}"
+        tail = f"({rn_init_names(T)}出場,{RN_WAIT}秒後重新來過)"
     L = [head, RT_SEP, "各單淨損益"]
     L += [f"{rn_nm(T, r['side'], r['lvl'])} {x}|{y}|{r['why']}" for r, x, y in zip(rows, a, b)]
     L += rn_pl_secs(T, None, sorted({r["side"] for r in rows}))   # v8.2：這一輪有出場的方向：本日已實現
-    L += [f"時間:{hhmmss()}",
-          "(這一輪全部出場,策略結束)" if last else f"({rn_init_names(T)}出場,{RN_WAIT}秒後重新來過)"]
+    L += [f"時間:{hhmmss()}", tail]
     return L
 
 def rn_book(T, px):
@@ -5666,14 +5694,22 @@ def rn_wait_lines(T, px):
         L.append(f"掛L0 {rt_q(legs['L']['px'], tick)}")
     return L
 
+def rn_last_lines(T):
+    """v9.4：/status 持倉通知標題下面一行：🚦 最後一輪的說明。"""
+    if rn_whole(T):
+        return ["🚦 最後一輪,全部出場後策略結束"]
+    if T.get("last"):
+        return [f"🚦{T['last']} 最後一輪,全部出場後只剩 {T['dir']}"]
+    return []
+
 def rn_note_lines(T, px, now, fund=None):
     """/status 用（v8.6 起不再每個 /tf 自動發）：持倉中＝持倉通知；埋伏中＝埋伏通知。都有資金費率兩行。
     fund＝/status 當下查到的資金費率行；沒給就用 bot 每 60 秒查到的。"""
     tick = T["tick"]
     fl = rn_fund_line(T) if fund is None else fund
     if T["h0"] is not None and any(not p["out"] for p in T["pos"]):
-        return ([f"📣持倉通知 {rn_head(T)}",
-                 f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, tick)}"] + fl
+        return ([f"📣持倉通知 {rn_head(T)}"] + rn_last_lines(T)
+                + [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, tick)}"] + fl
                 + [RT_SEP] + rn_book(T, px)
                 + rn_pl_secs(T, px))   # v8.2：L、S 各自 持倉中／本日已實現
     return ([f"📣埋伏通知 {rn_head(T)}",
@@ -5691,7 +5727,7 @@ def rn_save():
                     "mfe": str(p["mfe"]), "mae": str(p["mae"]), "fu": str(p.get("fu", 0)), "fn": p.get("fn", 0),
                     "lev": s(p.get("lev")), "liq": s(p.get("liq"))}
         data = [{"v": 77, "sym": T["sym"], "lev": str(T["lev"]), "amt": str(T["amt"]), "off": str(T["off"]),
-                 "dir": T.get("dir", "LS"), "xx": bool(T.get("xx")), "mmr": s(T.get("mmr")), "last": bool(T.get("last")),
+                 "dir": T.get("dir", "LS"), "xx": bool(T.get("xx")), "mmr": s(T.get("mmr")), "last": T.get("last") or "",
                  "chat": T["chat"], "t0": T["t0"], "px0": str(T["px0"]), "h0": T["h0"], "wait_until": T.get("wait_until"),
                  "init": {k: str(v) for k, v in T["init"].items()},
                  "pos": [P(p) for p in T["pos"] if not p["out"]],
@@ -5790,13 +5826,16 @@ async def rn_worker(app, key):
                 T["ords"] = []
                 T["st"]["r"] += 1
                 send("\n".join(rn_end_lines(T)))
-                if T.get("last"):                          # v9.3：🚦 最後一輪打完 → 策略結束，不再開新的一輪
+                if rn_whole(T):                            # v9.3：🚦 最後一輪打完 → 策略結束，不再開新的一輪
                     print(f"[runt] 🚦 策略結束 {key}")
                     T["done"] = True
                     if RN.get(key) is T:
                         RN.pop(key, None)
                     rn_save()
                     return
+                if T.get("last"):                          # v9.4：單向 🚦 打完 → 那個方向結束，另一個方向照常
+                    print(f"[runt] 🚦 {T['last']} 策略結束 {key}，之後只做 {T['dir']}")
+                    T["last"] = ""
                 T["legs"] = {}
                 T["rnd"] = []
                 T["wait_until"] = time.time() + RN_WAIT
@@ -5858,6 +5897,8 @@ def rn_status_line(T):
         return f"💡{rn_par(T)}|埋伏中 {rt_hms(time.time() - T['t0'])}"
     px = T.get("px_last")
     s = f"💡{rn_par(T)}|持倉 {rt_hms(time.time() - T['h0'])}|{len(live)}單"
+    if T.get("last") and not rn_whole(T):
+        s += f"|🚦{T['last']} 最後一輪"
     if px:
         nr = sum((rn_q2(rn_money(T, p, px)["net"]) for p in live), Decimal(0))   # v8.4：各單相加
         s += f"|持倉中淨損益 {rn_sp(nr)}"
@@ -5953,11 +5994,11 @@ async def cmd_runt(u, c):
     if err:
         await retry(f"{E.WARN} {err}"); return
     T0 = RN.get(p["sym"])
-    if T0 is not None and T0.get("last"):                 # v9.3：🚦 最後一輪還沒打完 → 不能重新下（避免併倉）
+    if T0 is not None and rn_whole(T0):                   # v9.3：🚦 最後一輪還沒打完 → 不能重新下（避免併倉）
         await retry(f"{E.WARN} 🚦{p['sym']} 最後一輪進行中\n這一輪全部出場(策略結束)後才能重新 /runt {p['sym']}"); return
     if T0 is not None:
         await retry(f"{E.WARN} {p['sym']} 已經在跑 runt\n同一帳戶同一幣種只能一組(避免併倉)\n"
-                    f"要換請先 /stoprunt {p['sym']}"); return
+                    f"要換請先 /stoprunt {p['sym']} LS"); return
     try:
         spec = await get_spec(p["sym"])
     except Exception:
@@ -6000,57 +6041,143 @@ def rn_stop_lines(T, now, last=False):
               "BOT 不平倉,單子照自己的 SL/TP 出場"]
     return L + rn_pl_secs(T, px if live else None)   # v8.2
 
+def rn_stop_one(T, sides, now):
+    """v9.4（1111）：/stoprunt 一個幣種的 sides（LS／L／S）。每一個要停的方向：
+    沒有進場 → 馬上停止（還沒成交的 L0/S0 撤掉）；有進場 → 🚦 最後一輪（這一輪照常作戰、層單照掛，那一邊全部出場後結束）。
+    另一個方向照常一輪接一輪；兩個方向都停了＝整個幣種（沒有持倉馬上停止，有持倉 🚦 打完策略結束）。BOT 永遠不平倉。
+    回傳 (種類, 畫面)：stop＝整個幣種停止；part＝單向停止、另一邊照常；last＝有方向變成 🚦；again＝已經是最後一輪。"""
+    d0 = T["dir"]
+    want = [x for x in "LS" if x in sides and x in rn_dirs(T)]
+    live = {x: [p for p in T["pos"] if p["side"] == x and not p["out"]] for x in "LS"}
+    newlast, stopped, again, cxl = [], [], [], []
+    for x in want:
+        if x in (T.get("last") or ""):
+            again.append(x); continue
+        T["dir"] = T["dir"].replace(x, "")
+        if live[x]:
+            T["last"] = rn_ls((T.get("last") or "") + x); newlast.append(x)
+        else:
+            stopped.append(x)
+            g = (T.get("legs") or {}).get(x)
+            if g and not g["fill"]:
+                if not g["dead"]:
+                    cxl.append(x)
+                T["legs"].pop(x, None)
+            T["ords"] = [o for o in T["ords"] if o["side"] != x]
+    any_live = any(live.values())
+    key = T["key"]
+    if rn_whole(T) and not any_live:                       # 兩個方向都停、沒有持倉 → 整個幣種馬上停止
+        T["dir"] = d0                                      # 畫面照停止前的方向
+        T["done"] = True
+        tk = T.get("task")
+        if tk:
+            tk.cancel()
+        if RN.get(key) is T:
+            RN.pop(key, None)
+        for p in [p for p in T["pos"] if p["out"]]:        # 停止那一刻剛好出場、還沒發通知的：算進本日
+            rn_done(T, p, rn_money(T, p, p["out"][1]))
+            T["pos"].remove(p)
+        print(f"[runt] 停止 {key}")
+        return "stop", rn_stop_lines(T, now)
+    if rn_whole(T):                                        # 整個幣種 🚦 最後一輪
+        n = sum(len(v) for v in live.values())
+        if newlast or stopped:
+            print(f"[runt] 🚦 最後一輪 {key}")
+            return "last", rn_stop_lines(T, now, last=True)
+        return "again", [rn_par(T), f"已經是最後一輪,持倉 {n} 單", "這一輪全部出場後結束策略",
+                         "BOT 不平倉,單子照自己的 SL/TP 出場"]
+    # 只停一個方向：另一個方向照常
+    if newlast:
+        print(f"[runt] 🚦 {''.join(newlast)} 最後一輪 {key}")
+    if stopped:
+        print(f"[runt] 停止 {''.join(stopped)} {key}，之後只做 {T['dir']}")
+    px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
+    L = [rn_par(T)]
+    if any_live and px is not None and T["h0"] is not None:
+        L += [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, T['tick'])}", RT_SEP] + rn_book(T, px)
+    elif any_live:
+        L.append(f"持倉 {sum(len(v) for v in live.values())} 單|未出場")
+    elif T.get("wait_until"):
+        L.append("本輪結束,等待重新埋伏中")
+    else:
+        L.append(f"埋伏中 {rt_hms(now - T['t0'])}")
+        if px is not None:
+            L += rn_wait_lines(T, px)
+    L.append(RT_SEP)
+    for x in stopped:
+        L.append(f"{x} 已停止(沒有進場" + (f",{x}0 掛單撤掉" if x in cxl else "") + ")")
+    for x in newlast:
+        L += [f"🚦{x} 最後一輪:持倉 {len(live[x])} 單,這一輪照常作戰(層單照掛)", f"{x} 全部出場後 {x} 結束"]
+    for x in again:
+        L.append(f"🚦{x} 已經是最後一輪,持倉 {len(live[x])} 單")
+    L.append(f"{T['dir']} 照常作戰,之後只做 {T['dir']}")
+    if newlast or again:
+        L.append("BOT 不平倉,單子照自己的 SL/TP 出場")
+    L += rn_pl_secs(T, px if any_live else None)
+    return ("last" if newlast else ("part" if stopped else "again")), L
+
+RN_STOP_ASK = ["📝 請輸入要停止的幣種和方向,或 all",
+               "例:WLDUSDT LS(兩邊)、WLDUSDT L(只停多)、WLDUSDT S(只停空)、all(全部幣種、兩邊)",
+               "沒有進場＝馬上停止;有進場＝🚦最後一輪(這一輪打完才結束,BOT 不平倉)"]
+RN_STOP_RETRY = "請重新輸入要停止的幣種和方向,或 all(例 WLDUSDT LS、WLDUSDT L)"
+RN_STOP_HINT = "WLDUSDT LS 或 all"
+
+def rn_stop_parse(a):
+    """v9.4：/stoprunt 幣種 方向（LS／L／S，一定要打）或 all。回傳 (幣種或 ALL, 方向, 錯誤說明)。"""
+    a = [x.strip() for x in a if x.strip()]
+    if not a:
+        return None, None, "要有幣種和方向,或 all"
+    if a[0].upper() == "ALL":
+        if len(a) > 1:
+            return None, None, "all 後面不用加方向(all＝全部幣種、兩邊)"
+        return "ALL", "LS", None
+    if len(a) == 1:
+        return None, None, f"要加方向:{a[0].upper()} LS(兩邊)、L(只停多)、S(只停空)"
+    if len(a) > 2:
+        return None, None, f"參數數量錯誤(需2個:幣種 方向,收到{len(a)}個)"
+    d = a[1].upper()
+    d = "LS" if d == "SL" else d
+    if d not in ("LS", "L", "S"):
+        return None, None, f"方向只能 LS、L、S(收到 {a[1]})"
+    return a[0].upper(), d, None
+
 async def cmd_stoprunt(u, c):
-    """沒帶參數 → 列出進行中，等你輸入幣種或 all；幣種沒在跑 → 繼續等你重打。
+    """沒帶參數 → 列出進行中，等你輸入；打錯／幣種或方向沒在跑 → 繼續等你重打。
     v9.3（1111）：沒有持倉（埋伏中、等 300 秒）→ 馬上停止；有持倉 → 🚦 最後一輪：這一輪照常作戰（層單照掛），
-    L0/S0 與全部持倉出場後「🚦 策略結束」，不再開新的一輪。BOT 永遠不平倉（1111 自己去 OKX 平倉）；再打一次也不會強制平倉。"""
+    全部出場後「🚦 策略結束」，不再開新的一輪。BOT 永遠不平倉（1111 自己去 OKX 平倉）；再打一次也不會強制平倉。
+    v9.4（1111）：/stoprunt 幣種 方向（LS 兩邊、L 只停多、S 只停空）；/stoprunt all＝全部幣種、兩邊。規則見 rn_stop_one。"""
     a = c.args or []
     if not RN:
         await reply(u, f"{E.BOT} 目前沒有進行中的 runt"); return
     run_lines = rn_running()
+    retry = lambda msg: ask(u, "stoprunt", cmd_stoprunt, "\n".join([msg, RN_STOP_RETRY] + run_lines), RN_STOP_HINT)
     if not a:
-        await ask(u, "stoprunt", cmd_stoprunt, "\n".join(["📝 請輸入要停止的幣種,或 all",
-                                                          "(有持倉的＝🚦最後一輪:這一輪打完才結束,BOT 不平倉)"]
-                                                         + run_lines + [ASK_CANCEL]),
-                  "WLDUSDT 或 all"); return
-    w = a[0].strip().upper()
+        await ask(u, "stoprunt", cmd_stoprunt, "\n".join(RN_STOP_ASK + run_lines + [ASK_CANCEL]), RN_STOP_HINT); return
+    w, sides, err = rn_stop_parse(a)
+    if err:
+        await retry(f"{E.WARN} {err}"); return
     allk = w == "ALL"
     keys = list(RN.keys()) if allk else [k for k in RN if k == w]
     if not keys:
-        await ask(u, "stoprunt", cmd_stoprunt, "\n".join([f"{E.WARN} {w} 沒有在跑 runt", "請重新輸入要停止的幣種,或 all"]
-                                                          + run_lines), "WLDUSDT 或 all"); return
-    B = []                                                 # 每個幣種一段
-    n_stop = n_last = 0
+        await retry(f"{E.WARN} {w} 沒有在跑 runt"); return
+    if not allk:
+        have = rn_dirs(RN[w])
+        if not any(x in have for x in sides):
+            await retry(f"{E.WARN} {w} 沒有在跑 {sides}(目前方向 {have})"); return
+    B, kinds = [], []                                      # 每個幣種一段
     now = time.time()
     for key in keys:
         T = RN.get(key)
         if T is None:
             continue
-        live = [p for p in T["pos"] if not p["out"]]
-        if live:                                           # 有持倉 → 🚦 最後一輪（不平倉、不撤層單）
-            n_last += 1
-            if T.get("last"):
-                B.append([rn_par(T), f"已經是最後一輪,持倉 {len(live)} 單",
-                          "這一輪全部出場後結束策略", "BOT 不平倉,單子照自己的 SL/TP 出場"])
-                continue
-            T["last"] = True
-            print(f"[runt] 🚦 最後一輪 {key}")
-            B.append(rn_stop_lines(T, now, last=True))
-            continue
-        n_stop += 1                                        # 沒有持倉 → 馬上停止
-        T["done"] = True
-        tk = T.get("task")
-        if tk:
-            tk.cancel()
-        RN.pop(key, None)
-        for p in [p for p in T["pos"] if p["out"]]:        # 停止那一刻剛好出場、還沒發通知的：算進本日
-            rn_done(T, p, rn_money(T, p, p["out"][1]))
-            T["pos"].remove(p)
-        B.append(rn_stop_lines(T, now))
+        k, L = rn_stop_one(T, sides, now)
+        kinds.append(k); B.append(L)
     rn_save()
-    if n_last and not n_stop:
+    stop_like = any(k in ("stop", "part") for k in kinds)
+    last_like = any(k in ("last", "again") for k in kinds)
+    if last_like and not stop_like:
         title = f"🚦 runt 最後一輪｜{ACCT}"
-    elif n_last:
+    elif last_like:
         title = f"🚫 runt 停止／🚦 最後一輪｜{ACCT}"
     else:
         title = f"🚫 runt {'全部停止' if allk else '停止'}｜{ACCT}"
@@ -6084,7 +6211,12 @@ async def rn_recover(app):
                 continue
             spec = await get_spec(p["sym"])
             T = rn_new(p, spec, d["chat"])
-            T["last"] = bool(d.get("last"))
+            lv = d.get("last")
+            if lv is True:                                 # v9.3 的存檔：整個幣種 🚦 → v9.4：兩個方向都停了，持倉的方向是最後一輪
+                T["dir"] = ""
+                T["last"] = rn_ls("".join(x["side"] for x in d.get("pos") or [])) or p["dir"]
+            else:
+                T["last"] = rn_ls(lv) if isinstance(lv, str) else ""
             if T["mmr"] is None:
                 T["mmr"] = await rn_mmr(spec)
             st = d.get("st") or {}
@@ -6105,6 +6237,7 @@ async def rn_recover(app):
                     pos[-1]["liq"] = rn_liq(T, pos[-1]["side"], pos[-1]["ent"], pos[-1]["lev"])
             if pos:                                        # 持倉：接著跑
                 now = time.time()
+                T["last"] = rn_ls("".join(c for c in T["last"] if any(q["side"] == c for q in pos)))   # v9.4
                 init = {k: Decimal(v) for k, v in (d.get("init") or {}).items()}
                 for q in pos:
                     if q["lvl"] == 0:
@@ -6120,13 +6253,15 @@ async def rn_recover(app):
                                   for r in d.get("rnd") or []]})
                 T["note_last"] = rt_note_base(T["h0"])
                 rn_start(app, T)
-                names.append(f"{rn_par(T)}|持倉 {len(pos)} 單" + (f"|掛單 {len(T['ords'])} 張" if T["ords"] else ""))
+                names.append(f"{rn_par(T)}|持倉 {len(pos)} 單" + (f"|掛單 {len(T['ords'])} 張" if T["ords"] else "")
+                             + (f"|🚦{T['last']} 最後一輪" if T["last"] and not rn_whole(T) else ""))
                 continue
             if d.get("rnd"):                               # 這一輪其實已經全部出場（還沒來得及發本輪結束）
                 T["st"]["r"] += 1
-            if T["last"]:                                  # v9.3：🚦 最後一輪已經全部出場 → 策略結束，不再恢復
+            if rn_whole(T):                                # v9.3：🚦 最後一輪已經全部出場 → 策略結束，不再恢復
                 names.append(f"🚦{T['sym']} 最後一輪已全部出場,策略結束")
                 continue
+            T["last"] = ""                                 # v9.4：單向 🚦 已經全部出場 → 那個方向結束，另一個方向照常
             if d.get("wait_until") and float(d["wait_until"]) > time.time():   # 本輪結束後的 300 秒還沒等完：等完剩下的
                 T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "wait_until": float(d["wait_until"]), "nxt": 0.0})
                 rn_start(app, T)
@@ -6203,7 +6338,8 @@ async def cmd_menu(u, c):
         "損益 % 照 OKX 收益率（÷保證金）；毛利率＝價格漲跌%。強平照 OKX 逐倉預估強平價模擬（損失整筆保證金）。"
         "損益分持倉中／本日已實現（L、S 分開，台灣時間換日）；資金費照 OKX 費率模擬計入\n"
         "　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX 1U 0.5%　｜可同時跑多個幣種｜同幣種只能一組\n"
-        "/stoprunt 幣種｜all　沒有持倉＝馬上停止；有持倉＝🚦最後一輪（這一輪照常作戰，全部出場後策略結束，BOT 不平倉）\n"
+        "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
+        "沒有進場＝馬上停止；有進場＝🚦最後一輪（這一輪照常作戰，全部出場後那個方向結束，BOT 不平倉）；停一邊，另一邊照常\n"
         "/tf 查看/設定週期\n/coins 幣種\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
