@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v8.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v8.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -3542,7 +3542,14 @@ def battle_lines(recs, ts):
 
 
 async def cmd_summary(u, c):
-    """總表一頁 → 每個「幣種＋方向」各一頁。多幣種時才分得清誰賺誰賠。"""
+    """v8.7（1111）：/summary 改成統計 /runt 的本日損益（總表＋分幣種）。原本 /run 的戰報留在 cmd_summary_run（將來移回 /run 再用）。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    for m in await rn_sum_msgs(rn_today()):
+        await reply(u, "\n".join(m))
+
+
+async def cmd_summary_run(u, c):
+    """（/run 用，v8.7 起沒有掛指令）總表一頁 → 每個「幣種＋方向」各一頁。多幣種時才分得清誰賺誰賠。"""
     t = today8(); recs = load_trades(t)
     ts = {k: v for k, v in STATS.items() if str(v.get("date")) == str(t)}
 
@@ -4871,7 +4878,9 @@ async def rt_recover(app):
 #        SL、TP 送出後過 RT_LAT 才生效；生效後逐筆成交價碰到就出場，出場價＝那一筆成交價（含滑價）。往虧損走就一直抱著。
 #   ④ 初始單出場 → 撤掉這一邊還沒成交的層單；已持倉的層單照自己的 SL/TP 走完；全部出場 → 本輪結束
 #      → 等 60 秒（v8.1）→ 用現價重新來過。
-#   ⑤ 通知（v8.6，1111）：有事件發生才通知——進場成交、出場通知、本輪結束、資金費結算、00:00 本日結算。
+#   ⑤ 通知（v8.6，1111）：有事件發生才通知——進場成交、出場通知、本輪結束、資金費結算。
+#      v8.7：00:00 每個幣種的本日結算拿掉，改成 00:00 自動發前一天完整的 /summary（總表＋分幣種）；
+#      每一張出場記一行到 runtlog_{ACCT}.jsonl（/summary 出場統計用，保留 30 天）。
 #      不再每個 /tf 發持倉通知／埋伏通知；/status 隨時看（持倉中＝持倉通知、埋伏中＝埋伏通知的內容，
 #      都有資金費率兩行，/status 當下向 OKX 查，v8.5）。/test1 的埋伏通知不變（照 /tf）。
 #      L0/S0 掛上去之後不改價、不重掛，等到一邊成交（1111 2026-10-05：維持現狀）。
@@ -4898,6 +4907,7 @@ RN_FUND_PRE = 15              #            結算前 15 秒內再查一次，拿
 RN_FILE    = f"/srv/1111bot/data/runtlayer_{ACCT}.json"   # 不可用 runt_{ACCT}.json（那是 v7.2 撤單保險會讀的檔）
 RN_DAY_FILE = f"/srv/1111bot/data/runtday_{ACCT}.json"    # 本日已實現（同幣種同方向，v8.2）
 RN_DAY_KEEP = 30               # 保留最近 30 天
+RN_LOG_FILE = f"/srv/1111bot/data/runtlog_{ACCT}.jsonl"   # v8.7：每一張出場一行（/summary 出場統計、日後數據分析），保留 30 天
 RN_DAY = {}                    # 日期 -> 幣種 -> L/S -> 損益累計
 RN = {}                        # 幣種 -> 參數＋狀態（見 rn_new）
 RN_SL_WAIT = "SL 未設(毛利率 >0.20% 才設)"
@@ -5022,14 +5032,19 @@ def rn_done(T, p, m):
     T["st"]["u"] += m["netu"]
     T["st"]["gu"] += m["gu"]
     rn_acc_add(rn_day(T["sym"], p["side"], rn_today(p["out"][0])), m)
+    rn_log_add(T, p, m)
     T["rnd"].append({"side": p["side"], "lvl": p["lvl"], "ent": p["ent"], "t_in": p["t_in"],
                      "t_out": p["out"][0], "net": m["net"], "netu": m["netu"], "gu": m["gu"], "fu": m["fu"], "why": p["out"][2]})
 
-def rn_pl(title, a):
+def rn_pl(title, a, fee=False):
     """損益一段：標題＋毛損益、淨損益（% 與 U 各自對齊）。a＝rn_acc 格式的合計。
     v8.4（1111）：% 與 U 都是各單直接相加（原本 % 是 ÷ 名目價值合計＝平均，兩單 0.16%、0.12% 會顯示 0.14%）。
-    有結算過資金費（fn > 0）才多一行資金費（＋收、−付；淨損益已含）。"""
-    rows = [("毛損益", a["gp"], a["gu"])] + ([("資金費", a["fp"], a["fu"])] if a["fn"] else []) + [("淨損益", a["np"], a["u"])]
+    有結算過資金費、而且取整後不是 0 才多一行資金費（＋收、−付；淨損益已含；v8.7：+0.00%|+0.0000U 不列）。
+    fee＝多一行手續費（/summary 全部合計用；＝毛損益＋資金費−淨損益）。"""
+    fd = a["fn"] and (rn_q2(a["fp"]) != 0 or rn_q4(a["fu"]) != 0)
+    rows = ([("毛損益", a["gp"], a["gu"])]
+            + ([("手續費", a["np"] - a["gp"] - a["fp"], a["u"] - a["gu"] - a["fu"])] if fee else [])
+            + ([("資金費", a["fp"], a["fu"])] if fd else []) + [("淨損益", a["np"], a["u"])])
     x = rn_pad([rn_sp(r[1]) for r in rows])
     y = rn_pad([rn_su(r[2]) for r in rows])
     return [title] + [f"{r[0]} {p}|{q}" for r, p, q in zip(rows, x, y)]
@@ -5058,21 +5073,117 @@ def rn_pl_secs(T, px, sides=("L", "S")):
             L += [RT_SEP] + x
     return L
 
-def rn_day_lines(T, d):
-    """本日結算（台灣時間 00:00 換日時發前一天的）。"""
-    L = [f"📅 本日結算 {rn_head(T)}", f"{d[5:7]}/{d[8:10]} 00:00~24:00"]
-    day = (RN_DAY.get(d) or {}).get(T["sym"]) or {}
-    for s in ("L", "S"):
-        a = day.get(s)
-        if a and a["n"]:
-            L += [RT_SEP] + rn_pl(f"{s} 本日已實現 {a['n']}單", a)
-    if not any((day.get(s) or {}).get("n") for s in ("L", "S")):
-        L += [RT_SEP, "本日沒有出場的單"]
-    live = [p for p in T["pos"] if not p["out"]]
-    if live:
-        L += [RT_SEP, f"持倉中 {len(live)}單 跨日繼續,出場時算在出場那一天"]
-    L.append(f"時間:{hhmmss()}")
-    return L
+def rn_log_add(T, p, m):
+    """v8.7：一張出場記一行（JSON），/summary 的出場統計用，也留給 1111 做數據分析。"""
+    try:
+        t_in, (t_out, px, why) = p["t_in"], p["out"]
+        r = {"d": rn_today(t_out), "sym": T["sym"], "side": p["side"], "lvl": p["lvl"], "lev": str(T["lev"]), "amt": str(T["amt"]),
+             "ent": str(p["ent"]), "px": str(px), "t_in": round(t_in, 3), "t_out": round(t_out, 3), "hold": round(t_out - t_in, 1),
+             "why": why, "n_mv": p["n_mv"], "mfe": str(rn_q2(p["mfe"])), "mae": str(rn_q2(p["mae"])),
+             "gp": str(rn_q2(m["g"])), "np": str(rn_q2(m["net"])), "fp": str(rn_q2(m["fund"])),
+             "gu": str(rn_q4(m["gu"])), "u": str(rn_q4(m["netu"])), "fu": str(rn_q4(m["fu"])), "fn": m["fn"]}
+        with open(RN_LOG_FILE, "a") as f:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print("[runt] log fail", e)
+
+def rn_log_read(d):
+    """v8.7：讀某一天（台灣時間）的逐單出場紀錄。"""
+    out = []
+    try:
+        if os.path.exists(RN_LOG_FILE):
+            with open(RN_LOG_FILE) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("d") == d:
+                        out.append(r)
+    except Exception as e:
+        print("[runt] log read fail", e)
+    return out
+
+def rn_log_prune():
+    """v8.7：bot 重開時只留最近 30 天的逐單紀錄。"""
+    try:
+        if not os.path.exists(RN_LOG_FILE):
+            return
+        keep = (now8() - timedelta(days=RN_DAY_KEEP)).strftime("%Y-%m-%d")
+        with open(RN_LOG_FILE) as f:
+            lines = [x for x in f if x.strip() and (json.loads(x).get("d") or "") >= keep]
+        tmp = RN_LOG_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp, RN_LOG_FILE)
+    except Exception as e:
+        print("[runt] log prune fail", e)
+
+async def rn_sum_msgs(d, full=False):
+    """v8.7 /summary（1111 定案）：第一則總表、第二則分幣種。d＝台灣時間的日期；full＝00:00 自動發前一天完整 24 小時。
+    已實現＝本日記錄（RN_DAY）；持倉中＝現在還抱著的單用現價算（假設現在市價平倉）；出場統計＝逐單紀錄（runtlog）。
+    什麼都沒有：full＝不發（回傳 []）；手動 /summary＝回一則「本日沒有出場的單,也沒有持倉」。"""
+    day = RN_DAY.get(d) or {}
+    hold = {}                                                # (幣種, L/S) -> rn_acc
+    for T in list(RN.values()):
+        live = [p for p in T["pos"] if not p["out"]]
+        if not live:
+            continue
+        px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
+        if px is None:
+            try:
+                px = await get_last(T["iid"])
+            except Exception:
+                continue
+        for p in live:
+            rn_acc_add(hold.setdefault((T["sym"], p["side"]), rn_acc()), rn_money(T, p, px))
+    def tot(accs):
+        a = rn_acc()
+        for x in accs:
+            for k in a:
+                a[k] += x[k]
+        return a
+    R = tot([a for v in day.values() for a in v.values()])
+    H = tot(hold.values())
+    recs = rn_log_read(d)
+    span = f"{d[5:7]}/{d[8:10]} 00:00~{'24:00' if full else hhmmss()[:5]}(台灣時間)"
+    head = [f"📊 summary｜{ACCT}", span]
+    foot = [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]
+    if not R["n"] and not H["n"]:
+        return [] if full else [head + [RT_SEP, "本日沒有出場的單,也沒有持倉"] + foot]
+    L = head + [RT_SEP, "全部合計"]
+    if R["n"]:
+        L += rn_pl(f"已實現 {R['n']}單", R, fee=True)
+    if H["n"]:
+        L += rn_pl(f"持倉中 {H['n']}單(未實現)", H)
+        L += [f"{'24:00' if full else '現在'}全部平倉試算", f"淨損益 {rn_sp(R['np'] + H['np'])}|{rn_su(R['u'] + H['u'])}"]
+    if recs:
+        why = {w: sum(1 for r in recs if r.get("why") == w) for w in ("SL", "SL(移動)", "TP")}
+        avg = sum(float(r.get("hold") or 0) for r in recs) / len(recs)
+        key = lambda r: (Decimal(r.get("np") or "0"), Decimal(r.get("u") or "0"))
+        b, w = max(recs, key=key), min(recs, key=key)
+        one = lambda r: f"{r['sym']} {r['side']}{r['lvl']} {rn_sp(Decimal(r['np']))}|{rn_su(Decimal(r['u']))}"
+        L += [RT_SEP, f"出場統計({len(recs)}單)",
+              "出場原因 " + "|".join(f"{k} {v}" for k, v in why.items()),
+              f"平均持倉 {rt_hold_str(avg)}",
+              f"最好 {one(b)}", f"最差 {one(w)}"]
+    if len(recs) < R["n"]:
+        L.append(f"(另有 {R['n'] - len(recs)} 單是 v8.7 以前出場,沒有逐單紀錄)")
+    L += foot
+    M = [f"📊 summary｜{ACCT} 分幣種", span]
+    syms = set(day) | {k[0] for k in hold}
+    net = lambda sym: sum((a["u"] for a in (day.get(sym) or {}).values()), Decimal(0))
+    for sym in sorted(syms, key=lambda x: (-net(x), x)):
+        M += [RT_SEP, sym]
+        for side in ("L", "S"):
+            h = hold.get((sym, side))
+            if h:
+                M += rn_pl(f"{side} 持倉中 {h['n']}單(未實現)", h)
+            a = (day.get(sym) or {}).get(side)
+            if a and a["n"]:
+                M += rn_pl(f"{side} 本日已實現 {a['n']}單", a)
+    M += foot
+    return [L, M]
 
 def rn_day_save():
     try:
@@ -5499,11 +5610,7 @@ async def rn_worker(app, key):
             T["ev"].clear()
             if not on():
                 return
-            d = rn_today()
-            if d != T.get("day"):                          # 台灣時間 00:00 換日 → 發前一天的本日結算（v8.2）
-                old, T["day"] = T.get("day"), d
-                if old:
-                    send("\n".join(rn_day_lines(T, old)))
+            # v8.7（1111）：00:00 不再發每個幣種的本日結算，改成 00:00 自動發前一天完整的 /summary。
             if T.get("wait_until"):                        # 本輪結束後等 60 秒（v8.1）
                 if time.time() < T["wait_until"]:
                     T["nxt"] = min(T["wait_until"], time.time() + 1.0)
@@ -5765,6 +5872,7 @@ async def rn_recover(app):
     """重開後恢復：持倉、層單掛單接著跑（關機期間沒有看盤）；埋伏中的用重開當下的現價重新來過。
     v7.6 的存檔（沒有初始埋伏點、沒有層單）也認得：埋伏點當 0.2%，持倉當初始單。"""
     rn_day_load()                                      # 本日已實現（v8.2）
+    rn_log_prune()                                     # 逐單出場紀錄只留 30 天（v8.7）
     try:
         if not os.path.exists(RN_FILE):
             return
@@ -5875,7 +5983,7 @@ async def cmd_menu(u, c):
         "/run 商品 方向 槓桿 保證金 A單埋伏% 兩單間距% 緊貼度% TP% SL%\n"
         f"例：/run WIFUSDT S 1x 1 1.2 0.25 0.15 6 0.8\n週期依 /tf（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 商品　停指定幣種\n/stop all　停全部+清殘單\n"
-        "/status 所有策略現況\n/summary 總表＋分幣種/方向戰報\n"
+        "/status 所有策略現況\n/summary 本日 /runt 戰報（總表＋分幣種）；每天 00:00 自動發前一天的\n"
         "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
         "/amp　全部幣種K線振幅分析（依 /tf；1m/3m看7天、5m/10m看14天、15m/30m看30天；照 /coins 順序一頁一個）\n"
         "/test1 商品 埋伏% 每秒次數(1～4)\n"
@@ -6022,8 +6130,13 @@ class _U:
     def __init__(self, app, chat): self.message = _M(app, chat)
 
 async def job_summary(ctx):
-    if not CHAT_ID: return
-    try: await cmd_summary(_U(ctx.application, CHAT_ID), ctx)
+    """v8.7（1111）：每天台灣時間 00:00 自動發前一天完整 24 小時的 /summary（/runt）；前一天什麼都沒有就不發。"""
+    chat = CHAT_ID or next((T["chat"] for T in RN.values()), None)
+    if not chat: return
+    d = (now8() - timedelta(minutes=5)).strftime("%Y-%m-%d")
+    try:
+        for m in await rn_sum_msgs(d, full=True):
+            await ctx.bot.send_message(chat, "\n".join(m))
     except Exception as e: print("auto summary fail", e)
 
 # ---------- 啟動 ----------
@@ -6031,7 +6144,7 @@ async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
     CMDS = [BotCommand("status", "現況"),
-            BotCommand("summary", "當日戰報"),
+            BotCommand("summary", "本日戰報（runt）"),
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
             BotCommand("coins", "幣種"),
             BotCommand("amp", "振幅分析（全部幣種，依/tf看7～30天）"),
@@ -6061,9 +6174,9 @@ async def _post_init(app):
     try:
         jq = app.job_queue
         if jq:
-            t2359 = datetime.strptime("23:59", "%H:%M").time().replace(tzinfo=TZ8)
-            jq.run_daily(job_summary, time=t2359, name="daily_summary")
-            print("已排程：每日 23:59 自動 /summary")
+            t0010 = datetime.strptime("00:00:10", "%H:%M:%S").time().replace(tzinfo=TZ8)   # v8.7：00:00 發前一天完整的
+            jq.run_daily(job_summary, time=t0010, name="daily_summary")
+            print("已排程：每日 00:00 自動 /summary（前一天）")
     except Exception as e:
         print("schedule fail", e)
     asyncio.create_task(frame_mover(app))
