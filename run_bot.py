@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v9.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v9.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4283,6 +4283,9 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v9.9（1111 2026-10-06）：浮動槓桿加 YX（L0 2X、L1 4X…L9 20X）、ZX（L0 5X、L1 10X…L9 50X），幣種最高槓桿要 ≥20X／≥50X 才能用；
+#     T["xx"]＝倍數（0 固定、1 XX、2 YX、5 ZX；舊存檔 true＝XX）。ZX 照做法 A，L7（40X）成交後再跌約 0.36% 就整個方向強平，L8、L9 碰不到（1111 知道）。
+#     /coins 改成 幣種｜最小保證金(1X)｜最大槓桿。
 #   v9.8（1111 2026-10-05）：照 OKX 逐倉的「合倉」算（同幣種同方向＝一組，風險、保證金、強平都合起來算）：
 #     做法 A（OKX 還沒實測，先這樣算）：XX 每加一層，整個方向改成那一層的槓桿（只往上），合倉保證金＝倉位合計÷目前槓桿；
 #     預估強平價用合倉算，碰到 → 整個方向一起強平，損失全部合倉保證金（按倉位大小分攤到每一單），合成一則「強平通知」。
@@ -4413,11 +4416,12 @@ def rn_groups():
     return sorted(RN.values(), key=lambda T: (first[T["sym"]], T["dir"]))
 
 def rn_lev(T, lvl):
-    """v9.3：這一層的槓桿。XX＝第 n 層 n+1 倍（L0 1X、L1 2X…L9 10X）；否則每一層一樣。每一層保證金都一樣。"""
-    return Decimal(lvl + 1) if T.get("xx") else T["lev"]
+    """v9.3：這一層的槓桿。XX＝第 n 層 n+1 倍（L0 1X、L1 2X…L9 10X）；否則每一層一樣。每一層保證金都一樣。
+    v9.9：YX＝2 倍（L0 2X…L9 20X）、ZX＝5 倍（L0 5X…L9 50X）。T["xx"]＝倍數（0＝固定槓桿）。"""
+    return Decimal(lvl + 1) * int(T["xx"]) if T.get("xx") else T["lev"]
 
 def rn_levs(T):
-    return "XX" if T.get("xx") else f"{pct(T['lev'])}X"
+    return RN_XNAME.get(int(T["xx"]), "XX") if T.get("xx") else f"{pct(T['lev'])}X"
 
 def rn_plev(T, p):
     return p.get("lev") or rn_lev(T, p["lvl"])
@@ -4950,7 +4954,7 @@ def rn_new(p, spec, chat):
     return {**p, "key": rn_key(p["sym"], p["dir"]), "chat": chat, "iid": spec["iid"], "tick": spec["tick"],
             "ev": asyncio.Event(), "done": False, "rest_t": 0.0, "save_t": time.time() + RT_SAVE_SEC,
             "pos": [], "legs": {}, "ords": [], "rnd": [], "init": {}, "h0": None, "cxl_due": None, "px_last": None,
-            "wait_until": None, "last": False, "dir": p["dir"], "xx": p.get("xx", False), "mmr": p.get("mmr"),
+            "wait_until": None, "last": False, "dir": p["dir"], "xx": int(p.get("xx") or 0), "mmr": p.get("mmr"),
             "st": {"r": 0, "n": 0, "u": Decimal(0), "gu": Decimal(0)}, "day": rn_today(),
             "fund": {"t": None, "rate": None, "q": 0.0, "qt": 0.0, "last": None, "busy": False}}
 
@@ -5259,7 +5263,7 @@ def rn_save():
                     "mfe": str(p["mfe"]), "mae": str(p["mae"]), "fu": str(p.get("fu", 0)), "fn": p.get("fn", 0),
                     "lev": s(p.get("lev")), "liq": s(p.get("liq"))}
         data = [{"v": 77, "sym": T["sym"], "lev": str(T["lev"]), "amt": str(T["amt"]), "off": str(T["off"]),
-                 "dir": T.get("dir", "LS"), "xx": bool(T.get("xx")), "mmr": s(T.get("mmr")), "last": bool(T.get("last")), "grp": 1, "lev_now": s(T.get("lev_now")),
+                 "dir": T.get("dir", "LS"), "xx": int(T.get("xx") or 0), "mmr": s(T.get("mmr")), "last": bool(T.get("last")), "grp": 1, "lev_now": s(T.get("lev_now")),
                  "chat": T["chat"], "t0": T["t0"], "px0": str(T["px0"]), "h0": T["h0"], "wait_until": T.get("wait_until"),
                  "init": {k: str(v) for k, v in T["init"].items()},
                  "pos": [P(p) for p in T["pos"] if not p["out"]],
@@ -5469,11 +5473,13 @@ RN_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"
           "幣種 方向 槓桿 保證金 初始埋伏點%\n"
           "例:WLDUSDT LS 1X 1U 0.5%\n"
           "方向:LS 兩邊(各自一組)、L 只做多、S 只做空\n"
-          "槓桿:1X～100X 每一層一樣;XX＝L0 1X、L1 2X…L9 10X\n"
+          "槓桿:1X～100X 每一層一樣;XX＝L0 1X…L9 10X;YX＝L0 2X…L9 20X;ZX＝L0 5X…L9 50X\n"
           "槓桿要加 X,保證金要加 U,埋伏點要加 %")
 RN_RETRY = "請重新輸入 /runt 參數:\n幣種 方向 槓桿 保證金 初始埋伏點%\n例:WLDUSDT LS 1X 1U 0.5%"
 RN_HINT = "WLDUSDT LS 1X 1U 0.5%"
 RN_XX_MIN = Decimal(RN_NLV + 1)              # v9.3：XX 最深一層 L9＝10X，幣種最高槓桿要 ≥10X
+RN_XMUL = {"XX": 1, "YX": 2, "ZX": 5}         # v9.9（1111）：浮動槓桿 第 n 層＝(n+1)×倍數；L9 要 10×倍數（XX 10X、YX 20X、ZX 50X）
+RN_XNAME = {v: k for k, v in RN_XMUL.items()}
 
 def rn_parse(a):
     """解析 5 個參數（v9.3：幣種 方向 槓桿 保證金 初始埋伏點%）。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
@@ -5490,13 +5496,14 @@ def rn_parse(a):
         p["dir"] = d
     else:
         return None, f"方向只能 LS、L、S(收到 {a[1]})"
-    if a[2].upper() == "XX":
-        p["xx"], p["lev"] = True, RN_XX_MIN
+    if a[2].upper() in RN_XMUL:                            # v9.9：XX／YX／ZX
+        p["xx"] = RN_XMUL[a[2].upper()]
+        p["lev"] = RN_XX_MIN * p["xx"]                     # L9 的槓桿（幣種最高槓桿要夠）
     else:
         m = re.fullmatch(r"(\d+(?:\.\d+)?)[xX]", a[2])
         if not m:
-            return None, "槓桿要加 X(例 1X),或 XX"
-        p["xx"], p["lev"] = False, Decimal(m.group(1))
+            return None, "槓桿要加 X(例 1X),或 XX、YX、ZX"
+        p["xx"], p["lev"] = 0, Decimal(m.group(1))
         if p["lev"] < 1:
             return None, "槓桿不可小於 1X"
         if p["lev"] > 100:
@@ -5546,9 +5553,10 @@ async def cmd_runt(u, c):
         spec = await get_spec(sym)
     except Exception:
         await retry(f"{E.LOSS} 找不到幣種 {sym}"); return
-    if p["xx"] and spec["maxlev"] < RN_XX_MIN:            # v9.3：XX 到 L9 要 10X
+    if p["xx"] and spec["maxlev"] < p["lev"]:             # v9.3：XX 到 L9 要 10X；v9.9：YX 20X、ZX 50X
+        nm = RN_XNAME[p["xx"]]
         await retry(f"{E.WARN} {sym} 槓桿最高 {pct(spec['maxlev'])}X\n"
-                    f"XX 最深一層 L9 要 {pct(RN_XX_MIN)}X,這個幣種不能用 XX"); return
+                    f"{nm} 最深一層 L9 要 {pct(p['lev'])}X,這個幣種不能用 {nm}"); return
     if not p["xx"] and p["lev"] > spec["maxlev"]:
         await retry(f"{E.WARN} {sym} 槓桿最高 {pct(spec['maxlev'])}X"); return
     tick = spec["tick"]
@@ -5709,7 +5717,7 @@ async def rn_recover(app):
             chat0 = chat0 or d.get("chat")
             sym = d["sym"]
             base = {"sym": sym, "lev": Decimal(d["lev"]), "amt": Decimal(d["amt"]), "off": Decimal(d.get("off", "0.2")),
-                    "xx": bool(d.get("xx")), "mmr": D(d.get("mmr"))}
+                    "xx": int(d.get("xx") or 0), "mmr": D(d.get("mmr"))}   # v9.9：倍數（舊存檔 true＝XX）
             dsv, lv = d.get("dir", "LS") or "", d.get("last")
             pos_sides = rn_ls("".join(x["side"] for x in d.get("pos") or []))
             if d.get("grp"):                               # v9.6 的存檔：一筆＝一組（幣種＋方向）
@@ -5839,12 +5847,12 @@ async def fng_lines():
 async def cmd_coins(u, c):
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
     on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
-    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
+    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━", "幣種｜最小保證金(1X)｜最大槓桿"]
     for sym in on:
         try:
             sp = await get_spec(sym); last = await get_last(sp["iid"])
-            mm = sp["minsz"] * sp["ctval"] * last
-            L.append(f"{sym}｜最小{sp['minsz']}張｜{mm:.4f}U")
+            mm = sp["minsz"] * sp["ctval"] * last          # 最小下單量的價值＝1X 的最小保證金（nX 時 ÷n）
+            L.append(f"{sym}｜{mm:.4f}U｜{pct(sp['maxlev'])}X")   # v9.9（1111）
         except Exception:
             L.append(f"{sym}｜查詢失敗")
     L += ["━━━━━━━━━━"] + await fng + ["━━━━━━━━━━", f"時間：{hhmmss()}"]
@@ -5871,17 +5879,17 @@ async def cmd_menu(u, c):
         "/status 所有策略現況\n/summary 本日 /runt 戰報（總表＋分幣種）；每天 00:00 自動發前一天的\n"
         "/price 幣種　價格階梯（只查價，不掛單）：S9～S0／現價／L0～L9，每一層離上一層 0.5%\n"
         "/runt 幣種 方向 槓桿 保證金 初始埋伏點%\n"
-        "　方向：LS 兩邊｜L 只做多｜S 只做空。槓桿：1X～100X 每一層一樣｜XX＝L0 1X、L1 2X…L9 10X（每一層保證金一樣，幣種最高槓桿要 ≥10X）\n"
+        "　方向：LS 兩邊｜L 只做多｜S 只做空。槓桿：1X～100X 每一層一樣｜XX＝L0 1X…L9 10X｜YX＝L0 2X…L9 20X｜ZX＝L0 5X…L9 50X（每一層保證金一樣，幣種最高槓桿要夠 L9）\n"
         "　L、S 各自一組、完全獨立（LS＝一次開兩組，同參數）。佈局（模擬，不下單）：初始單 L0（現價下方）／S0（現價上方）「初始埋伏點%」限價埋伏，不改價。"
         "L0/S0 虧損就掛同方向 L1/S1，L1/S1 也虧損就掛 L2/S2…最多 L9/S9；每一層離上一層 0.5%。"
         "每一單最高毛利率 >0.20% SL 先卡 +0.10%；>0.30% 框架形成：SL＝最高−0.20%、TP＝最高+0.15%，之後一起往獲利移動；某一層出場撤掉比它深的掛單，L0/S0 出場撤掉沒成交的單，全部出場後等 300 秒重新來過（有事件才通知，狀態用 /status 看）。"
         "損益 % ＝ U ÷ 每單保證金（可以相加）；毛利率＝價格漲跌%。持倉中多列 OKX 合倉（同幣種同方向合起來：倉位、均價、槓桿、保證金、收益率、預估強平價）；"
-        "XX 每加一層整個方向改成那一層的槓桿；碰到合倉預估強平價＝整個方向一起強平、損失合倉保證金（合成一則強平通知）。"
+        "XX／YX／ZX 每加一層整個方向改成那一層的槓桿；碰到合倉預估強平價＝整個方向一起強平、損失合倉保證金（合成一則強平通知）。"
         "損益分持倉中／本日已實現（L、S 分開，台灣時間換日）；資金費照 OKX 費率模擬計入\n"
-        "　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
+        "　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX 1U 0.5%、/runt WLDUSDT S YX 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
         "沒有進場＝馬上停止；有進場＝🚦最後一輪（這一輪照常作戰，全部出場後那一組結束，BOT 不平倉）；停一邊，另一邊照常\n"
-        "/tf 查看/設定週期\n/coins 幣種清單＋恐懼貪婪指數(近7天)\n"
+        "/tf 查看/設定週期\n/coins 幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
         "兩單都成交時完全對沖，損益鎖死=-間距，與價格無關；\n"
