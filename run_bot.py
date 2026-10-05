@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v9.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v9.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4882,13 +4882,14 @@ async def rt_recover(app):
 #        價格已經回落、離 0.10% 不到 1 跳時，這次不設（不動），等下一次。
 #        SL、TP 送出後過 RT_LAT 才生效；生效後逐筆成交價碰到就出場，出場價＝那一筆成交價（含滑價）。往虧損走就一直抱著。
 #   ④ 初始單出場 → 撤掉這一邊還沒成交的層單；已持倉的層單照自己的 SL/TP 走完；全部出場 → 本輪結束
-#      → 等 60 秒（v8.1）→ 用現價重新來過。
+#      → 等 300 秒（v9.2；v8.1～v9.1 是 60 秒）→ 用現價重新來過。
 #   ⑤ 通知（v8.6，1111）：有事件發生才通知——進場成交、出場通知、本輪結束、資金費結算。
 #      v8.7：00:00 每個幣種的本日結算拿掉，改成 00:00 自動發前一天完整的 /summary（總表＋分幣種）；
 #      每一張出場記一行到 runtlog_{ACCT}.jsonl（/summary 出場統計用，保留 30 天）。
 #      v8.8：出場統計的「最差」改成「最深套住」；拿掉「另有 N 單…」備註。
 #      v8.9：持倉中下面加「套牢明細」；「最差」＝套牢明細裡淨損益最低的那一單（跟最好同格式）；段落之間空一行。
 #      v9.1：出場通知也加「套牢明細」（同幣種同方向），持倉中／本日已實現／套牢明細之間空一行，拿掉最後一行「(L0還在,繼續)」。
+#      v9.2：所有損益段落都列手續費（毛損益／手續費／資金費／淨損益）；淨損益＝畫面上的毛損益−手續費＋資金費；本輪結束後等 300 秒。
 #      不再每個 /tf 發持倉通知／埋伏通知；/status 隨時看（持倉中＝持倉通知、埋伏中＝埋伏通知的內容，
 #      都有資金費率兩行，/status 當下向 OKX 查，v8.5）。/test1 的埋伏通知不變（照 /tf）。
 #      L0/S0 掛上去之後不改價、不重掛，等到一邊成交（1111 2026-10-05：維持現狀）。
@@ -4906,7 +4907,7 @@ RN_SL_MIN  = Decimal("0.10")   # 保本點的 SL 位置 +0.10%（也是 SL 最�
 RN_BOX     = Decimal("0.30")   # v9.0 框架點：最高毛利率 > 0.30% → 框架形成（1111：吃不到大行情再調遠這個）
 RN_SL_GAP  = Decimal("0.20")   # 框架：SL＝最高毛利率 −0.20%（v8.1～v8.9 是 −0.10%）
 RN_TP_GAP  = Decimal("0.20")   # 框架：TP＝最高毛利率 +0.20%（框寬 0.40%）
-RN_WAIT    = 60                # 本輪結束後等 60 秒才重新取價埋伏（v8.1）
+RN_WAIT    = 300               # 本輪結束後等 300 秒才重新取價埋伏（v9.2，1111；v8.1～v9.1 是 60 秒）
 RN_NLV     = 9                 # 9 層：L1～L9／S1～S9
 RN_LV_STEP = Decimal("0.5")    # v8.2：每一層離上一層的價格 0.5%（L 往下、S 往上；往離現價遠的方向取 tick）
 RN_FEE_IN  = Decimal("0.02")   # 手續費 0.07%＝限價進場 0.02%
@@ -4997,9 +4998,12 @@ def rn_money(T, p, px):
     gross_u = p["qty"] * ((px - p["ent"]) if p["side"] == "L" else (p["ent"] - px))
     fee_u = notional * RN_FEE_IN / 100 + p["qty"] * px * RN_FEE_OUT / 100
     fu = p.get("fu", Decimal(0))                           # v8.2 資金費（＋收、−付），已在每次結算時記到這一單
-    net_u = gross_u - fee_u + fu
-    return {"g": rn_g(p["side"], p["ent"], px), "fee": fee_u / notional * 100, "net": net_u / notional * 100,
-            "gu": gross_u, "feeu": fee_u, "netu": net_u, "fu": fu, "fund": fu / notional * 100, "fn": p.get("fn", 0)}
+    # v9.2（1111）：毛損益、手續費、資金費先照畫面取整（% 到 0.01、U 到 0.0001），淨損益＝毛損益−手續費＋資金費，
+    # 畫面上每一段自己加都對得上（原本各自四捨五入，會出現 0.72%−0.07%＝0.64% 的情況）。
+    g, fee, fund = rn_q2(rn_g(p["side"], p["ent"], px)), rn_q2(fee_u / notional * 100), rn_q2(fu / notional * 100)
+    gu, feeu, fuq = rn_q4(gross_u), rn_q4(fee_u), rn_q4(fu)
+    return {"g": g, "fee": fee, "net": g - fee + fund, "gu": gu, "feeu": feeu, "netu": gu - feeu + fuq,
+            "fu": fuq, "fund": fund, "fn": p.get("fn", 0)}
 
 def rn_acc():
     """一組損益合計（v8.4，1111：合計＝各單相加，例 0.16%＋0.12%＝0.28%）：
@@ -5045,11 +5049,11 @@ def rn_done(T, p, m):
     T["rnd"].append({"side": p["side"], "lvl": p["lvl"], "ent": p["ent"], "t_in": p["t_in"],
                      "t_out": p["out"][0], "net": m["net"], "netu": m["netu"], "gu": m["gu"], "fu": m["fu"], "why": p["out"][2]})
 
-def rn_pl(title, a, fee=False):
+def rn_pl(title, a, fee=True):
     """損益一段：標題＋毛損益、淨損益（% 與 U 各自對齊）。a＝rn_acc 格式的合計。
     v8.4（1111）：% 與 U 都是各單直接相加（原本 % 是 ÷ 名目價值合計＝平均，兩單 0.16%、0.12% 會顯示 0.14%）。
     有結算過資金費、而且取整後不是 0 才多一行資金費（＋收、−付；淨損益已含；v8.7：+0.00%|+0.0000U 不列）。
-    fee＝多一行手續費（/summary 全部合計用；＝毛損益＋資金費−淨損益）。"""
+    fee＝手續費一行（＝淨損益−毛損益−資金費）；v9.2（1111）：所有段落都列手續費，順序 毛損益／手續費／資金費／淨損益。"""
     fd = a["fn"] and (rn_q2(a["fp"]) != 0 or rn_q4(a["fu"]) != 0)
     rows = ([("毛損益", a["gp"], a["gu"])]
             + ([("手續費", a["np"] - a["gp"] - a["fp"], a["u"] - a["gu"] - a["fu"])] if fee else [])
@@ -5659,7 +5663,7 @@ async def rn_worker(app, key):
             if not on():
                 return
             # v8.7（1111）：00:00 不再發每個幣種的本日結算，改成 00:00 自動發前一天完整的 /summary。
-            if T.get("wait_until"):                        # 本輪結束後等 60 秒（v8.1）
+            if T.get("wait_until"):                        # 本輪結束後等 RN_WAIT 秒（v9.2：300 秒）
                 if time.time() < T["wait_until"]:
                     T["nxt"] = min(T["wait_until"], time.time() + 1.0)
                     continue
@@ -5698,7 +5702,7 @@ async def rn_worker(app, key):
                 rn_done(T, p, m)
                 print(f"[runt] 出場 {key} {p['side']}{p['lvl']} {p['out'][2]} @{p['out'][1]} 淨{m['netu']}")
                 send("\n".join(rn_exit_lines(T, p, m, rn_tail(T, p))))
-            if outs and not T["pos"]:                      # 全部出場 → 本輪結束 → 等 60 秒 → 用現價重新來過
+            if outs and not T["pos"]:                      # 全部出場 → 本輪結束 → 等 RN_WAIT 秒 → 用現價重新來過
                 T["ords"] = []
                 T["st"]["r"] += 1
                 send("\n".join(rn_end_lines(T)))
@@ -6042,7 +6046,7 @@ async def cmd_menu(u, c):
         "/runt 商品 槓桿 保證金 初始埋伏點%\n"
         "　佈局（模擬，不下單）：初始單 L0/S0 在現價上下「初始埋伏點%」限價埋伏，不改價；一邊成交撤另一邊。"
         "L0/S0 虧損就掛同方向 L1/S1，L1/S1 也虧損就掛 L2/S2…最多 L9/S9；每一層離上一層 0.5%。"
-        "每一單最高毛利率 >0.20% SL 先卡 +0.10%；>0.30% 框架形成：SL＝最高−0.20%、TP＝最高+0.20%，之後一起往獲利移動；某一層出場撤掉比它深的掛單，L0/S0 出場撤掉沒成交的單，全部出場後等 60 秒重新來過（有事件才通知，狀態用 /status 看）。"
+        "每一單最高毛利率 >0.20% SL 先卡 +0.10%；>0.30% 框架形成：SL＝最高−0.20%、TP＝最高+0.20%，之後一起往獲利移動；某一層出場撤掉比它深的掛單，L0/S0 出場撤掉沒成交的單，全部出場後等 300 秒重新來過（有事件才通知，狀態用 /status 看）。"
         "損益分持倉中／本日已實現（L、S 分開，台灣時間換日）；資金費照 OKX 費率模擬計入\n"
         "　例：/runt WLDUSDT 1X 1U 0.2%　｜可同時跑多個幣種｜同幣種只能一組\n"
         "/stoprunt 幣種｜all　停止指定幣種／全部 runt\n"
