@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v9.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v9.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4888,6 +4888,7 @@ async def rt_recover(app):
 #      每一張出場記一行到 runtlog_{ACCT}.jsonl（/summary 出場統計用，保留 30 天）。
 #      v8.8：出場統計的「最差」改成「最深套住」；拿掉「另有 N 單…」備註。
 #      v8.9：持倉中下面加「套牢明細」；「最差」＝套牢明細裡淨損益最低的那一單（跟最好同格式）；段落之間空一行。
+#      v9.1：出場通知也加「套牢明細」（同幣種同方向），持倉中／本日已實現／套牢明細之間空一行，拿掉最後一行「(L0還在,繼續)」。
 #      不再每個 /tf 發持倉通知／埋伏通知；/status 隨時看（持倉中＝持倉通知、埋伏中＝埋伏通知的內容，
 #      都有資金費率兩行，/status 當下向 OKX 查，v8.5）。/test1 的埋伏通知不變（照 /tf）。
 #      L0/S0 掛上去之後不改價、不重掛，等到一邊成交（1111 2026-10-05：維持現狀）。
@@ -5510,10 +5511,24 @@ def rn_exit_lines(T, p, m, tail):
           f"最低毛利率 {lo}",
           RT_SEP,
           "這一單已實現"] + [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
-    L += rn_pl_secs(T, px, (p["side"],))   # v8.2：這個方向的 持倉中／本日已實現
+    # v9.1（1111 版面）：這個方向的 持倉中(未實現)／本日已實現／套牢明細，段落之間空一行，時間前也空一行；
+    # 最後一行「(L0還在,繼續)」拿掉（tail 不再用）。套牢明細＝這個幣種同方向還抱著的每一單（0 層往上），用出場價算淨損益。
+    side = p["side"]
+    live = sorted([q for q in T["pos"] if q["side"] == side and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
+    hold, rows = [], []
+    if live:
+        a = rn_acc()
+        for q in live:
+            mq = rn_money(T, q, px)
+            rn_acc_add(a, mq)
+            rows.append(f"{T['sym']} {side}{q['lvl']} {rn_sp(rn_q2(mq['net']))}|{rn_su(rn_q4(mq['netu']))}")
+        hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)
+    d = ((RN_DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
+    day = rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []
+    blocks = rn_join([hold, day, (["套牢明細"] + rows) if rows else []])
+    if blocks:
+        L += [RT_SEP] + blocks + [""]
     L.append(f"時間:{hhmmss()}")
-    if tail:
-        L.append(tail)
     return L
 
 def rn_end_lines(T):
