@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v9.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v9.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4283,6 +4283,11 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v9.8（1111 2026-10-05）：照 OKX 逐倉的「合倉」算（同幣種同方向＝一組，風險、保證金、強平都合起來算）：
+#     做法 A（OKX 還沒實測，先這樣算）：XX 每加一層，整個方向改成那一層的槓桿（只往上），合倉保證金＝倉位合計÷目前槓桿；
+#     預估強平價用合倉算，碰到 → 整個方向一起強平，損失全部合倉保證金（按倉位大小分攤到每一單），合成一則「強平通知」。
+#     持倉中下面加三行：合倉 倉位|均價|槓桿、保證金|收益率（OKX：未實現收益÷保證金）、預估強平價(距現價%)。
+#     % 照舊＝U÷每單保證金（可以相加）。出場通知「持倉 3:16|SL移動0次|TP移動0次」。v9.7：刪 /tune /amp /test1 /stoptest1、/test2→/price、/coins 恐懼貪婪。
 #   v9.6（1111 2026-10-05）：L、S 完全獨立：一組策略＝幣種＋方向（RN key＝'DOGEUSDT L'），各有自己的槓桿、保證金、埋伏點、
 #     輪次、300 秒、🚦。/runt 幣種 L／S 開一組，LS＝一次開兩組（同參數），開完各打各的；不再「一邊成交撤另一邊」，
 #     同幣種可以同時有 L、S 持倉（實盤用 OKX 雙向持倉）。同幣種同方向只能一組（🚦 打完前也不能重開）；
@@ -4448,6 +4453,61 @@ async def rn_mmr(spec):
         print("[runt] mmr query fail", iid, type(e).__name__, e)
     return RN_MMR_DEF
 
+def rn_glev(T):
+    """v9.8 做法 A（1111 先用這個算，等實測 OKX 再確認）：OKX 逐倉＋雙向持倉的槓桿是「幣種＋方向」一個設定。
+    XX：每加一層就把整個方向改成那一層的倍數 → 目前槓桿＝這一輪開過的最高那一層（只往上，不往下）；新的一輪從 L0 1X 重來。
+    固定槓桿：就是那個槓桿。"""
+    if not T.get("xx"):
+        return T["lev"]
+    return T.get("lev_now") or max([rn_plev(T, p) for p in T["pos"] if not p["out"]] or [Decimal(1)])
+
+def rn_gpos(T):
+    """v9.8 合倉（OKX 逐倉：風險、保證金、強平都按同幣種同方向合起來算）：
+    倉位＝Σ數量×進場價、均價＝倉位÷數量、保證金＝倉位÷目前槓桿；
+    預估強平價：做多＝(倉位−保證金)÷(數量×(1−維持保證金率))，做空＝(倉位＋保證金)÷(數量×(1＋維持保證金率))，
+    往均價方向取 tick（保守）；1X 做多不會強平（None）。沒有持倉＝None。"""
+    live = [p for p in T["pos"] if not p["out"]]
+    if not live:
+        return None
+    lev = rn_glev(T)
+    key = (tuple(id(p) for p in live), lev)
+    c = T.get("gcache")
+    if c and c[0] == key:
+        return c[1]
+    N = sum((p["qty"] * p["ent"] for p in live), Decimal(0))
+    Q = sum((p["qty"] for p in live), Decimal(0))
+    M = N / lev
+    mmr = T.get("mmr") or RN_MMR_DEF
+    if T["dir"] == "L":
+        liq = None if lev <= 1 else align((N - M) / (Q * (1 - mmr)), T["tick"], "S")
+    else:
+        liq = align((N + M) / (Q * (1 + mmr)), T["tick"], "L")
+    g = {"n": N, "q": Q, "avg": N / Q, "lev": lev, "m": M, "liq": liq, "live": live}
+    T["gcache"] = (key, g)
+    return g
+
+def rn_g_lines(T, px):
+    """v9.8 持倉中下面的合倉三行（就是 OKX App 合倉看到的）：倉位、均價、槓桿／保證金、收益率（＝未實現收益÷保證金，不含手續費）／
+    預估強平價（距現價 %）。1111：預估強平價後面不空格。"""
+    g = rn_gpos(T)
+    if not g or px is None:
+        return []
+    tick = T["tick"]
+    upl = sum((rn_q4(rn_money(T, p, px)["gu"]) for p in g["live"]), Decimal(0))
+    L = [f"合倉 {rn_q4(g['n'])}U|均價 {rt_q(g['avg'], tick)}|{pct(g['lev'])}X",
+         f"保證金 {rn_q4(g['m'])}U|收益率 {rn_sp(rn_q2(upl / g['m'] * 100))}"]
+    if g["liq"] is None:
+        L.append("預估強平價無(1X做多)")
+    else:
+        L.append(f"預估強平價{rt_q(g['liq'], tick)}(距現價{rn_sp(rn_q2((g['liq'] / px - 1) * 100))})")
+    return L
+
+def rn_dur(sec):
+    """v9.8（1111）：持倉時間用 3:16、1:03:16（不寫分秒，畫面窄一點）。"""
+    sec = max(0, int(sec))
+    h, m, x = sec // 3600, sec % 3600 // 60, sec % 60
+    return f"{h}:{m:02d}:{x:02d}" if h else f"{m}:{x:02d}"
+
 def rn_head(T):
     return f"{rn_sym(T)} {T['dir']} {rn_levs(T)} {pct(T['amt'])}U"
 
@@ -4524,7 +4584,7 @@ def rn_money(T, p, px):
     margin = T["amt"]
     notional = margin * rn_plev(T, p)
     if p.get("out") and p["out"][2] == "強平":
-        gross_u = -margin
+        gross_u = -(p.get("liqm") or margin)               # v9.8：合倉強平，每一單損失分攤到的保證金
         fee_u = notional * RN_FEE_IN / 100
     else:
         gross_u = p["qty"] * ((px - p["ent"]) if p["side"] == "L" else (p["ent"] - px))
@@ -4603,7 +4663,7 @@ def rn_pl_side(T, side, px):
         a = rn_acc()
         for p in live:
             rn_acc_add(a, rn_money(T, p, px))
-        L += rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)
+        L += rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a) + (rn_g_lines(T, px) if side == T["dir"] else [])   # v9.8：合倉
     d = ((RN_DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     if d and d["n"]:
         L += rn_pl(f"{side} 本日已實現 {d['n']}單", d)
@@ -4870,6 +4930,8 @@ def rn_pos(T, side, lvl, ent, t, px_hit):
     """一張單成交 → 一個持倉（各自獨立：自己的進場價、SL/TP、最高/最低毛利率）。"""
     g0 = rn_g(side, ent, px_hit)
     lev = rn_lev(T, lvl)
+    if T.get("xx") and lev > (T.get("lev_now") or 0):       # v9.8 做法 A：整個方向改成這一層的槓桿
+        T["lev_now"] = lev
     return {"side": side, "lvl": lvl, "ent": ent, "t_in": t, "qty": T["amt"] * lev / ent,
             "lev": lev, "liq": rn_liq(T, side, ent, lev),
             "sl": None, "tp": None, "sl_g": None, "tp_g": None, "pend": None,
@@ -4878,6 +4940,7 @@ def rn_pos(T, side, lvl, ent, t, px_hit):
 
 def rn_round(T, t0, px0):
     """開始新的一輪：取價 → 初始單上下埋伏（不帶 TP/SL，不改價）。"""
+    T["lev_now"] = None                                    # v9.8：新的一輪從 L0 的槓桿重來
     T.update({"t0": t0, "px0": px0, "cxl_due": None, "nxt": 0.0, "note_last": rt_note_base(t0),
               "init": {}, "ords": [], "rnd": [], "h0": None, "wait_until": None,
               "legs": {s: {"side": s, "px": rt_amb(px0, s, T["off"], T["tick"]), "fill": None, "dead": False}
@@ -4925,10 +4988,7 @@ def rn_touch(T, px, t):
         if p["pend"] and t >= p["pend"][4]:                # SL/TP 過了送單時間才生效
             p["sl"], p["tp"], p["sl_g"], p["tp_g"] = p["pend"][:4]; p["pend"] = None
         isL = p["side"] == "L"
-        liq = p.get("liq")
-        if liq is not None and ((isL and px <= liq) or (not isL and px >= liq)):   # v9.3：碰到預估強平價 → 強平
-            p["out"] = (t, liq, "強平")
-        elif p["sl"] is None:
+        if p["sl"] is None:                                # v9.8：強平改成整個方向（合倉）一起，在下面判斷
             continue
         elif p["tp"] is not None and ((isL and px >= p["tp"]) or (not isL and px <= p["tp"])):   # v9.0：框架形成前沒有 TP
             p["out"] = (t, px, "TP")
@@ -4937,6 +4997,14 @@ def rn_touch(T, px, t):
         if p["out"]:                                       # 出場 → 撤掉這一邊比它後掛（更深）的掛單；L0/S0 出場＝這一邊全部撤掉
             T["ords"] = [o for o in T["ords"] if o["side"] != p["side"] or o["lvl"] <= p["lvl"]]
             T["ev"].set()
+    g = rn_gpos(T)                                         # v9.8：碰到合倉的預估強平價 → 整個方向一起強平，損失全部合倉保證金
+    if g and g["liq"] is not None and ((T["dir"] == "L" and px <= g["liq"]) or (T["dir"] == "S" and px >= g["liq"])):
+        for p in g["live"]:
+            p["out"] = (t, g["liq"], "強平")
+            p["liqm"] = p["qty"] * p["ent"] / g["lev"]     # 這一單分攤的保證金（按倉位大小）
+        T["liq_evt"] = {"t": t, "px": g["liq"], "n": g["n"], "avg": g["avg"], "lev": g["lev"], "m": g["m"]}
+        T["ords"] = []
+        T["ev"].set()
 
 def rn_on_tick(iid, px):
     """WS 逐筆成交價（由 _ws_push_px 呼叫）。"""
@@ -5059,7 +5127,7 @@ def rn_exit_lines(T, p, m, tail):
     if p["t_arm"]:
         L.append(f"設SL {rt_t(p['t_arm'])}|{rt_q(p['arm_px'], tick)}")
     L += [f"出場 {rt_t(t)}|{rt_q(px, tick)}|{why}",
-          f"持倉 {rt_hold_str(t - p['t_in'])}|SL移動{p['n_mv']}次|TP移動{p.get('n_tp', 0)}次",   # v9.5（1111）：數字前後不空格
+          f"持倉 {rn_dur(t - p['t_in'])}|SL移動{p['n_mv']}次|TP移動{p.get('n_tp', 0)}次",   # v9.5／v9.8（1111）：不空格、時間 3:16
           f"最高毛利率 {hi}",
           f"最低毛利率 {lo}",
           RT_SEP,
@@ -5075,13 +5143,33 @@ def rn_exit_lines(T, p, m, tail):
             mq = rn_money(T, q, px)
             rn_acc_add(a, mq)
             rows.append(f"{rn_sym(T)} {rn_nm(T, side, q['lvl'])} {rn_sp(rn_q2(mq['net']))}|{rn_su(rn_q4(mq['netu']))}")
-        hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)
+        hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a) + rn_g_lines(T, px)   # v9.8：合倉
     d = ((RN_DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []
     blocks = rn_join([hold, day, (["套牢明細"] + rows) if rows else []])
     if blocks:
         L += [RT_SEP] + blocks + [""]
     L.append(f"時間:{hhmmss()}")
+    return L
+
+def rn_liq_lines(T, items):
+    """v9.8（1111 核可）：整個方向一起強平，合成一則強平通知（不會一層發一則）。items＝[(單, rn_money), ...]。"""
+    tick = T["tick"]
+    ev = T.get("liq_evt") or {}
+    items = sorted(items, key=lambda x: (x[0]["lvl"], x[0]["t_in"]))
+    a = rn_pad([rn_sp(m["net"]) for _, m in items])
+    b = rn_pad([rn_su(m["netu"]) for _, m in items])
+    tp = sum((m["net"] for _, m in items), Decimal(0)); tu = sum((m["netu"] for _, m in items), Decimal(0))
+    lev = ev.get("lev") or rn_glev(T)
+    L = [f"{E.pnl_emoji(tu)} 強平通知 {rn_sym(T)} {T['dir']} {pct(lev)}X {pct(T['amt'])}U",
+         RT_SEP,
+         f"強平 {rt_t(ev.get('t', time.time()))}|{rt_q(ev.get('px', items[0][0]['out'][1]), tick)}"]
+    if ev:
+        L += [f"合倉 {rn_q4(ev['n'])}U|均價 {rt_q(ev['avg'], tick)}|{pct(ev['lev'])}X",
+              f"保證金 {rn_q4(ev['m'])}U(全部損失)"]
+    L += [RT_SEP]
+    L += [f"{rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {x}|{y}" for (p, _), x, y in zip(items, a, b)]
+    L += [RT_SEP, f"淨損益 {rn_sp(tp)}|{rn_su(tu)}", f"時間:{hhmmss()}"]
     return L
 
 def rn_end_lines(T):
@@ -5171,7 +5259,7 @@ def rn_save():
                     "mfe": str(p["mfe"]), "mae": str(p["mae"]), "fu": str(p.get("fu", 0)), "fn": p.get("fn", 0),
                     "lev": s(p.get("lev")), "liq": s(p.get("liq"))}
         data = [{"v": 77, "sym": T["sym"], "lev": str(T["lev"]), "amt": str(T["amt"]), "off": str(T["off"]),
-                 "dir": T.get("dir", "LS"), "xx": bool(T.get("xx")), "mmr": s(T.get("mmr")), "last": bool(T.get("last")), "grp": 1,
+                 "dir": T.get("dir", "LS"), "xx": bool(T.get("xx")), "mmr": s(T.get("mmr")), "last": bool(T.get("last")), "grp": 1, "lev_now": s(T.get("lev_now")),
                  "chat": T["chat"], "t0": T["t0"], "px0": str(T["px0"]), "h0": T["h0"], "wait_until": T.get("wait_until"),
                  "init": {k: str(v) for k, v in T["init"].items()},
                  "pos": [P(p) for p in T["pos"] if not p["out"]],
@@ -5260,12 +5348,18 @@ async def rn_worker(app, key):
                 print(f"[runt] 層單成交 {key} {p['side']}{p['lvl']}@{p['ent']}")
                 send("\n".join(rn_lay_fill_lines(T, p)))
             outs = sorted([p for p in T["pos"] if p["out"]], key=lambda p: p["out"][0])
+            liqs = []
             for p in outs:                                 # 每一單各自出場
                 T["pos"].remove(p)
                 m = rn_money(T, p, p["out"][1])
                 rn_done(T, p, m)
                 print(f"[runt] 出場 {key} {p['side']}{p['lvl']} {p['out'][2]} @{p['out'][1]} 淨{m['netu']}")
+                if p["out"][2] == "強平":                  # v9.8：強平合成一則
+                    liqs.append((p, m)); continue
                 send("\n".join(rn_exit_lines(T, p, m, rn_tail(T, p))))
+            if liqs:
+                send("\n".join(rn_liq_lines(T, liqs)))
+                T.pop("liq_evt", None)
             if outs and not T["pos"]:                      # 全部出場 → 本輪結束 → 等 RN_WAIT 秒 → 用現價重新來過
                 T["ords"] = []
                 T["st"]["r"] += 1
@@ -5670,6 +5764,7 @@ async def rn_recover(app):
                         if q["lvl"] == 0:
                             init.setdefault(q["side"], q["ent"])
                     h0 = float(d["h0"]) if d.get("grp") and d.get("h0") is not None else min(q["t_in"] for q in pos)
+                    T["lev_now"] = D(d.get("lev_now")) if d.get("grp") else None   # v9.8；舊存檔＝持倉裡最高的那一層
                     T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "pos": pos, "legs": {}, "init": init,
                               "cxl_due": None, "nxt": 0.0, "h0": h0,
                               "ords": [{"side": o["side"], "lvl": int(o["lvl"]), "px": Decimal(o["px"]), "live": now,
@@ -5780,7 +5875,8 @@ async def cmd_menu(u, c):
         "　L、S 各自一組、完全獨立（LS＝一次開兩組，同參數）。佈局（模擬，不下單）：初始單 L0（現價下方）／S0（現價上方）「初始埋伏點%」限價埋伏，不改價。"
         "L0/S0 虧損就掛同方向 L1/S1，L1/S1 也虧損就掛 L2/S2…最多 L9/S9；每一層離上一層 0.5%。"
         "每一單最高毛利率 >0.20% SL 先卡 +0.10%；>0.30% 框架形成：SL＝最高−0.20%、TP＝最高+0.15%，之後一起往獲利移動；某一層出場撤掉比它深的掛單，L0/S0 出場撤掉沒成交的單，全部出場後等 300 秒重新來過（有事件才通知，狀態用 /status 看）。"
-        "損益 % 照 OKX 收益率（÷保證金）；毛利率＝價格漲跌%。強平照 OKX 逐倉預估強平價模擬（損失整筆保證金）。"
+        "損益 % ＝ U ÷ 每單保證金（可以相加）；毛利率＝價格漲跌%。持倉中多列 OKX 合倉（同幣種同方向合起來：倉位、均價、槓桿、保證金、收益率、預估強平價）；"
+        "XX 每加一層整個方向改成那一層的槓桿；碰到合倉預估強平價＝整個方向一起強平、損失合倉保證金（合成一則強平通知）。"
         "損益分持倉中／本日已實現（L、S 分開，台灣時間換日）；資金費照 OKX 費率模擬計入\n"
         "　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
