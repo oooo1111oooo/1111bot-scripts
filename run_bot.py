@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v9.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v9.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -382,8 +382,6 @@ def _ws_push_px(iid, px):
     except Exception:
         return
     WS_PX[iid] = (d, time.time())
-    if RT:
-        rt_on_tick(iid, d)      # 【v7.4】/test 模擬：逐筆成交價碰到掛單價＝成交
     if RN:
         rn_on_tick(iid, d)      # 【v7.6】/runt 模擬：逐筆成交價判斷成交、SL/TP 出場
     for S in list(STRATS.values()):
@@ -3730,7 +3728,7 @@ def _tune_block(sym, all_rows):
 
 async def cmd_tune(u, c):
     """調參報告：用實測數據回答 SL 與緊貼該設多少。
-    用法：/tune [幣種] [天數]"""
+    用法：/check data [幣種] [天數]（v9.7：/tune 指令刪除，報告留在 /check data）"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     a = c.args or []
     sym = None; days = 3
@@ -4090,233 +4088,15 @@ async def cmd_selftest(u, c):
                       _selftest_lines(), [f"時間：{hhmmss()}　（新入口：/check rule）"])
 
 
-# ---------- /amp 振幅分析（v6.3：不產生 Excel，直接回 TG） ----------
-# v6.3（1111 核可）：/amp 幣種 —— 用當下的 /tf 抓最近 2000 根已收線 K 線（OKX 不到 2000 根就用有的），回：
-#   最高振幅（哪一根）、平均振幅、中位振幅（v6.5）、最高價（哪一根）、現價（查詢當下）、最低價（哪一根）。
-#   中位振幅＝全部振幅由小排到大取正中間；根數是雙數時取中間兩個的平均（2000 根＝第 1000、1001 根的平均）。
-#   v6.6：最高價和現價之間多一行 ⬆️ 現價到最高價的距離%＝(最高價−現價)÷現價；現價和最低價之間多一行
-#         ⬇️ 現價到最低價的距離%＝(最低價−現價)÷現價（帶正負號，3 位小數，兩行右對齊）；標題改 ⚡️。
-#   v6.7：平均振幅、中位振幅後面加「最高振幅÷它」的倍數（小數兩位）；⬆️⬇️ 拿掉正負號
-#         （⬆️＝現價要漲多少才到最高價、⬇️＝現價要跌多少才到最低價；只有現價已經在區間外時那一行才是負數）；
-#         最低價下面加「區　間」＝⬆️% ＋ ⬇️%，後面是「區間÷最高振幅」的倍數。
-#         倍數和區間都用畫面上顯示的數字算（1111 自己按計算機會一樣），倍數四捨五入到小數兩位。
-#   v6.8：/amp 不帶參數 —— 照 /coins 的幣種順序（有啟用的、照字母排），一個幣種一頁，算好一個就先送；
-#         標題後面加頁碼（例 1/16）；查不到的那一頁寫「查詢失敗，跳下一個」；進行中再按 /amp 會回進行到第幾個。
-#         在背景跑，不會卡住其他指令。
-#   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。
-#   /tf 不是 OKX 原生週期（6m 8m 10m 12m 20m 25m）→ 用能整除的最大原生週期（1m/3m/5m/15m/30m）合成，
-#   邊界跟 bot 其他地方一樣以整點（epoch）對齊，湊不滿一整根的丟掉（只用完整、已收線的 K 線）。
-AMP_DAYS = {"1m": 7, "3m": 7, "5m": 14, "10m": 14, "15m": 30, "30m": 30}   # v7.1（1111）：每個週期看幾天
-
-
-def amp_n(tf):
-    """v7.1（1111）：1m/3m 看一週、5m/10m 看兩週、15m/30m 看一個月（30 天），根數＝天數÷週期：
-    1m 10080、3m 3360、5m 4032、10m 2016、15m 2880、30m 1440。"""
-    return AMP_DAYS.get(tf, 7) * 86400 // TF_SEC[tf]
-AMP_NATIVE = (30, 15, 5, 3, 1)   # OKX 原生分鐘週期（大→小）
-
-
-async def amp_fetch_page(iid, after, ep, bar):
-    """抓一頁 K 線（新->舊，只含已收線）。candles 只有最近約 1440 根，抓完改 history-candles 續抓。
-    回傳 (list, 下一個ep, 是否到盡頭, 這一頁最舊那一根的時間＝下一頁從這裡往前抓)。
-    OKX 回錯誤（多半是太快被限流）→ 等一下重試，最多 3 次。"""
-    lim = 300 if ep == "candles" else 100
-    q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit={lim}" + (f"&after={after}" if after else "")
-    r = {}
-    for i in range(3):
-        r = await pub(q)
-        if r.get("code") == "0":
-            break
-        await asyncio.sleep(1.0 + i)
-    if r.get("code") != "0":
-        raise RuntimeError(f"OKX K線查詢失敗 {r.get('code')} {r.get('msg')}")
-    batch = r.get("data") or []
-    if not batch:
-        if ep == "candles" and after:
-            return [], "history-candles", False, after   # candles 僅近期，改歷史端點續抓
-        return [], ep, True, after                   # OKX 沒有更早資料（多半是該幣上市日）
-    oldest = str(min(int(c[0]) for c in batch))
-    out = []
-    for c in batch:
-        try:
-            if len(c) >= 9 and str(c[8]) != "1":
-                continue                             # 還沒收線的那一根不要
-            out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]),
-                        "l": Decimal(c[3]), "c": Decimal(c[4])})
-        except Exception:
-            continue
-    out.sort(key=lambda x: x["ts"], reverse=True)
-    return out, ep, False, oldest
-
-
-async def amp_klines(iid, tf, n):
-    """回傳最近 n+1 根（多一根當第一根的前收）已收線的 tf K 線（舊->新）；OKX 不夠就回有的。"""
-    tfm = TF_SEC[tf] // 60
-    bm = next(m for m in AMP_NATIVE if tfm % m == 0)
-    bar, k, tfms = f"{bm}m", tfm // bm, TF_SEC[tf] * 1000
-    need = (n + 2) * k                               # 原生根數（多抓一組，最新那組可能還沒收完）
-    base = {}; after, ep = "", "candles"
-    for _ in range(need // 100 + 30):
-        page, ep, done, after = await amp_fetch_page(iid, after, ep, bar)
-        if done:
-            break
-        for x in page:
-            base[x["ts"]] = x
-        if len(base) >= need:
-            break
-        await asyncio.sleep(0.12 if ep == "history-candles" else 0.06)   # 不要打太快（OKX 限流）
-    if k == 1:
-        return sorted(base.values(), key=lambda x: x["ts"])[-(n + 1):]
-    grp = {}
-    for x in base.values():
-        grp.setdefault(x["ts"] // tfms, []).append(x)
-    out = []
-    for g, L in grp.items():
-        if len(L) != k:
-            continue                                 # 不完整（還沒收完或 OKX 缺資料）
-        L.sort(key=lambda x: x["ts"])
-        out.append({"ts": g * tfms, "o": L[0]["o"], "h": max(x["h"] for x in L),
-                    "l": min(x["l"] for x in L), "c": L[-1]["c"]})
-    out.sort(key=lambda x: x["ts"])
-    return out[-(n + 1):]
-
-
-def amp_stats(kl, n):
-    """kl＝舊->新。回傳分析用的根數與各項數字（同數值取第一次出現的那一根）。"""
-    if len(kl) > n:
-        prev, rows = kl[0]["c"], kl[1:]
-    else:
-        prev, rows = kl[0]["o"], kl
-    amps = []
-    for x in rows:
-        amps.append((x["h"] - x["l"]) / prev * 100 if prev else Decimal(0))
-        prev = x["c"]
-    iA = max(range(len(rows)), key=lambda i: (amps[i], -i))
-    iH = max(range(len(rows)), key=lambda i: (rows[i]["h"], -i))
-    iL = min(range(len(rows)), key=lambda i: (rows[i]["l"], i))
-    sa = sorted(amps); m = len(sa) // 2
-    amed = sa[m] if len(sa) % 2 else (sa[m - 1] + sa[m]) / 2     # v6.5：中位振幅
-    return {"rows": rows, "n": len(rows), "amax": amps[iA], "tA": rows[iA]["ts"], "aavg": sum(amps) / len(amps), "amed": amed,
-            "hi": rows[iH]["h"], "tH": rows[iH]["ts"], "lo": rows[iL]["l"], "tL": rows[iL]["ts"]}
-
-
-def _amp_t(ms):
-    return datetime.fromtimestamp(ms / 1000, TZ8).strftime("%m/%d %H:%M")
-
-
-def _amp_right(ss):
-    """同一欄右對齊：位數不夠的前面補數字寬的空白。"""
-    w = max(len(x) for x in ss)
-    return ["\u2007" * (w - len(x)) + x for x in ss]
-
-
-AMP_RUN = {"on": False, "i": 0, "n": 0, "task": None}   # v6.8：/amp 進行中（避免重複跑）
-
-
-async def amp_page(sym, tf, head):
-    """一個幣種一頁：成功回完整畫面；查不到回「查詢失敗，跳下一個」。"""
-    try:
-        spec = await get_spec(sym)
-        iid, tick = spec["iid"], spec["tick"]
-        n = amp_n(tf)
-        kl = await amp_klines(iid, tf, n)
-        last = await get_last(iid); t_now = time.time()
-    except Exception as e:
-        print("[amp] fail", sym, type(e).__name__, e)
-        return f"{head}\n💥 {sym} 查詢失敗，跳下一個"
-    if not kl:
-        return f"{head}\n💥 {sym} 查無K線資料，跳下一個"
-    S = amp_stats(kl, n)
-    q = lambda v: str(Decimal(str(v)).quantize(tick))
-    sA, sV, sM = f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"
-    a1, a2, a3 = _amp_right([sA, sV, sM])
-    p1, p2, p3 = _amp_right([q(S["hi"]), q(last), q(S["lo"])])
-    def rx(a, b):                                    # v6.7：倍數＝畫面上的 a ÷ 畫面上的 b，四捨五入到小數兩位
-        a, b = Decimal(a), Decimal(b)
-        return str((a / b).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if b else "-"
-    r2, r3 = _amp_right([rx(sA, sV), rx(sA, sM)])
-    up = Decimal(f"{(S['hi'] - last) / last * 100:.3f}")   # 現價要漲多少才到最高價（負＝已經衝過最高價）
-    dn = Decimal(f"{(last - S['lo']) / last * 100:.3f}")   # 現價要跌多少才到最低價（負＝已經跌破最低價）
-    up = up if up else Decimal("0.000"); dn = dn if dn else Decimal("0.000")   # 不要出現 -0.000
-    rg = up + dn                                     # 區間＝兩個 % 相加（＝(最高價−最低價)÷現價）
-    d1, d2 = _amp_right([f"{up:.3f}", f"{dn:.3f}"])
-    cnt = f"{S['n']}根" + ("" if S["n"] >= n else "(OKX只有這些)")
-    L = [head,
-         f"{sym}｜{tf}｜{cnt}",
-         f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
-         "━━━━━━━━━━",
-         f"最高振幅 {a1}%｜{_amp_t(S['tA'])}",
-         f"平均振幅 {a2}%｜{r2}倍",
-         f"中位振幅 {a3}%｜{r3}倍",
-         "━━━━━━━━━━",
-         f"最高價 {p1}｜{_amp_t(S['tH'])}",
-         f"\u2b06\ufe0f {d1}%",
-         f"現\u3000價 {p2}｜{_amp_t(t_now * 1000)}",
-         f"\u2b07\ufe0f {d2}%",
-         f"最低價 {p3}｜{_amp_t(S['tL'])}",
-         f"區\u3000間 {rg:.3f}%｜{rx(f'{rg:.3f}', sA)}倍",
-         "━━━━━━━━━━",
-         f"時間:{hhmmss()}"]
-    return "\n".join(L)
-
-
-async def _amp_all(u, tf, syms):
-    """背景跑：照 /coins 的順序一個幣種一頁，算好一個就先送（不卡住其他指令）。"""
-    n = len(syms)
-    try:
-        for i, sym in enumerate(syms, 1):
-            AMP_RUN["i"] = i
-            head = f"\u26a1\ufe0f 振幅分析｜{ACCT}｜{i}/{n}"
-            try:
-                page = await amp_page(sym, tf, head)
-            except Exception as e:                   # 萬一算的時候出錯，也只影響這一頁
-                print("[amp] page fail", sym, type(e).__name__, e)
-                page = f"{head}\n💥 {sym} 查詢失敗，跳下一個"
-            await reply(u, page)
-    finally:
-        AMP_RUN["on"] = False
-
-
-async def cmd_amp(u, c):
-    """/amp（v6.8 起不帶參數）—— 依目前 /tf，照 /coins 的幣種順序，每個幣種抓一段 K 線（v7.1：天數見 AMP_DAYS），一個幣種一頁。
-    打了參數（例 /amp ZECUSDT）也一樣跑全部，參數不理。"""
-    tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
-    if AMP_RUN["on"]:
-        await reply(u, f"{E.BOT} 振幅分析進行中（{AMP_RUN['i']}/{AMP_RUN['n']}），請等跑完"); return
-    syms = sorted([s["symbol"] for s in SYMS if s["enabled"]])      # 跟 /coins 同一份清單、同一個順序
-    if not syms:
-        await reply(u, f"{E.BOT} /coins 沒有啟用的幣種"); return
-    AMP_RUN.update(on=True, i=0, n=len(syms))
-    AMP_RUN["task"] = asyncio.create_task(_amp_all(u, tf, syms))
-
-# ---------- /test1 插針測試：模擬（v7.4；v8.3 /test、/stoptest 改名 /test1、/stoptest1） ----------
-# v7.4（1111 2026-10-04 核可）：/runt、/stoprunt 改名 /test、/stoptest，參數簡化，成交後自動重新掛單一直跑。
-#   完全不下單、只查價格，OKX 上不會出現任何單子。（v7.3 的 /runt 模擬、v7.2 真實掛單版、v7.1 以前的雙向對沖模擬都拿掉。）
-# 目的：測每種幣的插針速度 —— 單子每次查價都跟著現價移動，只有在一次查價的間隔內一口氣走完埋伏距離的針才會成交，
-#       看參數要多久才會被碰到。
-# 指令：/test 幣種 埋伏% 每秒次數　　例：/test WLDUSDT 0.5% 2
-#   大小寫皆可；埋伏要加 %；每秒次數只能 1～4（每秒查價、改價幾次：1＝每 1 秒、2＝每 0.5 秒、3＝每 0.33 秒、4＝每 0.25 秒）。
-#   一律 L、S 同時掛（框住現價）。可同時跑多個幣種；同一幣種也可以跑不同參數；參數完全一樣的不能重複。
-# 停止：/stoptest 幣種（停掉這個幣種全部的 test）、/stoptest all（全部停）、/stoptest（用法＋進行中清單）。
-# 規則（1111 定案）：
-#   ① 下指令就查現價：L 掛在 現價×(1−埋伏%)（往下取 tick）、S 掛在 現價×(1+埋伏%)（往上取 tick），框住現價。單子只存在 BOT 裡。
-#   ② 每秒查價 N 次，L、S 一起跟著現價移動（算一次改價；取 tick 後價格沒變的那張不動）。
-#   ③ 成交＝OKX 逐筆成交價（WS trades）碰到掛單價（L：成交價 ≤ 掛單價；S：成交價 ≥ 掛單價），進場價＝掛單價。
-#      兩次查價之間的每一筆都檢查。WS 斷線時，由每次查價補判斷。
-#   ④ 送單時間 RT_LAT（VPS 到 OKX 實測 18 ms）：改價要過 RT_LAT 才生效，這段時間內碰到舊價就算成交；
-#      一張成交後，反向單要過 RT_LAT 才撤掉，這段時間內反向也被碰到 → 兩張都成交（標題 LS）。同一邊永遠只有一張。
-#   ⑤ 成交 → 進場成交通知 → 馬上用當時的現價重新框住，同樣策略一直跑，直到 /stoptest（模擬只做到進場，沒有出場）。
-#   ⑥ 每一輪（每重新掛一次單）重新算「初次」（那一輪第一次掛單的時間和現價）和「改價次數」→ 每次成交都看得出等了多久。
-#   ⑦ 埋伏通知：每一個 /tf 一則（對齊這一輪的初次：00:05:00、00:10:00 …；/tf 改了下一則就生效）。
-#   ⑧ bot 重開：接著跑（這一輪的初次不變，關機期間沒有看盤），單子用重開當下的現價重新框住。
+# ---------- 共用工具（v7.4 起放在 /test1 區；v9.7 刪除 /amp、/test1、/stoptest1 後，留下 /runt、/price 共用的部分） ----------
+# 送單時間、查價（WS 優先、REST 限速）、時間與價格格式、TG 依序發送。/runt 的規則見下面的 /runt 區。
 RT_LAT      = 0.018         # 送單時間（秒）＝VPS 到 OKX 實測平均 18 ms（2026-09-30 量 20 次：14～27 ms）
 RT_REST_GAP = 1.0           # WS 沒有新鮮報價時，REST 查價最快 1 秒一次（5 個帳戶共用 REST 額度 20 次/2 秒）
 RT_SAVE_SEC = 10            # 改價次數每 10 秒存檔一次
-RT_FILE     = f"/srv/1111bot/data/test_{ACCT}.json"
+RT_FILE     = f"/srv/1111bot/data/test_{ACCT}.json"      # v9.7：/test1 刪除，重開時有這個存檔就通知一次後改名（rt_gone）
 RT_OLD_FILES = (f"/srv/1111bot/data/runtsim_{ACCT}.json",   # v7.3 的 /runt 模擬
                 f"/srv/1111bot/data/runtest_{ACCT}.json")   # v7.1 以前的雙向對沖模擬（都不再恢復）
 RT_V72_FILE = f"/srv/1111bot/data/runt_{ACCT}.json"       # v7.2（OKX 真實掛單版，沒部署）的存檔：若存在就撤掉它的單
-RT = {}                     # key（參數）-> 參數＋狀態（見 rt_new）
 RT_BG = set()               # 背景工作（保留參照，避免中途被回收）
 RT_SEP = "━━━━━━━━━━"
 RT_FW = {"L": "Ｌ", "S": "Ｓ"}        # 1111：畫面上的 L、S 用全形字（上下行對齊）
@@ -4361,28 +4141,6 @@ def rt_amb(px, side, off, tick):
         return align(px * (1 - off / 100), tick, "L")
     return align(px * (1 + off / 100), tick, "S")
 
-def rt_head(T):
-    return f"{T['sym']} LS"
-
-def rt_par(T):
-    return f"埋伏{rt_p2(T['off'])}% 每秒{T['rate']}次"
-
-def rt_key(p):
-    """參數完全一樣＝同一組（不能重複）；只要有一個參數不同就可以同時跑。"""
-    return f"{p['sym']} {pct(p['off'])}% {p['rate']}"
-
-def rt_save():
-    try:
-        data = [{"sym": T["sym"], "off": str(T["off"]), "rate": T["rate"], "chat": T["chat"],
-                 "t0": T["t0"], "px0": str(T["px0"]), "n": T["n"]}
-                for T in RT.values() if not T.get("done")]
-        os.makedirs(os.path.dirname(RT_FILE), exist_ok=True)
-        tmp = RT_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, RT_FILE)
-    except Exception as e:
-        print("[test] save fail", e)
 
 async def rt_send(app, chat, text):
     for i in range(2):
@@ -4408,46 +4166,6 @@ def rt_note_base(t0):
     iv = TF_SEC.get(ACCOUNT_TF, 300)
     return t0 + max(0, (time.time() - t0) // iv) * iv
 
-def rt_legs(px, off, tick):
-    """S 在上、L 在下（畫面順序）。"""
-    return {s: {"side": s, "px": rt_amb(px, s, off, tick), "pend": None, "fill": None, "dead": False}
-            for s in ("S", "L")}
-
-def rt_round(T, t0, px0, n=0):
-    """開始新的一輪：初次＝這一刻的時間和現價，改價次數歸零（重開恢復時帶回原本的初次和次數）。"""
-    T.update({"t0": t0, "px0": px0, "n": n, "legs": rt_legs(T["px_now"], T["off"], T["tick"]),   # 單子永遠框住「現在」的現價
-              "hit": False, "cxl_due": None, "nxt": 0.0, "note_last": rt_note_base(t0)})
-
-def rt_new(p, spec, chat):
-    return {**p, "key": rt_key(p), "chat": chat, "iid": spec["iid"], "tick": spec["tick"],
-            "step": 1.0 / p["rate"], "ev": asyncio.Event(), "done": False, "rest_t": 0.0,
-            "save_t": time.time() + RT_SAVE_SEC}
-
-def rt_touch(T, px, t):
-    """一筆價格（WS 逐筆成交價，或 WS 斷線時的查價）在時刻 t 檢查碰觸。
-    改價過了 RT_LAT 才生效（之前用舊價）；一張成交後，反向單過了 RT_LAT 才撤掉（之前照樣會被碰到）。"""
-    if T["done"] or "legs" not in T:
-        return
-    for g in T["legs"].values():
-        if g["fill"] or g["dead"]:
-            continue
-        if g["pend"] and t >= g["pend"][1]:
-            g["px"] = g["pend"][0]; g["pend"] = None
-        if T["cxl_due"] is not None and t >= T["cxl_due"]:
-            g["dead"] = True; continue
-        if (g["side"] == "L" and px <= g["px"]) or (g["side"] == "S" and px >= g["px"]):
-            g["fill"] = (t, g["px"], px)
-            if T["cxl_due"] is None:
-                T["cxl_due"] = t + RT_LAT
-            T["hit"] = True
-            T["ev"].set()
-
-def rt_on_tick(iid, px):
-    """WS 逐筆成交價（由 _ws_push_px 呼叫）。"""
-    t = time.time()
-    for T in list(RT.values()):
-        if T.get("iid") == iid:
-            rt_touch(T, px, t)
 
 async def rt_px(T):
     """現價：WS 逐筆成交價優先（不吃 REST 額度）；WS 3 秒沒有新報價才走 REST，而且最快 1 秒一次。"""
@@ -4463,255 +4181,15 @@ async def rt_px(T):
     except Exception:
         return None
 
-def rt_fill_lines(T, filled):
-    """進場成交通知（1111 核可的畫面）。filled＝成交的單（一般 1 張；極少數 2 張都成交）。"""
-    tick = T["tick"]
-    sides = {g["side"] for g in filled}
-    tag = "LS" if len(sides) == 2 else ("L(S)" if "L" in sides else "(L)S")
-    two = len(filled) == 2
-    L = [f"🔔 進場成交 {T['sym']} {tag}",
-         rt_par(T),
-         RT_SEP,
-         f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"]
-    for g in filled:
-        L.append(f"進場 {rt_t(g['fill'][0])}|{rt_q(g['fill'][1], tick)}" + (f"({RT_FW[g['side']]})" if two else ""))
-    t_in = min(g["fill"][0] for g in filled)
-    L += [f"埋伏 {rt_hold_str(t_in - T['t0'])}|改價 {T['n']} 次",
-          RT_SEP,
-          f"時間:{hhmmss()}"]
-    return L
 
-def rt_note_lines(T, px, now):
-    """埋伏通知（1111 核可的畫面）。"""
-    tick = T["tick"]
-    return [f"📣埋伏通知 {rt_head(T)}",
-            rt_par(T),
-            f"⏰埋伏時間 {rt_hms(now - T['t0'])}|改價 {T['n']} 次",
-            f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}",
-            f"現價 {rt_t(now)}|{rt_q(px, tick)}"]
-
-def rt_report(app, T):
-    """有成交就發進場成交通知（排隊送出）。回傳是否有成交。"""
-    filled = sorted([g for g in T["legs"].values() if g["fill"]], key=lambda g: g["side"])   # 兩張都成交時 L 在前（跟標題 LS 同順序）
-    if not filled:
-        return False
-    txt = "\n".join(rt_fill_lines(T, filled))
-    print(f"[test] 進場成交 {T['key']} " + " ".join(f"{g['side']}@{g['fill'][1]}(成交價{g['fill'][2]})" for g in filled))
-    rt_chain(T, lambda: rt_send(app, T["chat"], txt))
-    return True
-
-def rt_end(app, T):
-    """停止一組：停止那一刻已經成交的照樣發進場通知。回傳是否有成交。"""
-    T["done"] = True
-    t = T.get("task")
-    if t:
-        t.cancel()
-    hit = rt_report(app, T)
-    if RT.get(T["key"]) is T:
-        RT.pop(T["key"], None)
-    return hit
-
-async def rt_worker(app, key):
-    """一組 test 的迴圈：每秒查價 N 次、改價；成交就通知並馬上重新掛單。碰觸判斷在 rt_touch（WS 逐筆）。"""
-    T = RT[key]
-    on = lambda: RT.get(key) is T and not T["done"]
-    try:
-        WS_WANT.add(T["iid"])
-        while on():
-            now = time.time()
-            if now < T["nxt"] and not T["ev"].is_set():
-                try:
-                    await asyncio.wait_for(T["ev"].wait(), timeout=T["nxt"] - now)
-                except asyncio.TimeoutError:
-                    pass
-            T["ev"].clear()
-            if not on():
-                return
-            now = time.time()
-            if T["hit"]:                                   # 有單成交 → 等反向單的撤單時間（RT_LAT）過完 → 通知 → 重新掛單
-                rem = T["cxl_due"] - now
-                if rem > 0:
-                    await asyncio.sleep(rem + 0.005)
-                    if not on():
-                        return
-                rt_report(app, T)
-                T["legs"] = {}                             # 這一輪結束（查價途中的逐筆不再判斷）
-                px = None
-                while on() and px is None:
-                    px = await rt_px(T)
-                    if px is None:
-                        await asyncio.sleep(0.2)
-                if not on():
-                    return
-                T["px_now"] = px
-                rt_round(T, time.time(), rt_q(px, T["tick"]))
-                rt_save()
-                continue
-            if now < T["nxt"]:
-                continue
-            T["nxt"] = now + T["step"] - (now % T["step"])
-            px = await rt_px(T)
-            if px is None or not on():
-                continue
-            rt_touch(T, px, time.time())                    # WS 斷線時靠查價判斷（WS 正常時逐筆已經判斷過，重複判斷不影響）
-            if T["hit"]:
-                T["ev"].set(); continue
-            iv = TF_SEC.get(ACCOUNT_TF, 300)
-            if now - T["note_last"] >= iv:                 # 埋伏通知：每一個 /tf 一則
-                T["note_last"] = T["note_last"] + iv if now - T["note_last"] < 2 * iv else rt_note_base(T["t0"])
-                txt = "\n".join(rt_note_lines(T, px, now))
-                rt_chain(T, lambda t=txt: rt_send(app, T["chat"], t))
-            moved = False
-            due = time.time() + RT_LAT                      # 改價過了送單時間才生效
-            for g in T["legs"].values():
-                amb = rt_amb(px, g["side"], T["off"], T["tick"])
-                cur = g["pend"][0] if g["pend"] else g["px"]
-                if amb != cur:
-                    if g["pend"] and time.time() >= g["pend"][1]:
-                        g["px"] = g["pend"][0]
-                    g["pend"] = (amb, due); moved = True
-            if moved:
-                T["n"] += 1
-            if time.time() >= T["save_t"]:
-                T["save_t"] = time.time() + RT_SAVE_SEC
-                rt_save()
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        print("[test] worker fail", key, type(e).__name__, e)
-        T["done"] = True
-        if RT.get(key) is T:
-            RT.pop(key, None)
-        rt_save()
-        await rt_send(app, T["chat"], f"{E.LOSS} test1 異常停止 {rt_head(T)}\n{rt_par(T)}\n"
-                                      f"{type(e).__name__}: {e}\n時間:{hhmmss()}")
-
-def rt_start(app, T):
-    RT[T["key"]] = T
-    T["task"] = asyncio.create_task(rt_worker(app, T["key"]))
-    rt_save()
-
-RT_USAGE = ("📝 用法：\n"
-            "/test1 幣種 埋伏% 每秒次數\n"
-            "/test1 WLDUSDT 0.5% 2\n"
-            "大小寫皆可\n"
-            "埋伏要加 %\n"
-            "每秒次數 1～4(每秒查價、改價幾次)\n"
-            "L、S 同時掛,框住現價\n"
-            "模擬(不下單),成交後馬上重新掛單,一直跑\n"
-            "可同時跑多個幣種\n"
-            "參數完全一樣的不能重複\n"
-            "\n"
-            "停止：/stoptest1 幣種 或 /stoptest1 all")
-
-def rt_parse(a):
-    """解析 3 個參數。成功回傳 (dict, None)，失敗回傳 (None, 錯誤說明)。"""
-    a = [x.strip() for x in a]
-    if len(a) != 3:
-        return None, f"參數數量錯誤(需3個,收到{len(a)}個)"
-    p = {"sym": a[0].upper()}
-    if not p["sym"].endswith("USDT") or len(p["sym"]) <= 4:
-        return None, f"幣種格式錯誤:{a[0]}(例 WLDUSDT)"
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)%", a[1])
-    if not m:
-        return None, "埋伏要加 %(例 0.5%)"
-    p["off"] = Decimal(m.group(1))
-    if p["off"] <= 0:
-        return None, "埋伏須大於 0"
-    if p["off"] > 20:
-        return None, "埋伏不可超過 20%"
-    m = re.fullmatch(r"(\d+)次?", a[2])
-    if not m or not (1 <= int(m.group(1)) <= 4):
-        return None, "每秒次數只能 1～4(例 2)"
-    p["rate"] = int(m.group(1))
-    return p, None
-
-def rt_status_line(T):
-    return (f"💡{rt_head(T)} {rt_par(T)}|"
-            f"{rt_hms(time.time() - T['t0'])}|改價 {T['n']} 次")
-
-def rt_running():
-    return ["進行中："] + ([rt_status_line(T) for T in RT.values()] or ["目前沒有進行中的 test1"])
-
-RT_ASK_TEST = ("📝 請輸入 /test1 參數(直接打參數,不用打 /test1)\n"
-               "幣種 埋伏% 每秒次數\n"
-               "例:WLDUSDT 0.5% 2\n"
-               "每秒次數 1～4")
-RT_RETRY_TEST = "請重新輸入 /test1 參數:\n幣種 埋伏% 每秒次數\n例:WLDUSDT 0.5% 2"
-
-async def cmd_test(u, c):
-    """v7.5：沒帶參數 → 先告訴你參數怎麼打，再等你輸入；打錯 → 回錯誤原因，繼續等你重打。"""
-    global CHAT_ID; CHAT_ID = u.effective_chat.id
-    a = c.args or []
-    if not a:
-        await ask(u, "test1", cmd_test, "\n".join([RT_ASK_TEST, RT_SEP] + [x.replace("：", ":") for x in rt_running()]
-                                                  + [ASK_CANCEL]), "WLDUSDT 0.5% 2"); return
-    retry = lambda msg: ask(u, "test1", cmd_test, f"{msg}\n{RT_RETRY_TEST}", "WLDUSDT 0.5% 2")
-    p, err = rt_parse(a)
-    if err:
-        await retry(f"{E.WARN} {err}"); return
-    if rt_key(p) in RT:
-        await retry(f"{E.WARN} {p['sym']} LS 埋伏{rt_p2(p['off'])}% 每秒{p['rate']}次 已經在跑\n"
-                    f"參數完全一樣的不能重複(要換請先 /stoptest1 {p['sym']})"); return
-    try:
-        spec = await get_spec(p["sym"])
-    except Exception:
-        await retry(f"{E.LOSS} 找不到幣種 {p['sym']}"); return
-    tick = spec["tick"]
-    try:
-        px0 = rt_q(await get_last(spec["iid"]), tick)
-    except Exception:
-        await retry(f"{E.LOSS} 查不到 {p['sym']} 現價,請稍後再試"); return
-    if rt_key(p) in RT:                                   # 查價途中又打了一次一樣的
-        return
-    T = rt_new(p, spec, u.effective_chat.id)
-    T["px_now"] = px0
-    rt_round(T, time.time(), px0)
-    rt_start(c.application, T)
-    legs = T["legs"]
-    await reply(u, "\n".join([f"📣 test1 啟動｜{ACCT}", rt_head(T), rt_par(T),
-                              f"掛Ｓ單 {rt_q(legs['S']['px'], tick)}",
-                              f"現　價 {px0}",
-                              f"掛Ｌ單 {rt_q(legs['L']['px'], tick)}"]))
-
-async def cmd_stoptest(u, c):
-    """v7.5：沒帶參數 → 列出進行中，等你輸入幣種或 all；幣種沒在跑 → 繼續等你重打。"""
-    a = c.args or []
-    if not RT:
-        await reply(u, f"{E.BOT} 目前沒有進行中的 test1"); return
-    run_lines = [x.replace("：", ":") for x in rt_running()]
-    if not a:
-        await ask(u, "stoptest1", cmd_stoptest, "\n".join(["📝 請輸入要停止的幣種,或 all"] + run_lines + [ASK_CANCEL]),
-                  "WLDUSDT 或 all"); return
-    w = a[0].strip().upper()
-    if w == "ALL":
-        keys = list(RT.keys()); title = f"🚫 test1 全部停止｜{ACCT}"
-    else:
-        keys = [k for k, T in RT.items() if T["sym"] == w]; title = f"🚫 test1 停止｜{ACCT}"
-    if not keys:
-        await ask(u, "stoptest1", cmd_stoptest, "\n".join([f"{E.WARN} {w} 沒有在跑 test1", "請重新輸入要停止的幣種,或 all"]
-                                                          + run_lines), "WLDUSDT 或 all"); return
-    L = [title]
-    ts = time.time()
-    for key in keys:
-        T = RT.get(key)
-        if T is None:
-            continue
-        hit = rt_end(c.application, T)
-        L.append(f"{rt_head(T)} {rt_par(T)}")
-        L.append(f"埋伏 {rt_hms(ts - T['t0'])}|改價 {T['n']} 次|" + ("有成交,進場通知另發" if hit else "已停止"))
-    rt_save()
-    L.append(f"時間:{hhmmss()}")
-    await reply(u, "\n".join(L))
-
-# ---------- /test2 價格階梯（v8.3，1111 設計中） ----------
-# 指令：/test2 幣種　例：/test2 WLDUSDT（只查現價、列出價格，不掛單、不下單、不跑迴圈）。
+# ---------- /price 價格階梯（v8.3 /test2；v9.7 改名 /price） ----------
+# 指令：/price 幣種　例：/price WLDUSDT（只查現價、列出價格，不掛單、不下單、不跑迴圈）。
 # 畫面（1111 定案：跟 /runt 同方向，價格由高到低）：S9～S0／現價／L0～L9。
 #   S0、L0 離現價 0.5%，之後每一層離上一層 0.5%（S 往上取 tick、L 往下取 tick，往離現價遠的方向）。
 T2_STEP = Decimal("0.5")
 T2_N    = 10                       # S0～S9、L0～L9
 T2_HINT = "WLDUSDT"
-T2_ASK  = "📝 請輸入 /test2 幣種(直接打幣種,不用打 /test2)\n例:WLDUSDT"
+T2_ASK  = "📝 請輸入 /price 幣種(直接打幣種,不用打 /price)\n例:WLDUSDT"
 
 def t2_ladder(px, tick):
     """S0～S9、L0～L9 的價格：從現價開始，每一層＝上一層 ±0.5%。"""
@@ -4724,18 +4202,18 @@ def t2_ladder(px, tick):
 
 def t2_lines(sym, px, tick):
     S, L = t2_ladder(px, tick)
-    out = [f"📣 test2｜{ACCT}", sym, RT_SEP]
+    out = [f"📣 price｜{ACCT}", sym, RT_SEP]
     out += [f"S{i} {rt_q(S[i], tick)}" for i in range(T2_N - 1, -1, -1)]
     out += [f"現價 {rt_q(px, tick)}"]
     out += [f"L{i} {rt_q(L[i], tick)}" for i in range(T2_N)]
     return out + [RT_SEP, f"時間:{hhmmss()}"]
 
-async def cmd_test2(u, c):
-    """沒帶參數 → 先問幣種；打錯 → 回錯誤原因，繼續等你重打。"""
+async def cmd_price(u, c):
+    """/price（v9.7 由 /test2 改名）：沒帶參數 → 先問幣種；打錯 → 回錯誤原因，繼續等你重打。"""
     a = c.args or []
     if not a:
-        await ask(u, "test2", cmd_test2, f"{T2_ASK}\n{ASK_CANCEL}", T2_HINT); return
-    retry = lambda msg: ask(u, "test2", cmd_test2, f"{msg}\n請重新輸入 /test2 幣種(例 WLDUSDT)", T2_HINT)
+        await ask(u, "price", cmd_price, f"{T2_ASK}\n{ASK_CANCEL}", T2_HINT); return
+    retry = lambda msg: ask(u, "price", cmd_price, f"{msg}\n請重新輸入 /price 幣種(例 WLDUSDT)", T2_HINT)
     if len(a) != 1:
         await retry(f"{E.WARN} 參數數量錯誤(需1個,收到{len(a)}個)"); return
     sym = a[0].strip().upper()
@@ -4752,10 +4230,9 @@ async def cmd_test2(u, c):
         await retry(f"{E.LOSS} 查不到 {sym} 現價,請稍後再試"); return
     await reply(u, "\n".join(t2_lines(sym, px, tick)))
 
-async def cmd_runt_renamed(u, c):
-    """舊名提示：v7.4 /runtest、/stopruntest；v8.3 /test、/stoptest → /test1、/stoptest1。"""
-    await reply(u, f"{E.BOT} 已改名：\n/test1 幣種 埋伏% 每秒次數\n例：/test1 WLDUSDT 0.5% 2\n"
-                   f"停止：/stoptest1 幣種 或 /stoptest1 all")
+async def cmd_test2_renamed(u, c):
+    """v9.7：/test2 改名 /price。"""
+    await reply(u, f"{E.BOT} 已改名：/price 幣種\n例：/price WLDUSDT")
 
 async def rt_v72_cleanup(app):
     """v7.2（OKX 真實掛單版）若曾部署過：撤掉它存檔裡的單（只撤這些 ordId，不碰持倉），回報後把存檔改名。"""
@@ -4784,64 +4261,24 @@ async def rt_v72_cleanup(app):
     L.append(f"時間:{hhmmss()}")
     await rt_send(app, data[0].get("chat"), "\n".join(L))
 
-async def rt_recover(app):
-    """重開後恢復：接著跑（這一輪的初次、改價次數不變；關機期間沒有看盤），單子用重開當下的現價重新框住。"""
+async def rt_gone(app):
+    """v9.7（1111：測試完畢）：/test1 刪除。v7.2 真實掛單版的保險照舊（有存檔才撤它的單）；
+    原本在跑的 test1（還有更舊的 runtsim／runtest 存檔）不再恢復，存檔改名 .removed，通知一次。"""
     await rt_v72_cleanup(app)
-    old = []; chat_old = None
-    for fp in RT_OLD_FILES:                               # 舊版 runt：不再恢復，通知一次後改名
+    n = 0; chat0 = None
+    for fp in (RT_FILE,) + tuple(RT_OLD_FILES):
         if not os.path.exists(fp):
             continue
         try:
-            rows = json.load(open(fp))
-            os.replace(fp, fp + ".old")
-            for d in rows or []:
-                old.append(f"{d.get('sym')} {d.get('dr', '')} 埋伏{d.get('off')}%")
-                chat_old = chat_old or d.get("chat")
+            rows = json.load(open(fp)) or []
+            os.replace(fp, fp + ".removed")
+            n += len(rows)
+            for d in rows:
+                chat0 = chat0 or d.get("chat")
         except Exception as e:
-            print("[test] old file fail", fp, e)
-    if old and chat_old:
-        await rt_send(app, chat_old, "\n".join([f"{E.WARN} 舊版 runt 已停用,以下沒有恢復:"] + old +
-                                               ["新指令：/test1 幣種 埋伏% 每秒次數", f"時間:{hhmmss()}"]))
-    try:
-        if not os.path.exists(RT_FILE):
-            return
-        data = json.load(open(RT_FILE))
-    except Exception as e:
-        print("[test] recover read fail", e); return
-    names = []; bad = []; chat0 = None
-    for d in data:
-        try:
-            chat0 = chat0 or d.get("chat")
-            p = {"sym": d["sym"], "off": Decimal(d["off"]), "rate": int(d["rate"])}
-            if rt_key(p) in RT:
-                continue
-            spec = await get_spec(p["sym"])
-            px = None
-            for i in range(3):                          # 重開當下查現價（WS 還沒連上），失敗重試
-                try:
-                    px = await get_last(spec["iid"]); break
-                except Exception:
-                    await asyncio.sleep(1)
-            T = rt_new(p, spec, d["chat"])
-            if px is None:
-                bad.append(f"{rt_head(T)} {rt_par(T)}"); continue
-            T["px_now"] = px
-            rt_round(T, float(d["t0"]), Decimal(d["px0"]), int(d.get("n", 0)))
-            rt_start(app, T)
-            names.append(f"{rt_head(T)} {rt_par(T)}")
-        except Exception as e:
-            print("[test] recover fail", d, type(e).__name__, e)
-            bad.append(f"{d.get('sym')} 埋伏{d.get('off')}%")
-    rt_save()
-    L = []
-    if names:
-        L += [f"{E.BOT} test1 已自動恢復(bot 重開)"] + names
-        L += ["用現價重新框住,繼續埋伏(初次不變)", "關機期間沒有看盤"]
-    if bad:
-        L += [f"{E.WARN} 以下查不到現價,沒有恢復,請重新下指令:"] + bad
-    if L and chat0:
-        L.append(f"時間:{hhmmss()}")
-        await rt_send(app, chat0, "\n".join(L))
+            print("[test1] removed file fail", fp, e)
+    if n and chat0:
+        await rt_send(app, chat0, "\n".join([f"{E.BOT} test1 已刪除(測試完畢)", f"原本在跑的 {n} 組已停止,不再恢復", f"時間:{hhmmss()}"]))
 
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
@@ -6276,7 +5713,36 @@ async def rn_recover(app):
         L.append(f"時間:{hhmmss()}")
         await rt_send(app, chat0, "\n".join(L))
 
+FNG_URL = "https://api.alternative.me/fng/?limit=7"      # v9.7：Crypto Fear & Greed Index（alternative.me，免費、不用 key，每天 08:00 台灣時間更新）
+FNG_ZH = {"Extreme Fear": ("😱", "極度恐懼"), "Fear": ("😨", "恐懼"), "Neutral": ("😐", "中性"),
+          "Greed": ("😊", "貪婪"), "Extreme Greed": ("🤑", "極度貪婪")}
+WEEK_ZH = "一二三四五六日"
+
+async def fng_fetch():
+    """向 alternative.me 查最近 7 天的恐懼貪婪指數（最新的在前）。回傳 [(台灣日期, 數值, 英文分級), ...]。"""
+    r = await HTTP.get(FNG_URL, timeout=10)
+    rows = []
+    for d in r.json()["data"][:7]:
+        rows.append((datetime.fromtimestamp(int(d["timestamp"]), TZ8), int(d["value"]), d.get("value_classification", "")))
+    if not rows:
+        raise ValueError("no data")
+    return rows
+
+async def fng_lines():
+    """v9.7（1111）：/coins 最後的恐懼貪婪指數，近 7 天清單（最新在上）；查不到就一行查詢失敗。"""
+    try:
+        rows = await fng_fetch()
+    except Exception as e:
+        print("[coins] fng fail", type(e).__name__, e)
+        return ["恐懼貪婪指數 查詢失敗,稍後再試"]
+    L = ["恐懼貪婪指數(近7天)"]
+    for t, v, cls in rows:
+        emo, zh = FNG_ZH.get(cls, ("", cls))
+        L.append(f"{t:%m/%d}({WEEK_ZH[t.weekday()]}) {emo} {v} {zh}".replace("  ", " "))
+    return L + ["(每天 08:00 更新)"]
+
 async def cmd_coins(u, c):
+    fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
     on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
     for sym in on:
@@ -6286,7 +5752,7 @@ async def cmd_coins(u, c):
             L.append(f"{sym}｜最小{sp['minsz']}張｜{mm:.4f}U")
         except Exception:
             L.append(f"{sym}｜查詢失敗")
-    L += ["━━━━━━━━━━", f"時間：{hhmmss()}"]
+    L += ["━━━━━━━━━━"] + await fng + ["━━━━━━━━━━", f"時間：{hhmmss()}"]
     await reply(u, "\n".join(L))
 
 async def cmd_timeframe(u, c):
@@ -6299,8 +5765,8 @@ async def cmd_timeframe(u, c):
         await ask(u, "tf", cmd_timeframe, f"{E.WARN} 週期須為:" + "/".join(TF_SEC.keys()) + "\n請重新輸入週期(例 3m)", "3m"); return
     ACCOUNT_TF = tf; save_state()
     # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
-    #       v7.4：/test 的埋伏通知間隔跟 /tf（下一則起）。
-    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}\n/test1 埋伏通知：下一則起每 {tf} 一則")
+    #       v9.7：/test1 刪除，回覆拿掉 /test1 那一行。
+    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}")
 
 async def cmd_menu(u, c):
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
@@ -6308,13 +5774,7 @@ async def cmd_menu(u, c):
         f"例：/run WIFUSDT S 1x 1 1.2 0.25 0.15 6 0.8\n週期依 /tf（目前 {ACCOUNT_TF}）\n"
         "/confirm 確認啟動\n/stop 幣種　停指定幣種\n/stop all　停全部+清殘單\n"
         "/status 所有策略現況\n/summary 本日 /runt 戰報（總表＋分幣種）；每天 00:00 自動發前一天的\n"
-        "/tune [幣種] [天數] 調參報告（SL/緊貼建議）\n"
-        "/amp　全部幣種K線振幅分析（依 /tf；1m/3m看7天、5m/10m看14天、15m/30m看30天；照 /coins 順序一頁一個）\n"
-        "/test1 幣種 埋伏% 每秒次數(1～4)\n"
-        "　插針測試（模擬，不下單）：L 在現價下方、S 在上方框住現價，每秒查價、改價N次，逐筆成交價碰到就算成交；一邊成交立刻撤另一邊，通知後馬上重新掛單一直跑\n"
-        "　例：/test1 WLDUSDT 0.5% 2　｜可同時跑多個幣種｜不帶參數＝查看進行中\n"
-        "/stoptest1 幣種｜all　停止指定幣種／全部 test1\n"
-        "/test2 幣種　價格階梯（只查價，不掛單）：S9～S0／現價／L0～L9，每一層離上一層 0.5%\n"
+        "/price 幣種　價格階梯（只查價，不掛單）：S9～S0／現價／L0～L9，每一層離上一層 0.5%\n"
         "/runt 幣種 方向 槓桿 保證金 初始埋伏點%\n"
         "　方向：LS 兩邊｜L 只做多｜S 只做空。槓桿：1X～100X 每一層一樣｜XX＝L0 1X、L1 2X…L9 10X（每一層保證金一樣，幣種最高槓桿要 ≥10X）\n"
         "　L、S 各自一組、完全獨立（LS＝一次開兩組，同參數）。佈局（模擬，不下單）：初始單 L0（現價下方）／S0（現價上方）「初始埋伏點%」限價埋伏，不改價。"
@@ -6325,7 +5785,7 @@ async def cmd_menu(u, c):
         "　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
         "沒有進場＝馬上停止；有進場＝🚦最後一輪（這一輪照常作戰，全部出場後那一組結束，BOT 不平倉）；停一邊，另一邊照常\n"
-        "/tf 查看/設定週期\n/coins 幣種\n"
+        "/tf 查看/設定週期\n/coins 幣種清單＋恐懼貪婪指數(近7天)\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
         "兩單都成交時完全對沖，損益鎖死=-間距，與價格無關；\n"
@@ -6355,9 +5815,9 @@ async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
 
 # ---------- 指令輸入引導（v7.5，1111 核可；v8.2 改） ----------
-# 手機點選單裡的指令會直接送出、沒辦法帶參數。現在：需要參數的指令（/run /stop /test1 /stoptest1 /test2 /runt /stoprunt /tf）沒帶參數時，
+# 手機點選單裡的指令會直接送出、沒辦法帶參數。現在：需要參數的指令（/run /stop /price /runt /stoprunt /tf；v9.7 起 /test1 /stoptest1 刪除）沒帶參數時，
 # 先回「參數怎麼打」，鍵盤自動跳出（ForceReply，輸入框有灰色範例），1111 直接打參數送出即可（不用再打指令）。
-# 打錯 → 回錯誤原因，繼續等他重打。點任何其他指令就不等了。一次打完整（/test1 WLDUSDT 0.5% 2）照樣能用。
+# 打錯 → 回錯誤原因，繼續等他重打。點任何其他指令就不等了。一次打完整（/runt WLDUSDT LS 1X 1U 0.5%）照樣能用。
 # 等待狀態只在記憶體裡，bot 重開就清掉。
 # v8.2（1111）：60 秒沒輸入就自動取消，不用打「取消」；逾時會發一行「已自動取消」順便收掉回覆列
 #   （以前 ForceReply 沒人回就一直掛著，每次點進聊天室都跳出「回覆…」）。
@@ -6473,13 +5933,10 @@ async def _post_init(app):
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "本日戰報（runt）"),
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
-            BotCommand("coins", "幣種"),
-            BotCommand("amp", "振幅分析（全部幣種，依/tf看7～30天）"),
-            BotCommand("test1", "插針測試（模擬，不下單）"),
-            BotCommand("stoptest1", "停止test1｜幣種或all"),
-            BotCommand("test2", "價格階梯（只查價）"),
+            BotCommand("coins", "幣種＋恐懼貪婪指數"),
+            BotCommand("price", "價格階梯（只查價）"),
             BotCommand("runt", "佈局（模擬，不下單）"),
-            BotCommand("stoprunt", "停止runt｜幣種或all"),
+            BotCommand("stoprunt", "停止runt｜幣種 方向或all"),
             BotCommand("stop", "停指定｜all＝停全部"),
             BotCommand("run", "建立策略"),
             BotCommand("tf", "週期"),
@@ -6512,7 +5969,7 @@ async def _post_init(app):
     asyncio.create_task(ws_public_task())
     asyncio.create_task(ws_private_task())
     await startup_recover(app)
-    await rt_recover(app)
+    await rt_gone(app)        # v9.7：/test1 刪除 → 原本在跑的不再恢復，通知一次
     await rn_recover(app)     # v7.6／v7.7：/runt 佈局
     for S in STRATS.values():
         try:
@@ -6537,14 +5994,11 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, wait_clear), group=-1)    # v7.5：點任何指令 → 取消正在等的參數
     for cmd, fn in [(["menu", "start"], cmd_menu), ("run", cmd_run_w), ("confirm", cmd_confirm),   # v7.5：/run /stop 沒參數先問
                     ("stop", cmd_stop_w), ("status", cmd_status),
-                    ("summary", cmd_summary), ("tune", cmd_tune),
+                    ("summary", cmd_summary),                                # v9.7：/tune 刪除（同一份報告 /check data 還在）
                     ("check", cmd_check),
                     ("selftest", cmd_selftest), ("log", cmd_log),
-                    ("amp", cmd_amp),
-                    ("test1", cmd_test), ("stoptest1", cmd_stoptest),        # v8.3：/test /stoptest 改名 /test1 /stoptest1
-                    ("test2", cmd_test2),                                    # v8.3：價格階梯（只查價）
+                    ("price", cmd_price), ("test2", cmd_test2_renamed),      # v9.7：/test2 改名 /price；/amp /test1 /stoptest1 刪除
                     ("runt", cmd_runt), ("stoprunt", cmd_stoprunt),          # v7.6／v7.7：/runt＝佈局（模擬）
-                    (["runtest", "stopruntest", "test", "stoptest"], cmd_runt_renamed),   # 舊名 → 提示已改名
                     (["tf", "timeframe"], cmd_timeframe), ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
