@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v8.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v8.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4881,6 +4881,7 @@ async def rt_recover(app):
 #   ⑤ 通知（v8.6，1111）：有事件發生才通知——進場成交、出場通知、本輪結束、資金費結算。
 #      v8.7：00:00 每個幣種的本日結算拿掉，改成 00:00 自動發前一天完整的 /summary（總表＋分幣種）；
 #      每一張出場記一行到 runtlog_{ACCT}.jsonl（/summary 出場統計用，保留 30 天）。
+#      v8.8：出場統計的「最差」改成「最深套住」（出場前最低毛利率最低的那一單）；拿掉「另有 N 單…」備註。
 #      不再每個 /tf 發持倉通知／埋伏通知；/status 隨時看（持倉中＝持倉通知、埋伏中＝埋伏通知的內容，
 #      都有資金費率兩行，/status 當下向 OKX 查，v8.5）。/test1 的埋伏通知不變（照 /tf）。
 #      L0/S0 掛上去之後不改價、不重掛，等到一邊成交（1111 2026-10-05：維持現狀）。
@@ -5161,14 +5162,18 @@ async def rn_sum_msgs(d, full=False):
         why = {w: sum(1 for r in recs if r.get("why") == w) for w in ("SL", "SL(移動)", "TP")}
         avg = sum(float(r.get("hold") or 0) for r in recs) / len(recs)
         key = lambda r: (Decimal(r.get("np") or "0"), Decimal(r.get("u") or "0"))
-        b, w = max(recs, key=key), min(recs, key=key)
-        one = lambda r: f"{r['sym']} {r['side']}{r['lvl']} {rn_sp(Decimal(r['np']))}|{rn_su(Decimal(r['u']))}"
+        b = max(recs, key=key)
         L += [RT_SEP, f"出場統計({len(recs)}單)",
               "出場原因 " + "|".join(f"{k} {v}" for k, v in why.items()),
               f"平均持倉 {rt_hold_str(avg)}",
-              f"最好 {one(b)}", f"最差 {one(w)}"]
-    if len(recs) < R["n"]:
-        L.append(f"(另有 {R['n'] - len(recs)} 單是 v8.7 以前出場,沒有逐單紀錄)")
+              f"最好 {b['sym']} {b['side']}{b['lvl']} {rn_sp(Decimal(b['np']))}|{rn_su(Decimal(b['u']))}"]
+        # v8.8（1111）：「最差」改成「最深套住」＝出場前最低毛利率最低的那一單（這個策略出場一定獲利，最差只是賺最少的，沒意義）。
+        # 只有 1 單不列（跟最好同一單）；當天出場的單都沒有虧損過也不列。
+        if len(recs) > 1:
+            dp = min(recs, key=lambda r: (Decimal(r.get("mae") or "0"), -Decimal(r.get("np") or "0")))
+            if Decimal(dp.get("mae") or "0") < 0:
+                L.append(f"最深套住 {dp['sym']} {dp['side']}{dp['lvl']} 最低{rn_sp(Decimal(dp['mae']))}→出場{rn_sp(Decimal(dp['np']))}")
+    # v8.8（1111）：「(另有 N 單是 v8.7 以前出場,沒有逐單紀錄)」拿掉（v8.7 部署當天才會有落差）。
     L += foot
     M = [f"📊 summary｜{ACCT} 分幣種", span]
     syms = set(day) | {k[0] for k in hold}
