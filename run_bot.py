@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v10.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v10.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4334,6 +4334,7 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v10.4（1111 2026-10-07）：/coins 再拿掉 PEPEUSDT（只是不列，/runt 照樣可以用）。其他不變。
 #   v10.3（1111 2026-10-07）：TG 左下 Menu 順序改成 status、summary、coins、price、run、stop、runt、stoprunt、timeframe、check、menu
 #     （週期列 /timeframe，/tf 照樣可以打）。其他不變。
 #   v10.2（1111 2026-10-07）：級距槓桿改名 XX1～XX5：XX→XX1（1X…10X）、YX→XX2（2X…20X）、ZX→XX5（5X…50X），
@@ -6039,7 +6040,7 @@ async def fng_lines():
         L.append(f"{t:%m/%d}({WEEK_ZH[t.weekday()]}) {emo} {v} {zh}".replace("  ", " "))
     return L + ["(每天 08:00 更新)"]
 
-COINS_HIDE = ("HYPEUSDT", "XAUUSDT", "ZECUSDT")   # v10.1（1111）：/coins 不列這 3 個（只是不列，/runt 照樣可以用）
+COINS_HIDE = ("HYPEUSDT", "XAUUSDT", "ZECUSDT", "PEPEUSDT")   # v10.1（1111）：/coins 不列（只是不列，/runt 照樣可以用）；v10.4 加 PEPEUSDT
 
 async def coins_acct_lines():
     """v10.1（1111：下策略時要知道帳戶還有多少錢）：交易帳戶 USDT 四行，當下向 OKX 查（/api/v5/account/balance），名稱照 OKX：
