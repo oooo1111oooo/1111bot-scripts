@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v10.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v10.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4334,6 +4334,7 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v10.5（1111 2026-10-07）：/coins 加 PUMP、NIGHT、ETHFI、ENA、APT、JUP、ARB、ONDO、AERO、ASTER（COINS_ADD），照字母排序。其他不變。
 #   v10.4（1111 2026-10-07）：/coins 再拿掉 PEPEUSDT（只是不列，/runt 照樣可以用）。其他不變。
 #   v10.3（1111 2026-10-07）：TG 左下 Menu 順序改成 status、summary、coins、price、run、stop、runt、stoprunt、timeframe、check、menu
 #     （週期列 /timeframe，/tf 照樣可以打）。其他不變。
@@ -6041,6 +6042,8 @@ async def fng_lines():
     return L + ["(每天 08:00 更新)"]
 
 COINS_HIDE = ("HYPEUSDT", "XAUUSDT", "ZECUSDT", "PEPEUSDT")   # v10.1（1111）：/coins 不列（只是不列，/runt 照樣可以用）；v10.4 加 PEPEUSDT
+# v10.5（1111）：/coins 多列這 10 個（2026-10-07 查過 OKX 都有 USDT 永續、都在交易中）。跟 symbols.json 合起來、拿掉 COINS_HIDE，照字母排序。
+COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSDT", "ARBUSDT", "ONDOUSDT", "AEROUSDT", "ASTERUSDT")
 
 async def coins_acct_lines():
     """v10.1（1111：下策略時要知道帳戶還有多少錢）：交易帳戶 USDT 四行，當下向 OKX 查（/api/v5/account/balance），名稱照 OKX：
@@ -6062,7 +6065,7 @@ async def coins_acct_lines():
 async def cmd_coins(u, c):
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
     acct = asyncio.ensure_future(coins_acct_lines())         # v10.1：交易帳戶放最前面
-    on = sorted([s["symbol"] for s in SYMS if s["enabled"] and s["symbol"] not in COINS_HIDE])
+    on = sorted(({s["symbol"] for s in SYMS if s["enabled"]} | set(COINS_ADD)) - set(COINS_HIDE))   # v10.5：加 COINS_ADD，不重複
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"] + await acct
     L += ["━━━━━━━━━━", "幣種｜最小保證金(1X)｜最大槓桿"]
     for sym in on:
