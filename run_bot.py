@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v10.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v10.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4334,6 +4334,12 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v10.1（1111 2026-10-07）：① 套牢明細（出場通知、/summary）：XX／YX／ZX 每一行加這一層的槓桿（S3 4X），
+#     % 是 U÷每單保證金，越上層槓桿越大、倉位越大，所以 XX 的套牢 % 是山形、不是階梯（不是算錯；÷槓桿就是 0.5% 的階梯）。
+#     ② 本輪結束／🚦 策略結束：拿掉「各單淨損益」一單一行。本輪結束＝這一輪：期間、歷時、出場原因、各層出場、這一輪已實現；
+#     策略結束＝整個策略（/runt 開始～結束、所有輪，從逐單紀錄 runtlog 取最後 st.n 筆）：開始、結束、歷時｜輪數｜出場單數、
+#     整個策略已實現、出場統計（出場原因、平均持倉、最長持倉、最高毛利率、最好、最差）、各層出場；後面照舊接本日已實現。
+#     ③ /coins：最前面加交易帳戶(USDT) 餘額／權益／可用／佔用（當下查 OKX）；HYPEUSDT、XAUUSDT、ZECUSDT 不列（/runt 照樣可用）。
 #   v10.0（1111 2026-10-06）：Telegram 單則上限 4096 字，o2222o 組數多時 /status 超過上限整則被拒收（沒有回應）→
 #     所有回覆、通知、00:00 自動 /summary：超過 3800 字自動分頁，每頁標題加 (1/N)；/status、/stoprunt 以組為單位，不把同一組切開。
 #   v9.9（1111 2026-10-06）：浮動槓桿加 YX（L0 2X、L1 4X…L9 20X）、ZX（L0 5X、L1 10X…L9 50X），幣種最高槓桿要 ≥20X／≥50X 才能用；
@@ -4575,6 +4581,16 @@ def rn_nm(T, side, lvl):
     """畫面上的名稱（v7.9：一律半形）：初始單 L0/S0，層單 L1～L9/S1～S9。（v9.4 的 🚦L3 在 v9.6 拿掉：🚦 標在每一組的幣種前面）"""
     return f"{side}{lvl}"
 
+def rn_lvx(T, lvl, lev=None):
+    """v10.1：XX／YX／ZX 每一層槓桿不同 → 名稱後面加槓桿（S3 4X）；固定槓桿只寫 S3（槓桿在標題）。lev＝那一單實際的槓桿。"""
+    if not T.get("xx"):
+        return ""
+    return f" {pct(lev if lev is not None else rn_lev(T, lvl))}X"
+
+def rn_nmx(T, p):
+    """v10.1：一張單的名稱＋（XX／YX／ZX 才有的）槓桿。"""
+    return rn_nm(T, p["side"], p["lvl"]) + rn_lvx(T, p["lvl"], rn_plev(T, p))
+
 def rn_title(side, lvl):
     """標題上的名稱（同 rn_nm）。"""
     return f"{side}{lvl}"
@@ -4696,7 +4712,8 @@ def rn_done(T, p, m):
     rn_acc_add(rn_day(T["sym"], p["side"], rn_today(p["out"][0])), m)
     rn_log_add(T, p, m)
     T["rnd"].append({"side": p["side"], "lvl": p["lvl"], "ent": p["ent"], "t_in": p["t_in"],
-                     "t_out": p["out"][0], "net": m["net"], "netu": m["netu"], "gu": m["gu"], "fu": m["fu"], "why": p["out"][2]})
+                     "t_out": p["out"][0], "net": m["net"], "netu": m["netu"], "gu": m["gu"], "fu": m["fu"], "why": p["out"][2],
+                     "g": m["g"], "fund": m["fund"], "fn": m["fn"], "mfe": rn_q2(p["mfe"]), "lev": rn_plev(T, p)})   # v10.1：統計用
 
 def rn_pl(title, a, fee=True):
     """損益一段：標題＋毛損益、淨損益（% 與 U 各自對齊）。a＝rn_acc 格式的合計。
@@ -4811,7 +4828,8 @@ async def rn_sum_msgs(d, full=False):
         for p in live:
             m = rn_money(T, p, px)
             rn_acc_add(hold.setdefault((T["sym"], p["side"]), rn_acc()), m)
-            rows.append((rn_sym(T), p["side"], p["lvl"], rn_q2(m["net"]), rn_q4(m["netu"]), p["t_in"]))   # v9.3／v9.6：🚦 那一組
+            rows.append((rn_sym(T), p["side"], p["lvl"], rn_q2(m["net"]), rn_q4(m["netu"]), p["t_in"],
+                         rn_lvx(T, p["lvl"], rn_plev(T, p))))     # v9.3／v9.6：🚦 那一組；v10.1：XX／YX／ZX 加槓桿
     def tot(accs):
         a = rn_acc()
         for x in accs:
@@ -4826,7 +4844,7 @@ async def rn_sum_msgs(d, full=False):
     foot = [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]
     if not R["n"] and not H["n"]:
         return [] if full else [head + [RT_SEP, "本日沒有出場的單,也沒有持倉"] + foot]
-    one = lambda sym, side, lvl, np_, u: f"{sym} {side}{lvl} {rn_sp(np_)}|{rn_su(u)}"
+    one = lambda sym, side, lvl, np_, u, lx="": f"{sym} {side}{lvl}{lx} {rn_sp(np_)}|{rn_su(u)}"
     # 套牢明細：虧最多的幣種在前，同一個幣種由 0 層往上
     ct = {}
     for r in rows:
@@ -4835,7 +4853,7 @@ async def rn_sum_msgs(d, full=False):
     L = head + [RT_SEP, "全部合計"]
     L += rn_join([rn_pl(f"已實現 {R['n']}單", R, fee=True) if R["n"] else [],
                   rn_pl(f"持倉中 {H['n']}單(未實現)", H) if H["n"] else [],
-                  (["套牢明細"] + [one(*r[:5]) for r in rows]) if rows else [],
+                  (["套牢明細"] + [one(*r[:5], r[6]) for r in rows]) if rows else [],
                   [f"{'24:00' if full else '現在'}全部平倉試算", f"淨損益 {rn_sp(R['np'] + H['np'])}|{rn_su(R['u'] + H['u'])}"]
                   if H["n"] else []])
     if recs:
@@ -4847,7 +4865,7 @@ async def rn_sum_msgs(d, full=False):
         bw = [f"最好 {one(b['sym'], b['side'], b['lvl'], Decimal(b['np']), Decimal(b['u']))}"]
         if rows:
             w = min(rows, key=lambda r: (r[3], r[4]))
-            bw.append(f"最差 {one(*w[:5])}")
+            bw.append(f"最差 {one(*w[:5], w[6])}")
         L += [RT_SEP] + rn_join([[f"出場統計({len(recs)}單)",
                                   "出場原因 " + "|".join(f"{k} {v}" for k, v in why.items()),
                                   f"平均持倉 {rt_hold_str(avg)}"], bw])
@@ -5008,7 +5026,7 @@ def rn_new(p, spec, chat):
             "ev": asyncio.Event(), "done": False, "rest_t": 0.0, "save_t": time.time() + RT_SAVE_SEC,
             "pos": [], "legs": {}, "ords": [], "rnd": [], "init": {}, "h0": None, "cxl_due": None, "px_last": None,
             "wait_until": None, "last": False, "dir": p["dir"], "xx": int(p.get("xx") or 0), "mmr": p.get("mmr"),
-            "st": {"r": 0, "n": 0, "u": Decimal(0), "gu": Decimal(0)}, "day": rn_today(),
+            "st": {"r": 0, "n": 0, "u": Decimal(0), "gu": Decimal(0)}, "day": rn_today(), "t_run": time.time(),
             "fund": {"t": None, "rate": None, "q": 0.0, "qt": 0.0, "last": None, "busy": False}}
 
 def rn_touch(T, px, t):
@@ -5196,10 +5214,15 @@ def rn_exit_lines(T, p, m, tail):
     hold, rows = [], []
     if live:
         a = rn_acc()
+        ms = []
         for q in live:
             mq = rn_money(T, q, px)
             rn_acc_add(a, mq)
-            rows.append(f"{rn_sym(T)} {rn_nm(T, side, q['lvl'])} {rn_sp(rn_q2(mq['net']))}|{rn_su(rn_q4(mq['netu']))}")
+            ms.append(mq)
+        # v10.1（1111）：XX／YX／ZX 每一行加這一層的槓桿（越上層槓桿越大、倉位越大，% 才會是山形）；% 和 U 各自對齊
+        xs = rn_pad([rn_sp(rn_q2(mq["net"])) for mq in ms])
+        ys = rn_pad([rn_su(rn_q4(mq["netu"])) for mq in ms])
+        rows = [f"{rn_sym(T)} {rn_nmx(T, q)} {x}|{y}" for q, x, y in zip(live, xs, ys)]
         hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a) + rn_g_lines(T, px)   # v9.8：合倉
     d = ((RN_DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []
@@ -5229,21 +5252,129 @@ def rn_liq_lines(T, items):
     L += [RT_SEP, f"淨損益 {rn_sp(tp)}|{rn_su(tu)}", f"時間:{hhmmss()}"]
     return L
 
+RN_WHY = ("SL", "SL(移動)", "TP", "強平")     # v10.1：出場原因的排列順序
+
+def rn_span(sec):
+    """v10.1：時間長度。一天以內跟持倉一樣（50:38、1:50:11），超過一天加「天」（1天1:50:11），跑一星期也好讀。"""
+    sec = max(0, int(sec))
+    d, r = divmod(sec, 86400)
+    return f"{d}天{r // 3600}:{r % 3600 // 60:02d}:{r % 60:02d}" if d else rn_dur(r)
+
+def rn_mdt(t):
+    """v10.1：日期＋時間 10/06 09:12:03（台灣時間）。"""
+    return datetime.fromtimestamp(t, TZ8).strftime("%m/%d %H:%M:%S")
+
+def rn_rec_round(T, r):
+    """v10.1：本輪紀錄（T["rnd"] 的一筆）→ 統計用的一單。v10.0 以前的紀錄沒有毛損益%／資金費% → 用 U ÷ 保證金補。"""
+    amt = T["amt"]
+    fu = Decimal(r.get("fu", 0))
+    return {"side": r["side"], "lvl": int(r["lvl"]), "lev": r.get("lev"), "why": r.get("why", ""),
+            "g": r["g"] if r.get("g") is not None else rn_q2(Decimal(r["gu"]) / amt * 100),
+            "net": Decimal(r["net"]), "fund": r["fund"] if r.get("fund") is not None else rn_q2(fu / amt * 100),
+            "gu": Decimal(r["gu"]), "netu": Decimal(r["netu"]), "fu": fu, "fn": int(r.get("fn", 1 if fu else 0)),
+            "t_in": float(r["t_in"]), "t_out": float(r["t_out"]), "mfe": r.get("mfe")}
+
+def rn_rec_log(r):
+    """v10.1：逐單出場紀錄（runtlog 一行）→ 統計用的一單。"""
+    D = lambda k: Decimal(str(r.get(k) or "0"))
+    return {"side": r["side"], "lvl": int(r["lvl"]), "lev": Decimal(r["lev"]) if r.get("lev") else None, "why": r.get("why", ""),
+            "g": D("gp"), "net": D("np"), "fund": D("fp"), "gu": D("gu"), "netu": D("u"), "fu": D("fu"), "fn": int(r.get("fn") or 0),
+            "t_in": float(r["t_in"]), "t_out": float(r["t_out"]), "mfe": Decimal(r["mfe"]) if r.get("mfe") is not None else None}
+
+def rn_run_recs(T):
+    """v10.1 策略結束：整個策略（從 /runt 開始、所有輪）出場的每一單，從逐單紀錄（runtlog）取。
+    這一組出場過 T["st"]["n"] 單（bot 重開也接著算）→ 取這個幣種、這個方向最後的 n 筆；有 /runt 開始時間的話，只取那之後出場的。"""
+    n = int(T["st"]["n"])
+    if n <= 0 or not os.path.exists(RN_LOG_FILE):
+        return []
+    t_run = T.get("t_run")
+    out = []
+    try:
+        with open(RN_LOG_FILE) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("sym") != T["sym"] or r.get("side") != T["dir"]:
+                    continue
+                if t_run is not None and float(r.get("t_out") or 0) < t_run - 1:
+                    continue
+                out.append(r)
+        return [rn_rec_log(r) for r in out[-n:]]
+    except Exception as e:
+        print("[runt] run recs read fail", e)
+        return []
+
+def rn_stat_lines(T, recs, full):
+    """v10.1（1111：一大串各單淨損益沒有意義，跑一星期也要看得懂）：統計取代一單一行。
+    full＝策略結束才有的「出場統計」（平均／最長持倉、最高毛利率、最好、最差）。回傳 (出場原因一行, 出場統計段, 各層出場段)。"""
+    why = {}
+    for r in recs:
+        why[r["why"]] = why.get(r["why"], 0) + 1
+    ws = [w for w in RN_WHY if why.get(w)] + [w for w in why if w not in RN_WHY]
+    why_line = "出場原因 " + "|".join(f"{w} {why[w]}" for w in ws)
+    nm = lambda r: f"{r['side']}{r['lvl']}" + rn_lvx(T, r["lvl"], r.get("lev"))
+    stat = []
+    if full and recs:
+        hold = [r["t_out"] - r["t_in"] for r in recs]
+        lg = max(recs, key=lambda r: r["t_out"] - r["t_in"])
+        stat = ["出場統計", why_line, f"平均持倉 {rn_span(sum(hold) / len(hold))}",
+                f"最長持倉 {nm(lg)} {rn_span(lg['t_out'] - lg['t_in'])}"]
+        mf = [r for r in recs if r.get("mfe") is not None]
+        if mf:
+            h = max(mf, key=lambda r: r["mfe"])
+            stat.append(f"最高毛利率 {nm(h)} {rn_sp(h['mfe'])}")
+        b = max(recs, key=lambda r: (r["net"], r["netu"]))
+        w = min(recs, key=lambda r: (r["net"], r["netu"]))
+        stat += [f"最好 {nm(b)} {rn_sp(b['net'])}|{rn_su(b['netu'])}|{b['why']}",
+                 f"最差 {nm(w)} {rn_sp(w['net'])}|{rn_su(w['netu'])}|{w['why']}"]
+    lv = {}
+    for r in recs:
+        k = (r["side"], r["lvl"])
+        x = lv.setdefault(k, [0, Decimal(0), Decimal(0)])
+        x[0] += 1; x[1] += rn_q2(r["net"]); x[2] += rn_q4(r["netu"])
+    ks = sorted(lv)
+    cs = rn_pad([f"{lv[k][0]}單" for k in ks])
+    ps = rn_pad([rn_sp(lv[k][1]) for k in ks])
+    us = rn_pad([rn_su(lv[k][2]) for k in ks])
+    layer = ["各層出場"] + [f"{sd}{l}{rn_lvx(T, l)} {c}|{x}|{y}" for (sd, l), c, x, y in zip(ks, cs, ps, us)]
+    return why_line, stat, layer
+
 def rn_end_lines(T):
-    """本輪結束（初始單出場、全部清空）。"""
-    rows = sorted(T["rnd"], key=lambda r: (r["side"], r["lvl"], r["t_out"]))
-    a = rn_pad([rn_sp(r["net"]) for r in rows])
-    b = rn_pad([rn_su(r["netu"]) for r in rows])
-    u = sum((r["netu"] for r in rows), Decimal(0))
+    """本輪結束（初始單出場、全部清空）。🚦 最後一輪打完＝策略結束。
+    v10.1（1111）：拿掉「各單淨損益」一單一行 —— 本輪結束＝這一輪的統計；策略結束＝整個策略（從 /runt 開始、所有輪）的統計。"""
+    rnd = [rn_rec_round(T, r) for r in T["rnd"]]
+    u = sum((r["netu"] for r in rnd), Decimal(0))
+    sides = sorted({r["side"] for r in rnd})
+    end = max([r["t_out"] for r in rnd] or [time.time()])
     if rn_whole(T):                                        # v9.3：🚦 這一組打完
-        head = f"🚦 策略結束 {T['sym']} {T['dir']} {rn_levs(T)} {pct(T['amt'])}U"
-        tail = "(這一輪全部出場,策略結束)"
+        recs = rn_run_recs(T) or rnd                       # 逐單紀錄讀不到 → 至少列這一輪
+        t0 = T.get("t_run") or min([r["t_in"] for r in recs] or [T.get("t0") or end])
+        why_line, stat, layer = rn_stat_lines(T, recs, True)
+        a = rn_acc()
+        for r in recs:
+            rn_acc_add(a, r)
+        n_all = int(T["st"]["n"])
+        note = [f"(逐單紀錄只找到 {len(recs)}/{n_all} 單)"] if len(recs) < n_all else []
+        L = [f"🚦 策略結束 {T['sym']} {T['dir']} {rn_levs(T)} {pct(T['amt'])}U", RT_SEP,
+             f"開始 {rn_mdt(t0)}", f"結束 {rn_mdt(end)}",
+             f"歷時 {rn_span(end - t0)}|{T['st']['r']}輪|出場 {n_all}單"] + note
+        L += [RT_SEP] + rn_pl(f"整個策略已實現 {len(recs)}單", a)
+        L += [RT_SEP] + stat + [RT_SEP] + layer
+        tail = "(全部出場,策略結束)"
     else:
-        head = f"{E.pnl_emoji(u)} 本輪結束 {rn_head(T)}"
+        t0 = T.get("t0") or min([r["t_in"] for r in rnd] or [end])
+        why_line, _, layer = rn_stat_lines(T, rnd, False)
+        a = rn_acc()
+        for r in rnd:
+            rn_acc_add(a, r)
+        span = rn_mdt(t0) + "～" + (rt_t(end) if rn_today(t0) == rn_today(end) else rn_mdt(end))
+        L = [f"{E.pnl_emoji(u)} 本輪結束 {rn_head(T)}", RT_SEP,
+             f"這一輪 {span}", f"歷時 {rn_span(end - t0)}|出場 {len(rnd)}單", why_line]
+        L += [RT_SEP] + layer + [RT_SEP] + rn_pl(f"這一輪已實現 {len(rnd)}單", a)
         tail = f"({rn_init_names(T)}出場,{RN_WAIT}秒後重新來過)"
-    L = [head, RT_SEP, "各單淨損益"]
-    L += [f"{rn_nm(T, r['side'], r['lvl'])} {x}|{y}|{r['why']}" for r, x, y in zip(rows, a, b)]
-    L += rn_pl_secs(T, None, sorted({r["side"] for r in rows}))   # v8.2：這一輪有出場的方向：本日已實現
+    L += rn_pl_secs(T, None, sides)                        # v8.2：這一輪有出場的方向：本日已實現
     L += [f"時間:{hhmmss()}", tail]
     return L
 
@@ -5322,8 +5453,9 @@ def rn_save():
                  "pos": [P(p) for p in T["pos"] if not p["out"]],
                  "ords": [{"side": o["side"], "lvl": o["lvl"], "px": str(o["px"]), "t": o["t"]} for o in T["ords"]],
                  "rnd": [{**r, "ent": str(r["ent"]), "net": str(r["net"]), "netu": str(r["netu"]), "gu": str(r["gu"]),
-                          "fu": str(r.get("fu", 0))}
+                          "fu": str(r.get("fu", 0)), **{k: str(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}
                          for r in T["rnd"]],
+                 "t_run": T.get("t_run"),                     # v10.1：/runt 開始的時間（策略結束統計用）
                  "st": {"r": T["st"]["r"], "n": T["st"]["n"], "u": str(T["st"]["u"]), "gu": str(T["st"]["gu"])}}
                 for T in RN.values() if not T.get("done")]
         os.makedirs(os.path.dirname(RN_FILE), exist_ok=True)
@@ -5796,6 +5928,7 @@ async def rn_recover(app):
                     continue
                 T = rn_new({**base, "dir": x}, spec, d["chat"])
                 T["last"] = last
+                T["t_run"] = float(d["t_run"]) if d.get("t_run") is not None else None   # v10.1：舊存檔沒有 → 策略結束時用逐單紀錄回推
                 T["st"] = {"r": int(st.get("r", st.get("n", 0))), "n": int(st.get("n", 0)), "u": Decimal(st.get("u", "0"))}
                 fee1 = rn_notional(T) * (RN_FEE_IN + RN_FEE_OUT) / 100       # v8.1 以前的存檔沒有毛損益：用淨損益＋每單手續費 0.07% 補回
                 T["st"]["gu"] = Decimal(st["gu"]) if "gu" in st else T["st"]["u"] + fee1 * T["st"]["n"]
@@ -5827,7 +5960,8 @@ async def rn_recover(app):
                                         "t": float(o.get("t", now))} for o in d.get("ords") or [] if o["side"] == x],
                               "rnd": [{**r, "ent": Decimal(r["ent"]), "net": Decimal(r["net"]), "netu": Decimal(r["netu"]),
                                        "gu": Decimal(r["gu"]) if "gu" in r else Decimal(r["netu"]) + fee1,
-                                       "fu": Decimal(r.get("fu", "0"))}
+                                       "fu": Decimal(r.get("fu", "0")),
+                                       **{k: Decimal(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}   # v10.1
                                       for r in d.get("rnd") or [] if r.get("side", x) == x]})
                     T["note_last"] = rt_note_base(T["h0"])
                     rn_start(app, T)
@@ -5892,10 +6026,31 @@ async def fng_lines():
         L.append(f"{t:%m/%d}({WEEK_ZH[t.weekday()]}) {emo} {v} {zh}".replace("  ", " "))
     return L + ["(每天 08:00 更新)"]
 
+COINS_HIDE = ("HYPEUSDT", "XAUUSDT", "ZECUSDT")   # v10.1（1111）：/coins 不列這 3 個（只是不列，/runt 照樣可以用）
+
+async def coins_acct_lines():
+    """v10.1（1111：下策略時要知道帳戶還有多少錢）：交易帳戶 USDT 四行，當下向 OKX 查（/api/v5/account/balance），名稱照 OKX：
+    餘額＝cashBal、權益＝eq（餘額＋未實現損益）、可用＝availBal（還能拿去下單）、佔用＝frozenBal（持倉保證金＋掛單）。
+    帳戶裡沒有 USDT＝四行都是 0；查詢失敗就一行說明。"""
+    try:
+        r = await api("GET", "/api/v5/account/balance?ccy=USDT")
+        if str(r.get("code")) != "0":
+            raise ValueError(f"code={r.get('code')} {r.get('msg', '')}")
+        x = next((d for d in (r.get("data") or [{}])[0].get("details") or [] if d.get("ccy") == "USDT"), {})
+    except Exception as e:
+        print("[coins] balance fail", type(e).__name__, e)
+        return ["交易帳戶(USDT) 查詢失敗,稍後再試"]
+    D = lambda k: Decimal(x.get(k) or "0")
+    rows = [("餘額", D("cashBal")), ("權益", D("eq")), ("可用", D("availBal")), ("佔用", D("frozenBal"))]
+    vs = rn_pad([f"{rn_q4(v):.4f}U" for _, v in rows])
+    return ["交易帳戶(USDT)"] + [f"{k} {v}" for (k, _), v in zip(rows, vs)]
+
 async def cmd_coins(u, c):
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
-    on = sorted([s["symbol"] for s in SYMS if s["enabled"]])
-    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━", "幣種｜最小保證金(1X)｜最大槓桿"]
+    acct = asyncio.ensure_future(coins_acct_lines())         # v10.1：交易帳戶放最前面
+    on = sorted([s["symbol"] for s in SYMS if s["enabled"] and s["symbol"] not in COINS_HIDE])
+    L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"] + await acct
+    L += ["━━━━━━━━━━", "幣種｜最小保證金(1X)｜最大槓桿"]
     for sym in on:
         try:
             sp = await get_spec(sym); last = await get_last(sp["iid"])
@@ -5937,7 +6092,7 @@ async def cmd_menu(u, c):
         "　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX 1U 0.5%、/runt WLDUSDT S YX 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
         "沒有進場＝馬上停止；有進場＝🚦最後一輪（這一輪照常作戰，全部出場後那一組結束，BOT 不平倉）；停一邊，另一邊照常\n"
-        "/tf 查看/設定週期\n/coins 幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
+        "/tf 查看/設定週期\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
         "━━━━━━━━━━\n"
         "【戰術】A限價 + B觸發 同時埋伏（反向同量）。\n"
         "兩單都成交時完全對沖，損益鎖死=-間距，與價格無關；\n"
@@ -6086,7 +6241,7 @@ async def _post_init(app):
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "本日戰報（runt）"),
             BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
-            BotCommand("coins", "幣種＋恐懼貪婪指數"),
+            BotCommand("coins", "帳戶＋幣種＋恐懼貪婪指數"),
             BotCommand("price", "價格階梯（只查價）"),
             BotCommand("runt", "佈局（模擬，不下單）"),
             BotCommand("stoprunt", "停止runt｜幣種 方向或all"),
