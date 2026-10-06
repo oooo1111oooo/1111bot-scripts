@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v10.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v10.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4334,6 +4334,8 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v10.6（1111 2026-10-07）：/status、/stoprunt、輸入提示的進行中清單、/summary 套牢明細與分幣種：幣種一律照字母排序
+#     （同幣種 L 在前、0 層往上）。只改畫面順序，策略、損益都不變。
 #   v10.5（1111 2026-10-07）：/coins 加 PUMP、NIGHT、ETHFI、ENA、APT、JUP、ARB、ONDO、AERO、ASTER（COINS_ADD），照字母排序。其他不變。
 #   v10.4（1111 2026-10-07）：/coins 再拿掉 PEPEUSDT（只是不列，/runt 照樣可以用）。其他不變。
 #   v10.3（1111 2026-10-07）：TG 左下 Menu 順序改成 status、summary、coins、price、run、stop、runt、stoprunt、timeframe、check、menu
@@ -4476,11 +4478,9 @@ def rn_sym(T):
     return f"🚦{T['sym']}" if rn_whole(T) else T["sym"]
 
 def rn_groups():
-    """v9.6：畫面上的順序：同幣種排在一起（照幣種第一次出現的順序），L 在前。"""
-    first = {}
-    for T in RN.values():
-        first.setdefault(T["sym"], len(first))
-    return sorted(RN.values(), key=lambda T: (first[T["sym"]], T["dir"]))
+    """v9.6：畫面上的順序：同幣種排在一起，L 在前。
+    v10.6（1111：同時跑很多幣種，比較好辨識）：幣種照字母排序（原本是照開始的先後）。只影響畫面順序。"""
+    return sorted(RN.values(), key=lambda T: (T["sym"], T["dir"]))
 
 def rn_lev(T, lvl):
     """v9.3：這一層的槓桿。XX＝第 n 層 n+1 倍（L0 1X、L1 2X…L9 10X）；否則每一層一樣。每一層保證金都一樣。
@@ -4854,11 +4854,8 @@ async def rn_sum_msgs(d, full=False):
     if not R["n"] and not H["n"]:
         return [] if full else [head + [RT_SEP, "本日沒有出場的單,也沒有持倉"] + foot]
     one = lambda sym, side, lvl, np_, u, lx="": f"{sym} {side}{lvl}{lx} {rn_sp(np_)}|{rn_su(u)}"
-    # 套牢明細：虧最多的幣種在前，同一個幣種由 0 層往上
-    ct = {}
-    for r in rows:
-        ct[r[0]] = ct.get(r[0], Decimal(0)) + r[4]
-    rows.sort(key=lambda r: (ct[r[0]], r[0], r[1], r[2], r[5]))
+    # 套牢明細：v10.6（1111）幣種照字母排序（原本虧最多的在前），同一個幣種 L 在前、由 0 層往上；🚦 不影響排序
+    rows.sort(key=lambda r: (r[0].lstrip("🚦"), r[1], r[2], r[5]))
     L = head + [RT_SEP, "全部合計"]
     L += rn_join([rn_pl(f"已實現 {R['n']}單", R, fee=True) if R["n"] else [],
                   rn_pl(f"持倉中 {H['n']}單(未實現)", H) if H["n"] else [],
@@ -4881,8 +4878,7 @@ async def rn_sum_msgs(d, full=False):
     L += foot
     M = [f"📊 summary｜{ACCT} 分幣種", span]
     syms = set(day) | {k[0] for k in hold}
-    net = lambda sym: sum((a["u"] for a in (day.get(sym) or {}).values()), Decimal(0))
-    for sym in sorted(syms, key=lambda x: (-net(x), x)):
+    for sym in sorted(syms):                                 # v10.6（1111）：分幣種照字母排序（原本賺最多的在前）
         blocks = []
         for side in ("L", "S"):
             h = hold.get((sym, side))
