@@ -133,7 +133,7 @@ def next_open_epoch(now_epoch, tf):
     sec = TF_SEC[tf]
     return ((now_epoch // sec) + 1) * sec
 
-VERSION = "v10.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v10.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -4334,6 +4334,8 @@ async def rt_gone(app):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v10.3（1111 2026-10-07）：TG 左下 Menu 順序改成 status、summary、coins、price、run、stop、runt、stoprunt、timeframe、check、menu
+#     （週期列 /timeframe，/tf 照樣可以打）。其他不變。
 #   v10.2（1111 2026-10-07）：級距槓桿改名 XX1～XX5：XX→XX1（1X…10X）、YX→XX2（2X…20X）、ZX→XX5（5X…50X），
 #     新增 XX3（3X…30X）、XX4（4X…40X）；第 n 層＝(n+1)×倍數，幣種最高槓桿要夠 L9（30X、40X）。舊名稱打了提示新名稱。
 #     做法 A（維持保證金率 1% 估算）：XX3 十層都碰得到（L9 進場後離強平約 0.8%）；XX4 到 L8（36X）後約 0.4% 就整個方向強平，L9 碰不到。
@@ -6249,16 +6251,18 @@ async def job_summary(ctx):
 async def _post_init(app):
     global HTTP
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
+    # v10.3（1111 2026-10-07）：左下 Menu 順序 status、summary、coins、price、run、stop、runt、stoprunt、timeframe、check、menu
+    #   （週期改列 /timeframe；/tf 照樣可以打）
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "本日戰報（runt）"),
-            BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
             BotCommand("coins", "帳戶＋幣種＋恐懼貪婪指數"),
             BotCommand("price", "價格階梯（只查價）"),
+            BotCommand("run", "建立策略"),
+            BotCommand("stop", "停指定｜all＝停全部"),
             BotCommand("runt", "佈局（模擬，不下單）"),
             BotCommand("stoprunt", "停止runt｜幣種 方向或all"),
-            BotCommand("stop", "停指定｜all＝停全部"),
-            BotCommand("run", "建立策略"),
-            BotCommand("tf", "週期"),
+            BotCommand("timeframe", "週期"),
+            BotCommand("check", "健檢 sl｜api｜log｜rule｜data"),
             BotCommand("menu", "說明")]
     # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
     # 只刪 Default 會被舊清單蓋住，導致左下 Menu 卡在舊版）
