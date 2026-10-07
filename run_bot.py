@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v11.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v11.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -685,6 +685,11 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v11.2（1111 2026-10-08）：畫面（/runt、/run 一起）：表格每一層改成「L00 1X 時間|毛利率|📍」（rn_rows：層數兩位數、XX 才寫槓桿、
+#     毛利率＝價格漲跌%、📍 離強平或 SL 價格、不列進場價）。① 出場通知：「最低毛利率」「淨損益」下面的橫線改空白列；未實現加 🔴；
+#     「L 套牢明細」＋這一單名稱＋出場時間|出場價＋每一層（不寫時間）。② 層單進場成交：兩條橫線改空白列，每一層寫進場時:分:秒。
+#     ③ /status 持倉通知：資金費率兩行→空白列→⏰持倉|現價→每一層（進場時:分）→空白列→持倉中(未實現)🔴。④ /summary 套牢明細：
+#     每個幣種一段（幣種一行），每一層同 /status（% 改成毛利率，原本的淨損益%和 U 不再逐行列）。/stoprunt、本輪結束、L0 成交通知不動。
 #   v11.1（1111 2026-10-07）：/amp 振幅分析加回（v9.7 刪掉的），Menu 放在 /timeframe 下面；幣種跟 /coins 同一份（coins_list）；
 #     1m 看 2 天（原本 7 天）、其他週期天數照舊；分隔符號半形 |。說明在「/amp 振幅分析」那一區。/run、/runt 不變。
 #   v11.0（1111 2026-10-07 授權）：/run、/stop 實盤上線（規則同 /runt，OKX 真的下單；見「/run 實盤」那一區）。
@@ -1082,7 +1087,7 @@ def rn_pl(title, a, fee=True):
     y = rn_pad([rn_su(r[2]) for r in rows])
     return [title] + [f"{r[0]} {p}|{q}" for r, p, q in zip(rows, x, y)]
 
-def rn_pl_side(T, side, px):
+def rn_pl_side(T, side, px, red=False):
     """同一方向：持倉中(未實現)、本日已實現（沒有的那段不列）。v8.2：1111 定案只看本日，不列累計。
     持倉中＝假設現在用 px 市價平倉，含進場 0.02%＋出場 0.05% 手續費。"""
     L = []
@@ -1091,7 +1096,7 @@ def rn_pl_side(T, side, px):
         a = rn_acc()
         for p in live:
             rn_acc_add(a, rn_money(T, p, px))
-        L = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)   # v10.7（1111）：合倉三行拿掉（每一層各自強平）
+        L = rn_pl(f"{side} 持倉中 {len(live)}單(未實現){'🔴' if red else ''}", a)   # v10.7：合倉三行拿掉；v11.2：/status 加 🔴（red）
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     if d and d["n"]:
         L = rn_join([L, rn_pl(f"{side} 本日已實現 {d['n']}單", d)])   # v10.7：跟持倉中之間空一行
@@ -1186,7 +1191,8 @@ async def rn_sum_msgs(d, full=False, M=None):
     MM = M or SIM
     day = MM.DAY.get(d) or {}
     hold = {}                                                # (幣種, L/S) -> rn_acc
-    rows = []                                                # 套牢明細：(幣種, L/S, 層, 淨損益%, 淨損益U, 進場時間)
+    rows = []                                                # 「最差」用：(幣種, L/S, 層, 淨損益%, 淨損益U, 進場時間)
+    trap = {}                                                # v11.2 套牢明細：幣種 -> [(組, 價格, 持倉)]
     for T in list(MM.G.values()):
         live = [p for p in T["pos"] if not p["out"]]
         if not live:
@@ -1199,6 +1205,7 @@ async def rn_sum_msgs(d, full=False, M=None):
                 continue
         if T.get("real"):
             px = rr_mark(T, px)
+        trap.setdefault(T["sym"], []).append((T, px, live))
         for p in live:
             m = rn_money(T, p, px)
             rn_acc_add(hold.setdefault((T["sym"], p["side"]), rn_acc()), m)
@@ -1222,10 +1229,23 @@ async def rn_sum_msgs(d, full=False, M=None):
     one = lambda sym, side, lvl, np_, u, lx="": f"{sym} {side}{lvl}{lx} {rn_sp(np_)}|{rn_su(u)}"
     # 套牢明細：v10.6（1111）幣種照字母排序（原本虧最多的在前），同一個幣種 L 在前、由 0 層往上；🚦 不影響排序
     rows.sort(key=lambda r: (r[0].lstrip("🚦"), r[1], r[2], r[5]))
+    # v11.2（1111）：套牢明細每個幣種一段（幣種一行，🚦＝最後一輪），每一層跟 /status 同一行：L00 1X 09:06|-6.21%|📍無；幣種照字母，之間空一行。
+    #   同幣種 L、S 都有持倉：同一段先 L 後 S；只有一邊是 🚦 → 各自一段，標題「🚦AAVEUSDT L」。
+    tb = []
+    for sym in sorted(trap):
+        gs = sorted(trap[sym], key=lambda x: x[0]["dir"])
+        if len({rn_whole(x[0]) for x in gs}) == 1:
+            blk = [f"{'🚦' if rn_whole(gs[0][0]) else ''}{sym}"]
+            for T, px, live in gs:
+                blk += rn_rows(T, px, live, "%H:%M")
+            tb.append(blk)
+        else:
+            for T, px, live in gs:
+                tb.append([f"{rn_sym(T)} {T['dir']}"] + rn_rows(T, px, live, "%H:%M"))
     L = head + [RT_SEP, "全部合計"]
     L += rn_join([rn_pl(f"已實現 {R['n']}單", R, fee=True) if R["n"] else [],
                   rn_pl(f"持倉中 {H['n']}單(未實現)", H) if H["n"] else [],
-                  (["套牢明細"] + [one(*r[:5], r[6]) for r in rows]) if rows else [],
+                  (["套牢明細"] + rn_join(tb)) if tb else [],
                   [f"{'24:00' if full else '現在'}全部平倉試算", f"淨損益 {rn_sp(R['np'] + H['np'])}|{rn_su(R['u'] + H['u'])}"]
                   if H["n"] else []])
     if recs:
@@ -1574,14 +1594,49 @@ def rn_fill_lines(T, ps):
           f"時間:{hhmmss()}"]
     return L
 
+def rn_nm2(side, lvl):
+    """v11.2（1111）：表格裡的層數兩位數 L00～L09。"""
+    return f"{side}{lvl:02d}"
+
+def rn_rows(T, px, live, tfmt=None, extra=False):
+    """v11.2（1111）：表格每一層一行＝層數兩位數、槓桿（XX 才寫）、[進場時間]|毛利率（px 算，價格漲跌%）|📍 離強平（已設 SL＝SL 價格）。
+    進場成交通知 tfmt＝時:分:秒；/status、/summary 時:分；出場通知的套牢明細不寫時間（None）。
+    extra＝也列這一輪已出場的 L0/S0（「已出場」）、還在掛的層（「掛單中|掛單價」）——/status、出場通知用。% 欄對齊。"""
+    tick = T["tick"]
+    rows = []                                              # (方向, 層, 排序時間, 種類, 資料)
+    if extra:
+        for r in T["rnd"]:
+            if r["lvl"] == 0:
+                rows.append((r["side"], 0, r["t_in"], "out", r))
+    for q in live:
+        rows.append((q["side"], q["lvl"], q["t_in"], "pos", q))
+    if extra:
+        for o in T["ords"]:
+            rows.append((o["side"], o["lvl"], 9e18, "ord", o))
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    gi = iter(rn_pad([rn_sp(rn_g(x["side"], x["ent"], px)) for _, _, _, k, x in rows if k == "pos"]))
+    out = []
+    for side, lvl, _, k, x in rows:
+        lev = rn_plev(T, x) if k == "pos" else (x.get("lev") or rn_lev(T, lvl))
+        nm = rn_nm2(side, lvl) + (f" {pct(lev)}X" if T.get("xx") else "")
+        if k == "out":
+            out.append(f"{nm} 已出場")
+            continue
+        if k == "ord":
+            out.append(f"{nm} {'撤單中' if x.get('cxl') else '掛單中'}|{rt_q(x['px'], tick)}")
+            continue
+        sl = rn_cur_sltp(x)[0]
+        tm = datetime.fromtimestamp(x["t_in"], TZ8).strftime(tfmt) + "|" if tfmt else ""
+        out.append(f"{nm} {tm}{next(gi)}|" + (rn_pin(x, px, T) if sl is None else f"SL {rt_q(sl, tick)}"))
+    return out
+
 def rn_lay_fill_lines(T, p):
     """層單進場成交通知：列出這一邊目前持倉中的單（初始單＋各層）。"""
-    tick = T["tick"]
     held = sorted([q for q in T["pos"] if q["side"] == p["side"] and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
-    L = [f"{E.ENTRY} 進場成交 {rn_tg(T)}{rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U",
-         RT_SEP]
-    L += [f"{rn_nm(T, q['side'], q['lvl'])} {rt_t(q['t_in'])}|{rt_q(q['ent'], tick)}" for q in held]
-    L += [RT_SEP, RN_SL_WAIT, f"時間:{hhmmss()}"]
+    # v11.2（1111）：橫線改空白列；每一行＝層數兩位數 槓桿 進場時:分:秒|毛利率|📍（跟 /status 同一套，用剛成交這一單的進場價算）
+    L = [f"{E.ENTRY} 進場成交 {rn_tg(T)}{rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U", ""]
+    L += rn_rows(T, p["ent"], held, "%H:%M:%S")
+    L += ["", RN_SL_WAIT, f"時間:{hhmmss()}"]
     return L
 
 def rn_exit_lines(T, p, m, tail):
@@ -1604,7 +1659,7 @@ def rn_exit_lines(T, p, m, tail):
           f"持倉 {rn_dur(t - p['t_in'])}|SL移動{p['n_mv']}次|TP移動{p.get('n_tp', 0)}次",   # v9.5／v9.8（1111）：不空格、時間 3:16
           f"最高毛利率 {hi}",
           f"最低毛利率 {lo}",
-          RT_SEP,
+          "",                                              # v11.2（1111）：橫線改空白列
           "這一單已實現"] + [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
     # v9.1（1111 版面）：這個方向的 持倉中(未實現)／本日已實現／套牢明細，段落之間空一行，時間前也空一行；
     # 最後一行「(L0還在,繼續)」拿掉（tail 不再用）。套牢明細＝這個幣種同方向還抱著的每一單（0 層往上）；v10.9 改成 /status 的格式。
@@ -1619,15 +1674,16 @@ def rn_exit_lines(T, p, m, tail):
             mq = rn_money(T, q, qpx)
             rn_acc_add(a, mq)
             ms.append(mq)
-        # v10.9（1111）：套牢明細改成跟 /status 一樣（rn_book）：每一層 進場價|毛利率(出場價算)|📍離強平 或 SL 價格，
-        #   還在掛的層單「掛單中」、已出場的 L0/S0「已出場」也列；不再每行重複幣種（標題有）。淨損益合計看上面的持倉中。
-        rows = rn_book(T, px)
-        hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)   # v10.7：合倉三行拿掉（每一層各自強平）
+        # v11.2（1111）：「L 套牢明細」＋這一單的名稱＋出場時間|出場價，每一層 L00 1X -2.89%|📍無（不寫時間、不寫進場價；
+        #   % ＝毛利率用出場價算、📍 離強平或 SL 價格）；已出場的 L0/S0、掛單中的層也列。淨損益合計看上面的持倉中。
+        rows = [f"{side} 套牢明細", f"{rn_tg(T)}{rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U",
+                f"{rt_t(t)}|{rt_q(px, tick)}"] + rn_rows(T, px, live, None, extra=True)
+        hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)🔴", a)   # v11.2（1111）：未實現加 🔴
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []
-    blocks = rn_join([hold, day, (["套牢明細"] + rows) if rows else []])
+    blocks = rn_join([hold, day, rows])
     if blocks:
-        L += [RT_SEP] + blocks + [""]
+        L += [""] + blocks + [""]                         # v11.2（1111）：橫線改空白列
     L.append(f"時間:{hhmmss()}")
     return L
 
@@ -1824,10 +1880,12 @@ def rn_note_lines(T, px, now, fund=None):
     tick = T["tick"]
     fl = rn_fund_line(T) if fund is None else fund
     if T["h0"] is not None and any(not p["out"] for p in T["pos"]):
-        return ([f"📣持倉通知 {rn_head(T)}"] + rn_last_lines(T)
-                + [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, tick)}"] + fl
-                + [RT_SEP] + rn_book(T, px)
-                + rn_pl_secs(T, rr_mark(T, px) if T.get("real") else px))   # v8.2：L、S 各自 持倉中／本日已實現（v11.0 實盤用 OKX 標記價格）
+        # v11.2（1111）：資金費率兩行 → 空白列 → ⏰持倉|現價 → 每一層 L00 1X 09:06|-6.21%|📍無（進場時:分）→ 空白列 → 持倉中(未實現)🔴／本日已實現
+        live = [p for p in T["pos"] if not p["out"]]
+        sec = rn_pl_side(T, T["dir"], rr_mark(T, px) if T.get("real") else px, red=True)   # v11.0 實盤用 OKX 標記價格
+        return ([f"📣持倉通知 {rn_head(T)}"] + rn_last_lines(T) + fl + [""]
+                + [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, tick)}"] + rn_rows(T, px, live, "%H:%M", extra=True)
+                + ([""] + sec if sec else []))
     return ([f"📣埋伏通知 {rn_head(T)}",
              f"⏰埋伏時間 {rt_hms(now - T['t0'])}"] + fl
             + [f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"] + rn_wait_lines(T, px))
