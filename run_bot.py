@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v11.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v11.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -685,6 +685,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v11.1（1111 2026-10-07）：/amp 振幅分析加回（v9.7 刪掉的），Menu 放在 /timeframe 下面；幣種跟 /coins 同一份（coins_list）；
+#     1m 看 2 天（原本 7 天）、其他週期天數照舊；分隔符號半形 |。說明在「/amp 振幅分析」那一區。/run、/runt 不變。
 #   v11.0（1111 2026-10-07 授權）：/run、/stop 實盤上線（規則同 /runt，OKX 真的下單；見「/run 實盤」那一區）。
 #     /runt 跟 /run 共用這一區的 rn_ 函式（RnMode：SIM＝/runt、REAL＝/run，各自的組、本日已實現、存檔、逐單紀錄）；
 #     /status、/summary 實盤在前、模擬在後；每天 00:00 兩份都發。/runt 的規則、畫面、存檔不變。
@@ -3879,10 +3881,14 @@ async def coins_acct_lines():
     vs = rn_pad([f"{rn_q4(v):.4f}U" for _, v in rows])
     return ["交易帳戶(USDT)"] + [f"{k} {v}" for (k, _), v in zip(rows, vs)]
 
+def coins_list():
+    """/coins、/amp 共用的幣種清單：symbols.json 有啟用的＋COINS_ADD，拿掉 COINS_HIDE，照字母排序（v11.1 抽出來共用）。"""
+    return sorted(({s["symbol"] for s in SYMS if s["enabled"]} | set(COINS_ADD)) - set(COINS_HIDE))
+
 async def cmd_coins(u, c):
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
     acct = asyncio.ensure_future(coins_acct_lines())         # v10.1：交易帳戶放最前面
-    on = sorted(({s["symbol"] for s in SYMS if s["enabled"]} | set(COINS_ADD)) - set(COINS_HIDE))   # v10.5：加 COINS_ADD，不重複
+    on = coins_list()                                       # v10.5：加 COINS_ADD，不重複；v11.1：跟 /amp 共用
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"] + await acct
     L += ["━━━━━━━━━━", "幣種｜最小保證金(1X)｜最大槓桿"]
     for sym in on:
@@ -3908,6 +3914,184 @@ async def cmd_timeframe(u, c):
     #       v9.7：/test1 刪除，回覆拿掉 /test1 那一行。
     await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}")
 
+# ---------- /amp 振幅分析（v6.3～v9.6；v9.7 刪除；v11.1 1111 2026-10-07 加回） ----------
+# 指令：/amp（不帶參數）—— 用目前的 /tf 週期，照 /coins 的幣種清單和順序（v11.1：跟 /coins 同一份，coins_list），一個幣種一頁，
+#   算好一頁就先送；在背景跑，不卡住其他指令；進行中再按 /amp 回「進行中 第幾個/共幾個」。只查 OKX 公開 K 線，不下單。
+# 每一頁：最高振幅（哪一根）、平均振幅、中位振幅（後面是「最高振幅÷它」的倍數）、最高價（哪一根）、⬆️ 現價到最高價%、
+#   現價（查詢當下）、⬇️ 現價到最低價%、最低價（哪一根）、區間＝⬆️%＋⬇️%（後面是「區間÷最高振幅」的倍數）。
+#   振幅＝每根 (最高−最低) ÷ 前一根收盤（最舊那一根沒有前一根 → 用自己的開盤）。中位＝由小排到大取正中間（雙數取中間兩個平均）。
+#   倍數、區間都用畫面上顯示的數字算（1111 自己按計算機會一樣），四捨五入到小數兩位。只用完整、已收線的 K 線。
+#   10m 不是 OKX 原生週期 → 用 5m 合成（整點對齊，湊不滿一整根的丟掉）。
+# 看幾天（v11.1，1111）：1m 看 2 天（原本 7 天：10080 根、23 個幣種要 10 分鐘，還會擠到查價額度）、3m 7 天、5m／10m 14 天、
+#   15m／30m 30 天。根數＝天數÷週期：1m 2880、3m 3360、5m 4032、10m 2016、15m 2880、30m 1440。
+# v11.1：分隔符號改半形 |（跟其他畫面一致）。
+AMP_DAYS = {"1m": 2, "3m": 7, "5m": 14, "10m": 14, "15m": 30, "30m": 30}
+AMP_NATIVE = (30, 15, 5, 3, 1)   # OKX 原生分鐘週期（大→小）
+AMP_RUN = {"on": False, "i": 0, "n": 0, "task": None}
+
+def amp_n(tf):
+    return AMP_DAYS.get(tf, 7) * 86400 // TF_SEC[tf]
+
+async def amp_fetch_page(iid, after, ep, bar):
+    """抓一頁 K 線（新→舊，只含已收線）。candles 只有最近約 1440 根，抓完改 history-candles 續抓。
+    回傳 (list, 下一個 ep, 是否到盡頭, 這一頁最舊那一根的時間)。OKX 回錯誤（多半是太快被限流）→ 等一下重試，最多 3 次。"""
+    lim = 300 if ep == "candles" else 100
+    q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit={lim}" + (f"&after={after}" if after else "")
+    r = {}
+    for i in range(3):
+        r = await pub(q)
+        if r.get("code") == "0":
+            break
+        await asyncio.sleep(1.0 + i)
+    if r.get("code") != "0":
+        raise RuntimeError(f"OKX K線查詢失敗 {r.get('code')} {r.get('msg')}")
+    batch = r.get("data") or []
+    if not batch:
+        if ep == "candles" and after:
+            return [], "history-candles", False, after
+        return [], ep, True, after
+    oldest = str(min(int(c[0]) for c in batch))
+    out = []
+    for c in batch:
+        try:
+            if len(c) >= 9 and str(c[8]) != "1":
+                continue                                   # 還沒收線的那一根不要
+            out.append({"ts": int(c[0]), "o": Decimal(c[1]), "h": Decimal(c[2]), "l": Decimal(c[3]), "c": Decimal(c[4])})
+        except Exception:
+            continue
+    out.sort(key=lambda x: x["ts"], reverse=True)
+    return out, ep, False, oldest
+
+async def amp_klines(iid, tf, n):
+    """最近 n+1 根（多一根當第一根的前收）已收線的 tf K 線（舊→新）；OKX 不夠就回有的。"""
+    tfm = TF_SEC[tf] // 60
+    bm = next(m for m in AMP_NATIVE if tfm % m == 0)
+    bar, k, tfms = f"{bm}m", tfm // bm, TF_SEC[tf] * 1000
+    need = (n + 2) * k
+    base = {}; after, ep = "", "candles"
+    for _ in range(need // 100 + 30):
+        page, ep, done, after = await amp_fetch_page(iid, after, ep, bar)
+        if done:
+            break
+        for x in page:
+            base[x["ts"]] = x
+        if len(base) >= need:
+            break
+        await asyncio.sleep(0.12 if ep == "history-candles" else 0.06)   # 不要打太快（OKX 公開額度 5 個帳戶共用）
+    if k == 1:
+        return sorted(base.values(), key=lambda x: x["ts"])[-(n + 1):]
+    grp = {}
+    for x in base.values():
+        grp.setdefault(x["ts"] // tfms, []).append(x)
+    out = []
+    for g, L in grp.items():
+        if len(L) != k:
+            continue
+        L.sort(key=lambda x: x["ts"])
+        out.append({"ts": g * tfms, "o": L[0]["o"], "h": max(x["h"] for x in L), "l": min(x["l"] for x in L), "c": L[-1]["c"]})
+    out.sort(key=lambda x: x["ts"])
+    return out[-(n + 1):]
+
+def amp_stats(kl, n):
+    """kl＝舊→新。回傳分析用的根數與各項數字（同數值取第一次出現的那一根）。"""
+    if len(kl) > n:
+        prev, rows = kl[0]["c"], kl[1:]
+    else:
+        prev, rows = kl[0]["o"], kl
+    amps = []
+    for x in rows:
+        amps.append((x["h"] - x["l"]) / prev * 100 if prev else Decimal(0))
+        prev = x["c"]
+    iA = max(range(len(rows)), key=lambda i: (amps[i], -i))
+    iH = max(range(len(rows)), key=lambda i: (rows[i]["h"], -i))
+    iL = min(range(len(rows)), key=lambda i: (rows[i]["l"], i))
+    sa = sorted(amps); m = len(sa) // 2
+    amed = sa[m] if len(sa) % 2 else (sa[m - 1] + sa[m]) / 2
+    return {"rows": rows, "n": len(rows), "amax": amps[iA], "tA": rows[iA]["ts"], "aavg": sum(amps) / len(amps), "amed": amed,
+            "hi": rows[iH]["h"], "tH": rows[iH]["ts"], "lo": rows[iL]["l"], "tL": rows[iL]["ts"]}
+
+def _amp_t(ms):
+    return datetime.fromtimestamp(ms / 1000, TZ8).strftime("%m/%d %H:%M")
+
+def _amp_right(ss):
+    """同一欄右對齊：位數不夠的前面補數字寬的空白。"""
+    w = max(len(x) for x in ss)
+    return [" " * (w - len(x)) + x for x in ss]
+
+async def amp_page(sym, tf, head):
+    """一個幣種一頁：成功回完整畫面；查不到回「查詢失敗,跳下一個」。"""
+    try:
+        spec = await get_spec(sym)
+        iid, tick = spec["iid"], spec["tick"]
+        n = amp_n(tf)
+        kl = await amp_klines(iid, tf, n)
+        last = await get_last(iid); t_now = time.time()
+    except Exception as e:
+        print("[amp] fail", sym, type(e).__name__, e)
+        return f"{head}\n💥 {sym} 查詢失敗,跳下一個"
+    if not kl:
+        return f"{head}\n💥 {sym} 查無K線資料,跳下一個"
+    S = amp_stats(kl, n)
+    q = lambda v: str(Decimal(str(v)).quantize(tick))
+    sA, sV, sM = f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"
+    a1, a2, a3 = _amp_right([sA, sV, sM])
+    p1, p2, p3 = _amp_right([q(S["hi"]), q(last), q(S["lo"])])
+    def rx(a, b):                                          # 倍數＝畫面上的 a ÷ 畫面上的 b，四捨五入到小數兩位
+        a, b = Decimal(a), Decimal(b)
+        return str((a / b).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if b else "-"
+    r2, r3 = rx(sA, sV), rx(sA, sM)
+    up = Decimal(f"{(S['hi'] - last) / last * 100:.3f}")  # 現價要漲多少才到最高價（負＝已經衝過最高價）
+    dn = Decimal(f"{(last - S['lo']) / last * 100:.3f}")  # 現價要跌多少才到最低價（負＝已經跌破最低價）
+    up = up if up else Decimal("0.000"); dn = dn if dn else Decimal("0.000")
+    rg = up + dn
+    d1, d2 = _amp_right([f"{up:.3f}", f"{dn:.3f}"])
+    cnt = f"{S['n']}根" + ("" if S["n"] >= n else "(OKX只有這些)")
+    L = [head,
+         f"{sym}|{tf}|{cnt}",
+         f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
+         RT_SEP,
+         f"最高振幅 {a1}%|{_amp_t(S['tA'])}",
+         f"平均振幅 {a2}%|{r2}倍",
+         f"中位振幅 {a3}%|{r3}倍",
+         RT_SEP,
+         f"最高價 {p1}|{_amp_t(S['tH'])}",
+         f"⬆️ {d1}%",
+         f"現　價 {p2}|{_amp_t(t_now * 1000)}",
+         f"⬇️ {d2}%",
+         f"最低價 {p3}|{_amp_t(S['tL'])}",
+         f"區　間 {rg:.3f}%|{rx(f'{rg:.3f}', sA)}倍",
+         RT_SEP,
+         f"時間:{hhmmss()}"]
+    return "\n".join(L)
+
+async def _amp_all(u, tf, syms):
+    """背景跑：照 /coins 的順序一個幣種一頁，算好一個就先送（不卡住其他指令）。"""
+    n = len(syms)
+    try:
+        for i, sym in enumerate(syms, 1):
+            AMP_RUN["i"] = i
+            head = f"⚡️ 振幅分析|{ACCT}|{i}/{n}"
+            try:
+                page = await amp_page(sym, tf, head)
+            except Exception as e:
+                print("[amp] page fail", sym, type(e).__name__, e)
+                page = f"{head}\n💥 {sym} 查詢失敗,跳下一個"
+            await reply(u, page)
+    finally:
+        AMP_RUN["on"] = False
+
+async def cmd_amp(u, c):
+    """/amp（不帶參數；打了參數也一樣跑全部）—— 用目前的 /tf，照 /coins 的幣種清單和順序，一個幣種一頁。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
+    if AMP_RUN["on"]:
+        await reply(u, f"{E.BOT} 振幅分析進行中({AMP_RUN['i']}/{AMP_RUN['n']}),請等跑完"); return
+    syms = coins_list()
+    if not syms:
+        await reply(u, f"{E.BOT} /coins 沒有幣種"); return
+    AMP_RUN.update(on=True, i=0, n=len(syms))
+    AMP_RUN["task"] = asyncio.create_task(_amp_all(u, tf, syms))
+
 async def cmd_menu(u, c):
     """/menu 說明。v10.8：舊 /run（A/B 跨式）的說明、【戰術】【緊貼】段拿掉。v11.0：/run、/stop 實盤。"""
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
@@ -3924,7 +4108,7 @@ async def cmd_menu(u, c):
         "　例：/runt WLDUSDT LS 1X 1U 0.5%、/runt WLDUSDT L XX1 1U 0.5%、/runt WLDUSDT S XX3 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
         "沒有進場＝馬上停止；有進場＝🚦最後一輪（這一輪照常作戰，全部出場後那一組結束，BOT 不平倉）；停一邊，另一邊照常\n"
-        "/tf 查看/設定週期\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
+        "/tf 查看/設定週期\n/amp 振幅分析：用目前的週期，照 /coins 的幣種一個一頁（1m 看 2 天、3m 7 天、5m/10m 14 天、15m/30m 30 天）\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
         "/run 幣種 方向 槓桿 保證金 初始埋伏點%　實盤（OKX 真的下單）：規則跟 /runt 一樣；成交、出場、手續費、資金費都以 OKX 為準，"
         "每一層 SL/TP 是 OKX 條件單；開始前檢查 OKX 雙向持倉、那個方向沒有別的單、每一層夠最小張數；實盤先只開固定槓桿（例 1X）\n"
         "/stop 幣種 方向｜all　停止實盤：沒有持倉＝撤掉 OKX 掛單、確認後停止；有持倉＝🚦最後一輪（BOT 不平倉）\n"
@@ -4017,6 +4201,7 @@ async def _post_init(app):
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
     load_state()              # v10.8：聊天室、/tf 週期（原本在舊 /run 的 startup_recover）
     # v10.3（1111 2026-10-07）：左下 Menu 順序 status、summary、coins、price、run、stop、runt、stoprunt、timeframe、check、menu
+    #   v11.1：timeframe 下面加 amp
     #   （週期改列 /timeframe；/tf 照樣可以打）
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "本日戰報（實盤＋runt）"),
@@ -4027,6 +4212,7 @@ async def _post_init(app):
             BotCommand("runt", "佈局（模擬，不下單）"),
             BotCommand("stoprunt", "停止runt｜幣種 方向或all"),
             BotCommand("timeframe", "週期"),
+            BotCommand("amp", "振幅分析（依週期）"),
             BotCommand("check", "健檢｜api｜log"),
             BotCommand("menu", "說明")]
     # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
@@ -4079,7 +4265,8 @@ def main():
                     ("status", cmd_status), ("summary", cmd_summary),
                     ("check", cmd_check), ("price", cmd_price),             # v10.8：/log /selftest /test2 舊別名拿掉
                     ("runt", cmd_runt), ("stoprunt", cmd_stoprunt),          # v7.6／v7.7：/runt＝佈局（模擬）
-                    (["tf", "timeframe"], cmd_timeframe), ("coins", cmd_coins)]:
+                    (["tf", "timeframe"], cmd_timeframe), ("amp", cmd_amp),   # v11.1：/amp 加回
+                    ("coins", cmd_coins)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, on_text))   # v7.5：直接打參數
