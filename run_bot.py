@@ -102,7 +102,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v10.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v10.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -667,6 +667,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v10.9（1111 2026-10-07）：出場通知的「套牢明細」改成跟 /status 一樣（rn_book）：每一層 進場價|毛利率(出場價算)|📍離強平
+#     或 SL 價格，掛單中、已出場的 L0/S0 也列；不再每行重複幣種。/summary 的套牢明細不變（跨幣種，要有幣種名稱）。其他不變。
 #   v10.8（1111 2026-10-07 清理）：拿掉舊 /run、/stop、/confirm（A/B 跨式）整套（下單、緊貼引擎 frame_mover、私有 WS、對帳、
 #     出場報告、交易紀錄、重開接管），/check 的 sl、rule、data，/log /selftest /test2 別名，/test1、v7.2 一次性搬家程式，
 #     v10.7 後沒用的合倉函式，app.strategy.normal 的載入。/run、/stop 留在 Menu，回「實盤準備中」。
@@ -1501,21 +1503,17 @@ def rn_exit_lines(T, p, m, tail):
           RT_SEP,
           "這一單已實現"] + [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
     # v9.1（1111 版面）：這個方向的 持倉中(未實現)／本日已實現／套牢明細，段落之間空一行，時間前也空一行；
-    # 最後一行「(L0還在,繼續)」拿掉（tail 不再用）。套牢明細＝這個幣種同方向還抱著的每一單（0 層往上），用出場價算淨損益。
+    # 最後一行「(L0還在,繼續)」拿掉（tail 不再用）。套牢明細＝這個幣種同方向還抱著的每一單（0 層往上）；v10.9 改成 /status 的格式。
     side = p["side"]
     live = sorted([q for q in T["pos"] if q["side"] == side and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
     hold, rows = [], []
     if live:
         a = rn_acc()
-        ms = []
         for q in live:
-            mq = rn_money(T, q, px)
-            rn_acc_add(a, mq)
-            ms.append(mq)
-        # v10.1（1111）：XX／YX／ZX 每一行加這一層的槓桿（越上層槓桿越大、倉位越大，% 才會是山形）；% 和 U 各自對齊
-        xs = rn_pad([rn_sp(rn_q2(mq["net"])) for mq in ms])
-        ys = rn_pad([rn_su(rn_q4(mq["netu"])) for mq in ms])
-        rows = [f"{rn_sym(T)} {rn_nmx(T, q)} {x}|{y}" for q, x, y in zip(live, xs, ys)]
+            rn_acc_add(a, rn_money(T, q, px))
+        # v10.9（1111）：套牢明細改成跟 /status 一樣（rn_book）：每一層 進場價|毛利率(出場價算)|📍離強平 或 SL 價格，
+        #   還在掛的層單「掛單中」、已出場的 L0/S0「已出場」也列；不再每行重複幣種（標題有）。淨損益合計看上面的持倉中。
+        rows = rn_book(T, px)
         hold = rn_pl(f"{side} 持倉中 {len(live)}單(未實現)", a)   # v10.7：合倉三行拿掉（每一層各自強平）
     d = ((RN_DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []
