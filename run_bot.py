@@ -336,6 +336,8 @@ def tg_pack(title, blocks, tail=(), lim=TG_LIM):
             pages.append(b[:k]); b = b[k:]
         if cur and size(cur) + size(b) > budget:
             pages.append(cur); cur = []
+        if not cur and b and b[0] == "":                   # v11.3：新的一頁不要用空白列開頭（同幣種 S、L 之間的空白列剛好換頁）
+            b[0] = RT_SEP
         cur += b
     tail = list(tail)
     if cur and size(cur) + size(tail) > budget:
@@ -409,7 +411,10 @@ async def cmd_status(u, c):
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     rf, sf = await asyncio.gather(rn_status_fund(REAL), rn_status_fund(SIM))
     rn_blocks = rn_status_blocks(rf, REAL) + rn_status_blocks(sf, SIM)   # v11.0：實盤（/run）在前、模擬（/runt）在後
-    blocks = [[RT_SEP] + b + rr_status_warn(T) for b, T in zip(rn_blocks, rn_groups(REAL) + rn_groups(SIM))] or [[RT_SEP, "目前沒有進行中的幣種"]]
+    gs = rn_groups(REAL) + rn_groups(SIM)
+    same = lambda i: i and gs[i - 1]["sym"] == gs[i]["sym"] and bool(gs[i - 1].get("real")) == bool(gs[i].get("real"))
+    # v11.3（1111）：同一個幣種的 S、L 之間空一行（不同幣種、實盤／模擬之間照舊橫線）
+    blocks = [["" if same(i) else RT_SEP] + b + rr_status_warn(T) for i, (b, T) in enumerate(zip(rn_blocks, gs))] or [[RT_SEP, "目前沒有進行中的幣種"]]
     for part in tg_pack(f"📊 status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]):
         await reply(u, part)
 
@@ -698,7 +703,10 @@ async def cmd_price(u, c):
 #     ⑥ 畫面 rn_rows（/status、層單成交、出場通知持倉中明細、/stoprunt）：`L01 2X 09:06|-8.80%|📍-47.10%`＝
 #        L01 加到這一單的損失合計（槓桿×價格%，一單保證金＝100%）|L01～這一單合起來的強平價離那個價格的 %（最後一列＝整個倉位）；
 #        有 SL 的單最後加 |SL 價格；/status 多一行 🎯原點。/summary 不再列套牢明細；「套牢明細」改名「持倉中明細」。
-#     ⑦ 重新一輪等待 300 → 111 秒（RN_WAIT）。
+#     ⑦ 重新一輪等待 300 → 111 秒（RN_WAIT）。⑧ SL/TP（1111 2026-10-10 定案）：保本點 最高毛利率 >0.30% → SL 設在 +0.20%（離現價至少 0.10%；扣手續費、滑價還有賺）、
+#        沒有 TP；0.30%～0.40% 之間 SL 不動；框架點 >0.40% → SL＝最高 −0.20%、TP＝最高 +0.15%，之後一起往獲利移動
+#        （RN_ARM 0.20→0.30、RN_SL_MIN 0.10→0.20、RN_BOX 0.30→0.40；−0.20%／+0.15% 不變）。
+#     ⑨ /status：S 在上、L 在下（rn_groups，各處清單一起）；同一個幣種的 S、L 之間用空白列（不同幣種、實盤／模擬之間照舊橫線）。
 #   v11.2（1111 2026-10-08）：畫面（/runt、/run 一起）：表格每一層改成「L00 1X 時間|毛利率|📍」（rn_rows：層數兩位數、XX 才寫槓桿、
 #     毛利率＝價格漲跌%、📍 離強平或 SL 價格、不列進場價）。① 出場通知：「最低毛利率」「淨損益」下面的橫線改空白列；未實現加 🔴；
 #     「L 套牢明細」＋這一單名稱＋出場時間|出場價＋每一層（不寫時間）。② 層單進場成交：兩條橫線改空白列，每一層寫進場時:分:秒。
@@ -824,9 +832,9 @@ async def cmd_price(u, c):
 #      用結算前最後查到的費率、當下成交價（實盤 OKX 用標記價格，差很小）。關機期間的結算不補算。
 #   ⑦ bot 重開：持倉、層單掛單接著跑（關機期間沒有看盤）；埋伏中的用重開當下的現價重新來過。
 RN_STEP    = 0.25              # 每秒查價 4 次（固定）
-RN_ARM     = Decimal("0.20")   # v9.0 保本點：最高毛利率 > 0.20% → SL 先卡在 +0.10%（還沒有 TP）
-RN_SL_MIN  = Decimal("0.10")   # 保本點的 SL 位置 +0.10%（也是 SL 最低）
-RN_BOX     = Decimal("0.30")   # v9.0 框架點：最高毛利率 > 0.30% → 框架形成（1111：吃不到大行情再調遠這個）
+RN_ARM     = Decimal("0.30")   # 保本點：最高毛利率 > 0.30% → SL 先卡在 +0.20%（還沒有 TP）；v9.0～v11.2 0.20%（v11.3 1111：0.20% → 0.30%）
+RN_SL_MIN  = Decimal("0.20")   # 保本點的 SL 位置 +0.20%（也是 SL 最低）；v11.2 以前 +0.10%（v11.3 1111：有滑價，改 +0.20%）
+RN_BOX     = Decimal("0.40")   # 框架點：最高毛利率 > 0.40% → 框架形成（SL 剛好接上 +0.20%）；v9.0～v11.2 0.30%
 RN_SL_GAP  = Decimal("0.20")   # 框架：SL＝最高毛利率 −0.20%（v9.5，1111：−0.25% 太遠；v9.3～v9.4 −0.25%，v9.0～v9.2 −0.20%，v8.1～v8.9 −0.10%）
 RN_TP_GAP  = Decimal("0.15")   # 框架：TP＝最高毛利率 +0.15%（v9.3 起；v9.5 框寬 0.35%）
 RN_MMR_DEF = Decimal("0.01")   # v9.3 強平：查不到 OKX 維持保證金率時先用 1%（OKX 多數幣種第 1 檔）
@@ -841,7 +849,7 @@ RN_FILE    = f"/srv/1111bot/data/runtlayer_{ACCT}.json"   # 不可用 runt_{ACCT
 RN_DAY_FILE = f"/srv/1111bot/data/runtday_{ACCT}.json"    # 本日已實現（同幣種同方向，v8.2）
 RN_DAY_KEEP = 30               # 保留最近 30 天
 RN_LOG_FILE = f"/srv/1111bot/data/runtlog_{ACCT}.jsonl"   # v8.7：每一張出場一行（/summary 出場統計、日後數據分析），保留 30 天
-RN_SL_WAIT = "SL 未設(毛利率 >0.20% 才設)"
+RN_SL_WAIT = "SL 未設(毛利率 >0.30% 才設)"
 
 
 class RnMode:
@@ -888,7 +896,7 @@ def rn_groups(M=None):
     """v9.6：畫面上的順序：同幣種排在一起，L 在前。
     v10.6（1111：同時跑很多幣種，比較好辨識）：幣種照字母排序（原本是照開始的先後）。只影響畫面順序。
     v11.0：M＝SIM（/runt，預設）或 REAL（/run）。"""
-    return sorted((M or SIM).G.values(), key=lambda T: (T["sym"], T["dir"]))
+    return sorted((M or SIM).G.values(), key=lambda T: (T["sym"], T["dir"] != "S"))   # v11.3（1111）：S 在上、L 在下
 
 def rn_lev(T, lvl):
     """v9.3：這一層的槓桿。XX＝第 n 層 n+1 倍（L0 1X、L1 2X…L9 10X）；否則每一層一樣。每一層保證金都一樣。
@@ -1536,8 +1544,8 @@ def rn_on_tick(iid, px):
 
 def rn_rule(T, p, px, now):
     """每次查價（0.25 秒）判斷一次（v9.0，1111 定案）：
-    保本點：最高毛利率 > 0.20% → SL 卡在 +0.10%（沒有 TP；0.20%～0.30% 之間不動）；
-    框架點：最高毛利率 > 0.30% → SL＝最高 −0.20%（最低 0.10%）、TP＝最高 +0.15%（v9.5），之後一起往獲利方向移動。
+    保本點：最高毛利率 > 0.30% → SL 卡在 +0.20%（沒有 TP；0.30%～0.40% 之間不動）；（v11.3；v11.2 以前 >0.20% → +0.10%）
+    框架點：最高毛利率 > 0.40% → SL＝最高 −0.20%（最低 0.20%）、TP＝最高 +0.15%（v9.5），之後一起往獲利方向移動。（v11.2 以前 >0.30%）
     v9.5：TP 移動次數 n_tp（框架形成後 TP 每變一次 +1；形成那一次不算），跟 SL 移動次數 n_mv 一樣記。
     最高＝逐筆成交價記錄的最高；SL 至少離現價 1 跳；只往獲利方向。"""
     side, ent, tick = p["side"], p["ent"], T["tick"]
@@ -1551,13 +1559,13 @@ def rn_rule(T, p, px, now):
     if hi > RN_BOX:                                        # 框架點：框架形成／移動
         sl_px = rn_lvl(side, ent, max(RN_SL_MIN, hi - RN_SL_GAP), tick)
         tp_px = rn_lvl(side, ent, hi + RN_TP_GAP, tick)
-    else:                                                  # 保本點：SL 卡 +0.10%，還沒有 TP
+    else:                                                  # 保本點：SL 卡 +0.20%，還沒有 TP
         sl_px = rn_lvl(side, ent, RN_SL_MIN, tick)
         tp_px = None
     lim = px - tick if isL else px + tick                  # SL 至少離現價 1 跳
     if better(sl_px, lim):
         sl_px = lim
-        if better(rn_lvl(side, ent, RN_SL_MIN, tick), sl_px):   # 離 0.10% 不到 1 跳 → 這次不設／SL 不動
+        if better(rn_lvl(side, ent, RN_SL_MIN, tick), sl_px):   # 離 +0.20% 不到 1 跳 → 這次不設／SL 不動
             sl_px = cur_sl
     if cur_sl is not None and (sl_px is None or not better(sl_px, cur_sl)):
         sl_px = cur_sl                                     # 只往獲利方向
@@ -1565,7 +1573,7 @@ def rn_rule(T, p, px, now):
         tp_px = cur_tp
     if sl_px is None:
         if T.get("real"):
-            p["want"] = None                               # 這次不設（價格已回落到 0.10% 以內）→ 舊的待送也作廢
+            p["want"] = None                               # 這次不設（價格已回落到 +0.20% 以內）→ 舊的待送也作廢
         return
     if T.get("real"):                                      # v11.0 實盤：算好的 SL/TP 交給 rr_algo_tick 送 OKX（OKX 接受才算數，移動次數那時才記）
         same = sl_px == cur_sl and tp_px == cur_tp
@@ -2302,7 +2310,7 @@ def rn_status_blocks(fund=None, M=None):
     out = []
     now = time.time()
     fund = fund or {}
-    for T in rn_groups(M):                                # v9.6：同幣種排在一起，L 在前
+    for T in rn_groups(M):                                # v9.6：同幣種排在一起；v11.3：S 在前、L 在後
         key = T["key"]
         fl = fund[key] if key in fund else rn_fund_line(T)
         if T.get("wait_until"):
@@ -2698,7 +2706,7 @@ async def rn_recover(app):
 #   下單：L0/S0、L1～L9 都是 OKX post-only 限價單（只做 maker；會吃單就被 OKX 取消 → 那一層 30 秒後再試，一輪 3 次就不再掛）。
 #         張數＝保證金×槓桿÷掛單價÷每張幣數，往下取到 OKX 張數單位（實際保證金會比參數 U 少一點，% 用實際的算）。
 #   成交：OKX 回報（每 0.5 秒對帳 OKX 持倉、掛單、條件單；私有 WS 有動靜馬上對）。進場價＝OKX 成交均價、時間＝OKX 成交時間。
-#   SL/TP：每一層自己一張 OKX OCO 條件單（只平那一層的張數，最新成交價觸發、市價平倉）。保本點（最高毛利率 >0.20%）才掛：
+#   SL/TP：每一層自己一張 OKX OCO 條件單（只平那一層的張數，最新成交價觸發、市價平倉）。保本點（最高毛利率 >0.27%，v11.3）才掛：
 #         SL +0.10%；OKX 的 OCO 一定要有 TP → 框架形成前 TP 先放很遠的佔位（進場價 ±50%），框架點（>0.30%）才改成真的 TP。
 #         移動＝改單（amend）。同一層最快 0.5 秒改一次、同一幣種每秒最多 7 次（OKX 改單 20 次/2 秒）。OKX 接受了才算數（移動次數也是）。
 #         觸發價跟現價方向不對（價格在往返中走掉，51280 等）→ 下一拍用新價重算。
@@ -4213,7 +4221,9 @@ async def fng_lines():
 
 COINS_HIDE = ("HYPEUSDT", "XAUUSDT", "ZECUSDT", "PEPEUSDT")   # v10.1（1111）：/coins 不列（只是不列，/runt 照樣可以用）；v10.4 加 PEPEUSDT
 # v10.5（1111）：/coins 多列這 10 個（2026-10-07 查過 OKX 都有 USDT 永續、都在交易中）。跟 symbols.json 合起來、拿掉 COINS_HIDE，照字母排序。
-COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSDT", "ARBUSDT", "ONDOUSDT", "AEROUSDT", "ASTERUSDT")
+# v11.3（1111 2026-10-10）：加 STXUSDT（查過 OKX：STX-USDT-SWAP 交易中，每張 10 STX、最小 0.1 張、最高 20X）。
+COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSDT", "ARBUSDT", "ONDOUSDT", "AEROUSDT", "ASTERUSDT",
+             "STXUSDT")
 
 async def coins_acct_lines():
     """v10.1（1111：下策略時要知道帳戶還有多少錢）：交易帳戶 USDT 四行，當下向 OKX 查（/api/v5/account/balance），名稱照 OKX：
@@ -4453,7 +4463,7 @@ async def cmd_menu(u, c):
         "　佈局（模擬，不下單）：一輪開始 L01 掛在現價下方、S01 掛在現價上方「初始埋伏點%」。"
         "LS 共用原點：先成交那一邊的成交價＝🎯原點，另一邊撤掉、改掛原點 ±2%；這一輪的層價都從原點算，原點這一輪不動。"
         "每一邊最多 5 單 L01～L05／S01～S05，每單間隔 2%；最深那一單虧損就掛下一單（掛單價已經被現價穿過＝先不掛）。"
-        "每一單最高毛利率 >0.20% SL 先卡 +0.10%；>0.30% 框架形成：SL＝最高−0.20%、TP＝最高+0.15%，之後一起往獲利移動；某一單出場撤掉比它深的掛單。"
+        "每一單最高毛利率 >0.30% SL 先卡 +0.20%（還沒有 TP）；>0.40% 框架形成：SL＝最高−0.20%、TP＝最高+0.15%，之後一起往獲利移動；某一單出場撤掉比它深的掛單。"
         "一邊全部出場、另一邊還有單 → 這一邊在自己的第一單位置重新掛（原點不變）；兩邊都沒有單 → 這一輪結束，等 111 秒用現價重新來過（有事件才通知，狀態用 /status 看）。"
         "損益 % ＝ U ÷ 每單保證金（可以相加）；毛利率＝價格漲跌%。"
         "強平：同一邊合起來算（跟 OKX 一樣，逐倉公式含維持保證金率、平倉手續費、已付資金費），碰到＝這一邊全部強平、每單各損失自己的保證金。"
