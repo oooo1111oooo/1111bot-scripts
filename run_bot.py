@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v11.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v11.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -690,6 +690,10 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v11.5（1111 2026-10-11）：本輪結束不再另外發一則，寫在最後一則出場通知（或 💥強平通知）的最下面（rn_end_note）：
+#     本日合計 → 空白列 → 本輪結束 幣種 方向 槓桿 保證金（另一邊閒置中、這一輪有出場的也一行）→ (已全部出場,111秒後重新來過) → 空白列 → 時間。
+#     起始／結束／歷時、本輪合計、各層出場不再列（/summary 有）。實盤照樣跟 OKX 倉位紀錄對帳，對不上才另外發 ⚠️（rr_round_warn）。
+#     🚦 策略結束照樣另外發一則。少見情況（預測要結束、剛好又成交）→ 之後真的結束時發完整的本輪結束（end_told）。
 #   v11.4（1111 2026-10-11 看過模擬畫面 OK）：三則通知改版面（/runt、/run 一起；層單成交、💥強平、🚦策略結束、/status 不動）。
 #     ① 進場成交（第一張）：標題 → 原點 價格|月/日 時:分:秒 → 空白列 → 初次／進場／埋伏 → 空白列 →（實盤 OKX 張數）→ 時間；橫線、SL 未設拿掉。
 #     ② 出場通知：標題（閒置說明在標題下面）→ 空白列 → 進場／設SL／出場（月/日 時:分:秒|價格）、（實盤 觸發|滑價）、持倉 1分29秒、原因、
@@ -1473,7 +1477,7 @@ def rn_pos(T, side, lvl, ent, t, px_hit):
 def rn_round(T, t0, px0):
     """開始新的一輪：取價 → 初始單上下埋伏（不帶 TP/SL，不改價）。"""
     T["lev_now"] = None                                    # v9.8：新的一輪從 L0 的槓桿重來
-    T.update({"org": None, "base": None, "endreq": False})  # v11.3：原點等第一張成交才定
+    T.update({"org": None, "base": None, "endreq": False, "end_told": False})  # v11.3：原點等第一張成交才定
     T.update({"t0": t0, "px0": px0, "cxl_due": None, "nxt": 0.0, "note_last": rt_note_base(t0),
               "init": {}, "ords": [], "rnd": [], "h0": None, "wait_until": None,
               "legs": {s: {"side": s, "px": rt_amb(px0, s, T["off"], T["tick"]), "fill": None, "dead": False}
@@ -1731,7 +1735,7 @@ def rn_lay_fill_lines(T, p):
     L += ["", RN_SL_WAIT, f"時間:{hhmmss()}"]
     return L
 
-def rn_exit_lines(T, p, m, tail=""):
+def rn_exit_lines(T, p, m, tail=None):
     """每一單各自出場的通知。v11.3（1111 2026-10-11 版面）：
     標題（閒置說明在標題下面）→ 空白列 → 進場／設SL／出場（月/日 時:分:秒|價格）、實盤觸發|滑價、持倉、原因、移動 SL n次 | TP n次、最高／最低毛利率
     → 本單 → 本日合計（這個幣種這一邊）→ 🎯持倉中 N單（這一邊還抱著的每一單＋還在掛的，同 /status；沒有就不列）→ 時間。淨損益後面加 🟢／🔴。"""
@@ -1763,7 +1767,8 @@ def rn_exit_lines(T, p, m, tail=""):
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"本日合計 {d['n']}單", d, mark=True) if d and d["n"] else []
     rows = [f"🎯持倉中 {len(live)}單"] + rn_rows(T, px, live, "%H:%M", extra=True, done=False) if live else []
-    return L + [""] + rn_join([one, day, rows]) + ["", f"時間:{hhmmss()}"]
+    # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
+    return L + [""] + rn_join([one, day, rows, tail or []]) + ["", f"時間:{hhmmss()}"]
 
 
 RN_WHY = ("SL", "SL(移動)", "TP", "強平")     # v10.1：出場原因的排列順序
@@ -2065,7 +2070,7 @@ def rn_org_join(P, o):
     """把 P 拉進原點 o 的這一輪：第一層＝原點 ±2%（往離原點遠的方向取 tick），撤掉它的初始埋伏單、不再等 111 秒。"""
     P["org"] = dict(o)
     P["base"] = rt_amb(o["px"], P["dir"], RN_LV_STEP, P["tick"])
-    P.update({"wait_until": None, "t0": o["t"], "px0": o["px"], "h0": None, "endreq": False, "nxt": 0.0})
+    P.update({"wait_until": None, "t0": o["t"], "px0": o["px"], "h0": None, "endreq": False, "nxt": 0.0, "end_told": False})
     if P.get("real"):                                      # 實盤：OKX 上的初始單撤掉；OKX 確認沒了 rr_worker 才清掉
         P["cool"], P["rej"], P["okx_round"] = {}, {}, None  # 新的一輪：上一輪的冷卻、被拒次數歸零
         for g in (P.get("legs") or {}).values():
@@ -2094,6 +2099,13 @@ def rn_origin_set(T, p):
 def rn_same_round(T, P):
     return P is not None and T.get("org") and P.get("org") == T["org"]
 
+def rn_end_note(T, P=None, own=True):
+    """v11.4（1111 2026-10-11）：本輪結束不再另外發一則，寫在最後一則出場通知（或 💥強平通知）的最下面：
+    本輪結束 幣種 方向 槓桿 保證金（own＝這一組；🚦 最後一輪不寫，另外發策略結束）／另一邊閒置中、這一輪有出場的也一起寫一行
+    ／(已全部出場,111秒後重新來過)。都沒有＝空的。"""
+    L = ([f"本輪結束 {rn_head(T)}"] if own else []) + ([f"本輪結束 {rn_head(P)}"] if P is not None else [])
+    return L + [f"(已全部出場,{RN_WAIT}秒後重新來過)"] if L else []
+
 def rn_idle_note(T, side):
     """v11.3：這一邊全部出場、另一邊還有持倉（同一個原點）→ 出場通知最後一行說明「閒置」：原點不變、第一單掛回原位。其他情況＝空字串。"""
     P = rn_partner(T)
@@ -2104,7 +2116,7 @@ def rn_idle_note(T, side):
     return (f"({side} 全部出場,{o} 還有持倉:原點 {rt_q(T['org']['px'], T['tick'])} 不變,"
             f"{rn_nm2(side, 0)} 掛回 {rt_q(T['base'], T['tick'])})")
 
-def rn_liq_lines(T, items):
+def rn_liq_lines(T, items, tail=None):
     """v11.3（1111）：合倉強平一則通知（同一邊這次強平的每一單一行，各自損失自己的保證金）。items＝[(持倉, rn_money)]。"""
     tick = T["tick"]
     items = sorted(items, key=lambda x: (x[0]["lvl"], x[0]["t_in"]))
@@ -2124,16 +2136,18 @@ def rn_liq_lines(T, items):
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     L += [""] + rn_join([rn_pl(f"這次強平 {len(items)}單", a), rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []])
     note = "" if rn_live(T) else rn_idle_note(T, side)
-    return L + ["", f"時間:{hhmmss()}"] + ([note] if note else [])
+    return L + (["", *tail] if tail else []) + ["", f"時間:{hhmmss()}"] + ([note] if note else [])
 
-def rn_over(app, T):
-    """模擬：這一組本輪結束（這一輪有出場才發本輪結束通知）。🚦 最後一輪＝策略結束（這一組拿掉，回傳 True）。"""
+def rn_over(app, T, told=False):
+    """模擬：這一組本輪結束（這一輪有出場才發本輪結束通知）。🚦 最後一輪＝策略結束（這一組拿掉，回傳 True）。
+    v11.4（1111）：told＝本輪結束已經寫在出場通知最下面 → 不另外發（🚦 策略結束照樣另外發）。"""
     T["ords"] = []
     T["legs"] = {}
     if T["rnd"]:
         T["st"]["r"] += 1
-        txt = "\n".join(rn_end_lines(T))
-        rt_chain(T, lambda t=txt: rt_send(app, T["chat"], t))
+        if not told or rn_whole(T):
+            txt = "\n".join(rn_end_lines(T))
+            rt_chain(T, lambda t=txt: rt_send(app, T["chat"], t))
     if rn_whole(T):                                        # v9.3：🚦 最後一輪打完 → 策略結束，不再開新的一輪
         print(f"[runt] 🚦 策略結束 {T['key']}")
         T["done"] = True
@@ -2141,7 +2155,8 @@ def rn_over(app, T):
             RN.pop(T["key"], None)
         T["ev"].set()
         return True
-    T.update({"rnd": [], "wait_until": time.time() + RN_WAIT, "nxt": 0.0, "org": None, "base": None, "h0": None, "endreq": False})
+    T.update({"rnd": [], "wait_until": time.time() + RN_WAIT, "nxt": 0.0, "org": None, "base": None, "h0": None, "endreq": False,
+              "end_told": False})
     T["ev"].set()
     return False
 
@@ -2207,28 +2222,31 @@ async def rn_worker(app, key):
                 print(f"[runt] 層單成交 {key} {p['side']}{p['lvl']}@{p['ent']}")
                 send("\n".join(rn_lay_fill_lines(T, p)))
             outs = sorted([p for p in T["pos"] if p["out"]], key=lambda p: p["out"][0])
-            liqs = []
+            exits, liqs = [], []
             for p in outs:                                 # 每一單各自出場；v11.3：強平（合倉）的合成一則
                 T["pos"].remove(p)
                 m = rn_money(T, p, p["out"][1])
                 rn_done(T, p, m)
                 print(f"[runt] 出場 {key} {p['side']}{p['lvl']} {p['out'][2]} @{p['out'][1]} 淨{m['netu']}")
-                if p["out"][2] == "強平":
-                    liqs.append((p, m))
-                    continue
-                send("\n".join(rn_exit_lines(T, p, m, rn_tail(T, p))))
+                (liqs if p["out"][2] == "強平" else exits).append((p, m))
+            P = rn_partner(T) if outs and not T["pos"] else None
+            same = rn_same_round(T, P)
+            idle = bool(outs) and not T["pos"] and same and rn_live(P) and not rn_whole(T)
+            end = bool(outs) and not T["pos"] and not idle   # 這一邊全部出場、另一邊也沒有持倉 → 這一輪結束
+            Pin = P if end and same and not P["pos"] and P["rnd"] and not rn_whole(P) else None
+            tail = rn_end_note(T, Pin, own=not rn_whole(T)) if end else []   # v11.4：本輪結束寫在最後一則出場通知最下面
+            for i, (p, m) in enumerate(exits):
+                send("\n".join(rn_exit_lines(T, p, m, tail if i == len(exits) - 1 and not liqs else None)))
             if liqs:
-                send("\n".join(rn_liq_lines(T, liqs)))
-            if outs and not T["pos"]:                      # 這一邊全部出場
-                P = rn_partner(T)
-                if rn_same_round(T, P) and rn_live(P) and not rn_whole(T):
-                    T["h0"] = None                         # v11.3：另一邊還有持倉 → 原點不動，這一邊在第一層重新掛（rn_layers）
-                    rn_save()
-                    continue
-                same = rn_same_round(T, P)
-                done = rn_over(app, T)                     # 本輪結束 → 等 RN_WAIT 秒 → 用現價重新來過（🚦＝策略結束）
+                send("\n".join(rn_liq_lines(T, liqs, tail)))
+            if idle:                                       # 這一邊全部出場
+                T["h0"] = None                             # v11.3：另一邊還有持倉 → 原點不動，這一邊在第一層重新掛（rn_layers）
+                rn_save()
+                continue
+            if end:
+                done = rn_over(app, T, told=True)          # 本輪結束 → 等 RN_WAIT 秒 → 用現價重新來過（🚦＝策略結束）
                 if same and not P["pos"]:                  # v11.3：另一邊閒置中（這一輪沒有持倉了）→ 一起結束這一輪
-                    rn_over(app, P)
+                    rn_over(app, P, told=Pin is not None)
                 elif same:                                 # 另一邊剛好也出場、還沒記帳 → 讓它自己記完、自己結束這一輪
                     P["ev"].set()
                 rn_save()
@@ -3573,6 +3591,17 @@ async def rr_round_okx(T):
         await asyncio.sleep(1.5)
     rr_ev("round_okx_none", T)
 
+def rr_round_warn(T, u):
+    """v11.4：本輪結束寫在出場通知最下面之後，OKX 對帳對不上（差額超過容許）才另外發一則提醒；對得上、OKX 還沒給紀錄＝不發（事件紀錄有）。"""
+    x = T.get("okx_round")
+    if not x:
+        return []
+    d = rn_q4(u) - rn_q4(x["rp"])
+    if abs(d) <= Decimal("0.0002") * max(1, len(T.get("rnd") or [])):
+        return []
+    return ([f"{E.WARN} OKX 對帳對不上 {rn_head(T)}", "這一輪 BOT 算的跟 OKX 倉位紀錄不一樣,請到 OKX 確認"]
+            + [x for x in rr_round_lines(T, u) if x != RT_SEP] + [f"時間:{hhmmss()}"])
+
 def rr_round_lines(T, u):
     """本輪結束／策略結束（實盤）：BOT 逐層合計 vs OKX 倉位紀錄。"""
     x = T.get("okx_round")
@@ -3789,7 +3818,7 @@ async def rr_worker(app, key):
                 for p in new:
                     p["told"] = True
                 if new:
-                    T["endreq"] = False                    # 要一起結束這一輪時初始單剛好成交 → 這一輪繼續
+                    T["endreq"] = T["end_told"] = False    # 要一起結束這一輪時初始單剛好成交 → 這一輪繼續
                     rn_origin_set(T, min(new, key=lambda p: p["t_in"]))   # v11.3：這一輪的原點
                     send("\n".join(rn_fill_lines(T, new) [:-1] + rr_fill_okx(T, new) + rn_fill_lines(T, new)[-1:]))
                     T["h0"] = min(p["t_in"] for p in new)
@@ -3804,23 +3833,32 @@ async def rr_worker(app, key):
                 if T["h0"] is None:
                     T["h0"] = p["t_in"]
                     T["note_last"] = rt_note_base(T["h0"])
-                T["endreq"] = False                        # 要一起結束這一輪時剛好成交 → 這一輪繼續
+                T["endreq"] = T["end_told"] = False        # 要一起結束這一輪時剛好成交 → 這一輪繼續
                 L = rn_lay_fill_lines(T, p)
                 send("\n".join(L[:-1] + rr_fill_okx(T, [p]) + L[-1:]))
             outs = sorted([p for p in T["pos"] if p["out"]], key=lambda p: p["out"][0])
-            liqs = []
+            exits, liqs = [], []
             for p in outs:                                 # 每一層各自出場（OKX 平倉單成交）；v11.3：強平的合成一則
                 T["pos"].remove(p)
                 p["told"] = True
                 m = rn_money(T, p, p["out"][1])
                 rn_done(T, p, m)
                 print(f"[run] 出場記帳 {key} {p['side']}{p['lvl']} {p['out'][2]} 淨{m['netu']}")
-                if p["out"][2] == "強平":
-                    liqs.append((p, m))
-                    continue
-                send("\n".join(rn_exit_lines(T, p, m, rn_tail(T, p))))
+                (liqs if p["out"][2] == "強平" else exits).append((p, m))
+            tail = []
+            if outs and not T["pos"]:                      # v11.4：這一邊全部出場、不會閒置 → 本輪結束寫在最後一則出場通知最下面
+                P = rn_partner(T)
+                if not (not T.get("endreq") and rn_same_round(T, P) and rn_live(P) and not rn_whole(T) and not T.get("stopping")):
+                    own = not rn_whole(T) and not T.get("stopping")
+                    Pin = P if rn_same_round(T, P) and not P["pos"] and P["rnd"] and not rn_whole(P) else None
+                    tail = rn_end_note(T, Pin, own)
+                    T["end_told"] = own
+                    if Pin is not None:
+                        Pin["end_told"] = True
+            for i, (p, m) in enumerate(exits):
+                send("\n".join(rn_exit_lines(T, p, m, tail if i == len(exits) - 1 and not liqs else None)))
             if liqs:
-                send("\n".join(rn_liq_lines(T, liqs)))
+                send("\n".join(rn_liq_lines(T, liqs, tail)))
             if T.get("stopping") and T["pos"]:             # /stop 撤單時剛好成交 → 🚦 最後一輪
                 T["stopping"], T["last"] = False, True
             ents = [g for g in (T.get("legs") or {}).values() if g.get("oid") or g.get("busy") or g.get("amb")]
@@ -3834,7 +3872,13 @@ async def rr_worker(app, key):
                     if T["rnd"]:
                         await rr_round_okx(T)
                         T["st"]["r"] += 1
-                        send("\n".join(rn_end_lines(T)))
+                        if T.get("end_told") and not rn_whole(T) and not T.get("stopping"):
+                            w = rr_round_warn(T, sum((rn_q4(Decimal(r["netu"])) for r in T["rnd"]), Decimal(0)))
+                            if w:                          # v11.4：本輪結束已寫在出場通知 → 只有 OKX 對帳對不上才另外通知
+                                send("\n".join(w))
+                        else:
+                            send("\n".join(rn_end_lines(T)))
+                    T["end_told"] = False
                     if rn_whole(T) or T.get("stopping"):
                         print(f"[run] 🚦 策略結束 {key}")
                         rr_stop_done(T, "last")
@@ -3842,7 +3886,7 @@ async def rr_worker(app, key):
                             rr_end_req(P)
                         return
                     T.update({"rnd": [], "wait_until": time.time() + RN_WAIT, "nxt": 0.0, "org": None, "base": None,
-                              "h0": None, "endreq": False})
+                              "h0": None, "endreq": False, "end_told": False})
                     if same and not rn_live(P):            # 另一邊閒置中 → 一起結束這一輪（撤掉它在第一層的掛單）
                         rr_end_req(P)
                     rr_save()
