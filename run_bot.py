@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v11.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -693,6 +693,7 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.0（1111 2026-10-11）：出場通知的 🎯持倉中那一段拿掉（本日合計下面空一行就是時間）。
 #   v11.9（1111 2026-10-11）：模擬 /runt 的損益 % 照 OKX 算（rn_inv）：已實現損益＝倉位價值×價格漲跌（＝槓桿×保證金×價格%）−手續費±資金費，
 #     收益率＝已實現損益 ÷ 保證金（投入的 U）。一單＝本來就是；好幾單合計（本日合計、分幣種、本輪、各層出場、強平合計、/stoprunt、進行中清單）
 #     改成 U 合計 ÷ 這一組的 U（原本每單 % 相加）；/summary 總表多一行「總投入金額 💰xU|n幣種」（今天有出場的每一組的 U 相加），
@@ -1817,9 +1818,9 @@ def rn_exit_lines(T, p, m, tail=None):
     one[-1] += E.pnl_emoji(rn_q4(m["netu"]))
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"本日合計 {d['n']}單", d, mark=True, inv=rn_inv(T)) if d and d["n"] else []
-    rows = [f"🎯持倉中 {len(live)}單"] + rn_rows(T, px, live, "%H:%M:%S", extra=True, done=False) if live else []
     # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
-    return L + [""] + rn_join([one, day, rows, tail or []]) + ["", f"時間:{hhmmss()}"]
+    # v12.0（1111 2026-10-11）：🎯持倉中那一段拿掉（每一單看 /status）
+    return L + [""] + rn_join([one, day, tail or []]) + ["", f"時間:{hhmmss()}"]
 
 
 RN_WHY = ("SL", "SL(移動)", "TP", "強平")     # v10.1：出場原因的排列順序
