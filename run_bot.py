@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v11.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v11.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -406,15 +406,18 @@ async def _reply_long(u, head, lines, tail):
 
 
 async def cmd_status(u, c):
-    """/status：每個 /runt 組一段（持倉中＝持倉通知、埋伏中＝埋伏通知，資金費率當下向 OKX 查）。
-    v10.0：太長分頁，一組不切開。v10.8：舊 /run 的部分拿掉。"""
+    """/status：v11.7（1111）一個幣種一段（rn_coin_lines：L、S 合在一起、一個原點、S 的單／現價／L 的單；損益、資金費率不列）。
+    v10.0：太長分頁，一段不切開。v10.8：舊 /run 的部分拿掉。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
-    rf, sf = await asyncio.gather(rn_status_fund(REAL), rn_status_fund(SIM))
-    rn_blocks = rn_status_blocks(rf, REAL) + rn_status_blocks(sf, SIM)   # v11.0：實盤（/run）在前、模擬（/runt）在後
-    gs = rn_groups(REAL) + rn_groups(SIM)
-    same = lambda i: i and gs[i - 1]["sym"] == gs[i]["sym"] and bool(gs[i - 1].get("real")) == bool(gs[i].get("real"))
-    # v11.3（1111）：同一個幣種的 S、L 之間空一行（不同幣種、實盤／模擬之間照舊橫線）
-    blocks = [["" if same(i) else RT_SEP] + b + rr_status_warn(T) for i, (b, T) in enumerate(zip(rn_blocks, gs))] or [[RT_SEP, "目前沒有進行中的幣種"]]
+    now = time.time()
+    blocks = []
+    for M in (REAL, SIM):                                  # v11.0：實盤（/run）在前、模擬（/runt）在後
+        by = {}
+        for T in rn_groups(M):
+            by.setdefault(T["sym"], []).append(T)
+        for sym in sorted(by):                             # v11.7（1111）：一個幣種一段（L、S 合在一起）
+            blocks.append([RT_SEP] + rn_coin_lines(by[sym], now))
+    blocks = blocks or [[RT_SEP, "目前沒有進行中的幣種"]]
     for part in tg_pack(f"📊 status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]):
         await reply(u, part)
 
@@ -690,6 +693,11 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v11.7（1111 2026-10-11「明白了就直接改了」）：/status 改版面（rn_coin_lines）：一個幣種一段（L、S 合在一起；實盤、模擬各自）。
+#     📣持倉通知／埋伏通知 幣種 方向(兩組＝LS) 槓桿 保證金 → 空白列 → 🌐原點 S01 時:分:秒|成交價（這一輪第一張成交，一個幣種只有一個；還沒有＝等第一張成交）
+#     → S 的單（S01、S02…）→ 現價 時:分:秒|現價🛜 → L 的單（L01、L02…）。持倉列 L01 時:分:秒|累計%|📌（有 SL 加 |SL 價格），
+#     掛單列 L02 時:分:秒|掛單價|掛單中✏️。損益（持倉中、本日已實現）、資金費率、⏰持倉、初次、已出場那一列拿掉（看 /summary）。
+#     列的格式（rn_rows）各處一致：不寫槓桿（XX 才寫）、時:分:秒、📍 改 📌、掛單列寫掛出去的時間。本輪結束等待中＝⏳一行。
 #   v11.6（1111 2026-10-11 看過模擬畫面 OK）：/summary 改版面（rn_sum_msgs；實盤、00:00 自動發的一起）。
 #     第一則：標題、日期 → 空白列 → 本日共計 N單⭐️ → 出場原因：設定SL n | 設定TP n／移動SL n | 移動TP n（TP 用 runtlog 的 n_tp 分）／
 #     有才列 強平 n | 手動平倉 n → 空白列 → 損益（淨損益後面 🟢／🔴）→ 有持倉：持倉中 N單(未實現) → 空白列 → 時間。
@@ -1695,6 +1703,7 @@ def rn_nm2(side, lvl):
 def rn_rows(T, px, live, tfmt=None, extra=False, done=True):
     """表格每一層一行（/status、層單進場成交、出場通知的持倉中明細、/stoprunt 共用）。
     v11.3（1111：跟 Excel 一樣）：L01 2X 09:06|-8.80%|📍-47.10%（已設 SL 再加 |SL 價格）
+    v11.7（1111）：L01 09:06:12|-8.80%|📌-47.10%（槓桿在標題，XX 才寫；📍 改 📌）；掛單列 L02 09:06:13|0.9751|掛單中✏️（掛出去的時間）。
       % ＝L01 加到這一層的損失合計（每一單＝槓桿×價格漲跌%，以一單保證金＝100%，用 px 算：現價／成交價／出場價）；
       📍＝L01 到這一層合起來的預估強平價（rn_gliq）離 px 的 %（＋在上面、−在下面）；最後一列＝整個倉位（實盤用 OKX 的強平價）。
     進場成交通知 tfmt＝時:分:秒；/status 時:分；出場通知的持倉中明細不寫時間（None）。
@@ -1724,17 +1733,20 @@ def rn_rows(T, px, live, tfmt=None, extra=False, done=True):
     out = []
     for side, lvl, _, k, x in rows:
         lev = rn_plev(T, x) if k == "pos" else (x.get("lev") or rn_lev(T, lvl))
-        nm = f"{rn_nm2(side, lvl)} {pct(lev)}X"
+        nm = rn_nm2(side, lvl) + rn_lvx(T, lvl, lev)       # v11.7：槓桿寫在標題（XX 才每一單寫）
         if k == "out":
             out.append(f"{nm} 已出場")
             continue
         if k == "ord":
-            out.append(f"{nm} {'撤單中' if x.get('cxl') else '掛單中'}|{rt_q(x['px'], tick)}")
+            to = x.get("t") or x.get("live")
+            tm = datetime.fromtimestamp(to, TZ8).strftime(tfmt or "%H:%M:%S") + "|" if to else ""
+            st = ("撤單中" if x.get("cxl") else "掛單中") + (f"(已成交{pct(x['acc'])}張)" if x.get("acc") else "")
+            out.append(f"{nm} {tm}{rt_q(x['px'], tick)}|{st}✏️")
             continue
         liq = info[id(x)][1]
         if okl and last.get(side) is x:
             liq = okl                                      # 實盤：整個倉位用 OKX 給的預估強平價
-        pin = "📍" + rn_sp(rn_q2((liq / px - 1) * 100)) if liq and px else "📍無"
+        pin = "📌" + rn_sp(rn_q2((liq / px - 1) * 100)) if liq and px else "📌無"
         sl = rn_cur_sltp(x)[0]
         tm = datetime.fromtimestamp(x["t_in"], TZ8).strftime(tfmt) + "|" if tfmt else ""
         out.append(f"{nm} {tm}{next(ci)}|{pin}" + (f"|SL {rt_q(sl, tick)}" if sl is not None else ""))
@@ -1780,7 +1792,7 @@ def rn_exit_lines(T, p, m, tail=None):
     one[-1] += E.pnl_emoji(rn_q4(m["netu"]))
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"本日合計 {d['n']}單", d, mark=True) if d and d["n"] else []
-    rows = [f"🎯持倉中 {len(live)}單"] + rn_rows(T, px, live, "%H:%M", extra=True, done=False) if live else []
+    rows = [f"🎯持倉中 {len(live)}單"] + rn_rows(T, px, live, "%H:%M:%S", extra=True, done=False) if live else []
     # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
     return L + [""] + rn_join([one, day, rows, tail or []]) + ["", f"時間:{hhmmss()}"]
 
@@ -1926,8 +1938,8 @@ def rn_pin(p, px, T=None):
     v11.0 實盤：用 OKX 持倉的預估強平價（OKX 同方向合成一個倉位，每一層一樣）。"""
     liq = rr_liq(T) if T is not None and T.get("real") else p.get("liq")
     if liq is None or not px:
-        return "📍無"
-    return "📍" + rn_sp(rn_q2((liq / px - 1) * 100))
+        return "📌無"
+    return "📌" + rn_sp(rn_q2((liq / px - 1) * 100))
 
 def rn_book(T, px):
     """持倉中的表（持倉通知、/stoprunt 共用）：各單一行＋合計。"""
@@ -1988,21 +2000,60 @@ def rn_last_lines(T):
         return ["🚦 最後一輪,全部出場後策略結束"]
     return []
 
-def rn_note_lines(T, px, now, fund=None):
-    """/status 用（v8.6 起不再每個 /tf 自動發）：持倉中＝持倉通知；埋伏中＝埋伏通知。都有資金費率兩行。
-    fund＝/status 當下查到的資金費率行；沒給就用 bot 每 60 秒查到的。"""
-    tick = T["tick"]
-    fl = rn_fund_line(T) if fund is None else fund
-    if T["h0"] is not None and any(not p["out"] for p in T["pos"]):
-        # v11.2（1111）：資金費率兩行 → 空白列 → ⏰持倉|現價 → 每一層 L00 1X 09:06|-6.21%|📍無（進場時:分）→ 空白列 → 持倉中(未實現)🔴／本日已實現
-        live = [p for p in T["pos"] if not p["out"]]
-        sec = rn_pl_side(T, T["dir"], rr_mark(T, px) if T.get("real") else px, red=True)   # v11.0 實盤用 OKX 標記價格
-        return ([f"📣持倉通知 {rn_head(T)}"] + rn_last_lines(T) + fl + [""] + rn_org_line(T)
-                + [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, tick)}"] + rn_rows(T, px, live, "%H:%M", extra=True)
-                + ([""] + sec if sec else []))
-    return ([f"📣埋伏通知 {rn_head(T)}",
-             f"⏰埋伏時間 {rt_hms(now - T['t0'])}"] + fl
-            + [f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"] + rn_org_line(T) + rn_wait_lines(T, px))
+def rn_coin_lines(gs, now):
+    """v11.7（1111 2026-10-11）/status：同一個幣種（實盤、模擬各自）一段，L、S 合在一起；損益、資金費率不列（看 /summary）。
+    📣持倉通知／埋伏通知 幣種 方向 槓桿 保證金 → 空白列 → 🌐原點（這一輪第一張成交：S01 時:分:秒|成交價；還沒有＝等第一張成交）
+    → S 的單（S01、S02…：持倉 時間|累計%|📌、掛單 時間|掛單價|掛單中✏️）→ 現價 時間|現價🛜 → L 的單（L01、L02…）。
+    方向：兩組都在＝LS，只有一組＝那一邊。兩邊槓桿／保證金不一樣＝S 2X 2U|L 1X 1U。🚦：全部是＝幣種前面，只有一邊＝標題後面 (S 🚦最後一輪)。"""
+    gs = sorted(gs, key=lambda T: T["dir"] != "S")         # S 在前
+    T0 = gs[0]
+    tick = T0["tick"]
+    hms = lambda t: datetime.fromtimestamp(t, TZ8).strftime("%H:%M:%S")
+    prm = lambda T: f"{rn_levs(T)} {pct(T['amt'])}U"
+    if len(gs) > 1 and len({prm(T) for T in gs}) > 1:
+        title = f"{T0['sym']} " + "|".join(f"{T['dir']} {prm(T)}" for T in gs)
+    else:
+        title = f"{T0['sym']} {'LS' if len(gs) > 1 else T0['dir']} {prm(T0)}"
+    wh = [T for T in gs if rn_whole(T)]
+    if wh and len(wh) == len(gs):
+        title = "🚦" + title
+    elif wh:
+        title += "".join(f"({T['dir']} 🚦最後一輪)" for T in wh)
+    tg = rn_tg(T0)
+    left = lambda T: max(0, int(T["wait_until"] - now))
+    if all(T.get("wait_until") for T in gs):
+        return [f"⏳{tg}{title}|本輪結束,剩 {max(left(T) for T in gs)} 秒重新埋伏"]
+    px = next((T.get("px_last") for T in gs if T.get("px_last")), None) or (WS_PX.get(T0["iid"]) or (None,))[0]
+    live = {T["dir"]: [p for p in T["pos"] if not p["out"]] for T in gs}
+    L = [f"📣{'持倉通知' if any(live.values()) else '埋伏通知'} {tg}{title}", ""]
+    orgs = [T["org"] for T in gs if T.get("org")]
+    if orgs:
+        o = min(orgs, key=lambda o: o["t"])
+        L.append(f"🌐原點 {o['side']}01 {hms(o['t'])}|{rt_q(o['px'], tick)}")
+    else:
+        L.append("🌐原點 等第一張成交")
+
+    def side_rows(T):
+        if T.get("wait_until"):
+            return [f"{T['dir']} 本輪結束,剩 {left(T)} 秒重新埋伏"]
+        rows = [f"{g['side']}01 {hms(T['t0'])}|{rt_q(g['px'], tick)}|{'撤單中' if g.get('cxl') else '掛單中'}✏️"
+                for g in (T.get("legs") or {}).values() if not g.get("fill") and not g.get("dead")]
+        if px is not None:
+            rows += rn_rows(T, px, live[T["dir"]], "%H:%M:%S", extra=True, done=False)
+        elif live[T["dir"]]:
+            rows.append(f"{T['dir']} 持倉 {len(live[T['dir']])}單")
+        return rows
+    for T in gs:
+        if T["dir"] == "S":
+            L += side_rows(T)
+    L.append(f"現價 {hms(now)}|{rt_q(px, tick)}🛜" if px is not None else "現價 查價中")
+    for T in gs:
+        if T["dir"] == "L":
+            L += side_rows(T)
+    for T in gs:
+        if T.get("real"):
+            L += rr_status_warn(T)
+    return L
 
 def rn_save():
     try:
@@ -2337,32 +2388,6 @@ def rn_status_line(T):
         s += f"|持倉中淨損益 {rn_sp(nr)}"
     return s
 
-def rn_status_blocks(fund=None, M=None):
-    """/status（v8.1）：每個 /runt 幣種一段，內容跟持倉通知／埋伏通知一樣；等待 60 秒中的寫剩幾秒。
-    v8.5：每一段都有資金費率兩行（fund＝幣種 -> /status 當下向 OKX 查到的行）。v11.0：M＝SIM／REAL。"""
-    out = []
-    now = time.time()
-    fund = fund or {}
-    for T in rn_groups(M):                                # v9.6：同幣種排在一起；v11.3：S 在前、L 在後
-        key = T["key"]
-        fl = fund[key] if key in fund else rn_fund_line(T)
-        if T.get("wait_until"):
-            out.append([f"⏳{rn_par(T)}", f"本輪結束,剩 {max(0, int(T['wait_until'] - now))} 秒重新埋伏"] + fl)
-            continue
-        px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
-        if px is None:
-            out.append([f"💡{rn_par(T)}", "查價中"] + fl)
-            continue
-        out.append(rn_note_lines(T, px, now, fl))
-    return out
-
-async def rn_status_fund(M=None):
-    """v8.5：/status 當下，所有 /runt 幣種一起向 OKX 查資金費率。v11.0：M＝SIM／REAL。"""
-    G = (M or SIM).G
-    keys = list(G.keys())
-    res = await asyncio.gather(*[rn_fund_now(G[k]) for k in keys], return_exceptions=True)
-    return {k: r for k, r in zip(keys, res) if isinstance(r, list)}
-
 def rn_running(M=None):
     M = M or SIM
     return ["進行中:"] + ([rn_status_line(T) for T in rn_groups(M)] or [f"目前沒有進行中的 {M.name}"])
@@ -2488,7 +2513,7 @@ def rn_stop_lines(T, now, last=False):
     live = [p for p in T["pos"] if not p["out"]]
     px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
     if live and px is not None and T["h0"] is not None:
-        L += [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, T['tick'])}", RT_SEP] + rn_rows(T, px, live, "%H:%M", extra=True)
+        L += [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, T['tick'])}", RT_SEP] + rn_rows(T, px, live, "%H:%M:%S", extra=True)
     elif live:
         L.append(f"持倉 {len(live)} 單|未出場")
     elif T.get("wait_until"):
@@ -4526,7 +4551,7 @@ async def cmd_menu(u, c):
         "一邊全部出場、另一邊還有單 → 這一邊在自己的第一單位置重新掛（原點不變）；兩邊都沒有單 → 這一輪結束，等 111 秒用現價重新來過（有事件才通知，狀態用 /status 看）。"
         "損益 % ＝ U ÷ 每單保證金（可以相加）；毛利率＝價格漲跌%。"
         "強平：同一邊合起來算（跟 OKX 一樣，逐倉公式含維持保證金率、平倉手續費、已付資金費），碰到＝這一邊全部強平、每單各損失自己的保證金。"
-        "/status 每一列：L01 2X 時間|% ＝ L01 加到這一單的損失合計|📍＝L01～這一單合起來離強平的 %（最後一列＝整個倉位）。"
+        "/status 一個幣種一段：🌐原點（這一輪第一張成交）→ S 的單 → 現價 → L 的單；持倉列 L01 時間|% ＝ L01 加到這一單的損失合計|📌＝L01～這一單合起來離強平的 %（最後一列＝整個倉位）；掛單列 時間|掛單價|掛單中✏️。"
         "損益分持倉中／本日已實現（L、S 分開，台灣時間換日）；資金費照 OKX 費率模擬計入\n"
         "　例：/runt WLDUSDT LS 2X 1U 0.5%、/runt WLDUSDT L 2X 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
