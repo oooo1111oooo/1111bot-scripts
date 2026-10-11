@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v11.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v11.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -693,6 +693,7 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v11.8（1111 2026-10-11）：/coins（/amp 一起）加 PEPEUSDT、ZECUSDT（從 COINS_HIDE 拿出來、加進 COINS_ADD）。
 #   v11.7（1111 2026-10-11「明白了就直接改了」）：/status 改版面（rn_coin_lines）：一個幣種一段（L、S 合在一起；實盤、模擬各自）。
 #     📣持倉通知／埋伏通知 幣種 方向(兩組＝LS) 槓桿 保證金 → 空白列 → 🌐原點 S01 時:分:秒|成交價（這一輪第一張成交，一個幣種只有一個；還沒有＝等第一張成交）
 #     → S 的單（S01、S02…）→ 現價 時:分:秒|現價🛜 → L 的單（L01、L02…）。持倉列 L01 時:分:秒|累計%|📌（有 SL 加 |SL 價格），
@@ -4303,11 +4304,12 @@ async def fng_lines():
         L.append(f"{t:%m/%d}({WEEK_ZH[t.weekday()]}) {emo} {v} {zh}".replace("  ", " "))
     return L + ["(每天 08:00 更新)"]
 
-COINS_HIDE = ("HYPEUSDT", "XAUUSDT", "ZECUSDT", "PEPEUSDT")   # v10.1（1111）：/coins 不列（只是不列，/runt 照樣可以用）；v10.4 加 PEPEUSDT
+COINS_HIDE = ("HYPEUSDT", "XAUUSDT")   # v10.1（1111）：/coins 不列（只是不列，/runt 照樣可以用）；v11.8（1111）：ZECUSDT、PEPEUSDT 加回 /coins
 # v10.5（1111）：/coins 多列這 10 個（2026-10-07 查過 OKX 都有 USDT 永續、都在交易中）。跟 symbols.json 合起來、拿掉 COINS_HIDE，照字母排序。
 # v11.3（1111 2026-10-10）：加 STXUSDT（查過 OKX：STX-USDT-SWAP 交易中，每張 10 STX、最小 0.1 張、最高 20X）。
+# v11.8（1111 2026-10-11）：加 PEPEUSDT、ZECUSDT（查過 OKX 都在交易中、最高 50X；原本在 COINS_HIDE 裡，拿出來）。
 COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSDT", "ARBUSDT", "ONDOUSDT", "AEROUSDT", "ASTERUSDT",
-             "STXUSDT")
+             "STXUSDT", "PEPEUSDT", "ZECUSDT")
 
 async def coins_acct_lines():
     """v10.1（1111：下策略時要知道帳戶還有多少錢）：交易帳戶 USDT 四行，當下向 OKX 查（/api/v5/account/balance），名稱照 OKX：
