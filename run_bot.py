@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v11.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v11.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -693,6 +693,10 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v11.9（1111 2026-10-11）：模擬 /runt 的損益 % 照 OKX 算（rn_inv）：已實現損益＝倉位價值×價格漲跌（＝槓桿×保證金×價格%）−手續費±資金費，
+#     收益率＝已實現損益 ÷ 保證金（投入的 U）。一單＝本來就是；好幾單合計（本日合計、分幣種、本輪、各層出場、強平合計、/stoprunt、進行中清單）
+#     改成 U 合計 ÷ 這一組的 U（原本每單 % 相加）；/summary 總表多一行「總投入金額 💰xU|n幣種」（今天有出場的每一組的 U 相加），
+#     % ＝ 全部 U ÷ 總投入金額（今天的投資報酬率）；/summary 不列持倉中。實盤 /run 待更新（1111：/runt 測試 OK 後再改成以 OKX 數字為主，現在照舊）。
 #   v11.8（1111 2026-10-11）：/coins（/amp 一起）加 PEPEUSDT、ZECUSDT（從 COINS_HIDE 拿出來、加進 COINS_ADD）。
 #   v11.7（1111 2026-10-11「明白了就直接改了」）：/status 改版面（rn_coin_lines）：一個幣種一段（L、S 合在一起；實盤、模擬各自）。
 #     📣持倉通知／埋伏通知 幣種 方向(兩組＝LS) 槓桿 保證金 → 空白列 → 🌐原點 S01 時:分:秒|成交價（這一輪第一張成交，一個幣種只有一個；還沒有＝等第一張成交）
@@ -1157,11 +1161,13 @@ def rn_done(T, p, m):
                      "t_out": p["out"][0], "net": m["net"], "netu": m["netu"], "gu": m["gu"], "fu": m["fu"], "why": p["out"][2],
                      "g": m["g"], "fund": m["fund"], "fn": m["fn"], "mfe": rn_q2(p["mfe"]), "lev": rn_plev(T, p)})   # v10.1：統計用
 
-def rn_pl(title, a, fee=True, mark=False):
+def rn_pl(title, a, fee=True, mark=False, inv=None):
     """損益一段：標題＋毛損益、淨損益（% 與 U 各自對齊）。a＝rn_acc 格式的合計。
     v8.4（1111）：% 與 U 都是各單直接相加（原本 % 是 ÷ 名目價值合計＝平均，兩單 0.16%、0.12% 會顯示 0.14%）。
     有結算過資金費、而且取整後不是 0 才多一行資金費（＋收、−付；淨損益已含；v8.7：+0.00%|+0.0000U 不列）。
     fee＝手續費一行（＝淨損益−毛損益−資金費）；v9.2（1111）：所有段落都列手續費，順序 毛損益／手續費／資金費／淨損益。"""
+    if inv:                                                # v11.9（1111，照 OKX）：% ＝ 已實現 U ÷ 投入的 U（模擬 /runt；實盤 /run 待更新）
+        a = {**a, "gp": rn_q2(a["gu"] / inv * 100), "fp": rn_q2(a["fu"] / inv * 100), "np": rn_q2(a["u"] / inv * 100)}
     fd = a["fn"] and (rn_q2(a["fp"]) != 0 or rn_q4(a["fu"]) != 0)
     rows = ([("毛損益", a["gp"], a["gu"])]
             + ([("手續費", a["np"] - a["gp"] - a["fp"], a["u"] - a["gu"] - a["fu"])] if fee else [])
@@ -1179,6 +1185,13 @@ def rn_hold(sec):
     d, r = divmod(sec, 86400)
     return (f"{d}天" if d else "") + (rt_hold_str(r) if not d else f"{r // 3600}時{r % 3600 // 60:02d}分{r % 60:02d}秒")
 
+def rn_inv(T):
+    """v11.9（1111 2026-10-11）：損益 % 的分母＝投入的 U（這一組設定的保證金，每一單一樣）。
+    OKX 的算法：已實現損益＝倉位價值×價格漲跌（＝槓桿×保證金×價格%）−手續費±資金費；收益率＝已實現損益 ÷ 保證金。
+    一單：跟 rn_money 一樣；好幾單合計：全部的 U 相加 ÷ 投入的 U（原本是每單 % 相加）。
+    實盤 /run 待更新（1111：/runt 測試 OK 後再改成以 OKX 數字為主）→ 回傳 None＝照舊。"""
+    return None if T.get("real") else T["amt"]
+
 def rn_pl_side(T, side, px, red=False):
     """同一方向：持倉中(未實現)、本日已實現（沒有的那段不列）。v8.2：1111 定案只看本日，不列累計。
     持倉中＝假設現在用 px 市價平倉，含進場 0.02%＋出場 0.05% 手續費。"""
@@ -1188,10 +1201,10 @@ def rn_pl_side(T, side, px, red=False):
         a = rn_acc()
         for p in live:
             rn_acc_add(a, rn_money(T, p, px))
-        L = rn_pl(f"{side} 持倉中 {len(live)}單(未實現){'🔴' if red else ''}", a)   # v10.7：合倉三行拿掉；v11.2：/status 加 🔴（red）
+        L = rn_pl(f"{side} 持倉中 {len(live)}單(未實現){'🔴' if red else ''}", a, inv=rn_inv(T))   # v10.7：合倉三行拿掉；v11.2：/status 加 🔴（red）
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     if d and d["n"]:
-        L = rn_join([L, rn_pl(f"{side} 本日已實現 {d['n']}單", d)])   # v10.7：跟持倉中之間空一行
+        L = rn_join([L, rn_pl(f"{side} 本日已實現 {d['n']}單", d, inv=rn_inv(T))])   # v10.7：跟持倉中之間空一行
     return L
 
 def rn_pl_secs(T, px, sides=None):
@@ -1283,8 +1296,9 @@ async def rn_sum_msgs(d, full=False, M=None):
     v11.3（1111）：/summary 不再列套牢明細（每一層看 /status）。"""
     MM = M or SIM
     day = MM.DAY.get(d) or {}
+    sim = MM is not REAL                                     # v11.9（1111）：模擬 /runt 改照 OKX 算投資報酬率、不列持倉中；實盤 /run 待更新（照舊）
     hold = {}                                                # (幣種, L/S) -> rn_acc
-    for T in list(MM.G.values()):
+    for T in ([] if sim else list(MM.G.values())):
         live = [p for p in T["pos"] if not p["out"]]
         if not live:
             continue
@@ -1317,7 +1331,22 @@ async def rn_sum_msgs(d, full=False, M=None):
     #   幣種 方向 槓桿 保證金 → ⭐️ N單 → 損益（有持倉再空一行列持倉中）。最後空一行 → 時間。
     foot = ["", f"時間:{hhmmss()}|{VERSION}"]
     if not R["n"] and not H["n"]:
-        return [] if full else [head + ["", "本日沒有出場的單,也沒有持倉"] + foot]
+        return [] if full else [head + ["", "本日沒有出場的單" if sim else "本日沒有出場的單,也沒有持倉"] + foot]
+    last = {}                                                # (幣種, 方向) → 當天最後一筆出場（停掉的組用它的槓桿、保證金）
+    for r in recs:
+        k = (r.get("sym"), r.get("side"))
+        if k not in last or float(r.get("t_out") or 0) >= float(last[k].get("t_out") or 0):
+            last[k] = r
+    def side_amt(sym, side):
+        """這一組投入的 U：還在跑＝現在的設定；停掉的＝當天最後一筆出場的設定；都沒有＝None。"""
+        T = MM.G.get(rn_key(sym, side))
+        if T is not None:
+            return T["amt"]
+        r = last.get((sym, side))
+        return Decimal(r["amt"]) if r and r.get("amt") else None
+    done_sides = [(sym, side) for sym, v in day.items() for side, a in v.items() if a["n"]]
+    invs = [side_amt(*k) for k in done_sides]
+    inv = sum((x for x in invs if x), Decimal(0)) if sim and invs and all(invs) else None   # v11.9：總投入金額＝今天有出場的每一組的 U 相加
     done_blk = []
     if R["n"]:
         done_blk = [f"本日共計 {R['n']}單⭐️"]
@@ -1335,14 +1364,9 @@ async def rn_sum_msgs(d, full=False, M=None):
             ws = sorted(other, key=lambda w: (w != "強平", w != "手動平倉", w))
             if ws:
                 done_blk.append(" | ".join(f"{w} {other[w]}" for w in ws))
-        done_blk += [""] + rn_pl("", R, mark=True)[1:]
+        done_blk += [""] + ([f"總投入金額 💰{pct(inv)}U|{len({k[0] for k in done_sides})}幣種"] if inv else []) + rn_pl("", R, mark=True, inv=inv)[1:]
     hold_blk = rn_pl(f"持倉中 {H['n']}單(未實現)", H, mark=True) if H["n"] else []
     L = head + [""] + rn_join([done_blk, hold_blk]) + foot
-    last = {}                                                # (幣種, 方向) → 當天最後一筆出場（停掉的組用它的槓桿、保證金）
-    for r in recs:
-        k = (r.get("sym"), r.get("side"))
-        if k not in last or float(r.get("t_out") or 0) >= float(last[k].get("t_out") or 0):
-            last[k] = r
     def side_head(sym, side):
         T = MM.G.get(rn_key(sym, side))
         if T is not None:
@@ -1358,7 +1382,7 @@ async def rn_sum_msgs(d, full=False, M=None):
         for side in ("S", "L"):
             a = (day.get(sym) or {}).get(side)
             h = hold.get((sym, side))
-            b = [f"⭐️ {a['n']}單"] + rn_pl("", a)[1:] if a and a["n"] else []
+            b = [f"⭐️ {a['n']}單"] + rn_pl("", a, inv=side_amt(sym, side) if sim else None)[1:] if a and a["n"] else []
             hb = rn_pl(f"持倉中 {h['n']}單(未實現)", h) if h else []
             if b or hb:
                 blocks.append([side_head(sym, side)] + b + ([""] if b and hb else []) + hb)
@@ -1792,7 +1816,7 @@ def rn_exit_lines(T, p, m, tail=None):
     one = ["本單"] + [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
     one[-1] += E.pnl_emoji(rn_q4(m["netu"]))
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
-    day = rn_pl(f"本日合計 {d['n']}單", d, mark=True) if d and d["n"] else []
+    day = rn_pl(f"本日合計 {d['n']}單", d, mark=True, inv=rn_inv(T)) if d and d["n"] else []
     rows = [f"🎯持倉中 {len(live)}單"] + rn_rows(T, px, live, "%H:%M:%S", extra=True, done=False) if live else []
     # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
     return L + [""] + rn_join([one, day, rows, tail or []]) + ["", f"時間:{hhmmss()}"]
@@ -1883,6 +1907,9 @@ def rn_stat_lines(T, recs, full):
         x[0] += 1; x[1] += rn_q2(r["net"]); x[2] += rn_q4(r["netu"])
     ks = sorted(lv)
     cs = rn_pad([f"{lv[k][0]}單" for k in ks])
+    if rn_inv(T):                                          # v11.9：% ＝ 這一層的 U 合計 ÷ 投入的 U
+        for k in ks:
+            lv[k][1] = rn_q2(lv[k][2] / rn_inv(T) * 100)
     ps = rn_pad([rn_sp(lv[k][1]) for k in ks])
     us = rn_pad([rn_su(lv[k][2]) for k in ks])
     layer = ["各層出場"] + [f"{rn_nm2(sd, l)}{rn_lvx(T, l)} {c}|{x}|{y}" for (sd, l), c, x, y in zip(ks, cs, ps, us)]
@@ -1906,7 +1933,7 @@ def rn_end_lines(T):
         L = [f"🚦 策略結束 {rn_tg(T)}{T['sym']} {T['dir']} {rn_levs(T)} {pct(T['amt'])}U", RT_SEP,
              f"開始 {rn_mdt(t0)}", f"結束 {rn_mdt(end)}",
              f"歷時 {rn_span(end - t0)}|{T['st']['r']}輪|出場 {n_all}單"] + note
-        L += [RT_SEP] + rn_pl(f"整個策略已實現 {len(recs)}單", a)
+        L += [RT_SEP] + rn_pl(f"整個策略已實現 {len(recs)}單", a, inv=rn_inv(T))
         L += [RT_SEP] + stat + [RT_SEP] + layer
         if T.get("real"):                                  # v11.0 實盤：最後這一輪跟 OKX 倉位紀錄對帳
             L += rr_round_lines(T, sum((r["netu"] for r in rnd), Decimal(0)))
@@ -1921,13 +1948,13 @@ def rn_end_lines(T):
         #   → 本日合計（這個幣種這一邊）→ 各層出場 → 時間。淨損益後面加 🟢／🔴；橫線、出場原因那一行拿掉。
         L = [f"{E.pnl_emoji(rn_q4(a['u']))} 本輪結束 {rn_head(T)}", f"(已全部出場,{RN_WAIT}秒後重新來過)", "",
              f"起始 {rn_mdt(t0)}", f"結束 {rn_mdt(end)}", f"歷時 {rn_hold(end - t0)}"]
-        blk = [rn_pl(f"本輪合計 {len(rnd)}單", a, mark=True)]
+        blk = [rn_pl(f"本輪合計 {len(rnd)}單", a, mark=True, inv=rn_inv(T))]
         if T.get("real"):                                  # v11.0 實盤：這一輪跟 OKX 倉位紀錄對帳
             blk.append([x for x in rr_round_lines(T, a["u"]) if x != RT_SEP])
         for s in sides:
             d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(s)
             if d and d["n"]:
-                blk.append(rn_pl(f"本日合計 {d['n']}單" if len(sides) == 1 else f"{s} 本日合計 {d['n']}單", d, mark=True))
+                blk.append(rn_pl(f"本日合計 {d['n']}單" if len(sides) == 1 else f"{s} 本日合計 {d['n']}單", d, mark=True, inv=rn_inv(T)))
         blk.append(layer)
         return L + [""] + rn_join(blk) + ["", f"時間:{hhmmss()}"]
     L += rn_pl_secs(T, None, sides)                        # v8.2：這一輪有出場的方向：本日已實現
@@ -2200,7 +2227,8 @@ def rn_liq_lines(T, items, tail=None):
     for _, m in items:
         rn_acc_add(a, m)
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
-    L += [""] + rn_join([rn_pl(f"這次強平 {len(items)}單", a), rn_pl(f"{side} 本日已實現 {d['n']}單", d) if d and d["n"] else []])
+    L += [""] + rn_join([rn_pl(f"這次強平 {len(items)}單", a, inv=rn_inv(T)),
+                         rn_pl(f"{side} 本日已實現 {d['n']}單", d, inv=rn_inv(T)) if d and d["n"] else []])
     note = "" if rn_live(T) else rn_idle_note(T, side)
     return L + (["", *tail] if tail else []) + ["", f"時間:{hhmmss()}"] + ([note] if note else [])
 
@@ -2386,6 +2414,8 @@ def rn_status_line(T):
         px = rr_mark(T, px)
     if px:
         nr = sum((rn_q2(rn_money(T, p, px)["net"]) for p in live), Decimal(0))   # v8.4：各單相加
+        if rn_inv(T):                                      # v11.9：U 合計 ÷ 投入的 U
+            nr = rn_q2(sum((rn_q4(rn_money(T, p, px)["netu"]) for p in live), Decimal(0)) / rn_inv(T) * 100)
         s += f"|持倉中淨損益 {rn_sp(nr)}"
     return s
 
