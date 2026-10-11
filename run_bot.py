@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -693,6 +693,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.1（1111 2026-10-11 看過模擬畫面 OK）：進場成交只有一種（rn_fill_notice；第一張、層單都一樣）：標題 → 空白列 → 🌐原點 月/日 時間|價格
+#     → 這一邊持倉的每一單（原點那一單後面 🌐）→ 🎯進場 月/日 時間|成交價 → 埋伏（掛單到成交，t_ord）→ 空白列 → 時間。初次、SL 未設拿掉。
 #   v12.0（1111 2026-10-11）：出場通知的 🎯持倉中那一段拿掉（本日合計下面空一行就是時間）。
 #   v11.9（1111 2026-10-11）：模擬 /runt 的損益 % 照 OKX 算（rn_inv）：已實現損益＝倉位價值×價格漲跌（＝槓桿×保證金×價格%）−手續費±資金費，
 #     收益率＝已實現損益 ÷ 保證金（投入的 U）。一單＝本來就是；好幾單合計（本日合計、分幣種、本輪、各層出場、強平合計、/stoprunt、進行中清單）
@@ -1562,6 +1564,7 @@ def rn_touch(T, px, t):
         if (g["side"] == "L" and px <= g["px"]) or (g["side"] == "S" and px >= g["px"]):
             g["fill"] = (t, g["px"], px)
             T["pos"].append(rn_pos(T, g["side"], 0, g["px"], t, px))
+            T["pos"][-1]["t_ord"] = T.get("t0")              # v12.1：埋伏＝從這一輪開始取價掛單到成交
             T["init"][g["side"]] = g["px"]
             if T["cxl_due"] is None:
                 T["cxl_due"] = t + RT_LAT                 # 反向單過了送單時間才撤掉
@@ -1572,6 +1575,7 @@ def rn_touch(T, px, t):
         if (o["side"] == "L" and px <= o["px"]) or (o["side"] == "S" and px >= o["px"]):
             T["ords"].remove(o)
             T["pos"].append(rn_pos(T, o["side"], o["lvl"], o["px"], t, px))
+            T["pos"][-1]["t_ord"] = o.get("t")               # v12.1：埋伏＝從這一張掛出去到成交
             T["ev"].set()
     for s in {p["side"] for p in T["pos"] if not p["out"]}:  # v11.3（1111）：合倉強平——這一邊全部一起，出場價＝預估強平價
         live = [p for p in T["pos"] if p["side"] == s and not p["out"]]
@@ -1701,32 +1705,28 @@ def rn_cur_sltp(p):
         return p["pend"][0], p["pend"][1], p["pend"][2], p["pend"][3]
     return p["sl"], p["tp"], p["sl_g"], p["tp_g"]
 
-def rn_fill_lines(T, ps):
-    """初始單進場成交通知。v11.3（1111 2026-10-11 版面）：標題 → 原點|日期 時間 → 空白列 → 初次、進場、埋伏 → 空白列 → 時間
-    （橫線、「SL 未設」那一行拿掉；實盤的 OKX 張數一行由 rr_worker 插在時間上面）。"""
+def rn_fill_notice(T, p):
+    """v12.1（1111 2026-10-11）：進場成交只有一種（第一張、層單、閒置那一邊再進場都一樣）：
+    標題 → 空白列 → 🌐原點 月/日 時:分:秒|原點價 → 這一邊持倉的每一單（同 /status 的列，用這一張的成交價算；原點那一單後面 🌐）
+    → 🎯進場 月/日 時:分:秒|成交價 → 埋伏（從這一張掛出去到成交）→ 空白列 → 時間。實盤：時間上面多 OKX 張數一行（rr_worker 插）。"""
     tick = T["tick"]
-    ps = sorted(ps, key=lambda p: p["side"])               # 兩張都成交時 L 在前
-    sides = {p["side"] for p in ps}
-    if T.get("dir", "LS") != "LS" and len(sides) == 1:     # v9.3：單向只有一張初始單；v11.3：L01 起
-        tag = f"{ps[0]['side']}01"
-    else:
-        tag = "L01S01" if len(sides) == 2 else ("L01(S01)" if "L" in sides else "(L01)S01")
-    two = len(ps) == 2
-    L = [f"{E.ENTRY} 進場成交 {rn_tg(T)}{rn_sym(T)} {tag} {pct(rn_lev(T, 0))}X {pct(T['amt'])}U"]
+    L = [f"{E.ENTRY} 進場成交 {rn_tg(T)}{rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U", ""]
     o = T.get("org")
-    if o:                                                  # v11.3：這一輪的原點（兩邊都從這裡算 2% 一層）
-        L.append(f"原點 {rt_q(o['px'], tick)}|{rn_mdt(o['t'])}")
-    L += ["", f"初次 {rt_t(T['t0'])}|{rt_q(T['px0'], tick)}"]
-    for p in ps:
-        L.append(f"進場 {rt_t(p['t_in'])}|{rt_q(p['ent'], tick)}" + (f"({p['side']}01)" if two else ""))
-    L += [f"埋伏 {rn_hold(min(p['t_in'] for p in ps) - T['t0'])}", "", f"時間:{hhmmss()}"]
-    return L
+    if o:
+        L.append(f"🌐原點 {rn_mdt(o['t'])}|{rt_q(o['px'], tick)}")
+    held = sorted([q for q in T["pos"] if q["side"] == p["side"] and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
+    if held:
+        L += rn_rows(T, p["ent"], held, "%H:%M:%S", mark_org=True)
+    L.append(f"🎯進場 {rn_mdt(p['t_in'])}|{rt_q(p['ent'], tick)}")
+    if p.get("t_ord"):
+        L.append(f"埋伏 {rn_hold(p['t_in'] - p['t_ord'])}")
+    return L + ["", f"時間:{hhmmss()}"]
 
 def rn_nm2(side, lvl):
     """v11.2（1111）：表格裡的層數兩位數。v11.3：從 01 開始（lvl 0 → L01）。"""
     return f"{side}{lvl + 1:02d}"
 
-def rn_rows(T, px, live, tfmt=None, extra=False, done=True):
+def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False):
     """表格每一層一行（/status、層單進場成交、出場通知的持倉中明細、/stoprunt 共用）。
     v11.3（1111：跟 Excel 一樣）：L01 2X 09:06|-8.80%|📍-47.10%（已設 SL 再加 |SL 價格）
     v11.7（1111）：L01 09:06:12|-8.80%|📌-47.10%（槓桿在標題，XX 才寫；📍 改 📌）；掛單列 L02 09:06:13|0.9751|掛單中✏️（掛出去的時間）。
@@ -1775,17 +1775,10 @@ def rn_rows(T, px, live, tfmt=None, extra=False, done=True):
         pin = "📌" + rn_sp(rn_q2((liq / px - 1) * 100)) if liq and px else "📌無"
         sl = rn_cur_sltp(x)[0]
         tm = datetime.fromtimestamp(x["t_in"], TZ8).strftime(tfmt) + "|" if tfmt else ""
-        out.append(f"{nm} {tm}{next(ci)}|{pin}" + (f"|SL {rt_q(sl, tick)}" if sl is not None else ""))
+        o = T.get("org") if mark_org else None             # v12.1：進場成交通知裡，原點那一單後面加 🌐
+        mk = "🌐" if o and x["side"] == o["side"] and x["lvl"] == 0 and abs(x["t_in"] - o["t"]) < 0.5 else ""
+        out.append(f"{nm} {tm}{next(ci)}|{pin}" + (f"|SL {rt_q(sl, tick)}" if sl is not None else "") + mk)
     return out
-
-def rn_lay_fill_lines(T, p):
-    """層單進場成交通知：列出這一邊目前持倉中的單（初始單＋各層）。"""
-    held = sorted([q for q in T["pos"] if q["side"] == p["side"] and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
-    # v11.2（1111）：橫線改空白列；每一行＝層數兩位數 槓桿 進場時:分:秒|毛利率|📍（跟 /status 同一套，用剛成交這一單的進場價算）
-    L = [f"{E.ENTRY} 進場成交 {rn_tg(T)}{rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U", ""]
-    L += rn_rows(T, p["ent"], held, "%H:%M:%S")
-    L += ["", RN_SL_WAIT, f"時間:{hhmmss()}"]
-    return L
 
 def rn_exit_lines(T, p, m, tail=None):
     """每一單各自出場的通知。v11.3（1111 2026-10-11 版面）：
@@ -2303,7 +2296,8 @@ async def rn_worker(app, key):
                 if new:
                     print(f"[runt] 初始單成交 {key} " + " ".join(f"{p['side']}@{p['ent']}" for p in new))
                     rn_origin_set(T, min(new, key=lambda p: p["t_in"]))   # v11.3：這一輪的原點
-                    send("\n".join(rn_fill_lines(T, new)))
+                    for p in sorted(new, key=lambda p: p["t_in"]):
+                        send("\n".join(rn_fill_notice(T, p)))   # v12.1：進場成交只有一種
                     T["h0"] = min(p["t_in"] for p in new)
                     T["note_last"] = rt_note_base(T["h0"])
                 rn_save()
@@ -2315,7 +2309,7 @@ async def rn_worker(app, key):
                     T["h0"] = p["t_in"]
                     T["note_last"] = rt_note_base(T["h0"])
                 print(f"[runt] 層單成交 {key} {p['side']}{p['lvl']}@{p['ent']}")
-                send("\n".join(rn_lay_fill_lines(T, p)))
+                send("\n".join(rn_fill_notice(T, p)))     # v12.1：進場成交只有一種
             outs = sorted([p for p in T["pos"] if p["out"]], key=lambda p: p["out"][0])
             exits, liqs = [], []
             for p in outs:                                 # 每一單各自出場；v11.3：強平（合倉）的合成一則
@@ -3503,6 +3497,7 @@ async def rr_sync_one(T, POS, PEND, PCL, ALG, ACL):
             T["ev"].set()
             continue
         p = rr_layer_new(T, side, 0, res[1])
+        p["t_ord"] = T.get("t0")                           # v12.1：埋伏＝從這一輪開始掛單到成交
         g["fill"] = (p["t_in"], p["ent"], p["ent"])
         T["init"][side] = p["ent"]
         T["cxl_due"] = now
@@ -3518,7 +3513,7 @@ async def rr_sync_one(T, POS, PEND, PCL, ALG, ACL):
                 rr_cool(T, f"{o['side']}{o['lvl']}", f"{rn_nm2(o['side'], o['lvl'])} 被 OKX 取消了(post-only 會吃單、或在 OKX 被取消)")
             T["ev"].set()
             continue
-        rr_layer_new(T, o["side"], o["lvl"], res[1])
+        rr_layer_new(T, o["side"], o["lvl"], res[1])["t_ord"] = o.get("t")   # v12.1：埋伏＝從這一張掛出去到成交
         T["ev"].set()
     for p in [p for p in T["pos"] if not p["out"]]:        # 條件單
         if p.get("acl_wait"):
@@ -3891,7 +3886,9 @@ async def rr_worker(app, key):
                 if new:
                     T["endreq"] = T["end_told"] = False    # 要一起結束這一輪時初始單剛好成交 → 這一輪繼續
                     rn_origin_set(T, min(new, key=lambda p: p["t_in"]))   # v11.3：這一輪的原點
-                    send("\n".join(rn_fill_lines(T, new) [:-1] + rr_fill_okx(T, new) + rn_fill_lines(T, new)[-1:]))
+                    for p in sorted(new, key=lambda p: p["t_in"]):
+                        L = rn_fill_notice(T, p)          # v12.1：進場成交只有一種；OKX 張數那一行在時間上面
+                        send("\n".join(L[:-1] + rr_fill_okx(T, [p]) + L[-1:]))
                     T["h0"] = min(p["t_in"] for p in new)
                     T["note_last"] = rt_note_base(T["h0"])
                 if T.get("stopping"):                      # /stop 撤單時剛好成交 → 🚦 最後一輪
@@ -3905,7 +3902,7 @@ async def rr_worker(app, key):
                     T["h0"] = p["t_in"]
                     T["note_last"] = rt_note_base(T["h0"])
                 T["endreq"] = T["end_told"] = False        # 要一起結束這一輪時剛好成交 → 這一輪繼續
-                L = rn_lay_fill_lines(T, p)
+                L = rn_fill_notice(T, p)                  # v12.1：進場成交只有一種
                 send("\n".join(L[:-1] + rr_fill_okx(T, [p]) + L[-1:]))
             outs = sorted([p for p in T["pos"] if p["out"]], key=lambda p: p["out"][0])
             exits, liqs = [], []
