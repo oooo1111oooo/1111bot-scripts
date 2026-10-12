@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -693,6 +693,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.4（1111 2026-10-12 看過模擬畫面 OK）：/status（實盤、模擬一起）持倉列的 % 改成這一單自己的進場價到現價（原本＝L01 加到這一單的累計），
+#     L 的單下面加一行「損益合計 -31.56%」（每一單 % 相加，L、S 都算；有持倉才列）。📌、進場成交通知、/stoprunt 不動。
 #   v12.3（1111 2026-10-12）：/coins（/amp 一起）加 SKYUSDT（加進 COINS_ADD）。
 #   v12.2（1111 2026-10-12 看過模擬畫面 OK）：模擬 /runt 的 /summary 改版面（rn_sum_sim）：總表＝本日總計 N單⭐️、出場原因、
 #     最大金額（今天同一時間最多佔用的保證金）|幣種、持倉金額（現在抱著的單×U）|幣種 🎯、總毛損益／總手續費／總資金費／總淨損益只寫 U；
@@ -1861,8 +1863,13 @@ def rn_nm2(side, lvl):
     """v11.2（1111）：表格裡的層數兩位數。v11.3：從 01 開始（lvl 0 → L01）。"""
     return f"{side}{lvl + 1:02d}"
 
-def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False):
+def rn_one(T, p, px):
+    """v12.4（1111 2026-10-12）：這一單自己的損益 %（槓桿×價格漲跌%，以一單保證金＝100%），照畫面取到 0.01%。"""
+    return rn_q2(rn_plev(T, p) * rn_g(p["side"], p["ent"], px))
+
+def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=False):
     """表格每一層一行（/status、層單進場成交、出場通知的持倉中明細、/stoprunt 共用）。
+    v12.4（1111 2026-10-12 看過模擬畫面 OK）：own＝True（/status）：% ＝這一單自己的進場價到現價（不累加），合計另起一行（rn_coin_lines）。
     v11.3（1111：跟 Excel 一樣）：L01 2X 09:06|-8.80%|📍-47.10%（已設 SL 再加 |SL 價格）
     v11.7（1111）：L01 09:06:12|-8.80%|📌-47.10%（槓桿在標題，XX 才寫；📍 改 📌）；掛單列 L02 09:06:13|0.9751|掛單中✏️（掛出去的時間）。
       % ＝L01 加到這一層的損失合計（每一單＝槓桿×價格漲跌%，以一單保證金＝100%，用 px 算：現價／成交價／出場價）；
@@ -1885,9 +1892,10 @@ def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False):
     for side, _, _, k, x in rows:
         if k != "pos":
             continue
-        cum[side] = cum.get(side, Decimal(0)) + rn_q2(rn_plev(T, x) * rn_g(side, x["ent"], px))
+        one = rn_one(T, x, px)
+        cum[side] = cum.get(side, Decimal(0)) + one
         sub.setdefault(side, []).append(x)
-        info[id(x)] = (cum[side], rn_gliq(T, side, list(sub[side])))
+        info[id(x)] = (one if own else cum[side], rn_gliq(T, side, list(sub[side])))
     last = {side: ps[-1] for side, ps in sub.items()}
     okl = rr_liq(T) if T.get("real") else None
     ci = iter(rn_pad([rn_sp(info[id(x)][0]) for _, _, _, k, x in rows if k == "pos"]))
@@ -2160,7 +2168,8 @@ def rn_last_lines(T):
 def rn_coin_lines(gs, now):
     """v11.7（1111 2026-10-11）/status：同一個幣種（實盤、模擬各自）一段，L、S 合在一起；損益、資金費率不列（看 /summary）。
     📣持倉通知／埋伏通知 幣種 方向 槓桿 保證金 → 空白列 → 🌐原點（這一輪第一張成交：S01 時:分:秒|成交價；還沒有＝等第一張成交）
-    → S 的單（S01、S02…：持倉 時間|累計%|📌、掛單 時間|掛單價|掛單中✏️）→ 現價 時間|現價🛜 → L 的單（L01、L02…）。
+    → S 的單（S01、S02…：持倉 時間|這一單的%|📌、掛單 時間|掛單價|掛單中✏️）→ 現價 時間|現價🛜 → L 的單（L01、L02…）
+    → 損益合計（v12.4：每一單 % 相加，有持倉才列）。
     方向：兩組都在＝LS，只有一組＝那一邊。兩邊槓桿／保證金不一樣＝S 2X 2U|L 1X 1U。🚦：全部是＝幣種前面，只有一邊＝標題後面 (S 🚦最後一輪)。"""
     gs = sorted(gs, key=lambda T: T["dir"] != "S")         # S 在前
     T0 = gs[0]
@@ -2196,7 +2205,7 @@ def rn_coin_lines(gs, now):
         rows = [f"{g['side']}01 {hms(T['t0'])}|{rt_q(g['px'], tick)}|{'撤單中' if g.get('cxl') else '掛單中'}✏️"
                 for g in (T.get("legs") or {}).values() if not g.get("fill") and not g.get("dead")]
         if px is not None:
-            rows += rn_rows(T, px, live[T["dir"]], "%H:%M:%S", extra=True, done=False)
+            rows += rn_rows(T, px, live[T["dir"]], "%H:%M:%S", extra=True, done=False, own=True)   # v12.4：每一單自己的 %
         elif live[T["dir"]]:
             rows.append(f"{T['dir']} 持倉 {len(live[T['dir']])}單")
         return rows
@@ -2207,6 +2216,10 @@ def rn_coin_lines(gs, now):
     for T in gs:
         if T["dir"] == "L":
             L += side_rows(T)
+    # v12.4（1111 2026-10-12）：損益合計＝上面每一單的 % 相加（L、S 都算；有持倉、查得到現價才列）
+    ones = [rn_one(T, p, px) for T in gs if not T.get("wait_until") for p in live[T["dir"]]] if px is not None else []
+    if ones:
+        L.append(f"損益合計 {rn_sp(sum(ones, Decimal(0)))}")
     for T in gs:
         if T.get("real"):
             L += rr_status_warn(T)
@@ -4717,7 +4730,7 @@ async def cmd_menu(u, c):
         "一邊全部出場、另一邊還有單 → 這一邊在自己的第一單位置重新掛（原點不變）；兩邊都沒有單 → 這一輪結束，等 111 秒用現價重新來過（有事件才通知，狀態用 /status 看）。"
         "損益 % ＝ U ÷ 每單保證金（可以相加）；毛利率＝價格漲跌%。"
         "強平：同一邊合起來算（跟 OKX 一樣，逐倉公式含維持保證金率、平倉手續費、已付資金費），碰到＝這一邊全部強平、每單各損失自己的保證金。"
-        "/status 一個幣種一段：🌐原點（這一輪第一張成交）→ S 的單 → 現價 → L 的單；持倉列 L01 時間|% ＝ L01 加到這一單的損失合計|📌＝L01～這一單合起來離強平的 %（最後一列＝整個倉位）；掛單列 時間|掛單價|掛單中✏️。"
+        "/status 一個幣種一段：🌐原點（這一輪第一張成交）→ S 的單 → 現價 → L 的單；持倉列 L01 時間|% ＝ 這一單自己的進場價到現價|📌＝L01～這一單合起來離強平的 %（最後一列＝整個倉位）；掛單列 時間|掛單價|掛單中✏️；最後一行 損益合計＝每一單 % 相加。"
         "損益分持倉中／本日已實現（L、S 分開，台灣時間換日）；資金費照 OKX 費率模擬計入\n"
         "　例：/runt WLDUSDT LS 2X 1U 0.5%、/runt WLDUSDT L 2X 1U 0.5%　｜可同時跑多個幣種｜同幣種同方向只能一組\n"
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
