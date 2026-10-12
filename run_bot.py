@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -809,6 +809,7 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.6（1111 2026-10-13）：/coins（/amp 一起）加 NEARUSDT、STRKUSDT、WUSDT、ZROUSDT、TIAUSDT、FILUSDT（加進 COINS_ADD）。
 #   v12.5（1111 2026-10-12）：OKX 公開查詢每 2 秒 20 次（整台 VPS 6 個帳戶共用）—— ① /coins 規格、現價各一次查全部（okx_specs_all、
 #     okx_last_all），查不到等 1 秒再查一次；② 備用查價：WS 連著一律用最後一筆成交價（沒成交＝價格沒變），WS 斷線或這次連線還沒成交
 #     才一次查全部（rt_bulk_px，每個帳戶最快 1 秒一次）；③ 重開恢復：規格、現價先一次查全部（rec_okx_ready），沒恢復成功的那一筆
@@ -4623,8 +4624,12 @@ COINS_HIDE = ("HYPEUSDT", "XAUUSDT")   # v10.1（1111）：/coins 不列（只�
 # v11.3（1111 2026-10-10）：加 STXUSDT（查過 OKX：STX-USDT-SWAP 交易中，每張 10 STX、最小 0.1 張、最高 20X）。
 # v11.8（1111 2026-10-11）：加 PEPEUSDT、ZECUSDT（查過 OKX 都在交易中、最高 50X；原本在 COINS_HIDE 裡，拿出來）。
 # v12.3（1111 2026-10-12）：加 SKYUSDT（查過 OKX：SKY-USDT-SWAP 交易中，每張 100 SKY、最小 1 張、最高 20X）。
+# v12.6（1111 2026-10-13）：加 NEARUSDT、STRKUSDT、WUSDT、ZROUSDT、TIAUSDT、FILUSDT（2026-10-13 查過 OKX 都是 USDT 永續、交易中）：
+#   NEAR 每張 10 NEAR、最小 0.1 張、最高 50X；STRK 每張 1 STRK、最小 1 張、50X；W 每張 1 W、最小 1 張、20X；
+#   ZRO 每張 1 ZRO、最小 1 張、20X；TIA 每張 1 TIA、最小 1 張、50X；FIL 每張 0.1 FIL、最小 1 張、50X。
 COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSDT", "ARBUSDT", "ONDOUSDT", "AEROUSDT", "ASTERUSDT",
-             "STXUSDT", "PEPEUSDT", "ZECUSDT", "SKYUSDT")
+             "STXUSDT", "PEPEUSDT", "ZECUSDT", "SKYUSDT",
+             "NEARUSDT", "STRKUSDT", "WUSDT", "ZROUSDT", "TIAUSDT", "FILUSDT")
 
 async def coins_acct_lines():
     """v10.1（1111：下策略時要知道帳戶還有多少錢）：交易帳戶 USDT 四行，當下向 OKX 查（/api/v5/account/balance），名稱照 OKX：
