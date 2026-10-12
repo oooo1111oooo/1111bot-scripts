@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -693,6 +693,7 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.3（1111 2026-10-12）：/coins（/amp 一起）加 SKYUSDT（加進 COINS_ADD）。
 #   v12.2（1111 2026-10-12 看過模擬畫面 OK）：模擬 /runt 的 /summary 改版面（rn_sum_sim）：總表＝本日總計 N單⭐️、出場原因、
 #     最大金額（今天同一時間最多佔用的保證金）|幣種、持倉金額（現在抱著的單×U）|幣種 🎯、總毛損益／總手續費／總資金費／總淨損益只寫 U；
 #     分幣種＝幣種 槓桿 U、最大金額、持倉金額、總成交單、總毛損益 U|S%+L%、總手續費 U|%、總淨損益 U → 空白列 → S n單、L n單（U|%，淨損益只寫 U）。
@@ -4470,8 +4471,9 @@ COINS_HIDE = ("HYPEUSDT", "XAUUSDT")   # v10.1（1111）：/coins 不列（只�
 # v10.5（1111）：/coins 多列這 10 個（2026-10-07 查過 OKX 都有 USDT 永續、都在交易中）。跟 symbols.json 合起來、拿掉 COINS_HIDE，照字母排序。
 # v11.3（1111 2026-10-10）：加 STXUSDT（查過 OKX：STX-USDT-SWAP 交易中，每張 10 STX、最小 0.1 張、最高 20X）。
 # v11.8（1111 2026-10-11）：加 PEPEUSDT、ZECUSDT（查過 OKX 都在交易中、最高 50X；原本在 COINS_HIDE 裡，拿出來）。
+# v12.3（1111 2026-10-12）：加 SKYUSDT（查過 OKX：SKY-USDT-SWAP 交易中，每張 100 SKY、最小 1 張、最高 20X）。
 COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSDT", "ARBUSDT", "ONDOUSDT", "AEROUSDT", "ASTERUSDT",
-             "STXUSDT", "PEPEUSDT", "ZECUSDT")
+             "STXUSDT", "PEPEUSDT", "ZECUSDT", "SKYUSDT")
 
 async def coins_acct_lines():
     """v10.1（1111：下策略時要知道帳戶還有多少錢）：交易帳戶 USDT 四行，當下向 OKX 查（/api/v5/account/balance），名稱照 OKX：
