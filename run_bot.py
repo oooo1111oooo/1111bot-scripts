@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -199,22 +199,63 @@ async def api(method, path, body=None):
         print("api fail", path, type(e).__name__, e)
         return {"code": "-1", "msg": str(e), "data": []}
 
-async def pub(path):
+async def pub(path, timeout=None):
     try:
-        r = await HTTP.get(BASE + path)
+        r = await (HTTP.get(BASE + path, timeout=timeout) if timeout else HTTP.get(BASE + path))
         return r.json()
     except Exception as e:
         print("pub fail", path, type(e).__name__, e)
         return {"code": "-1", "msg": str(e), "data": []}
 
+# v12.5（1111 2026-10-12）：OKX 公開查詢（規格、現價）每 2 秒最多 20 次，整台 VPS（6 個帳戶）共用。
+#   一個幣種查一次會撞到限制（/coins 排在後面的幣種查詢失敗、重開恢復被擋），改成一次查回全部 USDT 永續。
+USDT_SWAP = "-USDT-SWAP"
+
+def _spec_row(d):
+    return {"iid": d["instId"], "tick": Decimal(d["tickSz"]), "lot": Decimal(d["lotSz"]),
+            "minsz": Decimal(d["minSz"]), "ctval": Decimal(d["ctVal"]),
+            "maxlev": Decimal(d["lever"]), "ctvalccy": d["ctValCcy"]}
+
+async def okx_specs_all():
+    """v12.5：一次查回全部 USDT 永續的規格，放進 SPEC_CACHE（1 次查詢，不管幾個幣種）。成功回 True。"""
+    r = await pub("/api/v5/public/instruments?instType=SWAP")
+    if str(r.get("code")) != "0" or not r.get("data"):
+        print("[okx] 規格一次查全部失敗", r.get("code"), r.get("msg"))
+        return False
+    n = 0
+    for d in r["data"]:
+        iid = d.get("instId") or ""
+        if not iid.endswith(USDT_SWAP):
+            continue
+        try:
+            SPEC_CACHE[iid[:-len(USDT_SWAP)] + "USDT"] = _spec_row(d)
+            n += 1
+        except Exception:
+            pass                                           # 上架前的幣種欄位是空的，略過
+    return n > 0
+
+async def okx_last_all(timeout=None):
+    """v12.5：一次查回全部 USDT 永續的現價 {instId: 現價}（1 次查詢，不管幾個幣種）；查不到回 None。"""
+    r = await pub("/api/v5/market/tickers?instType=SWAP", timeout)
+    if str(r.get("code")) != "0" or not r.get("data"):
+        print("[okx] 現價一次查全部失敗", r.get("code"), r.get("msg"))
+        return None
+    out = {}
+    for x in r["data"]:
+        try:
+            if x.get("last"):
+                out[x["instId"]] = Decimal(x["last"])
+        except Exception:
+            pass
+    return out or None
+
 async def get_spec(s):
+    if s in SPEC_CACHE: return SPEC_CACHE[s]
+    await okx_specs_all()                                  # v12.5：先一次查全部（之後的幣種都不用再查）
     if s in SPEC_CACHE: return SPEC_CACHE[s]
     iid = inst_id(s)
     r = await pub(f"/api/v5/public/instruments?instType=SWAP&instId={iid}")
-    d = r["data"][0]
-    spec = {"iid": iid, "tick": Decimal(d["tickSz"]), "lot": Decimal(d["lotSz"]),
-            "minsz": Decimal(d["minSz"]), "ctval": Decimal(d["ctVal"]),
-            "maxlev": Decimal(d["lever"]), "ctvalccy": d["ctValCcy"]}
+    spec = _spec_row(r["data"][0])
     SPEC_CACHE[s] = spec
     return spec
 
@@ -226,11 +267,13 @@ async def get_last(iid):
 # 【為什麼需要】/runt 的成交、SL/TP 出場、最高毛利率都看逐筆成交價；REST 輪詢在「幾秒衝 2~3%」的針上
 # 只有幾個樣本，WS trades 逐筆推送才不會漏。
 # 【旁路原則】WS 掛掉自動降級回 REST 查價（1 秒一次，rt_px）。
+# v12.5：WS 連著時，冷門幣種幾秒沒成交也不另外查（沒成交＝價格沒變）；WS 斷線才一次查回全部幣種（rt_bulk_px）。
 WS_PUB_URL = "wss://ws.okx.com:8443/ws/v5/public"
 
 WS_PX   = {}        # iid -> (Decimal 價格, epoch 時間戳)
 WS_LIVE = {"pub": False, "pri": False}
 WS_WANT = set()     # 目前需要訂閱的 iid
+WS_CONN = {"t": 0.0, "rx": 0.0}   # v12.5：這一次公有 WS 連上的時間、最後一次收到逐筆成交的時間（任何幣種）
 _WS_AVAILABLE = None
 
 def _ws_lib():
@@ -269,6 +312,7 @@ async def ws_public_task():
         try:
             async with wsl.connect(WS_PUB_URL, ping_interval=20, ping_timeout=10) as ws:
                 WS_LIVE["pub"] = True
+                WS_CONN["t"] = WS_CONN["rx"] = time.time()   # v12.5：連線前收到的價格，要等這一次連線有新成交才算數
                 subbed = set()
                 print("[WS] 公有頻道已連線")
                 while not SHUTTING_DOWN:
@@ -290,6 +334,8 @@ async def ws_public_task():
                     m = json.loads(raw)
                     if m.get("arg", {}).get("channel") == "trades":
                         iid = m["arg"].get("instId")
+                        if m.get("data"):
+                            WS_CONN["rx"] = time.time()
                         for t in (m.get("data") or []):
                             _ws_push_px(iid, t.get("px"))
         except asyncio.CancelledError:
@@ -555,7 +601,7 @@ async def cmd_check(u, c):
 # ---------- 共用工具（v7.4 起放在 /test1 區；v9.7 刪除 /amp、/test1、/stoptest1 後，留下 /runt、/price 共用的部分） ----------
 # 送單時間、查價（WS 優先、REST 限速）、時間與價格格式、TG 依序發送。/runt 的規則見下面的 /runt 區。
 RT_LAT      = 0.018         # 送單時間（秒）＝VPS 到 OKX 實測平均 18 ms（2026-09-30 量 20 次：14～27 ms）
-RT_REST_GAP = 1.0           # WS 沒有新鮮報價時，REST 查價最快 1 秒一次（5 個帳戶共用 REST 額度 20 次/2 秒）
+RT_REST_GAP = 1.0           # WS 斷線時，一次查全部的現價最快 1 秒一次（v12.5：每個帳戶一次，不再每組各查；6 個帳戶共用 REST 額度 20 次/2 秒）
 RT_SAVE_SEC = 10            # 改價次數每 10 秒存檔一次
 RT_BG = set()               # 背景工作（保留參照，避免中途被回收）
 RT_SEP = "━━━━━━━━━━"
@@ -627,19 +673,89 @@ def rt_note_base(t0):
     return t0 + max(0, (time.time() - t0) // iv) * iv
 
 
-async def rt_px(T):
-    """現價：WS 逐筆成交價優先（不吃 REST 額度）；WS 3 秒沒有新報價才走 REST，而且最快 1 秒一次。"""
-    v = WS_PX.get(T["iid"])
+RT_WS_QUIET = 60     # v12.5：WS 連著，但所有幣種 60 秒都沒有任何成交 → 當作 WS 沒在動，改用一次查全部
+PX_BULK = {"t": 0.0, "got": 0.0, "px": {}, "busy": False}   # v12.5：一次查全部的現價（這個帳戶所有組共用）
+
+def ws_fresh(v, now):
+    """v12.5：WS 的價格能不能直接用：3 秒內的；或 WS 連著、還在收成交，而且這筆是這一次連線收到的（沒成交＝價格沒變）。"""
+    if not v:
+        return False
+    if now - v[1] < 3.0:
+        return True
+    return WS_LIVE["pub"] and v[1] >= WS_CONN["t"] and now - WS_CONN["rx"] < RT_WS_QUIET
+
+async def rt_bulk_px(iid):
+    """v12.5：WS 斷線（或這個幣種這一次連線還沒有成交）時的現價：一次查回全部幣種，這個帳戶所有組共用，
+    最快 1 秒查一次（6 個帳戶加起來每 2 秒最多 12 次，在 OKX 每 2 秒 20 次以內）；查到的 3 秒內都用它。"""
     now = time.time()
-    if v and now - v[1] < 3.0:
+    if now - PX_BULK["t"] >= RT_REST_GAP and not PX_BULK["busy"]:
+        PX_BULK["t"], PX_BULK["busy"] = now, True
+        try:
+            d = await okx_last_all(timeout=3.0)
+            if d:
+                PX_BULK["px"], PX_BULK["got"] = d, time.time()
+        finally:
+            PX_BULK["busy"] = False
+    px = PX_BULK["px"].get(iid)
+    return px if px is not None and time.time() - PX_BULK["got"] < 3.0 else None
+
+async def rt_px(T):
+    """現價：WS 逐筆成交價優先（不吃 REST 額度）。
+    v12.5：WS 連著時一律用最後一筆成交價（冷門幣種幾秒沒成交＝價格沒變，不再一組一秒去問 OKX）；
+    WS 斷線、或這個幣種這一次連線還沒有成交 → 一次查全部（rt_bulk_px）。"""
+    v = WS_PX.get(T["iid"])
+    if ws_fresh(v, time.time()):
         return v[0]
-    if now - T.get("rest_t", 0) < RT_REST_GAP:
-        return None
-    T["rest_t"] = now
-    try:
-        return await get_last(T["iid"])
-    except Exception:
-        return None
+    return await rt_bulk_px(T["iid"])
+
+async def rt_last_now(iid):
+    """v12.5：重開恢復用的現價：WS 有就用；沒有就用一次查全部的（不一個幣種一個幣種去問，查不到回 None）。"""
+    v = WS_PX.get(iid)
+    if ws_fresh(v, time.time()):
+        return v[0]
+    return await rt_bulk_px(iid)
+
+
+# ---------- v12.5（1111 2026-10-12）：重開恢復不清掉任何一組 ----------
+# 原本重開時每一組各自向 OKX 查規格（模擬埋伏中的再查現價），5 個帳戶同時重開會撞到 OKX 每 2 秒 20 次；
+# 被擋掉的組不恢復，而且存檔被覆蓋 → 永遠回不來（有持倉的也一樣）。現在：
+#   ① 恢復前規格、現價各一次查全部（rec_okx_ready），查不到每 3 秒再查，最多 10 次；
+#   ② 存檔裡還沒恢復成功的那一筆原樣保留（REC_HOLD，rn_save／rr_save 會一起寫回），背景每 10 秒再試，恢復了發通知。
+REC_HOLD = {"runt": [], "run": []}
+REC_RETRY = 10
+
+async def rec_okx_ready(syms, need_px=False):
+    """v12.5：重開恢復前，規格（need_px：還有現價）先一次查全部；查不到每 3 秒再查，最多 10 次。成功回 True。"""
+    for i in range(10):
+        ok = all(s in SPEC_CACHE for s in syms) or await okx_specs_all()
+        if ok and need_px:
+            await rt_bulk_px("")
+            ok = time.time() - PX_BULK["got"] < 3.0
+        if ok:
+            return True
+        print(f"[recover] OKX 規格／現價這次沒查到,3 秒後再試({i + 1}/10)")
+        await asyncio.sleep(3)
+    return False
+
+async def rec_hold_task(app):
+    """v12.5：重開時沒恢復成功的組，每 10 秒再試一次，恢復了發通知；全部恢復才結束。"""
+    while not SHUTTING_DOWN and (REC_HOLD["runt"] or REC_HOLD["run"]):
+        await asyncio.sleep(REC_RETRY)
+        for kind, one, save, title in (("runt", rn_rec_one, rn_save, "runt"), ("run", rr_rec_one, rr_save, "實盤 /run")):
+            names, chat = [], None
+            for d in list(REC_HOLD[kind]):
+                try:
+                    await one(app, d, names)
+                except Exception as e:
+                    print(f"[{kind}] recover retry fail", d.get("sym"), d.get("dir"), type(e).__name__, e)
+                    continue
+                if d in REC_HOLD[kind]:
+                    REC_HOLD[kind].remove(d)
+                chat = chat or d.get("chat")
+                save()
+            if names and chat:                             # 這一次補回來的合成一則通知
+                await rt_send(app, chat, "\n".join([f"{E.BOT} {title} 補恢復成功(bot 重開時沒查到 OKX)"] + names
+                                                    + ([] if REC_HOLD[kind] else ["全部恢復了"]) + [f"時間:{hhmmss()}"]))
 
 
 # ---------- /price 價格階梯（v8.3 /test2；v9.7 改名 /price） ----------
@@ -693,6 +809,10 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.5（1111 2026-10-12）：OKX 公開查詢每 2 秒 20 次（整台 VPS 6 個帳戶共用）—— ① /coins 規格、現價各一次查全部（okx_specs_all、
+#     okx_last_all），查不到等 1 秒再查一次；② 備用查價：WS 連著一律用最後一筆成交價（沒成交＝價格沒變），WS 斷線或這次連線還沒成交
+#     才一次查全部（rt_bulk_px，每個帳戶最快 1 秒一次）；③ 重開恢復：規格、現價先一次查全部（rec_okx_ready），沒恢復成功的那一筆
+#     不刪、留在存檔（REC_HOLD），背景每 10 秒再試（rec_hold_task），/runt、/run 都是。策略規則、參數、畫面不動。
 #   v12.4（1111 2026-10-12 看過模擬畫面 OK）：/status（實盤、模擬一起）持倉列的 % 改成這一單自己的進場價到現價（原本＝L01 加到這一單的累計），
 #     L 的單下面加一行「損益合計 -31.56%」（每一單 % 相加，L、S 都算；有持倉才列）。📌、進場成交通知、/stoprunt 不動。
 #   v12.3（1111 2026-10-12）：/coins（/amp 一起）加 SKYUSDT（加進 COINS_ADD）。
@@ -2248,6 +2368,7 @@ def rn_save():
                  "st": {"r": T["st"]["r"], "n": T["st"]["n"], "u": str(T["st"]["u"]), "gu": str(T["st"]["gu"])},
                  **rn_org_dump(T)}                             # v11.3：這一輪的原點
                 for T in RN.values() if not T.get("done")]
+        data += [d for d in REC_HOLD["runt"] if rn_key(d.get("sym", ""), d.get("dir") or "") not in RN]   # v12.5：還沒恢復成功的原樣保留
         os.makedirs(os.path.dirname(RN_FILE), exist_ok=True)
         rn_day_save()
         tmp = RN_FILE + ".tmp"
@@ -2799,11 +2920,117 @@ async def cmd_stoprunt(u, c):
     for part in tg_pack(title, [([RT_SEP] if i else []) + b for i, b in enumerate(B)], [f"時間:{hhmmss()}"]):   # v10.0：太長分頁
         await reply(u, part)
 
+async def rn_rec_one(app, d, names):
+    """v12.5：恢復存檔裡的一筆（rn_recover 抽出來；背景補恢復 rec_hold_task 也用）。查不到 OKX 就丟例外，那一筆留在存檔。
+    已經在跑的組（同幣種同方向）不重複建立。"""
+    D = lambda v: None if v is None else Decimal(v)
+    sym = d["sym"]
+    base = {"sym": sym, "lev": Decimal(d["lev"]), "amt": Decimal(d["amt"]), "off": Decimal(d.get("off", "0.2")),
+            "xx": int(d.get("xx") or 0), "mmr": D(d.get("mmr"))}   # v9.9：倍數（舊存檔 true＝XX）
+    dsv, lv = d.get("dir", "LS") or "", d.get("last")
+    pos_sides = rn_ls("".join(x["side"] for x in d.get("pos") or []))
+    if d.get("grp"):                               # v9.6 的存檔：一筆＝一組（幣種＋方向）
+        groups = [(dsv, bool(lv))]
+    else:                                          # v9.5 以前：一筆＝一個幣種（LS 綁在一起）→ v9.6 拆成 L、S 兩組
+        if lv is True:                             # v9.3：整個幣種 🚦
+            active, lastsides = "", pos_sides or rn_ls(dsv)
+        elif isinstance(lv, str):                  # v9.4～v9.5：dir＝還在跑的方向、last＝🚦 的方向
+            active, lastsides = rn_ls(dsv), rn_ls(lv)
+        else:
+            active, lastsides = rn_ls(dsv), ""
+        groups = []
+        for x in "LS":
+            if x in lastsides or (x in pos_sides and x not in active):
+                if x in pos_sides:
+                    groups.append((x, True))
+                else:
+                    names.append(f"🚦{sym} {x} 最後一輪已全部出場,策略結束")
+            elif x in active:
+                groups.append((x, False))
+    spec = await get_spec(sym)
+    if base["mmr"] is None:
+        base["mmr"] = await rn_mmr(spec)
+    st = d.get("st") or {}
+    px = None
+    for x, last in groups:
+        if rn_key(sym, x) in RN:
+            continue
+        T = rn_new({**base, "dir": x}, spec, d["chat"])
+        T["last"] = last
+        T["t_run"] = float(d["t_run"]) if d.get("t_run") is not None else None   # v10.1：舊存檔沒有 → 策略結束時用逐單紀錄回推
+        T["st"] = {"r": int(st.get("r", st.get("n", 0))), "n": int(st.get("n", 0)), "u": Decimal(st.get("u", "0"))}
+        fee1 = rn_notional(T) * (RN_FEE_IN + RN_FEE_OUT) / 100       # v8.1 以前的存檔沒有毛損益：用淨損益＋每單手續費 0.07% 補回
+        T["st"]["gu"] = Decimal(st["gu"]) if "gu" in st else T["st"]["u"] + fee1 * T["st"]["n"]
+        pos = []
+        for y in d.get("pos") or []:
+            if y["side"] != x:
+                continue
+            pos.append({"side": y["side"], "lvl": int(y.get("lvl", 0)), "ent": Decimal(y["ent"]), "t_in": float(y["t_in"]),
+                        "qty": Decimal(y["qty"]), "sl": D(y.get("sl")), "tp": D(y.get("tp")),
+                        "sl_g": D(y.get("sl_g")), "tp_g": D(y.get("tp_g")), "pend": None,
+                        "t_arm": y.get("t_arm"), "arm_px": D(y.get("arm_px")), "n_mv": int(y.get("n_mv", 0)), "n_tp": int(y.get("n_tp", 0)),
+                        "hi": D(y.get("hi")), "mfe": Decimal(y.get("mfe", "0")), "mae": Decimal(y.get("mae", "0")),
+                        "fu": Decimal(y.get("fu", "0")), "fn": int(y.get("fn", 0)),
+                        "lev": D(y.get("lev")) or rn_lev(T, int(y.get("lvl", 0))), "liq": D(y.get("liq")),
+                        "told": True, "out": None})
+            if pos[-1]["liq"] is None and y.get("lev") is None:          # v9.2 以前的存檔：補算預估強平價
+                pos[-1]["liq"] = rn_liq(T, pos[-1]["side"], pos[-1]["ent"], pos[-1]["lev"])
+        if pos:                                    # 持倉：接著跑
+            now = time.time()
+            init = {k: Decimal(v) for k, v in (d.get("init") or {}).items() if k == x}
+            for q in pos:
+                if q["lvl"] == 0:
+                    init.setdefault(q["side"], q["ent"])
+            h0 = float(d["h0"]) if d.get("grp") and d.get("h0") is not None else min(q["t_in"] for q in pos)
+            T["lev_now"] = D(d.get("lev_now")) if d.get("grp") else None   # v9.8；舊存檔＝持倉裡最高的那一層
+            T.update(rn_org_load(d))                   # v11.3：原點
+            T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "pos": pos, "legs": {}, "init": init,
+                      "cxl_due": None, "nxt": 0.0, "h0": h0,
+                      "ords": [{"side": o["side"], "lvl": int(o["lvl"]), "px": Decimal(o["px"]), "live": now,
+                                "t": float(o.get("t", now))} for o in d.get("ords") or [] if o["side"] == x],
+                      "rnd": [{**r, "ent": Decimal(r["ent"]), "net": Decimal(r["net"]), "netu": Decimal(r["netu"]),
+                               "gu": Decimal(r["gu"]) if "gu" in r else Decimal(r["netu"]) + fee1,
+                               "fu": Decimal(r.get("fu", "0")),
+                               **{k: Decimal(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}   # v10.1
+                              for r in d.get("rnd") or [] if r.get("side", x) == x]})
+            T["note_last"] = rt_note_base(T["h0"])
+            rn_start(app, T)
+            names.append(f"{rn_par(T)}|持倉 {len(pos)} 單" + (f"|掛單 {len(T['ords'])} 張" if T["ords"] else ""))
+            continue
+        if last:                                   # v9.3：🚦 最後一輪已經全部出場 → 策略結束，不再恢復
+            names.append(f"🚦{sym} {x} 最後一輪已全部出場,策略結束")
+            continue
+        if d.get("org") and not d.get("wait_until"):   # v11.3：閒置中（原點已定、這一邊沒有持倉）→ 照原點接著（第一層照掛）
+            T.update(rn_org_load(d))
+            T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "legs": {}, "nxt": 0.0, "h0": None,
+                      "ords": [{"side": o["side"], "lvl": int(o["lvl"]), "px": Decimal(o["px"]), "live": time.time(),
+                                "t": float(o.get("t", time.time()))} for o in d.get("ords") or [] if o["side"] == x],
+                      "rnd": [{**r, "ent": Decimal(r["ent"]), "net": Decimal(r["net"]), "netu": Decimal(r["netu"]),
+                               "gu": Decimal(r["gu"]), "fu": Decimal(r.get("fu", "0")),
+                               **{k: Decimal(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}
+                              for r in d.get("rnd") or [] if r.get("side", x) == x]})
+            rn_start(app, T)
+            names.append(f"{rn_par(T)}|原點 {T['org']['px']},這一邊在第一層 {T['base']} 掛著")
+            continue
+        if d.get("wait_until") and float(d["wait_until"]) > time.time():   # 本輪結束後的 111 秒還沒等完：等完剩下的
+            T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "wait_until": float(d["wait_until"]), "nxt": 0.0})
+            rn_start(app, T)
+            names.append(f"{rn_par(T)}|等完剩下 {int(T['wait_until'] - time.time())} 秒再埋伏")
+            continue
+        if px is None:                             # 埋伏中：用重開當下的現價重新來過
+            px = await rt_last_now(spec["iid"])    # v12.5：一次查全部的現價（重開前已經先查好）
+        if px is None:
+            raise RuntimeError("查不到現價")          # v12.5：整筆留在存檔，背景再試（不刪）
+        rn_round(T, time.time(), rt_q(px, spec["tick"]))
+        rn_start(app, T)
+        names.append(f"{rn_par(T)}|用現價重新埋伏")
+
 async def rn_recover(app):
     """重開後恢復：持倉、層單掛單接著跑（關機期間沒有看盤）；埋伏中的用重開當下的現價重新來過。
     v7.6 的存檔（沒有初始埋伏點、沒有層單）也認得：埋伏點當 0.2%，持倉當初始單。
     v9.6：存檔一筆＝一組（幣種＋方向，grp）；v9.5 以前一筆＝一個幣種 → 拆成 L、S 兩組（同參數）：
-    有持倉的照樣接著打（🚦 也保留）、沒持倉還在跑的用現價重新埋伏、已經停掉的不建立。"""
+    有持倉的照樣接著打（🚦 也保留）、沒持倉還在跑的用現價重新埋伏、已經停掉的不建立。
+    v12.5（1111 2026-10-12）：規格、現價先一次查全部（rec_okx_ready）；查不到 OKX 的那一筆不刪，留在存檔，背景每 10 秒再試（rec_hold_task）。"""
     rn_day_load()                                      # 本日已實現（v8.2）
     rn_log_prune()                                     # 逐單出場紀錄只留 30 天（v8.7）
     try:
@@ -2812,123 +3039,23 @@ async def rn_recover(app):
         data = json.load(open(RN_FILE))
     except Exception as e:
         print("[runt] recover read fail", e); return
-    names = []; bad = []; chat0 = None
-    D = lambda v: None if v is None else Decimal(v)
+    names = []; bad = []
+    chat0 = next((d.get("chat") for d in data if d.get("chat")), None)
+    await rec_okx_ready({d["sym"] for d in data if d.get("sym")}, any(not d.get("pos") for d in data))
+    REC_HOLD["runt"] = list(data)                      # v12.5：還沒恢復的全部留在存檔（恢復一筆拿掉一筆）
     for d in data:
         try:
-            chat0 = chat0 or d.get("chat")
-            sym = d["sym"]
-            base = {"sym": sym, "lev": Decimal(d["lev"]), "amt": Decimal(d["amt"]), "off": Decimal(d.get("off", "0.2")),
-                    "xx": int(d.get("xx") or 0), "mmr": D(d.get("mmr"))}   # v9.9：倍數（舊存檔 true＝XX）
-            dsv, lv = d.get("dir", "LS") or "", d.get("last")
-            pos_sides = rn_ls("".join(x["side"] for x in d.get("pos") or []))
-            if d.get("grp"):                               # v9.6 的存檔：一筆＝一組（幣種＋方向）
-                groups = [(dsv, bool(lv))]
-            else:                                          # v9.5 以前：一筆＝一個幣種（LS 綁在一起）→ v9.6 拆成 L、S 兩組
-                if lv is True:                             # v9.3：整個幣種 🚦
-                    active, lastsides = "", pos_sides or rn_ls(dsv)
-                elif isinstance(lv, str):                  # v9.4～v9.5：dir＝還在跑的方向、last＝🚦 的方向
-                    active, lastsides = rn_ls(dsv), rn_ls(lv)
-                else:
-                    active, lastsides = rn_ls(dsv), ""
-                groups = []
-                for x in "LS":
-                    if x in lastsides or (x in pos_sides and x not in active):
-                        if x in pos_sides:
-                            groups.append((x, True))
-                        else:
-                            names.append(f"🚦{sym} {x} 最後一輪已全部出場,策略結束")
-                    elif x in active:
-                        groups.append((x, False))
-            spec = await get_spec(sym)
-            if base["mmr"] is None:
-                base["mmr"] = await rn_mmr(spec)
-            st = d.get("st") or {}
-            px = None
-            for x, last in groups:
-                if rn_key(sym, x) in RN:
-                    continue
-                T = rn_new({**base, "dir": x}, spec, d["chat"])
-                T["last"] = last
-                T["t_run"] = float(d["t_run"]) if d.get("t_run") is not None else None   # v10.1：舊存檔沒有 → 策略結束時用逐單紀錄回推
-                T["st"] = {"r": int(st.get("r", st.get("n", 0))), "n": int(st.get("n", 0)), "u": Decimal(st.get("u", "0"))}
-                fee1 = rn_notional(T) * (RN_FEE_IN + RN_FEE_OUT) / 100       # v8.1 以前的存檔沒有毛損益：用淨損益＋每單手續費 0.07% 補回
-                T["st"]["gu"] = Decimal(st["gu"]) if "gu" in st else T["st"]["u"] + fee1 * T["st"]["n"]
-                pos = []
-                for y in d.get("pos") or []:
-                    if y["side"] != x:
-                        continue
-                    pos.append({"side": y["side"], "lvl": int(y.get("lvl", 0)), "ent": Decimal(y["ent"]), "t_in": float(y["t_in"]),
-                                "qty": Decimal(y["qty"]), "sl": D(y.get("sl")), "tp": D(y.get("tp")),
-                                "sl_g": D(y.get("sl_g")), "tp_g": D(y.get("tp_g")), "pend": None,
-                                "t_arm": y.get("t_arm"), "arm_px": D(y.get("arm_px")), "n_mv": int(y.get("n_mv", 0)), "n_tp": int(y.get("n_tp", 0)),
-                                "hi": D(y.get("hi")), "mfe": Decimal(y.get("mfe", "0")), "mae": Decimal(y.get("mae", "0")),
-                                "fu": Decimal(y.get("fu", "0")), "fn": int(y.get("fn", 0)),
-                                "lev": D(y.get("lev")) or rn_lev(T, int(y.get("lvl", 0))), "liq": D(y.get("liq")),
-                                "told": True, "out": None})
-                    if pos[-1]["liq"] is None and y.get("lev") is None:          # v9.2 以前的存檔：補算預估強平價
-                        pos[-1]["liq"] = rn_liq(T, pos[-1]["side"], pos[-1]["ent"], pos[-1]["lev"])
-                if pos:                                    # 持倉：接著跑
-                    now = time.time()
-                    init = {k: Decimal(v) for k, v in (d.get("init") or {}).items() if k == x}
-                    for q in pos:
-                        if q["lvl"] == 0:
-                            init.setdefault(q["side"], q["ent"])
-                    h0 = float(d["h0"]) if d.get("grp") and d.get("h0") is not None else min(q["t_in"] for q in pos)
-                    T["lev_now"] = D(d.get("lev_now")) if d.get("grp") else None   # v9.8；舊存檔＝持倉裡最高的那一層
-                    T.update(rn_org_load(d))                   # v11.3：原點
-                    T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "pos": pos, "legs": {}, "init": init,
-                              "cxl_due": None, "nxt": 0.0, "h0": h0,
-                              "ords": [{"side": o["side"], "lvl": int(o["lvl"]), "px": Decimal(o["px"]), "live": now,
-                                        "t": float(o.get("t", now))} for o in d.get("ords") or [] if o["side"] == x],
-                              "rnd": [{**r, "ent": Decimal(r["ent"]), "net": Decimal(r["net"]), "netu": Decimal(r["netu"]),
-                                       "gu": Decimal(r["gu"]) if "gu" in r else Decimal(r["netu"]) + fee1,
-                                       "fu": Decimal(r.get("fu", "0")),
-                                       **{k: Decimal(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}   # v10.1
-                                      for r in d.get("rnd") or [] if r.get("side", x) == x]})
-                    T["note_last"] = rt_note_base(T["h0"])
-                    rn_start(app, T)
-                    names.append(f"{rn_par(T)}|持倉 {len(pos)} 單" + (f"|掛單 {len(T['ords'])} 張" if T["ords"] else ""))
-                    continue
-                if last:                                   # v9.3：🚦 最後一輪已經全部出場 → 策略結束，不再恢復
-                    names.append(f"🚦{sym} {x} 最後一輪已全部出場,策略結束")
-                    continue
-                if d.get("org") and not d.get("wait_until"):   # v11.3：閒置中（原點已定、這一邊沒有持倉）→ 照原點接著（第一層照掛）
-                    T.update(rn_org_load(d))
-                    T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "legs": {}, "nxt": 0.0, "h0": None,
-                              "ords": [{"side": o["side"], "lvl": int(o["lvl"]), "px": Decimal(o["px"]), "live": time.time(),
-                                        "t": float(o.get("t", time.time()))} for o in d.get("ords") or [] if o["side"] == x],
-                              "rnd": [{**r, "ent": Decimal(r["ent"]), "net": Decimal(r["net"]), "netu": Decimal(r["netu"]),
-                                       "gu": Decimal(r["gu"]), "fu": Decimal(r.get("fu", "0")),
-                                       **{k: Decimal(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}
-                                      for r in d.get("rnd") or [] if r.get("side", x) == x]})
-                    rn_start(app, T)
-                    names.append(f"{rn_par(T)}|原點 {T['org']['px']},這一邊在第一層 {T['base']} 掛著")
-                    continue
-                if d.get("wait_until") and float(d["wait_until"]) > time.time():   # 本輪結束後的 111 秒還沒等完：等完剩下的
-                    T.update({"t0": float(d["t0"]), "px0": Decimal(d["px0"]), "wait_until": float(d["wait_until"]), "nxt": 0.0})
-                    rn_start(app, T)
-                    names.append(f"{rn_par(T)}|等完剩下 {int(T['wait_until'] - time.time())} 秒再埋伏")
-                    continue
-                for _ in range(3 if px is None else 0):    # 埋伏中：用重開當下的現價重新來過
-                    try:
-                        px = await get_last(spec["iid"]); break
-                    except Exception:
-                        await asyncio.sleep(1)
-                if px is None:
-                    bad.append(rn_par(T)); continue
-                rn_round(T, time.time(), rt_q(px, spec["tick"]))
-                rn_start(app, T)
-                names.append(f"{rn_par(T)}|用現價重新埋伏")
+            await rn_rec_one(app, d, names)
+            REC_HOLD["runt"].remove(d)
         except Exception as e:
-            print("[runt] recover fail", d, type(e).__name__, e)
-            bad.append(f"{d.get('sym')}")
+            print("[runt] recover fail", d.get("sym"), d.get("dir"), type(e).__name__, e)
+            bad.append(f"{d.get('sym')} {d.get('dir') or ''}".strip())
     rn_save()
     L = []
     if names:
         L += [f"{E.BOT} runt 已自動恢復(bot 重開)"] + names + ["持倉的 SL/TP、掛單不變,關機期間沒有看盤"]
     if bad:
-        L += [f"{E.WARN} 以下沒有恢復,請重新下指令:"] + bad
+        L += [f"{E.WARN} 以下這次沒查到 OKX,沒有清掉(存檔保留),BOT 每 10 秒再試,恢復了會再通知:"] + bad
     if L and chat0:
         L.append(f"時間:{hhmmss()}")
         await rt_send(app, chat0, "\n".join(L))
@@ -3865,6 +3992,7 @@ def rr_save():
                          "acx": (T.get("acx") or [])[-200:], "stopping": bool(T.get("stopping")),
                          "rej": T.get("rej") or {}, "cool": {k: v for k, v in (T.get("cool") or {}).items() if v < 9e17},
                          **rn_org_dump(T)})                      # v11.3：這一輪的原點
+        data += [d for d in REC_HOLD["run"] if rn_key(d.get("sym", ""), d.get("dir") or "") not in REAL.G]   # v12.5：還沒恢復成功的原樣保留
         os.makedirs(os.path.dirname(REAL.file), exist_ok=True)
         rn_day_save(REAL)
         tmp = REAL.file + ".tmp"
@@ -3889,8 +4017,61 @@ async def rr_fee_rate(iid):
         print("[run] trade-fee fail", iid, type(e).__name__, e)
     return RR_FEE_DEF
 
+async def rr_rec_one(app, d, names):
+    """v12.5：恢復 /run 存檔裡的一筆（rr_recover 抽出來；背景補恢復 rec_hold_task 也用）。查不到 OKX 就丟例外，那一筆留在存檔。"""
+    D = lambda v: None if v in (None, "") else Decimal(v)
+    if rn_key(d["sym"], d["dir"]) in REAL.G:             # v12.5：已經在跑（補恢復時）→ 不重複建立
+        return
+    spec = await get_spec(d["sym"])
+    base = {"sym": d["sym"], "lev": Decimal(d["lev"]), "amt": Decimal(d["amt"]), "off": Decimal(d["off"]), "xx": 0,
+            "mmr": await rn_mmr(spec), "dir": d["dir"]}
+    T = rn_new(base, spec, d["chat"])
+    rr_init(T, spec, D(d.get("fee_t")))
+    st = d.get("st") or {}
+    T.update({"last": bool(d.get("last")), "t_run": d.get("t_run"), "t0": d.get("t0") or time.time(),
+              "px0": D(d.get("px0")) or Decimal(0), "h0": d.get("h0"), "wait_until": d.get("wait_until"),
+              "init": {k: Decimal(v) for k, v in (d.get("init") or {}).items()}, "nxt": 0.0, "cxl_due": None,
+              "note_last": time.time(), "stopping": bool(d.get("stopping")),
+              "st": {"r": int(st.get("r", 0)), "n": int(st.get("n", 0)), "u": Decimal(st.get("u", "0")), "gu": Decimal(st.get("gu", "0"))},
+              "ff0": (d["ff0"][0], Decimal(d["ff0"][1])) if d.get("ff0") else None, "seen": list(d.get("seen") or []),
+              "acx": list(d.get("acx") or []), "rej": dict(d.get("rej") or {}), "cool": dict(d.get("cool") or {}),
+              **rn_org_load(d)})                     # v11.3：這一輪的原點
+    for y in d.get("pos") or []:
+        p = {k: y.get(k) for k in ("side", "lvl", "t_in", "t_arm", "n_mv", "n_tp", "fn", "oid", "aid", "aid_x", "xoid", "t_aid",
+                                   "manual", "n_acx", "t_trig", "acl_wait", "t_aw")}
+        for k in ("ent", "qty", "sz", "mg", "fee_in", "fee_out", "okpnl", "trig", "sl", "tp", "sl_g", "tp_g", "arm_px", "hi", "lev"):
+            p[k] = D(y.get(k))
+        p.update({"mfe": Decimal(y.get("mfe") or "0"), "mae": Decimal(y.get("mae") or "0"), "fu": Decimal(y.get("fu") or "0"),
+                  "n_mv": int(y.get("n_mv") or 0), "n_tp": int(y.get("n_tp") or 0), "fn": int(y.get("fn") or 0),
+                  "pend": None, "liq": None, "want": None, "told": bool(y.get("told", True)),
+                  "sent": tuple(D(x) for x in y["sent"]) if y.get("sent") else None,
+                  "out": (float(y["out"][0]), Decimal(y["out"][1]), y["out"][2]) if y.get("out") else None})
+        T["pos"].append(p)
+    for o in d.get("ords") or []:
+        T["ords"].append({"side": o["side"], "lvl": int(o["lvl"]), "px": Decimal(o["px"]), "t": o.get("t"), "live": time.time(),
+                          "oid": o.get("oid"), "clid": o.get("clid"), "sz": D(o.get("sz")), "cxl": bool(o.get("cxl")),
+                          "acc": D(o.get("acc")) or Decimal(0), "amb": bool(o.get("amb")), "t_s": o.get("t_s"), "busy": False})
+    legs = {}
+    for k, o in (d.get("legs") or {}).items():
+        legs[k] = {"side": o["side"], "px": Decimal(o["px"]), "fill": None, "dead": False, "oid": o.get("oid"), "clid": o.get("clid"),
+                   "sz": D(o.get("sz")), "cxl": bool(o.get("cxl")), "acc": D(o.get("acc")) or Decimal(0), "amb": bool(o.get("amb")),
+                   "t_s": o.get("t_s"), "busy": False, "n_rej": int(o.get("n_rej") or 0), "cool": 0}
+    T["legs"] = legs
+    T["rnd"] = [{**r, "ent": Decimal(r["ent"]), "net": Decimal(r["net"]), "netu": Decimal(r["netu"]), "gu": Decimal(r["gu"]),
+                 "fu": Decimal(r.get("fu", "0")), **{k: Decimal(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}
+                for r in d.get("rnd") or []]
+    rr_start(app, T)
+    live = [p for p in T["pos"] if not p["out"]]
+    if live:
+        names.append(f"{rn_par(T)}|持倉 {len(live)} 層" + (f"|層單 {len(T['ords'])} 張" if T["ords"] else ""))
+    elif T.get("wait_until"):
+        names.append(f"{rn_par(T)}|本輪結束,等完剩下的時間再埋伏")
+    else:
+        names.append(f"{rn_par(T)}|埋伏中(OKX 上的 L01/S01 掛單不變)")
+
 async def rr_recover(app):
-    """bot 重開：/run 的組接著跑，第一次對帳就以 OKX 為準補上關機期間的成交、出場（條件單觸發、手動平倉、強平）。"""
+    """bot 重開：/run 的組接著跑，第一次對帳就以 OKX 為準補上關機期間的成交、出場（條件單觸發、手動平倉、強平）。
+    v12.5（1111 2026-10-12）：規格先一次查全部；查不到 OKX 的那一筆不刪，留在存檔，背景每 10 秒再試（rec_hold_task）。"""
     rn_day_load(REAL)
     rn_log_prune(REAL)
     rn_log_prune(path=RR_EV_FILE)
@@ -3900,57 +4081,14 @@ async def rr_recover(app):
         data = json.load(open(REAL.file))
     except Exception as e:
         print("[run] recover read fail", e); return
-    D = lambda v: None if v in (None, "") else Decimal(v)
-    names, bad, chat0 = [], [], None
+    names, bad = [], []
+    chat0 = next((d.get("chat") for d in data if d.get("chat")), None)
+    await rec_okx_ready({d["sym"] for d in data if d.get("sym")})   # v12.5：規格先一次查全部
+    REC_HOLD["run"] = list(data)                       # v12.5：還沒恢復的全部留在存檔（恢復一筆拿掉一筆）
     for d in data:
         try:
-            chat0 = chat0 or d.get("chat")
-            spec = await get_spec(d["sym"])
-            base = {"sym": d["sym"], "lev": Decimal(d["lev"]), "amt": Decimal(d["amt"]), "off": Decimal(d["off"]), "xx": 0,
-                    "mmr": await rn_mmr(spec), "dir": d["dir"]}
-            T = rn_new(base, spec, d["chat"])
-            rr_init(T, spec, D(d.get("fee_t")))
-            st = d.get("st") or {}
-            T.update({"last": bool(d.get("last")), "t_run": d.get("t_run"), "t0": d.get("t0") or time.time(),
-                      "px0": D(d.get("px0")) or Decimal(0), "h0": d.get("h0"), "wait_until": d.get("wait_until"),
-                      "init": {k: Decimal(v) for k, v in (d.get("init") or {}).items()}, "nxt": 0.0, "cxl_due": None,
-                      "note_last": time.time(), "stopping": bool(d.get("stopping")),
-                      "st": {"r": int(st.get("r", 0)), "n": int(st.get("n", 0)), "u": Decimal(st.get("u", "0")), "gu": Decimal(st.get("gu", "0"))},
-                      "ff0": (d["ff0"][0], Decimal(d["ff0"][1])) if d.get("ff0") else None, "seen": list(d.get("seen") or []),
-                      "acx": list(d.get("acx") or []), "rej": dict(d.get("rej") or {}), "cool": dict(d.get("cool") or {}),
-                      **rn_org_load(d)})                     # v11.3：這一輪的原點
-            for y in d.get("pos") or []:
-                p = {k: y.get(k) for k in ("side", "lvl", "t_in", "t_arm", "n_mv", "n_tp", "fn", "oid", "aid", "aid_x", "xoid", "t_aid",
-                                           "manual", "n_acx", "t_trig", "acl_wait", "t_aw")}
-                for k in ("ent", "qty", "sz", "mg", "fee_in", "fee_out", "okpnl", "trig", "sl", "tp", "sl_g", "tp_g", "arm_px", "hi", "lev"):
-                    p[k] = D(y.get(k))
-                p.update({"mfe": Decimal(y.get("mfe") or "0"), "mae": Decimal(y.get("mae") or "0"), "fu": Decimal(y.get("fu") or "0"),
-                          "n_mv": int(y.get("n_mv") or 0), "n_tp": int(y.get("n_tp") or 0), "fn": int(y.get("fn") or 0),
-                          "pend": None, "liq": None, "want": None, "told": bool(y.get("told", True)),
-                          "sent": tuple(D(x) for x in y["sent"]) if y.get("sent") else None,
-                          "out": (float(y["out"][0]), Decimal(y["out"][1]), y["out"][2]) if y.get("out") else None})
-                T["pos"].append(p)
-            for o in d.get("ords") or []:
-                T["ords"].append({"side": o["side"], "lvl": int(o["lvl"]), "px": Decimal(o["px"]), "t": o.get("t"), "live": time.time(),
-                                  "oid": o.get("oid"), "clid": o.get("clid"), "sz": D(o.get("sz")), "cxl": bool(o.get("cxl")),
-                                  "acc": D(o.get("acc")) or Decimal(0), "amb": bool(o.get("amb")), "t_s": o.get("t_s"), "busy": False})
-            legs = {}
-            for k, o in (d.get("legs") or {}).items():
-                legs[k] = {"side": o["side"], "px": Decimal(o["px"]), "fill": None, "dead": False, "oid": o.get("oid"), "clid": o.get("clid"),
-                           "sz": D(o.get("sz")), "cxl": bool(o.get("cxl")), "acc": D(o.get("acc")) or Decimal(0), "amb": bool(o.get("amb")),
-                           "t_s": o.get("t_s"), "busy": False, "n_rej": int(o.get("n_rej") or 0), "cool": 0}
-            T["legs"] = legs
-            T["rnd"] = [{**r, "ent": Decimal(r["ent"]), "net": Decimal(r["net"]), "netu": Decimal(r["netu"]), "gu": Decimal(r["gu"]),
-                         "fu": Decimal(r.get("fu", "0")), **{k: Decimal(r[k]) for k in ("g", "fund", "mfe", "lev") if r.get(k) is not None}}
-                        for r in d.get("rnd") or []]
-            rr_start(app, T)
-            live = [p for p in T["pos"] if not p["out"]]
-            if live:
-                names.append(f"{rn_par(T)}|持倉 {len(live)} 層" + (f"|層單 {len(T['ords'])} 張" if T["ords"] else ""))
-            elif T.get("wait_until"):
-                names.append(f"{rn_par(T)}|本輪結束,等完剩下的時間再埋伏")
-            else:
-                names.append(f"{rn_par(T)}|埋伏中(OKX 上的 L01/S01 掛單不變)")
+            await rr_rec_one(app, d, names)
+            REC_HOLD["run"].remove(d)
         except Exception as e:
             print("[run] recover fail", d.get("sym"), type(e).__name__, e)
             bad.append(f"{d.get('sym')} {d.get('dir')}")
@@ -3959,7 +4097,7 @@ async def rr_recover(app):
     if names:
         L += [f"{E.BOT} 實盤 /run 已自動恢復(bot 重開)"] + names + ["以 OKX 為準對帳:關機期間的成交、出場、手動平倉會補上"]
     if bad:
-        L += [f"{E.WARN} 以下沒有恢復(OKX 上的單沒動,請到 OKX 檢查):"] + bad
+        L += [f"{E.WARN} 以下這次沒查到 OKX,沒有清掉(存檔保留,OKX 上的單沒動),BOT 每 10 秒再試,恢復了會再通知:"] + bad
     if L and chat0:
         L.append(f"時間:{hhmmss()}")
         await rt_send(app, chat0, "\n".join(L))
@@ -4515,9 +4653,19 @@ async def cmd_coins(u, c):
     on = coins_list()                                       # v10.5：加 COINS_ADD，不重複；v11.1：跟 /amp 共用
     L = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"] + await acct
     L += ["━━━━━━━━━━", "幣種｜最小保證金(1X)｜最大槓桿"]
+    # v12.5（1111 2026-10-12）：規格、現價各一次查全部（原本一個幣種查一次，27 個幣種超過 OKX 每 2 秒 20 次，排在後面的查詢失敗）；
+    #   查不到等 1 秒再查一次。規格這次沒查到就用之前查到的。
+    if not await okx_specs_all():
+        await asyncio.sleep(1)
+        await okx_specs_all()
+    lasts = await okx_last_all()
+    if lasts is None:
+        await asyncio.sleep(1)
+        lasts = await okx_last_all()
+    lasts = lasts or {}
     for sym in on:
         try:
-            sp = await get_spec(sym); last = await get_last(sp["iid"])
+            sp = SPEC_CACHE[sym]; last = lasts[sp["iid"]]
             mm = sp["minsz"] * sp["ctval"] * last          # 最小下單量的價值＝1X 的最小保證金（nX 時 ÷n）
             L.append(f"{sym}｜{mm:.4f}U｜{pct(sp['maxlev'])}X")   # v9.9（1111）
         except Exception:
@@ -4872,6 +5020,8 @@ async def _post_init(app):
     print(f"/runt 移動任務已啟動（{VERSION}）")   # deploy5.sh 用這一行確認版本（v10.8 以前是舊 /run 的 frame_mover 印的）
     await rn_recover(app)     # v7.6／v7.7：/runt 佈局
     await rr_recover(app)     # v11.0：/run 實盤（以 OKX 為準對帳）
+    if REC_HOLD["runt"] or REC_HOLD["run"]:
+        rt_bg(rec_hold_task(app))   # v12.5：這次沒恢復成功的組，背景每 10 秒再試
 
 async def _post_stop(app):
     global SHUTTING_DOWN
