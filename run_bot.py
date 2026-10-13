@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,9 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.0（1111 2026-10-13 看過模擬畫面 OK）：① 📌 強平價算出來 ≤0（1X 做多收的資金費比開倉手續費多）改寫 📌-100.00%（RN_PIN_ZERO），
+#     不再寫「無」（同一種情況有時「無」、有時 -99.97% 看起來很怪）；強平判斷不變。② 模擬 /summary 分幣種「總成交單」下面列每一層出場幾單
+#     （S01 0單|L01 9單，S、L 兩邊都列，層名照那個帳戶、接續的帳戶 L06～；用逐單紀錄 runtlog）。總表不加；實盤 /run 的 /summary 待更新。
 #   v12.9（1111 2026-10-13）：進場成交通知、/stoprunt（/stop）的持倉表改成跟持倉通知一樣：每一單自己的進場價到 % 欄的價格（不累加），
 #     表格下面加「損益合計」（rn_sum_line）。進場成交用這一張的成交價算、/stoprunt 用現價。現在所有持倉表都不再累加（rn_rows own=True）。
 #   v12.8（1111 2026-10-13 看過模擬畫面 OK）：接續帳戶（套牢單的延伸戰術，lad_ 開頭）：同一個幣種同一個方向，層數跨帳戶接著算，
@@ -1549,6 +1552,30 @@ def rn_sum_sim(d, full=False):
         if fu_on:
             out.append(f"{pre}資金費 {us[2]}|{ps[2]}")
         return out + [f"{pre}淨損益 {us[-1]}"]
+    def lay_lines(sym):
+        """v13.0（1111 2026-10-13）：總成交單下面每一層出場幾單：S01 0單|L01 9單（S、L 並排，兩邊都列；層名照那個帳戶，接續的帳戶 L06～）。"""
+        cnt = {(sd, k): 0 for sd in "SL" for k in range(RN_NLV + 1)}
+        bk = {}
+        for r in recs:
+            sd = r.get("side")
+            try:
+                k = int(r.get("lvl") or 0)
+            except Exception:
+                continue
+            if r.get("sym") != sym or sd not in ("S", "L") or not 0 <= k <= RN_NLV:
+                continue
+            cnt[(sd, k)] += 1
+            t = float(r.get("t_out") or 0)
+            if sd not in bk or t >= bk[sd][0]:
+                bk[sd] = (t, int(r.get("blk") or 0))
+        for sd in "SL":
+            if sd not in bk:
+                T = MM.G.get(rn_key(sym, sd))
+                bk[sd] = (0, int(T.get("blk") or 0) if T else 0)
+        sv = rn_pad([f"{cnt[('S', k)]}單" for k in range(RN_NLV + 1)])
+        lv = rn_pad([f"{cnt[('L', k)]}單" for k in range(RN_NLV + 1)])
+        nm = lambda sd, k: rn_nm({"blk": bk[sd][1]}, sd, k)
+        return [f"{nm('S', k)} {sv[k]}|{nm('L', k)} {lv[k]}" for k in range(RN_NLV + 1)]
     M = [f"📊 summary｜{ACCT} 分幣種", span]
     for sym in sorted(syms):
         sides = [sd for sd in ("S", "L") if ((day.get(sym) or {}).get(sd) or {}).get("n") or MM.G.get(rn_key(sym, sd))]
@@ -1574,7 +1601,7 @@ def rn_sum_sim(d, full=False):
             blk += [f"{sd} {a['n']}單"] + rows("", a, amt, pc)
         M += [RT_SEP, title, f"最大金額 {pct(peak(sym))}U💰", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯", f"總成交單 {ct['n']}單"]
         if ct["n"]:
-            M += rows("總", ct, None, sp) + [""] + blk
+            M += lay_lines(sym) + rows("總", ct, None, sp) + [""] + blk   # v13.0：每一層的單數
     M += [RT_SEP] + foot
     return [L, M]
 
@@ -2020,6 +2047,8 @@ def rn_nm2(side, lvl):
     """v11.2（1111）：表格裡的層數兩位數。v11.3：從 01 開始（lvl 0 → L01）。"""
     return f"{side}{lvl + 1:02d}"
 
+RN_PIN_ZERO = "📌-100.00%"   # v13.0（1111 2026-10-13）：強平價算出來 ≤0（1X 做多收的資金費比開倉手續費多）＝要跌到 0 才強平，不再寫「無」
+
 def rn_one(T, p, px):
     """v12.4（1111 2026-10-12）：這一單自己的損益 %（槓桿×價格漲跌%，以一單保證金＝100%），照畫面取到 0.01%。"""
     return rn_q2(rn_plev(T, p) * rn_g(p["side"], p["ent"], px))
@@ -2076,7 +2105,7 @@ def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=
         liq = info[id(x)][1]
         if okl and last.get(side) is x:
             liq = okl                                      # 實盤：整個倉位用 OKX 給的預估強平價
-        pin = "📌" + rn_sp(rn_q2((liq / px - 1) * 100)) if liq and px else "📌無"
+        pin = ("📌" + rn_sp(rn_q2((liq / px - 1) * 100)) if liq else RN_PIN_ZERO) if px else "📌無"   # v13.0：強平價 ≤0＝📌-100.00%
         sl = rn_cur_sltp(x)[0]
         tm = datetime.fromtimestamp(x["t_in"], TZ8).strftime(tfmt) + "|" if tfmt else ""
         o = T.get("org") if mark_org else None             # v12.1：進場成交通知裡，原點那一單後面加 🌐
@@ -2263,8 +2292,10 @@ def rn_pin(p, px, T=None):
     """v10.7（1111）：還沒設 SL 的那一層顯示 📍＝現價到這一層預估強平價的距離（＋強平價在上面、−在下面）；1X 做多不會強平＝📍無。
     v11.0 實盤：用 OKX 持倉的預估強平價（OKX 同方向合成一個倉位，每一層一樣）。"""
     liq = rr_liq(T) if T is not None and T.get("real") else p.get("liq")
-    if liq is None or not px:
+    if not px:
         return "📌無"
+    if liq is None:
+        return RN_PIN_ZERO                                 # v13.0：強平價 ≤0（不會強平）＝要跌到 0
     return "📌" + rn_sp(rn_q2((liq / px - 1) * 100))
 
 def rn_book(T, px):
