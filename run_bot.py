@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.9（1111 2026-10-13）：進場成交通知、/stoprunt（/stop）的持倉表改成跟持倉通知一樣：每一單自己的進場價到 % 欄的價格（不累加），
+#     表格下面加「損益合計」（rn_sum_line）。進場成交用這一張的成交價算、/stoprunt 用現價。現在所有持倉表都不再累加（rn_rows own=True）。
 #   v12.8（1111 2026-10-13 看過模擬畫面 OK）：接續帳戶（套牢單的延伸戰術，lad_ 開頭）：同一個幣種同一個方向，層數跨帳戶接著算，
 #     照下單先後：第 1 個帳戶 L01～L05、第 2 個 L06～L10 … 第 6 個 L26～L30（T["blk"]；程式裡每個帳戶還是 lvl 0～4，rn_nm 加上去）。
 #     第 2 個以後先等：前一個帳戶的 5 的倍數層還抱著、損失點（價格漲跌%，不含槓桿）> /gap 那一格 → 用現價往下埋伏點% 掛第一單；
@@ -2008,7 +2010,7 @@ def rn_fill_notice(T, p):
         L.append(f"🌐原點 {rn_mdt(o['t'])}|{rt_q(o['px'], tick)}")
     held = sorted([q for q in T["pos"] if q["side"] == p["side"] and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
     if held:
-        L += rn_rows(T, p["ent"], held, "%H:%M:%S", mark_org=True)
+        L += rn_rows(T, p["ent"], held, "%H:%M:%S", mark_org=True, own=True) + rn_sum_line(T, held, p["ent"])   # v12.9：同持倉通知
     L.append(f"🎯進場 {rn_mdt(p['t_in'])}|{rt_q(p['ent'], tick)}")
     if p.get("t_ord"):
         L.append(f"埋伏 {rn_hold(p['t_in'] - p['t_ord'])}")
@@ -2021,6 +2023,10 @@ def rn_nm2(side, lvl):
 def rn_one(T, p, px):
     """v12.4（1111 2026-10-12）：這一單自己的損益 %（槓桿×價格漲跌%，以一單保證金＝100%），照畫面取到 0.01%。"""
     return rn_q2(rn_plev(T, p) * rn_g(p["side"], p["ent"], px))
+
+def rn_sum_line(T, ps, px):
+    """v12.9（1111 2026-10-13：跟持倉通知一樣）：表格下面一行 損益合計＝上面每一單自己的 % 相加；沒有持倉＝不列。"""
+    return [f"損益合計 {rn_sp(sum((rn_one(T, q, px) for q in ps), Decimal(0)))}"] if ps else []
 
 def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=False):
     """表格每一層一行（/status、層單進場成交、出場通知的持倉中明細、/stoprunt 共用）。
@@ -2858,7 +2864,8 @@ def rn_stop_lines(T, now, last=False):
     live = [p for p in T["pos"] if not p["out"]]
     px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
     if live and px is not None and T["h0"] is not None:
-        L += [f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, T['tick'])}", RT_SEP] + rn_rows(T, px, live, "%H:%M:%S", extra=True)
+        L += ([f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, T['tick'])}", RT_SEP]
+              + rn_rows(T, px, live, "%H:%M:%S", extra=True, own=True) + rn_sum_line(T, live, px))   # v12.9：同持倉通知
     elif live:
         L.append(f"持倉 {len(live)} 單|未出場")
     elif T.get("wait_until"):
