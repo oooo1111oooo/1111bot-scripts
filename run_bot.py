@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.2（1111 2026-10-14）：/gap 預設改成 7.5% 12.5% 17.5% 22.5% 27.5%（04→05、08→09、12→13、16→17、20→21）。
+#     已經用 /gap 設過的（ladder/gap.json）照設過的；刪掉 gap.json 或再打一次 /gap 才會是新的預設。
 #   v13.1（1111 2026-10-13）：每個帳戶 4 層（RN_NLV＝3，L01～L04）、每層 2.5%（RN_LV_STEP；LS 另一邊第一單離原點也是）；接續帳戶跟著變：
 #     第 1 個帳戶 L01～L04、第 2 個 L05～L08 … 第 6 個 L21～L24（每個方向 24 單），4 的倍數層 L04、L08…；/gap 數值不變、名稱 04→05…20→21。
 #     畫面文字改成跟常數走。/summary 每一層：當天還有舊的第 5 層紀錄也列出來（加起來才對得上）。
@@ -3298,7 +3300,7 @@ async def rn_recover(app):
 LAD_DIR = "/srv/1111bot/data/ladder"
 LAD_FILE = f"{LAD_DIR}/{ACCT}.json"
 LAD_GAP_FILE = f"{LAD_DIR}/gap.json"
-LAD_GAP_DEF = [Decimal("7"), Decimal("7"), Decimal("12"), Decimal("17"), Decimal("22")]   # /gap 預設：05→06、10→11、15→16、20→21、25→26
+LAD_GAP_DEF = [Decimal("7.5"), Decimal("12.5"), Decimal("17.5"), Decimal("22.5"), Decimal("27.5")]   # /gap 預設（v13.2，1111）：04→05、08→09、12→13、16→17、20→21
 LAD_NBLK = 6                   # 最多 6 個帳戶（L01～L30）
 LAD_STALE = 5.0                # 紀錄超過 5 秒沒更新＝那個 bot 沒在跑
 LAD_EVERY = 0.25               # 每 0.25 秒寫一次自己的紀錄（有變才寫，最少 1 秒寫一次）
@@ -3399,7 +3401,7 @@ def lad_prev(T, force=False):
     return {"acct": None, "fresh": True, "five": None}
 
 def lad_gaps():
-    """/gap 的 5 個距離（6 個帳戶共用；1 秒內讀過就用上次的；沒設過＝預設 7% 7% 12% 17% 22%）。"""
+    """/gap 的 5 個距離（6 個帳戶共用；1 秒內讀過就用上次的；沒設過＝預設 7.5% 12.5% 17.5% 22.5% 27.5%）。"""
     now = time.time()
     if now - LAD_GAP["t"] >= 1.0:
         LAD_GAP["t"] = now
@@ -3506,7 +3508,7 @@ def lad_lines(T, px):
 
 
 # ---------- /gap：帳戶與帳戶的距離（v12.8，6 個帳戶共用） ----------
-GAP_HINT = "7% 7% 12% 17% 22%"
+GAP_HINT = "7.5% 12.5% 17.5% 22.5% 27.5%"
 
 def gap_lines(head=None):
     """/gap 畫面：05→06層 7.00%（% 欄對齊）。"""
@@ -3516,7 +3518,7 @@ def gap_lines(head=None):
     return ["⚙️ gap｜帳戶與帳戶的距離(6 個帳戶共用)"] + ([head] if head else []) + [f"{n} {x}" for n, x in zip(nm, ps)]
 
 def gap_parse(a):
-    """5 個距離（例 7% 7% 12% 17% 22%）：每個都要加 %、大於 0、小於 100。成功回 (list, None)，失敗回 (None, 說明)。"""
+    """5 個距離（例 7.5% 12.5% 17.5% 22.5% 27.5%）：每個都要加 %、大於 0、小於 100。成功回 (list, None)，失敗回 (None, 說明)。"""
     if len(a) != LAD_NBLK - 1:
         return None, f"要 {LAD_NBLK - 1} 個距離,你打了 {len(a)} 個"
     v = []
@@ -3534,7 +3536,7 @@ def gap_parse(a):
     return v, None
 
 async def cmd_gap(u, c):
-    """/gap 第5→6層 第10→11層 第15→16層 第20→21層 第25→26層（例 /gap 7% 7% 12% 17% 22%）：
+    """/gap 第4→5層 第8→9層 第12→13層 第16→17層 第20→21層（例 /gap 7.5% 12.5% 17.5% 22.5% 27.5%）：
     前一個帳戶的 5 的倍數層損失點（價格%，不含槓桿）超過這個距離，下一個帳戶才掛第一單。6 個帳戶共用，設了馬上生效。
     不帶參數＝顯示目前的設定、等你直接輸入。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
@@ -5422,9 +5424,9 @@ async def cmd_menu(u, c):
         "/stoprunt 幣種 方向｜all　方向 LS 兩邊／L 只停多／S 只停空；all＝全部幣種兩邊。"
         "沒有進場＝馬上停止；有進場＝🚦最後一輪（這一輪照常作戰，全部出場後那一組結束，BOT 不平倉）；停一邊，另一邊照常。"
         "/stoprunt all 平倉＝模擬全部馬上停止，還抱著的單用現價出場、記成手動平倉（只有模擬；實盤照舊 BOT 不平倉）\n"
-        f"/gap 7% 7% 12% 17% 22%　帳戶與帳戶的距離：第 {'、'.join(f'{(RN_NLV + 1) * k}→{(RN_NLV + 1) * k + 1}' for k in range(1, LAD_NBLK))} 層"
+        f"/gap 7.5% 12.5% 17.5% 22.5% 27.5%　帳戶與帳戶的距離：第 {'、'.join(f'{(RN_NLV + 1) * k}→{(RN_NLV + 1) * k + 1}' for k in range(1, LAD_NBLK))} 層"
         f"（前一個帳戶 {RN_NLV + 1} 的倍數層的損失點，價格%）；"
-        "6 個帳戶共用，設了馬上生效；預設 7% 7% 12% 17% 22%；不帶參數＝顯示目前的設定\n"
+        "6 個帳戶共用，設了馬上生效；預設 7.5% 12.5% 17.5% 22.5% 27.5%；不帶參數＝顯示目前的設定\n"
         "/tf 查看/設定週期\n/amp 振幅分析：用目前的週期，照 /coins 的幣種一個一頁（1m 看 2 天、3m 7 天、5m/10m 14 天、15m/30m 30 天）\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
         f"/run 幣種 方向 槓桿 保證金 埋伏點%　實盤（OKX 真的下單）：規則跟 /runt 一樣（共用原點、{RN_NLV + 1} 單、{pct(RN_LV_STEP)}%、接續帳戶）；成交、出場、手續費、資金費、強平價都以 OKX 為準，"
         "每一單 SL/TP 是 OKX 條件單；開始前檢查 OKX 雙向持倉、那個方向沒有別的單、每一單夠最小張數\n"
