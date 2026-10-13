@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v12.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v12.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -364,29 +364,49 @@ _BG = set()
 TG_LIM = 3800      # v10.0（1111）：Telegram 單則上限 4096 字，超過整則被拒收（o2222o 組數多時 /status 沒有回應）→ 每則最多 3800 字，太長自動分頁
 TG_SEP = "━━━━━━━━━━"
 
-def tg_pack(title, blocks, tail=(), lim=TG_LIM):
+TG_EMO = 95        # v12.7（1111 2026-10-13）：/status 每一則最多 95 個 emoji（Telegram 手機版一則只用自己的圖案畫前 100 個，超過的用手機內建圖案 → 🛜 變黃、📣 變紅）
+
+def tg_emo(s):
+    """v12.7：一段文字有幾個 emoji（一個 emoji 算一個，變體符號、ZWJ 接起來的不另算；寧可多算，不可少算）。"""
+    n, prev = 0, ""
+    for ch in s:
+        o = ord(ch)
+        if o in (0xFE0F, 0x20E3, 0x200D) or 0x1F3FB <= o <= 0x1F3FF or prev == "\u200d":
+            prev = ch
+            continue
+        if (0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF or 0x2300 <= o <= 0x23FF or 0x2B00 <= o <= 0x2BFF
+                or 0x2190 <= o <= 0x21FF or 0x25A0 <= o <= 0x25FF
+                or o in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x24C2, 0x2934, 0x2935, 0x3030, 0x303D, 0x3297, 0x3299)):
+            n += 1
+        prev = ch
+    return n
+
+def tg_pack(title, blocks, tail=(), lim=TG_LIM, emo=None):
     """v10.0：把一段一段（blocks＝每段幾行）整段裝進每一頁，不把同一段切開（一段本身就超過才逐行切）；
-    分成兩頁以上時，每頁標題後面加 (1/N)，tail（例：時間）放最後一頁。"""
+    分成兩頁以上時，每頁標題後面加 (1/N)，tail（例：時間）放最後一頁。
+    v12.7：emo＝每一頁最多幾個 emoji（含標題；/status 用 TG_EMO），超過就換下一頁；沒給＝只看字數（跟原本一樣）。"""
     budget = lim - len(title) - 10
+    ebud = emo - tg_emo(title) if emo else None
     size = lambda ls: sum(len(x) + 1 for x in ls)
+    fits = lambda ls: size(ls) <= budget and (ebud is None or sum(tg_emo(x) for x in ls) <= ebud)
     pages, cur = [], []
     for b in blocks:
         b = list(b)
-        while size(b) > budget:                            # 一段就超過：逐行切
+        while not fits(b):                                 # 一段就超過：逐行切
             if cur:
                 pages.append(cur); cur = []
-            k, n = 0, 0
-            while k < len(b) and n + len(b[k]) + 1 <= budget:
-                n += len(b[k]) + 1; k += 1
+            k = 0
+            while k < len(b) and fits(b[:k + 1]):
+                k += 1
             k = max(k, 1)
             pages.append(b[:k]); b = b[k:]
-        if cur and size(cur) + size(b) > budget:
+        if cur and not fits(cur + b):
             pages.append(cur); cur = []
         if not cur and b and b[0] == "":                   # v11.3：新的一頁不要用空白列開頭（同幣種 S、L 之間的空白列剛好換頁）
             b[0] = RT_SEP
         cur += b
     tail = list(tail)
-    if cur and size(cur) + size(tail) > budget:
+    if cur and not fits(cur + tail):
         pages.append(cur); cur = []
     cur += tail
     pages.append(cur)
@@ -453,7 +473,8 @@ async def _reply_long(u, head, lines, tail):
 
 async def cmd_status(u, c):
     """/status：v11.7（1111）一個幣種一段（rn_coin_lines：L、S 合在一起、一個原點、S 的單／現價／L 的單；損益、資金費率不列）。
-    v10.0：太長分頁，一段不切開。v10.8：舊 /run 的部分拿掉。"""
+    v10.0：太長分頁，一段不切開。v10.8：舊 /run 的部分拿掉。
+    v12.7（1111 2026-10-13）：每一則最多 95 個 emoji（超過換下一則），每個幣種都用 Telegram 自己的圖案（🛜 藍色、📣 黃色）。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     now = time.time()
     blocks = []
@@ -464,7 +485,7 @@ async def cmd_status(u, c):
         for sym in sorted(by):                             # v11.7（1111）：一個幣種一段（L、S 合在一起）
             blocks.append([RT_SEP] + rn_coin_lines(by[sym], now))
     blocks = blocks or [[RT_SEP, "目前沒有進行中的幣種"]]
-    for part in tg_pack(f"📊 status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"]):
+    for part in tg_pack(f"📊 status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"], emo=TG_EMO):   # v12.7：每一則最多 95 個 emoji
         await reply(u, part)
 
 
@@ -809,6 +830,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v12.7（1111 2026-10-13 看過模擬畫面 OK）：/status 分頁多一個條件：每一則最多 95 個 emoji（TG_EMO、tg_emo），超過換下一則（同一個幣種不切開）。
+#     原因：Telegram 手機版一則訊息只用自己的圖案畫前 100 個 emoji（比較舊的手機 50 個），超過的用手機內建圖案 → 後面幣種 🛜 變黃、📣 變紅。
 #   v12.6（1111 2026-10-13）：/coins（/amp 一起）加 NEARUSDT、STRKUSDT、WUSDT、ZROUSDT、TIAUSDT、FILUSDT（加進 COINS_ADD）。
 #   v12.5（1111 2026-10-12）：OKX 公開查詢每 2 秒 20 次（整台 VPS 6 個帳戶共用）—— ① /coins 規格、現價各一次查全部（okx_specs_all、
 #     okx_last_all），查不到等 1 秒再查一次；② 備用查價：WS 連著一律用最後一筆成交價（沒成交＝價格沒變），WS 斷線或這次連線還沒成交
