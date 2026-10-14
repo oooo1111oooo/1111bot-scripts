@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.3（1111 2026-10-14 看過模擬畫面 OK）：出場通知「本日合計 N單」、強平通知「本日已實現 N單」下面加每一層的單數（同 /summary：
+#     S01 0單|L01 7單…，S、L 兩邊都列，這一單已算進去；rn_lay_rows 從 rn_sum_sim 抽出來共用）。模擬、實盤都有。
 #   v13.2（1111 2026-10-14）：/gap 預設改成 7.5% 12.5% 17.5% 22.5% 27.5%（04→05、08→09、12→13、16→17、20→21）。
 #     已經用 /gap 設過的（ladder/gap.json）照設過的；刪掉 gap.json 或再打一次 /gap 才會是新的預設。
 #   v13.1（1111 2026-10-13）：每個帳戶 4 層（RN_NLV＝3，L01～L04）、每層 2.5%（RN_LV_STEP；LS 另一邊第一單離原點也是）；接續帳戶跟著變：
@@ -1460,6 +1462,39 @@ def rn_join(blocks):
             out += ([""] if out else []) + b
     return out
 
+def rn_lay_rows(recs, sym, MM):
+    """v13.0（1111 2026-10-13）：每一層出場幾單：S01 0單|L01 9單（S、L 並排，兩邊都列；層名照那個帳戶，接續的帳戶 L05～）。
+    recs＝當天的逐單紀錄（runtlog／runlog）。/summary 分幣種（v13.0）、出場通知、強平通知的本日合計下面（v13.3）共用。"""
+    top = RN_NLV                                       # v13.1：舊的紀錄（改層數之前）層數比較多 → 照樣列出來，加起來才對得上
+    for r in recs:
+        try:
+            if r.get("sym") == sym and r.get("side") in ("S", "L"):
+                top = max(top, min(int(r.get("lvl") or 0), 9))
+        except Exception:
+            pass
+    cnt = {(sd, k): 0 for sd in "SL" for k in range(top + 1)}
+    bk = {}
+    for r in recs:
+        sd = r.get("side")
+        try:
+            k = int(r.get("lvl") or 0)
+        except Exception:
+            continue
+        if r.get("sym") != sym or sd not in ("S", "L") or not 0 <= k <= top:
+            continue
+        cnt[(sd, k)] += 1
+        t = float(r.get("t_out") or 0)
+        if sd not in bk or t >= bk[sd][0]:
+            bk[sd] = (t, int(r.get("blk") or 0))
+    for sd in "SL":
+        if sd not in bk:
+            T = MM.G.get(rn_key(sym, sd))
+            bk[sd] = (0, int(T.get("blk") or 0) if T else 0)
+    sv = rn_pad([f"{cnt[('S', k)]}單" for k in range(top + 1)])
+    lv = rn_pad([f"{cnt[('L', k)]}單" for k in range(top + 1)])
+    nm = lambda sd, k: rn_nm({"blk": bk[sd][1]}, sd, k)
+    return [f"{nm('S', k)} {sv[k]}|{nm('L', k)} {lv[k]}" for k in range(top + 1)]
+
 def rn_sum_sim(d, full=False):
     """v12.2（1111 2026-10-12 版面）模擬 /runt 的 /summary（實盤 /run 待更新，照舊走 rn_sum_msgs 原本的寫法）。
     原則（1111）：% 只出現在分母固定的地方——S、L 每一邊＝U ÷ 那一邊設定的 U（＝每一單的 % 相加，OKX 每筆查得到）；
@@ -1559,37 +1594,7 @@ def rn_sum_sim(d, full=False):
         if fu_on:
             out.append(f"{pre}資金費 {us[2]}|{ps[2]}")
         return out + [f"{pre}淨損益 {us[-1]}"]
-    def lay_lines(sym):
-        """v13.0（1111 2026-10-13）：總成交單下面每一層出場幾單：S01 0單|L01 9單（S、L 並排，兩邊都列；層名照那個帳戶，接續的帳戶 L06～）。"""
-        top = RN_NLV                                       # v13.1：舊的紀錄（改層數之前）層數比較多 → 照樣列出來，加起來才對得上
-        for r in recs:
-            try:
-                if r.get("sym") == sym and r.get("side") in ("S", "L"):
-                    top = max(top, min(int(r.get("lvl") or 0), 9))
-            except Exception:
-                pass
-        cnt = {(sd, k): 0 for sd in "SL" for k in range(top + 1)}
-        bk = {}
-        for r in recs:
-            sd = r.get("side")
-            try:
-                k = int(r.get("lvl") or 0)
-            except Exception:
-                continue
-            if r.get("sym") != sym or sd not in ("S", "L") or not 0 <= k <= top:
-                continue
-            cnt[(sd, k)] += 1
-            t = float(r.get("t_out") or 0)
-            if sd not in bk or t >= bk[sd][0]:
-                bk[sd] = (t, int(r.get("blk") or 0))
-        for sd in "SL":
-            if sd not in bk:
-                T = MM.G.get(rn_key(sym, sd))
-                bk[sd] = (0, int(T.get("blk") or 0) if T else 0)
-        sv = rn_pad([f"{cnt[('S', k)]}單" for k in range(top + 1)])
-        lv = rn_pad([f"{cnt[('L', k)]}單" for k in range(top + 1)])
-        nm = lambda sd, k: rn_nm({"blk": bk[sd][1]}, sd, k)
-        return [f"{nm('S', k)} {sv[k]}|{nm('L', k)} {lv[k]}" for k in range(top + 1)]
+    lay_lines = lambda sym: rn_lay_rows(recs, sym, MM)   # v13.3：抽成 rn_lay_rows（出場通知、強平通知共用）
     M = [f"📊 summary｜{ACCT} 分幣種", span]
     for sym in sorted(syms):
         sides = [sd for sd in ("S", "L") if ((day.get(sym) or {}).get(sd) or {}).get("n") or MM.G.get(rn_key(sym, sd))]
@@ -2158,6 +2163,8 @@ def rn_exit_lines(T, p, m, tail=None):
     one[-1] += E.pnl_emoji(rn_q4(m["netu"]))
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"本日合計 {d['n']}單", d, mark=True, inv=rn_inv(T)) if d and d["n"] else []
+    if day:                                                # v13.3（1111 2026-10-14）：本日合計下面每一層的單數（同 /summary）
+        day = day[:1] + rn_lay_rows(rn_log_read(rn_today(), MD(T)), T["sym"], MD(T)) + day[1:]
     # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
     # v12.0（1111 2026-10-11）：🎯持倉中那一段拿掉（每一單看 /status）
     return L + [""] + rn_join([one, day, tail or []]) + ["", f"時間:{hhmmss()}"]
@@ -2581,8 +2588,10 @@ def rn_liq_lines(T, items, tail=None):
     for _, m in items:
         rn_acc_add(a, m)
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
-    L += [""] + rn_join([rn_pl(f"這次強平 {len(items)}單", a, inv=rn_inv(T)),
-                         rn_pl(f"{side} 本日已實現 {d['n']}單", d, inv=rn_inv(T)) if d and d["n"] else []])
+    dd = rn_pl(f"{side} 本日已實現 {d['n']}單", d, inv=rn_inv(T)) if d and d["n"] else []
+    if dd:                                                 # v13.3：本日已實現下面每一層的單數（同 /summary、出場通知）
+        dd = dd[:1] + rn_lay_rows(rn_log_read(rn_today(), MD(T)), T["sym"], MD(T)) + dd[1:]
+    L += [""] + rn_join([rn_pl(f"這次強平 {len(items)}單", a, inv=rn_inv(T)), dd])
     note = "" if rn_live(T) else rn_idle_note(T, side)
     return L + (["", *tail] if tail else []) + ["", f"時間:{hhmmss()}"] + ([note] if note else [])
 
