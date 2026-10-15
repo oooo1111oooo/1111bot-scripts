@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,13 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.4（1111 2026-10-15 看過模擬畫面 OK）：這一輪的淨利率%。
+#     ① 進場成交、/status：標題下面 ▶️第N輪（N＝T["st"]["r"]＋1；LS 兩邊不一樣＝▶️S 第11輪|L 第12輪）；每一單的 📌強平% 換成
+#        這一層這一輪的淨利率%（rn_rnd_map：這一輪這一層出場單的淨損益 U ÷ 設定的 U；沒出場過＝+0.00%）；
+#        損益合計 -14.79%|+1.81%（後面＝這一輪這一邊全部出場單，含現在沒有持倉的層；/status＝兩邊加起來）。進場成交 🎯進場 上面空一行。
+#     ② 出場通知本日合計、強平通知本日已實現下面每一層：S01 0單+0.00%|L01 0單+0.35%（單數＝本日，%＝這一輪；不空格）。
+#     ③ /summary 分幣種：總成交單 11單 | 共3輪（今天出場的單分屬幾輪：rn_rounds，逐單紀錄多記 org＝這一輪原點時間，
+#        舊紀錄用進出場時間接起來）；每一層 S01 3單+0.93%（今天這一層每一單的 % 相加＝U ÷ 那一單設定的 U）。
 #   v13.3（1111 2026-10-14 看過模擬畫面 OK）：出場通知「本日合計 N單」、強平通知「本日已實現 N單」下面加每一層的單數（同 /summary：
 #     S01 0單|L01 7單…，S、L 兩邊都列，這一單已算進去；rn_lay_rows 從 rn_sum_sim 抽出來共用）。模擬、實盤都有。
 #   v13.2（1111 2026-10-14）：/gap 預設改成 7.5% 12.5% 17.5% 22.5% 27.5%（04→05、08→09、12→13、16→17、20→21）。
@@ -1398,6 +1405,7 @@ def rn_log_add(T, p, m):
         t_in, (t_out, px, why) = p["t_in"], p["out"]
         r = {"d": rn_today(t_out), "sym": T["sym"], "side": p["side"], "lvl": p["lvl"], "lev": str(rn_plev(T, p)), "amt": str(T["amt"]),
              "blk": int(T.get("blk") or 0), "nm": rn_nm(T, p["side"], p["lvl"]),   # v12.8：第幾個帳戶、畫面上的層名（L06…）
+             "org": round(float(T["org"]["t"]), 3) if T.get("org") else None,      # v13.4：這一輪的原點時間（/summary 算輪數）
              "ent": str(p["ent"]), "px": str(px), "t_in": round(t_in, 3), "t_out": round(t_out, 3), "hold": round(t_out - t_in, 1),
              "why": why, "n_mv": p["n_mv"], "n_tp": p.get("n_tp", 0), "mfe": str(rn_q2(p["mfe"])), "mae": str(rn_q2(p["mae"])),
              "gp": str(rn_q2(m["g"])), "np": str(rn_q2(m["net"])), "fp": str(rn_q2(m["fund"])),
@@ -1462,7 +1470,7 @@ def rn_join(blocks):
             out += ([""] if out else []) + b
     return out
 
-def rn_lay_rows(recs, sym, MM):
+def rn_lay_rows(recs, sym, MM, pc=None):
     """v13.0（1111 2026-10-13）：每一層出場幾單：S01 0單|L01 9單（S、L 並排，兩邊都列；層名照那個帳戶，接續的帳戶 L05～）。
     recs＝當天的逐單紀錄（runtlog／runlog）。/summary 分幣種（v13.0）、出場通知、強平通知的本日合計下面（v13.3）共用。"""
     top = RN_NLV                                       # v13.1：舊的紀錄（改層數之前）層數比較多 → 照樣列出來，加起來才對得上
@@ -1490,10 +1498,62 @@ def rn_lay_rows(recs, sym, MM):
         if sd not in bk:
             T = MM.G.get(rn_key(sym, sd))
             bk[sd] = (0, int(T.get("blk") or 0) if T else 0)
-    sv = rn_pad([f"{cnt[('S', k)]}單" for k in range(top + 1)])
-    lv = rn_pad([f"{cnt[('L', k)]}單" for k in range(top + 1)])
+    # v13.4（1111 2026-10-15）：pc＝{(方向, 層): %} → 單數後面直接接淨利率%，不空格（S01 0單+0.00%）；整格一起對齊
+    cell = lambda sd, k: f"{cnt[(sd, k)]}單" + (rn_sp(pc.get((sd, k), Decimal(0))) if pc is not None else "")
+    sv = rn_pad([cell("S", k) for k in range(top + 1)])
+    lv = rn_pad([cell("L", k) for k in range(top + 1)])
     nm = lambda sd, k: rn_nm({"blk": bk[sd][1]}, sd, k)
     return [f"{nm('S', k)} {sv[k]}|{nm('L', k)} {lv[k]}" for k in range(top + 1)]
+
+def rn_day_pc(recs, sym):
+    """v13.4（1111 2026-10-15）/summary 每一層：今天這一層出場單的淨利率%（每一單 U ÷ 那一單設定的 U，相加）。"""
+    acc = {}
+    for r in recs:
+        try:
+            if r.get("sym") != sym or r.get("side") not in ("S", "L"):
+                continue
+            k = int(r.get("lvl") or 0)
+            amt = Decimal(r.get("amt") or "0")
+            v = Decimal(r.get("u") or "0") / amt * 100 if amt else Decimal(r.get("np") or "0")
+        except Exception:
+            continue
+        acc[(r["side"], k)] = acc.get((r["side"], k), Decimal(0)) + v
+    return {k: rn_q2(v) for k, v in acc.items()}
+
+def rn_rounds(recs, sym, MM, now=None):
+    """v13.4（1111 2026-10-15）/summary「共N輪」：今天出場的單分屬幾輪（昨天開始、今天才出場的那一輪也算）。
+    同一輪＝持倉時間接得起來（兩邊都沒有持倉才結束一輪，之後至少等 RN_WAIT 秒）：每一單從這一輪的原點（紀錄的 org；
+    v13.4 以前的紀錄沒有＝進場時間）到出場時間；現在還抱著的單接到現在。LS 共用原點＝一起算；接續的組（blk）各自算。"""
+    now = now or time.time()
+    key = lambda sd, b: "0" if not b else f"{sd}{b}"
+    iv = {}
+    for r in recs:
+        try:
+            if r.get("sym") != sym or r.get("side") not in ("S", "L"):
+                continue
+            t1 = float(r.get("t_out") or 0)
+            t0 = float(r.get("org") or r.get("t_in") or t1)
+            iv.setdefault(key(r["side"], int(r.get("blk") or 0)), []).append((min(t0, t1), t1, 1))
+        except Exception:
+            continue
+    for T in list(MM.G.values()):
+        if T.get("sym") != sym:
+            continue
+        o = (T.get("org") or {}).get("t")
+        for p in T["pos"]:
+            if not p["out"]:
+                iv.setdefault(key(T["dir"], int(T.get("blk") or 0)), []).append((min(float(o or p["t_in"]), p["t_in"]), now, 0))
+    n = 0
+    for xs in iv.values():
+        end, has = None, 0
+        for a, b, c in sorted(xs):
+            if end is None or a > end:
+                n += has
+                end, has = b, c
+            else:
+                end, has = max(end, b), has or c
+        n += has
+    return n
 
 def rn_sum_sim(d, full=False):
     """v12.2（1111 2026-10-12 版面）模擬 /runt 的 /summary（實盤 /run 待更新，照舊走 rn_sum_msgs 原本的寫法）。
@@ -1594,7 +1654,7 @@ def rn_sum_sim(d, full=False):
         if fu_on:
             out.append(f"{pre}資金費 {us[2]}|{ps[2]}")
         return out + [f"{pre}淨損益 {us[-1]}"]
-    lay_lines = lambda sym: rn_lay_rows(recs, sym, MM)   # v13.3：抽成 rn_lay_rows（出場通知、強平通知共用）
+    lay_lines = lambda sym: rn_lay_rows(recs, sym, MM, pc=rn_day_pc(recs, sym))   # v13.4：每一層後面接今天的淨利率%
     M = [f"📊 summary｜{ACCT} 分幣種", span]
     for sym in sorted(syms):
         sides = [sd for sd in ("S", "L") if ((day.get(sym) or {}).get(sd) or {}).get("n") or MM.G.get(rn_key(sym, sd))]
@@ -1618,7 +1678,8 @@ def rn_sum_sim(d, full=False):
             for k in ct:
                 ct[k] += a[k]
             blk += [f"{sd} {a['n']}單"] + rows("", a, amt, pc)
-        M += [RT_SEP, title, f"最大金額 {pct(peak(sym))}U💰", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯", f"總成交單 {ct['n']}單"]
+        M += [RT_SEP, title, f"最大金額 {pct(peak(sym))}U💰", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯",
+              f"總成交單 {ct['n']}單 | 共{rn_rounds(recs, sym, MM)}輪"]   # v13.4（1111）：共幾輪
         if ct["n"]:
             M += lay_lines(sym) + rows("總", ct, None, sp) + [""] + blk   # v13.0：每一層的單數
     M += [RT_SEP] + foot
@@ -2050,13 +2111,15 @@ def rn_fill_notice(T, p):
     標題 → 空白列 → 🌐原點 月/日 時:分:秒|原點價 → 這一邊持倉的每一單（同 /status 的列，用這一張的成交價算；原點那一單後面 🌐）
     → 🎯進場 月/日 時:分:秒|成交價 → 埋伏（從這一張掛出去到成交）→ 空白列 → 時間。實盤：時間上面多 OKX 張數一行（rr_worker 插）。"""
     tick = T["tick"]
-    L = [f"{E.ENTRY} 進場成交 {rn_tg(T)}{rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U", ""]
+    L = [f"{E.ENTRY} 進場成交 {rn_tg(T)}{rn_sym(T)} {rn_nm(T, p['side'], p['lvl'])} {pct(rn_plev(T, p))}X {pct(T['amt'])}U",
+         rn_rnd_no([T])]                                    # v13.4（1111 2026-10-15）：▶️第N輪（取代標題下面的空白列）
     o = T.get("org")
     if o:
         L.append(f"🌐原點 {rn_mdt(o['t'])}|{rt_q(o['px'], tick)}")
     held = sorted([q for q in T["pos"] if q["side"] == p["side"] and not q["out"]], key=lambda q: (q["lvl"], q["t_in"]))
     if held:
-        L += rn_rows(T, p["ent"], held, "%H:%M:%S", mark_org=True, own=True) + rn_sum_line(T, held, p["ent"])   # v12.9：同持倉通知
+        L += rn_rows(T, p["ent"], held, "%H:%M:%S", mark_org=True, own=True, rate=rn_rnd_map(T))   # v13.4：📌 → 這一輪的淨利率%
+        L += [x + f"|{rn_sp(rn_rnd_tot(T))}" for x in rn_sum_line(T, held, p["ent"])] + [""]   # v13.4：損益合計 -14.79%|+1.81%，下面空一行
     L.append(f"🎯進場 {rn_mdt(p['t_in'])}|{rt_q(p['ent'], tick)}")
     if p.get("t_ord"):
         L.append(f"埋伏 {rn_hold(p['t_in'] - p['t_ord'])}")
@@ -2076,7 +2139,31 @@ def rn_sum_line(T, ps, px):
     """v12.9（1111 2026-10-13：跟持倉通知一樣）：表格下面一行 損益合計＝上面每一單自己的 % 相加；沒有持倉＝不列。"""
     return [f"損益合計 {rn_sp(sum((rn_one(T, q, px) for q in ps), Decimal(0)))}"] if ps else []
 
-def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=False):
+def rn_rnd_map(T):
+    """v13.4（1111 2026-10-15）：這一輪每一層的淨利率%（這一輪這一層出場單的淨損益 U ÷ 設定的 U；實盤＝每一單 % 相加）。{(方向, 層): %}"""
+    inv, acc = rn_inv(T), {}
+    for r in T.get("rnd") or []:
+        k = (r["side"], r["lvl"])
+        acc[k] = acc.get(k, Decimal(0)) + (Decimal(r["netu"]) / inv * 100 if inv else Decimal(r["net"]))
+    return {k: rn_q2(v) for k, v in acc.items()}
+
+def rn_rnd_tot(T):
+    """v13.4：這一輪這一邊全部出場單的淨利率%（＝每一層相加，含現在沒有持倉的層）。"""
+    return sum(rn_rnd_map(T).values(), Decimal(0))
+
+def rn_rnd_no(gs):
+    """v13.4（1111 2026-10-15）：▶️第N輪（從 /runt 開始算；LS 兩邊不一樣＝▶️S 第11輪|L 第12輪）。"""
+    ns = [(T["dir"], int(T["st"]["r"]) + 1) for T in gs]
+    if len({n for _, n in ns}) == 1:
+        return f"▶️第{ns[0][1]}輪"
+    return "▶️" + "|".join(f"{d} 第{n}輪" for d, n in ns)
+
+def rn_lay_pc(T):
+    """v13.4：出場通知、強平通知每一層的淨利率%：這一組＋另一邊（同帳戶同幣種）這一輪的。"""
+    P = rn_partner(T)
+    return {**(rn_rnd_map(P) if P is not None else {}), **rn_rnd_map(T)}
+
+def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=False, rate=None):
     """表格每一層一行（/status、層單進場成交、出場通知的持倉中明細、/stoprunt 共用）。
     v12.4（1111 2026-10-12 看過模擬畫面 OK）：own＝True（/status）：% ＝這一單自己的進場價到現價（不累加），合計另起一行（rn_coin_lines）。
     v11.3（1111：跟 Excel 一樣）：L01 2X 09:06|-8.80%|📍-47.10%（已設 SL 再加 |SL 價格）
@@ -2108,6 +2195,8 @@ def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=
     last = {side: ps[-1] for side, ps in sub.items()}
     okl = rr_liq(T) if T.get("real") else None
     ci = iter(rn_pad([rn_sp(info[id(x)][0]) for _, _, _, k, x in rows if k == "pos"]))
+    # v13.4（1111 2026-10-15）：rate＝{(方向, 層): 這一輪的淨利率%} → 📌強平% 換成這一層這一輪的淨利率%（進場成交、/status）
+    ri = iter(rn_pad([rn_sp(rate.get((x["side"], x["lvl"]), Decimal(0))) for _, _, _, k, x in rows if k == "pos"])) if rate is not None else None
     out = []
     for side, lvl, _, k, x in rows:
         lev = rn_plev(T, x) if k == "pos" else (x.get("lev") or rn_lev(T, lvl))
@@ -2124,7 +2213,10 @@ def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=
         liq = info[id(x)][1]
         if okl and last.get(side) is x:
             liq = okl                                      # 實盤：整個倉位用 OKX 給的預估強平價
-        pin = ("📌" + rn_sp(rn_q2((liq / px - 1) * 100)) if liq else RN_PIN_ZERO) if px else "📌無"   # v13.0：強平價 ≤0＝📌-100.00%
+        if ri is not None:
+            pin = next(ri)
+        else:
+            pin = ("📌" + rn_sp(rn_q2((liq / px - 1) * 100)) if liq else RN_PIN_ZERO) if px else "📌無"   # v13.0：強平價 ≤0＝📌-100.00%
         sl = rn_cur_sltp(x)[0]
         tm = datetime.fromtimestamp(x["t_in"], TZ8).strftime(tfmt) + "|" if tfmt else ""
         o = T.get("org") if mark_org else None             # v12.1：進場成交通知裡，原點那一單後面加 🌐
@@ -2164,7 +2256,7 @@ def rn_exit_lines(T, p, m, tail=None):
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     day = rn_pl(f"本日合計 {d['n']}單", d, mark=True, inv=rn_inv(T)) if d and d["n"] else []
     if day:                                                # v13.3（1111 2026-10-14）：本日合計下面每一層的單數（同 /summary）
-        day = day[:1] + rn_lay_rows(rn_log_read(rn_today(), MD(T)), T["sym"], MD(T)) + day[1:]
+        day = day[:1] + rn_lay_rows(rn_log_read(rn_today(), MD(T)), T["sym"], MD(T), pc=rn_lay_pc(T)) + day[1:]   # v13.4：這一輪的淨利率%
     # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
     # v12.0（1111 2026-10-11）：🎯持倉中那一段拿掉（每一單看 /status）
     return L + [""] + rn_join([one, day, tail or []]) + ["", f"時間:{hhmmss()}"]
@@ -2404,7 +2496,7 @@ def rn_coin_lines(gs, now):
         return [f"⏳{tg}{title}|本輪結束,剩 {max(left(T) for T in gs)} 秒重新埋伏"]
     px = next((T.get("px_last") for T in gs if T.get("px_last")), None) or (WS_PX.get(T0["iid"]) or (None,))[0]
     live = {T["dir"]: [p for p in T["pos"] if not p["out"]] for T in gs}
-    L = [f"📣{'持倉通知' if any(live.values()) else '埋伏通知'} {tg}{title}", ""]
+    L = [f"📣{'持倉通知' if any(live.values()) else '埋伏通知'} {tg}{title}", rn_rnd_no(gs)]   # v13.4：▶️第N輪
     orgs = [(T, T["org"]) for T in gs if T.get("org")]
     if orgs:
         To, o = min(orgs, key=lambda x: x[1]["t"])
@@ -2420,7 +2512,8 @@ def rn_coin_lines(gs, now):
         rows = [f"{rn_nm(T, g['side'], 0)} {hms(T['t0'])}|{rt_q(g['px'], tick)}|{'撤單中' if g.get('cxl') else '掛單中'}✏️"
                 for g in (T.get("legs") or {}).values() if not g.get("fill") and not g.get("dead")]
         if px is not None:
-            rows += rn_rows(T, px, live[T["dir"]], "%H:%M:%S", extra=True, done=False, own=True)   # v12.4：每一單自己的 %
+            rows += rn_rows(T, px, live[T["dir"]], "%H:%M:%S", extra=True, done=False, own=True,
+                            rate=rn_rnd_map(T))            # v12.4：每一單自己的 %；v13.4：📌 → 這一輪的淨利率%
         elif live[T["dir"]]:
             rows.append(f"{T['dir']} 持倉 {len(live[T['dir']])}單")
         return rows
@@ -2434,7 +2527,8 @@ def rn_coin_lines(gs, now):
     # v12.4（1111 2026-10-12）：損益合計＝上面每一單的 % 相加（L、S 都算；有持倉、查得到現價才列）
     ones = [rn_one(T, p, px) for T in gs if not T.get("wait_until") for p in live[T["dir"]]] if px is not None else []
     if ones:
-        L.append(f"損益合計 {rn_sp(sum(ones, Decimal(0)))}")
+        rt = sum((rn_rnd_tot(T) for T in gs if not T.get("wait_until")), Decimal(0))   # v13.4：後面＝這一輪的淨利率%（兩邊加起來）
+        L.append(f"損益合計 {rn_sp(sum(ones, Decimal(0)))}|{rn_sp(rt)}")
     for T in gs:
         if T.get("real"):
             L += rr_status_warn(T)
@@ -2590,7 +2684,7 @@ def rn_liq_lines(T, items, tail=None):
     d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
     dd = rn_pl(f"{side} 本日已實現 {d['n']}單", d, inv=rn_inv(T)) if d and d["n"] else []
     if dd:                                                 # v13.3：本日已實現下面每一層的單數（同 /summary、出場通知）
-        dd = dd[:1] + rn_lay_rows(rn_log_read(rn_today(), MD(T)), T["sym"], MD(T)) + dd[1:]
+        dd = dd[:1] + rn_lay_rows(rn_log_read(rn_today(), MD(T)), T["sym"], MD(T), pc=rn_lay_pc(T)) + dd[1:]   # v13.4：這一輪的淨利率%
     L += [""] + rn_join([rn_pl(f"這次強平 {len(items)}單", a, inv=rn_inv(T)), dd])
     note = "" if rn_live(T) else rn_idle_note(T, side)
     return L + (["", *tail] if tail else []) + ["", f"時間:{hhmmss()}"] + ([note] if note else [])
