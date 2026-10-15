@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,11 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.8（1111 2026-10-15）：存檔改成全部的組一起、最多 1 秒一次（rn_save_soon＋rn_save_task）。原本每一組每 10 秒、每次成交出場
+#     都把「全部的組」整個存一次：組數 × 組數，加上每一輪的出場紀錄（rnd）越跑越多 → o1111o（20 幾個幣種）一秒存好幾次、
+#     py-spy 量到主程式 9 成以上的時間在存檔 → t3.nano CPU 額度 16:00 用完被限速（st 60%）→ WS ping timeout 一小時斷 30 次、
+#     價格延遲 → SL 出場價離 SL 很遠、/status 10 秒以上。現在：有事情（成交、出場、本輪結束、資金費）最快 1 秒存一次，
+#     平常每 10 秒存一次（RT_SAVE_SEC），關閉前補存。策略、畫面都不動。實盤 rr_save 照舊（組數少）。
 #   v13.7（1111 2026-10-15 看過模擬畫面 OK）：出場原因的名稱跟 /summary 一樣：SL→設定SL、SL(移動)→移動SL、TP→設定TP（沒移動過）／移動TP；
 #     強平、手動平倉不變。出場通知「原因」、策略結束「出場原因」都是（rn_why_nm）；逐單紀錄裡的 why 不動（VPS 統計指令照樣用）。
 #   v13.6（1111 2026-10-15）：TP 每秒移動 2 次（RN_TP_STEP＝0.5 秒），SL 照舊每秒 4 次。1111：插針很多但很少碰到 TP——
@@ -2557,7 +2562,30 @@ def rn_coin_lines(gs, now):
             L += rr_status_warn(T)
     return L
 
+RN_SAVE = {"dirty": False, "t": 0.0}   # v13.8：有沒有要存、上次存檔時間
+RN_SAVE_GAP = 1.0                       # v13.8：有事情最快 1 秒存一次（全部的組一起存）
+
+def rn_save_soon():
+    """v13.8：要存檔 → 先記下來，rn_save_task 最快 1 秒存一次（原本每一組各自馬上存全部的組）。"""
+    RN_SAVE["dirty"] = True
+
+def rn_save_due(now):
+    """v13.8：該不該存：有事情、離上次 ≥ 1 秒；或還有組在跑、離上次 ≥ 10 秒（最高／最低毛利率這些一直在變的）。"""
+    return ((RN_SAVE["dirty"] and now - RN_SAVE["t"] >= RN_SAVE_GAP)
+            or (bool(RN) and now - RN_SAVE["t"] >= RT_SAVE_SEC))
+
+async def rn_save_task():
+    """v13.8：模擬 /runt 的存檔只在這裡做（恢復完才開始）。"""
+    while not SHUTTING_DOWN:
+        await asyncio.sleep(0.25)
+        try:
+            if rn_save_due(time.time()):
+                rn_save()
+        except Exception as e:
+            print("[runt] save task fail", type(e).__name__, e)
+
 def rn_save():
+    RN_SAVE["dirty"], RN_SAVE["t"] = False, time.time()     # v13.8
     try:
         s = lambda v: None if v is None else str(v)
         def P(p):
@@ -2759,7 +2787,7 @@ async def rn_worker(app, key):
                 P = rn_partner(T)
                 if P is not None and P.get("org") and rn_live(P):   # v11.3：另一邊還在這一輪（有持倉）→ 加入它的原點
                     rn_org_join(T, P["org"])
-                    rn_save()
+                    rn_save_soon()
                     continue
                 px = await rn_wait_px(T, on)
                 if not on():
@@ -2767,7 +2795,7 @@ async def rn_worker(app, key):
                 if T.get("org") or not T.get("wait_until"):  # v11.3：等價格的時候被另一邊拉進原點了
                     continue
                 rn_round(T, time.time(), rt_q(px, T["tick"]))
-                rn_save()
+                rn_save_soon()
                 continue
             if T["legs"] and T["cxl_due"] is not None:     # 初始單成交 → 等反向單撤掉（RT_LAT）→ 進場通知 → 開始判斷
                 rem = T["cxl_due"] - time.time()
@@ -2786,7 +2814,7 @@ async def rn_worker(app, key):
                         send("\n".join(rn_fill_notice(T, p)))   # v12.1：進場成交只有一種
                     T["h0"] = min(p["t_in"] for p in new)
                     T["note_last"] = rt_note_base(T["h0"])
-                rn_save()
+                rn_save_soon()
                 continue
             new = [p for p in T["pos"] if not p["told"]]
             for p in sorted(new, key=lambda p: p["t_in"]):  # 層單成交（v11.3：也包含閒置那一邊在第一層的重新進場）
@@ -2816,7 +2844,7 @@ async def rn_worker(app, key):
                 send("\n".join(rn_liq_lines(T, liqs, tail)))
             if idle:                                       # 這一邊全部出場
                 T["h0"] = None                             # v11.3：另一邊還有持倉 → 原點不動，這一邊在第一層重新掛（rn_layers）
-                rn_save()
+                rn_save_soon()
                 continue
             if end:
                 done = rn_over(app, T, told=True)          # 本輪結束 → 等 RN_WAIT 秒 → 用現價重新來過（🚦＝策略結束）
@@ -2824,12 +2852,12 @@ async def rn_worker(app, key):
                     rn_over(app, P, told=Pin is not None)
                 elif same:                                 # 另一邊剛好也出場、還沒記帳 → 讓它自己記完、自己結束這一輪
                     P["ev"].set()
-                rn_save()
+                rn_save_soon()
                 if done:
                     return
                 continue
             if new or outs:
-                rn_save()
+                rn_save_soon()
                 continue
             now = time.time()
             if now < T["nxt"]:
@@ -2850,13 +2878,13 @@ async def rn_worker(app, key):
                 if L:
                     print(f"[runt] 資金費結算 {key} 費率 {f['rate'] if f['rate'] is not None else ''}")
                     send("\n".join(L))
-                    rn_save()
+                    rn_save_soon()
             if T["ev"].is_set():
                 continue
             lad_tick(T, px, time.time())                   # v12.8：接續的組：等待中＋條件成立 → 掛第一單；前一個帳戶那一層出場 → 撤掉
             if T.get("org") and not T["pos"] and not T["legs"] and not rn_same_round(T, rn_partner(T)):
                 done = rn_over(app, T)                     # v11.3：閒置中、另一邊已經不在這一輪（停掉、異常）→ 這一邊也結束這一輪
-                rn_save()
+                rn_save_soon()
                 if done:
                     return
                 continue
@@ -2866,9 +2894,7 @@ async def rn_worker(app, key):
                         rn_rule(T, p, px, time.time())
                 rn_layers(T, px, time.time())
             # v8.6（1111）：不再每個 /tf 發持倉通知／埋伏通知，有事件才通知；狀態用 /status 查。
-            if time.time() >= T["save_t"]:
-                T["save_t"] = time.time() + RT_SAVE_SEC
-                rn_save()
+            # v13.8：每一組各自每 10 秒存全部的組 → 拿掉（rn_save_task 統一每 10 秒存一次）
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -2882,13 +2908,13 @@ async def rn_worker(app, key):
 def rn_start(app, T):
     RN[T["key"]] = T
     T["task"] = asyncio.create_task(rn_worker(app, T["key"]))
-    rn_save()
+    rn_save_soon()                                         # v13.8：重開恢復 40 組不再存 40 次
 
 def rn_start_rec(app, T):
     """v13.1：重開恢復用：VPS 要求模擬平倉（RN_FLAT_FILE）時先不開始跑，等 rn_flat_boot 平倉。"""
     if RN_FLAT["on"]:
         RN[T["key"]] = T
-        rn_save()
+        rn_save_soon()
         return
     rn_start(app, T)
 
@@ -5701,10 +5727,13 @@ async def _post_init(app):
     if RN_FLAT["on"]:
         rt_bg(rn_flat_boot(app))    # v13.1：VPS 要求的模擬平倉
     rt_bg(lad_task())               # v12.8：6 個帳戶共用的紀錄（恢復完才開始寫）
+    rt_bg(rn_save_task())           # v13.8：模擬存檔統一在這裡（最快 1 秒一次、平常 10 秒一次）
 
 async def _post_stop(app):
     global SHUTTING_DOWN
     save_state()          # 關閉前最後一次存檔（聊天室、/tf 週期）
+    if RN_SAVE["dirty"]:
+        rn_save()         # v13.8：還沒存的（最多 1 秒內的事情）補存
     SHUTTING_DOWN = True
     print("關閉中：已保存狀態，停止後續寫檔")
 
