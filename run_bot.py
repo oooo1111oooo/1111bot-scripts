@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,9 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.6（1111 2026-10-15）：TP 每秒移動 2 次（RN_TP_STEP＝0.5 秒），SL 照舊每秒 4 次。1111：插針很多但很少碰到 TP——
+#     TP＝最高 +0.15% 每 0.25 秒跟著最高價往上推，急漲時 TP 一直被推走；TP 慢半拍，插針比較碰得到。距離 +0.15% 不動。
+#     7 天紀錄（6 個帳戶、獲利出場 3660 單）：TP 162 單（4.4%）。模擬、實盤一樣（實盤送 OKX 的 TP 也是每秒最多改 2 次）。
 #   v13.5（1111 2026-10-15）：/stoprunt（/stop）跟 /status 一樣：幣種那一行下面 ▶️第N輪（等待重新埋伏中不寫）、📌 → 這一輪的淨利率%、
 #     損益合計 -13.54%|+1.81%。/status 標題 📊 → ❇️（❇️ status｜o1111o(1/2)）。
 #   v13.4（1111 2026-10-15 看過模擬畫面 OK）：這一輪的淨利率%。
@@ -1043,6 +1046,7 @@ async def cmd_price(u, c):
 #      用結算前最後查到的費率、當下成交價（實盤 OKX 用標記價格，差很小）。關機期間的結算不補算。
 #   ⑦ bot 重開：持倉、層單掛單接著跑（關機期間沒有看盤）；埋伏中的用重開當下的現價重新來過。
 RN_STEP    = 0.25              # 每秒查價 4 次（固定）
+RN_TP_STEP = 0.5               # v13.6（1111 2026-10-15）：TP 每秒移動 2 次（SL 照舊每秒 4 次）——急漲急跌時 TP 慢半拍，插針比較碰得到
 RN_ARM     = Decimal("0.30")   # 保本點：最高毛利率 > 0.30% → SL 先卡在 +0.20%（還沒有 TP）；v9.0～v11.2 0.20%（v11.3 1111：0.20% → 0.30%）
 RN_SL_MIN  = Decimal("0.20")   # 保本點的 SL 位置 +0.20%（也是 SL 最低）；v11.2 以前 +0.10%（v11.3 1111：有滑價，改 +0.20%）
 RN_BOX     = Decimal("0.40")   # 框架點：最高毛利率 > 0.40% → 框架形成（SL 剛好接上 +0.20%）；v9.0～v11.2 0.30%
@@ -2021,6 +2025,7 @@ def rn_rule(T, p, px, now):
     保本點：最高毛利率 > 0.30% → SL 卡在 +0.20%（沒有 TP；0.30%～0.40% 之間不動）；（v11.3；v11.2 以前 >0.20% → +0.10%）
     框架點：最高毛利率 > 0.40% → SL＝最高 −0.20%（最低 0.20%）、TP＝最高 +0.15%（v9.5），之後一起往獲利方向移動。（v11.2 以前 >0.30%）
     v9.5：TP 移動次數 n_tp（框架形成後 TP 每變一次 +1；形成那一次不算），跟 SL 移動次數 n_mv 一樣記。
+    v13.6（1111 2026-10-15）：TP 每秒最多移動 2 次（離上次移動不到 RN_TP_STEP＝0.5 秒 → TP 這次不動），SL 照舊每次都判斷（每秒 4 次）。
     最高＝逐筆成交價記錄的最高；SL 至少離現價 1 跳；只往獲利方向。"""
     side, ent, tick = p["side"], p["ent"], T["tick"]
     isL = side == "L"
@@ -2045,10 +2050,14 @@ def rn_rule(T, p, px, now):
         sl_px = cur_sl                                     # 只往獲利方向
     if tp_px is None or (cur_tp is not None and not better(tp_px, cur_tp)):
         tp_px = cur_tp
+    if cur_tp is not None and tp_px != cur_tp and now - p.get("tp_t", 0.0) < RN_TP_STEP - 0.05:
+        tp_px = cur_tp                                     # v13.6：TP 離上次移動不到 0.5 秒 → 這次不動（SL 照常）
     if sl_px is None:
         if T.get("real"):
             p["want"] = None                               # 這次不設（價格已回落到 +0.20% 以內）→ 舊的待送也作廢
         return
+    if tp_px != cur_tp:
+        p["tp_t"] = now                                    # v13.6：TP 這次移動（框架形成那一次也算）的時間
     if T.get("real"):                                      # v11.0 實盤：算好的 SL/TP 交給 rr_algo_tick 送 OKX（OKX 接受才算數，移動次數那時才記）
         same = sl_px == cur_sl and tp_px == cur_tp
         p["want"] = None if (same and (p.get("aid") or p.get("acl_wait"))) else (sl_px, tp_px)   # OKX 上沒有條件單（被取消）→ 照原價重掛
