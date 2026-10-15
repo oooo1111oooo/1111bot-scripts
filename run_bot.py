@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v14.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v14.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -1039,6 +1039,9 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v14.1（1111 2026-10-16 看過模擬畫面 OK）：出場通知「本日合計」改成「本輪合計 N單」（rn_rnd_lines）：這一輪 L、S 兩邊加起來
+#     （單數、每一層的單數＋淨利率%、毛損益／手續費／資金費／淨損益），淨損益下面加 /status 的損益合計（持倉中每一單 % 相加|這一輪的淨利率%；
+#     沒有持倉＝+0.00%，照樣列）。強平通知的本日已實現不動。
 #   v14.0（1111 2026-10-15 看過模擬畫面 OK）：/amp 每一頁：橫線改成空白列；拿掉平均振幅、中位振幅；最高振幅下面加
 #     歷史高點（OKX 這個永續合約上市以來最高價|yyyy/mm/dd）→ ⬆️ 現價到歷史高點% → 現價 → ⬇️ → 歷史低點。amp_ath：月 K 找哪個月、日 K 找哪一天，
 #     一天查一次（data/amp_ath.json，6 個帳戶共用），這次的 K 線或現價創新高／新低就馬上更新。
@@ -2462,7 +2465,8 @@ def rn_rows(T, px, live, tfmt=None, extra=False, done=True, mark_org=False, own=
 def rn_exit_lines(T, p, m, tail=None):
     """每一單各自出場的通知。v11.3（1111 2026-10-11 版面）：
     標題（閒置說明在標題下面）→ 空白列 → 進場／設SL／出場（月/日 時:分:秒|價格）、實盤觸發|滑價、持倉、原因、移動 SL n次 | TP n次、最高／最低毛利率
-    → 本單 → 本日合計（這個幣種這一邊）→ 🎯持倉中 N單（這一邊還抱著的每一單＋還在掛的，同 /status；沒有就不列）→ 時間。淨損益後面加 🟢／🔴。"""
+    → 本單 → 本日合計（這個幣種這一邊）→ 🎯持倉中 N單（這一邊還抱著的每一單＋還在掛的，同 /status；沒有就不列）→ 時間。淨損益後面加 🟢／🔴。
+    v14.1（1111 2026-10-16）：本日合計 → 本輪合計（rn_rnd_lines）。"""
     tick = T["tick"]
     t, px, why = p["out"]
     side = p["side"]
@@ -2488,13 +2492,38 @@ def rn_exit_lines(T, p, m, tail=None):
           f"最低毛利率 {lo}"]
     one = ["本單"] + [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
     one[-1] += E.pnl_emoji(rn_q4(m["netu"]))
-    d = ((MD(T).DAY.get(rn_today()) or {}).get(T["sym"]) or {}).get(side)
-    day = rn_pl(f"本日合計 {d['n']}單", d, mark=True, inv=rn_inv(T)) if d and d["n"] else []
-    if day:                                                # v13.3（1111 2026-10-14）：本日合計下面每一層的單數（同 /summary）
-        day = day[:1] + rn_lay_rows(rn_log_read(rn_today(), MD(T)), T["sym"], MD(T), pc=rn_lay_pc(T)) + day[1:]   # v13.4：這一輪的淨利率%
+    rnd = rn_rnd_lines(T, px)                              # v14.1（1111 2026-10-16）：本日合計 → 本輪合計＋損益合計
     # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
     # v12.0（1111 2026-10-11）：🎯持倉中那一段拿掉（每一單看 /status）
-    return L + [""] + rn_join([one, day, tail or []]) + ["", f"時間:{hhmmss()}"]
+    return L + [""] + rn_join([one, rnd, tail or []]) + ["", f"時間:{hhmmss()}"]
+
+def rn_rnd_lines(T, px):
+    """v14.1（1111 2026-10-16 看過模擬畫面 OK）出場通知：本輪合計 N單＝這一輪 L、S 兩邊加起來（同 rn_lay_pc：這一組＋另一邊）
+    → 每一層 這一輪的單數＋淨利率%（S01 0單+0.00%|L01 1單+0.24%）→ 毛損益／手續費／資金費／淨損益（% ＝各邊 U ÷ 各邊設定的 U，相加；
+      淨損益%＝每一層相加，跟損益合計後面一樣）
+    → 損益合計 持倉中每一單 % 相加（px＝出場價）|這一輪的淨利率%（同 /status；沒有持倉＝+0.00%，照樣列）。"""
+    P = rn_partner(T)
+    gs = [T] + ([P] if P is not None else [])
+    a = rn_acc()
+    for G in gs:
+        b = rn_acc()
+        for r in G.get("rnd") or []:
+            rn_acc_add(b, rn_rec_round(G, r))
+        inv = rn_inv(G)
+        if inv:
+            b.update({"gp": rn_q2(b["gu"] / inv * 100), "fp": rn_q2(b["fu"] / inv * 100), "np": rn_q2(b["u"] / inv * 100)})
+        for k in a:
+            a[k] += b[k]
+    if not a["n"]:
+        return []
+    rt = sum((rn_rnd_tot(G) for G in gs), Decimal(0))
+    a["np"] = rt                                           # 淨損益%＝每一層的淨利率%相加＝損益合計後面（同 /status，不會差 0.01%）
+    recs = [{"sym": T["sym"], "side": r["side"], "lvl": r["lvl"], "t_out": r["t_out"], "blk": G.get("blk") or 0}
+            for G in gs for r in G.get("rnd") or []]
+    L = rn_pl(f"本輪合計 {a['n']}單", a, mark=True)
+    L = L[:1] + rn_lay_rows(recs, T["sym"], MD(T), pc=rn_lay_pc(T)) + L[1:]
+    ones = [rn_one(G, q, px) for G in gs for q in G["pos"] if not q["out"]]
+    return L + [f"損益合計 {rn_sp(sum(ones, Decimal(0)))}|{rn_sp(rt)}"]
 
 
 RN_WHY = ("SL", "SL(移動)", "TP", "強平")     # v10.1：出場原因的排列順序
