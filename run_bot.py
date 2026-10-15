@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -485,7 +485,7 @@ async def cmd_status(u, c):
         for sym in sorted(by):                             # v11.7（1111）：一個幣種一段（L、S 合在一起）
             blocks.append([RT_SEP] + rn_coin_lines(by[sym], now))
     blocks = blocks or [[RT_SEP, "目前沒有進行中的幣種"]]
-    for part in tg_pack(f"📊 status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"], emo=TG_EMO):   # v12.7：每一則最多 95 個 emoji
+    for part in tg_pack(f"❇️ status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"], emo=TG_EMO):   # v12.7：每一則最多 95 個 emoji
         await reply(u, part)
 
 
@@ -830,6 +830,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.5（1111 2026-10-15）：/stoprunt（/stop）跟 /status 一樣：幣種那一行下面 ▶️第N輪（等待重新埋伏中不寫）、📌 → 這一輪的淨利率%、
+#     損益合計 -13.54%|+1.81%。/status 標題 📊 → ❇️（❇️ status｜o1111o(1/2)）。
 #   v13.4（1111 2026-10-15 看過模擬畫面 OK）：這一輪的淨利率%。
 #     ① 進場成交、/status：標題下面 ▶️第N輪（N＝T["st"]["r"]＋1；LS 兩邊不一樣＝▶️S 第11輪|L 第12輪）；每一單的 📌強平% 換成
 #        這一層這一輪的淨利率%（rn_rnd_map：這一輪這一層出場單的淨損益 U ÷ 設定的 U；沒出場過＝+0.00%）；
@@ -3015,13 +3017,15 @@ async def cmd_runt(u, c):
     await reply(u, "\n".join(L))
 
 def rn_stop_lines(T, now, last=False):
-    """/stoprunt：這一組停止時的狀態。last＝v9.3 🚦 最後一輪（有持倉：照常作戰，全部出場後策略結束）。"""
-    L = [rn_par(T)]
+    """/stoprunt：這一組停止時的狀態。last＝v9.3 🚦 最後一輪（有持倉：照常作戰，全部出場後策略結束）。
+    v13.5（1111 2026-10-15）：跟 /status 一樣——幣種那一行下面 ▶️第N輪（等待重新埋伏中不寫）、📌 → 這一輪的淨利率%、損益合計後面接這一輪的%。"""
+    L = [rn_par(T)] + ([] if T.get("wait_until") else [rn_rnd_no([T])])
     live = [p for p in T["pos"] if not p["out"]]
     px = T.get("px_last") or (WS_PX.get(T["iid"]) or (None,))[0]
     if live and px is not None and T["h0"] is not None:
         L += ([f"⏰持倉 {rt_hms(now - T['h0'])}|現價 {rt_q(px, T['tick'])}", RT_SEP]
-              + rn_rows(T, px, live, "%H:%M:%S", extra=True, own=True) + rn_sum_line(T, live, px))   # v12.9：同持倉通知
+              + rn_rows(T, px, live, "%H:%M:%S", extra=True, own=True, rate=rn_rnd_map(T))   # v12.9：同持倉通知；v13.5：同 /status
+              + [x + f"|{rn_sp(rn_rnd_tot(T))}" for x in rn_sum_line(T, live, px)])
     elif live:
         L.append(f"持倉 {len(live)} 單|未出場")
     elif T.get("wait_until"):
