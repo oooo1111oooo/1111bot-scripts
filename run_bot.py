@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -338,12 +338,221 @@ async def ws_public_task():
                             WS_CONN["rx"] = time.time()
                         for t in (m.get("data") or []):
                             _ws_push_px(iid, t.get("px"))
+                            health_lag(t.get("ts"))           # v13.9：OKX 成交到收到隔了多久
         except asyncio.CancelledError:
             raise
         except Exception as e:
             print("[WS] 公有頻道斷線，3秒後重連", type(e).__name__, e)
+            health_ws_off()                                    # v13.9：/vps 斷線次數
         WS_LIVE["pub"] = False
         await asyncio.sleep(3)
+
+
+# ---------- v13.9（1111 2026-10-15 看過模擬畫面 OK）：/vps VPS 狀況 ----------
+# 每支 bot 每 10 秒寫自己的狀態到 health/{帳戶}.json；/vps（任何一個帳戶打都一樣）讀整台 VPS（/proc）＋全部帳戶的狀態檔。
+HEALTH_DIR   = "/srv/1111bot/data/health"
+HEALTH_FILE  = f"{HEALTH_DIR}/{ACCT}.json"
+HEALTH_EVERY = 10      # 每 10 秒寫一次自己的狀態
+HEALTH_STALE = 60      # 狀態檔超過 60 秒沒更新＝那支 bot 沒有回應
+VPS_ST_WARN  = 10      # 限速（st）超過 10% → ⚠️
+VPS_WS_WARN  = 3       # 最近 1 小時 WS 斷線 3 次以上 → ⚠️
+VPS_LAG_WARN = 2.0     # 價格延遲超過 2 秒 → ⚠️
+HEALTH = {"off": [], "lag": 0.0, "lags": [], "cpu": []}
+VPS_TYPE = {"v": None}
+
+def health_ws_off():
+    """v13.9：記一次 WS 斷線（/vps 最近 1 小時／今天）。"""
+    HEALTH["off"].append(time.time())
+
+def health_lag(ts):
+    """v13.9：一筆成交從 OKX 成交到收到隔了多久（秒），記這 10 秒內最大的。"""
+    try:
+        d = time.time() - int(ts) / 1000
+    except Exception:
+        return
+    if d > HEALTH["lag"]:
+        HEALTH["lag"] = d
+
+def health_day0(now=None):
+    """台灣時間今天 00:00。"""
+    return datetime.fromtimestamp(now or time.time(), TZ8).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+def health_load():
+    """v13.9：bot 重開時接著算今天的斷線次數。"""
+    try:
+        with open(HEALTH_FILE) as f:
+            d = json.load(f)
+        t0 = health_day0()
+        HEALTH["off"] = [float(x) for x in d.get("off") or [] if float(x) >= t0] + HEALTH["off"]
+    except Exception:
+        pass
+
+def proc_kb(key, path="/proc/self/status"):
+    """/proc 裡的一個數字（kB），讀不到＝0。"""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith(key + ":"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+def health_write():
+    """v13.9：寫自己的狀態：CPU（最近 1 分鐘平均）、記憶體、WS 斷線（最近 1 小時／今天）、價格延遲（最近 1 分鐘最大）。"""
+    now = time.time()
+    c = HEALTH["cpu"]
+    c.append((now, time.process_time()))
+    del c[:-7]
+    cpu = (c[-1][1] - c[0][1]) / (c[-1][0] - c[0][0]) * 100 if len(c) > 1 and c[-1][0] > c[0][0] else 0.0
+    t0 = health_day0(now)
+    HEALTH["off"] = [x for x in HEALTH["off"] if x >= t0]
+    HEALTH["lags"].append(HEALTH["lag"])
+    del HEALTH["lags"][:-6]
+    HEALTH["lag"] = 0.0
+    d = {"acct": ACCT, "v": VERSION, "t": now, "cpu": round(cpu, 1), "rss": proc_kb("VmRSS"), "swap": proc_kb("VmSwap"),
+         "ws_h": sum(1 for x in HEALTH["off"] if x >= now - 3600), "ws_d": len(HEALTH["off"]),
+         "lag": round(max(HEALTH["lags"]), 1), "ws": bool(WS_LIVE["pub"]) or not WS_WANT, "off": HEALTH["off"][-500:]}
+    os.makedirs(HEALTH_DIR, exist_ok=True)
+    tmp = HEALTH_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, HEALTH_FILE)
+
+async def health_task():
+    """v13.9：每 10 秒寫一次自己的狀態（/vps 用）。"""
+    health_load()
+    while not SHUTTING_DOWN:
+        try:
+            health_write()
+        except Exception as e:
+            print("[vps] 狀態寫檔失敗", type(e).__name__, e)
+        await asyncio.sleep(HEALTH_EVERY)
+
+def vps_cpu_raw():
+    with open("/proc/stat") as f:
+        return [int(x) for x in f.readline().split()[1:9]]   # user nice system idle iowait irq softirq steal
+
+async def vps_cpu():
+    """整台 VPS 這 1 秒：(CPU 用了幾 %, 被限速 st 幾 %)，跟 top 的 %Cpu(s) 一樣算法。"""
+    a = vps_cpu_raw()
+    await asyncio.sleep(1.0)
+    b = vps_cpu_raw()
+    d = [y - x for x, y in zip(a, b)]
+    tot = sum(d) or 1
+    return (d[0] + d[1] + d[2] + d[5] + d[6]) / tot * 100, d[7] / tot * 100
+
+def vps_mem():
+    """(記憶體已用 MB, 總共 MB, swap 已用 MB)，已用跟 free 指令一樣（扣掉 buff/cache）。"""
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            m[k] = int(v.split()[0])
+    used = m["MemTotal"] - m["MemFree"] - m.get("Buffers", 0) - m.get("Cached", 0) - m.get("SReclaimable", 0)
+    return used // 1024, m["MemTotal"] // 1024, (m.get("SwapTotal", 0) - m.get("SwapFree", 0)) // 1024
+
+def vps_disk():
+    st = os.statvfs("/")
+    g = 1024 ** 3
+    return (st.f_blocks - st.f_bfree) * st.f_frsize / g, st.f_blocks * st.f_frsize / g
+
+def vps_up():
+    with open("/proc/uptime") as f:
+        sec = int(float(f.read().split()[0]))
+    return f"{sec // 86400}天{sec % 86400 // 3600}時"
+
+async def vps_type():
+    """AWS 機型（向這台機器自己的 metadata 問一次，記住；問不到就不寫）。"""
+    if VPS_TYPE["v"] is None:
+        VPS_TYPE["v"] = ""
+        try:
+            async with httpx.AsyncClient(timeout=1.0, trust_env=False) as cl:
+                tk = (await cl.put("http://169.254.169.254/latest/api/token",
+                                   headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})).text
+                r = await cl.get("http://169.254.169.254/latest/meta-data/instance-type", headers={"X-aws-ec2-metadata-token": tk})
+                if r.status_code == 200 and r.text and len(r.text) < 40:
+                    VPS_TYPE["v"] = r.text.strip()
+        except Exception:
+            pass
+    return VPS_TYPE["v"]
+
+def vps_lines(cpu, st, mem, disk, up, typ, files, now):
+    """v13.9 /vps 畫面（1111 2026-10-15 看過模擬畫面 OK）。files＝各帳戶的狀態 {帳戶: dict}。"""
+    L = [f"🖥️ VPS｜{ACCT}"]
+    head = ([f"機型 {typ}"] if typ else []) + ([f"開機 {up}"] if up else [])
+    if head:
+        L.append("|".join(head))
+    L.append(RT_SEP)
+    warn = []
+    if cpu is not None:
+        L.append(f"CPU {cpu:.1f}%|限速 {st:.1f}%")
+        if st > VPS_ST_WARN:
+            warn.append("⚠️ 限速中(CPU 額度用完)")
+    if mem:
+        L.append(f"記憶體 {mem[0]}MB/{mem[1]}MB|swap {mem[2]}MB")
+    if disk:
+        L.append(f"硬碟 {disk[0]:.1f}GB/{disk[1]:.1f}GB")
+    L.append(RT_SEP)
+    live = {a: d for a, d in files.items() if now - float(d.get("t") or 0) <= HEALTH_STALE}
+    ks = [a for a in sorted(files) if a in live]
+    col = lambda f: dict(zip(ks, rn_pad([f(live[a]) for a in ks])))
+    c1 = col(lambda d: f"{float(d.get('cpu') or 0):.1f}%")
+    c2 = col(lambda d: f"{int(d.get('rss') or 0) // 1024}MB")
+    c3 = col(lambda d: f"{int(d.get('ws_h') or 0)}/{int(d.get('ws_d') or 0)}")
+    c4 = col(lambda d: f"{float(d.get('lag') or 0):.1f}秒")
+    for a in sorted(files):
+        if a not in live:
+            L.append(f"{a}|沒有回應")
+            warn.append(f"⚠️ {a} 沒有回應")
+            continue
+        d = live[a]
+        L.append(f"{a}|CPU {c1[a]}|記憶體 {c2[a]}|斷線 {c3[a]}|延遲 {c4[a]}")
+        if not d.get("ws", True):
+            warn.append(f"⚠️ {a} 價格連線中斷")
+        if int(d.get("ws_h") or 0) >= VPS_WS_WARN:
+            warn.append(f"⚠️ {a} 斷線 {int(d['ws_h'])}次(最近1小時)")
+        if float(d.get("lag") or 0) > VPS_LAG_WARN:
+            warn.append(f"⚠️ {a} 價格延遲 {float(d['lag']):.1f}秒")
+    if not files:
+        L.append("還沒有帳戶的狀態")
+    return L + [RT_SEP] + (warn or ["✅ 正常"]) + [f"時間:{hhmmss()}|{VERSION}"]
+
+def vps_files():
+    out = {}
+    try:
+        for fn in sorted(os.listdir(HEALTH_DIR)):
+            if fn.endswith(".json"):
+                try:
+                    with open(os.path.join(HEALTH_DIR, fn)) as f:
+                        d = json.load(f)
+                    out[d.get("acct") or fn[:-5]] = d
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        pass
+    return out
+
+async def cmd_vps(u, c):
+    """v13.9 /vps：整台 VPS 的狀況＋每個帳戶的 bot（在外面用手機也能看）。"""
+    global CHAT_ID; CHAT_ID = u.effective_chat.id
+    try:
+        cpu, st = await vps_cpu()
+    except Exception:
+        cpu = st = None
+    try:
+        mem = vps_mem()
+    except Exception:
+        mem = None
+    try:
+        disk = vps_disk()
+    except Exception:
+        disk = None
+    try:
+        up = vps_up()
+    except Exception:
+        up = ""
+    await reply(u, "\n".join(vps_lines(cpu, st, mem, disk, up, await vps_type(), vps_files(), time.time())))
 
 
 def ws_status():
@@ -830,6 +1039,10 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.9（1111 2026-10-15 看過模擬畫面 OK）：① TP＝最高 +0.10%（RN_TP_GAP 0.15→0.10）、每秒移動 1 次（RN_TP_STEP 0.5→1.0）；SL 不動；
+#     /menu 說明改成跟著常數。② 新指令 /vps：整台 VPS（機型、開機、CPU、限速 st、記憶體、swap、硬碟）＋每個帳戶（CPU 最近 1 分鐘、記憶體、
+#     WS 斷線 最近1小時/今天、價格延遲＝OKX 成交到收到的最近 1 分鐘最大值）＋警告（限速 >10%、斷線 ≥3 次/小時、延遲 >2 秒、價格連線中斷、
+#     沒有回應＝狀態檔超過 60 秒沒更新）。每支 bot 每 10 秒寫 /srv/1111bot/data/health/{帳戶}.json（health_task），/vps 讀全部。
 #   v13.8（1111 2026-10-15）：存檔改成全部的組一起、最多 1 秒一次（rn_save_soon＋rn_save_task）。原本每一組每 10 秒、每次成交出場
 #     都把「全部的組」整個存一次：組數 × 組數，加上每一輪的出場紀錄（rnd）越跑越多 → o1111o（20 幾個幣種）一秒存好幾次、
 #     py-spy 量到主程式 9 成以上的時間在存檔 → t3.nano CPU 額度 16:00 用完被限速（st 60%）→ WS ping timeout 一小時斷 30 次、
@@ -1053,12 +1266,12 @@ async def cmd_price(u, c):
 #      用結算前最後查到的費率、當下成交價（實盤 OKX 用標記價格，差很小）。關機期間的結算不補算。
 #   ⑦ bot 重開：持倉、層單掛單接著跑（關機期間沒有看盤）；埋伏中的用重開當下的現價重新來過。
 RN_STEP    = 0.25              # 每秒查價 4 次（固定）
-RN_TP_STEP = 0.5               # v13.6（1111 2026-10-15）：TP 每秒移動 2 次（SL 照舊每秒 4 次）——急漲急跌時 TP 慢半拍，插針比較碰得到
+RN_TP_STEP = 1.0               # v13.9（1111 2026-10-15）：TP 每秒移動 1 次（v13.6～v13.8 每秒 2 次；SL 照舊每秒 4 次）——急漲急跌時 TP 慢半拍，插針比較碰得到
 RN_ARM     = Decimal("0.30")   # 保本點：最高毛利率 > 0.30% → SL 先卡在 +0.20%（還沒有 TP）；v9.0～v11.2 0.20%（v11.3 1111：0.20% → 0.30%）
 RN_SL_MIN  = Decimal("0.20")   # 保本點的 SL 位置 +0.20%（也是 SL 最低）；v11.2 以前 +0.10%（v11.3 1111：有滑價，改 +0.20%）
 RN_BOX     = Decimal("0.40")   # 框架點：最高毛利率 > 0.40% → 框架形成（SL 剛好接上 +0.20%）；v9.0～v11.2 0.30%
 RN_SL_GAP  = Decimal("0.20")   # 框架：SL＝最高毛利率 −0.20%（v9.5，1111：−0.25% 太遠；v9.3～v9.4 −0.25%，v9.0～v9.2 −0.20%，v8.1～v8.9 −0.10%）
-RN_TP_GAP  = Decimal("0.15")   # 框架：TP＝最高毛利率 +0.15%（v9.3 起；v9.5 框寬 0.35%）
+RN_TP_GAP  = Decimal("0.10")   # 框架：TP＝最高毛利率 +0.10%（v13.9 1111；v9.3～v13.8 +0.15%）
 RN_MMR_DEF = Decimal("0.01")   # v9.3 強平：查不到 OKX 維持保證金率時先用 1%（OKX 多數幣種第 1 檔）
 RN_WAIT    = 111               # 本輪結束後等 111 秒才重新取價埋伏（v11.3，1111；v9.2～v11.2 是 300 秒）
 RN_NLV     = 3                 # v13.1（1111 2026-10-13）：每個帳戶每一邊最多 4 單：L01～L04（程式裡 lvl 0～3）；v11.3～v13.0 5 單、v8.2～v11.2 10 單
@@ -2031,9 +2244,9 @@ def rn_on_tick(iid, px):
 def rn_rule(T, p, px, now):
     """每次查價（0.25 秒）判斷一次（v9.0，1111 定案）：
     保本點：最高毛利率 > 0.30% → SL 卡在 +0.20%（沒有 TP；0.30%～0.40% 之間不動）；（v11.3；v11.2 以前 >0.20% → +0.10%）
-    框架點：最高毛利率 > 0.40% → SL＝最高 −0.20%（最低 0.20%）、TP＝最高 +0.15%（v9.5），之後一起往獲利方向移動。（v11.2 以前 >0.30%）
+    框架點：最高毛利率 > 0.40% → SL＝最高 −0.20%（最低 0.20%）、TP＝最高 +RN_TP_GAP（v13.9 +0.10%；v9.5～v13.8 +0.15%），之後一起往獲利方向移動。
     v9.5：TP 移動次數 n_tp（框架形成後 TP 每變一次 +1；形成那一次不算），跟 SL 移動次數 n_mv 一樣記。
-    v13.6（1111 2026-10-15）：TP 每秒最多移動 2 次（離上次移動不到 RN_TP_STEP＝0.5 秒 → TP 這次不動），SL 照舊每次都判斷（每秒 4 次）。
+    v13.6（1111 2026-10-15）：TP 每秒最多移動 RN_TP_STEP 一次（v13.9：1 秒；離上次移動不到 → TP 這次不動），SL 照舊每次都判斷（每秒 4 次）。
     最高＝逐筆成交價記錄的最高；SL 至少離現價 1 跳；只往獲利方向。"""
     side, ent, tick = p["side"], p["ent"], T["tick"]
     isL = side == "L"
@@ -5564,7 +5777,8 @@ async def cmd_menu(u, c):
         "　佈局（模擬，不下單）：一輪開始 L01 掛在現價下方、S01 掛在現價上方「埋伏點%」。"
         f"LS 共用原點：先成交那一邊的成交價＝🎯原點，另一邊撤掉、改掛原點 ±{pct(RN_LV_STEP)}%；這一輪的層價都從原點算，原點這一輪不動。"
         f"每一邊最多 {RN_NLV + 1} 單 L01～L{RN_NLV + 1:02d}／S01～S{RN_NLV + 1:02d}，每單間隔 {pct(RN_LV_STEP)}%；最深那一單虧損就掛下一單（掛單價已經被現價穿過＝先不掛）。"
-        "每一單最高毛利率 >0.30% SL 先卡 +0.20%（還沒有 TP）；>0.40% 框架形成：SL＝最高−0.20%、TP＝最高+0.15%，之後一起往獲利移動；某一單出場撤掉比它深的掛單。"
+        f"每一單最高毛利率 >{RN_ARM:.2f}% SL 先卡 +{RN_SL_MIN:.2f}%（還沒有 TP）；>{RN_BOX:.2f}% 框架形成：SL＝最高−{RN_SL_GAP:.2f}%、TP＝最高+{RN_TP_GAP:.2f}%，"
+        f"之後一起往獲利移動（SL 每秒 {round(1 / RN_STEP)} 次、TP 每秒 {round(1 / RN_TP_STEP)} 次）；某一單出場撤掉比它深的掛單。"
         "一邊全部出場、另一邊還有單 → 這一邊在自己的第一單位置重新掛（原點不變）；兩邊都沒有單 → 這一輪結束，等 111 秒用現價重新來過（有事件才通知，狀態用 /status 看）。"
         "損益 % ＝ U ÷ 每單保證金（可以相加）；毛利率＝價格漲跌%。"
         "強平：同一邊合起來算（跟 OKX 一樣，逐倉公式含維持保證金率、平倉手續費、已付資金費），碰到＝這一邊全部強平、每單各損失自己的保證金。"
@@ -5585,6 +5799,7 @@ async def cmd_menu(u, c):
         f"/run 幣種 方向 槓桿 保證金 埋伏點%　實盤（OKX 真的下單）：規則跟 /runt 一樣（共用原點、{RN_NLV + 1} 單、{pct(RN_LV_STEP)}%、接續帳戶）；成交、出場、手續費、資金費、強平價都以 OKX 為準，"
         "每一單 SL/TP 是 OKX 條件單；開始前檢查 OKX 雙向持倉、那個方向沒有別的單、每一單夠最小張數\n"
         "/stop 幣種 方向｜all　停止實盤：沒有持倉＝撤掉 OKX 掛單、確認後停止；有持倉＝🚦最後一輪（BOT 不平倉）\n"
+        "/vps VPS 狀況：CPU、限速、記憶體、硬碟；每個帳戶的 CPU、記憶體、WS 斷線(最近1小時/今天)、價格延遲；有問題列 ⚠️\n"
         "/check 健檢｜/check api｜/check log\n"
         f"━━━━━━━━━━\n週期 {ACCOUNT_TF}｜行情 WS {ws_status()}")
 
@@ -5691,7 +5906,8 @@ async def _post_init(app):
             BotCommand("timeframe", "週期"),
             BotCommand("amp", "振幅分析（依週期）"),
             BotCommand("check", "健檢｜api｜log"),
-            BotCommand("menu", "說明")]
+            BotCommand("menu", "說明"),
+            BotCommand("vps", "VPS 狀況")]                      # v13.9
     # 清除所有 scope 的舊指令（ThisChat/AllPrivateChats 優先權高於 Default，
     # 只刪 Default 會被舊清單蓋住，導致左下 Menu 卡在舊版）
     scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
@@ -5716,6 +5932,7 @@ async def _post_init(app):
         print("schedule fail", e)
     # WebSocket：逐筆成交價（/runt 判斷成交、SL/TP 出場）。斷線自動降級回 REST 查價。
     asyncio.create_task(ws_public_task())
+    rt_bg(health_task())            # v13.9：/vps 用的狀態（每 10 秒寫一次）
     RR_APP["app"] = app
     RR_TASK["sync"] = asyncio.create_task(rr_sync_task())   # v11.0：/run 實盤對帳（有 /run 才查 OKX）
     RR_TASK["ws"] = asyncio.create_task(ws_private_task())  # v11.0：私有頻道（有 /run 才連）
@@ -5752,7 +5969,7 @@ def main():
                     ("runt", cmd_runt), ("stoprunt", cmd_stoprunt),          # v7.6／v7.7：/runt＝佈局（模擬）
                     ("gap", cmd_gap),                                         # v12.8：帳戶與帳戶的距離
                     (["tf", "timeframe"], cmd_timeframe), ("amp", cmd_amp),   # v11.1：/amp 加回
-                    ("coins", cmd_coins)]:
+                    ("coins", cmd_coins), ("vps", cmd_vps)]:            # v13.9：/vps
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, on_text))   # v7.5：直接打參數
