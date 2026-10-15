@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v13.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -830,6 +830,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v13.7（1111 2026-10-15 看過模擬畫面 OK）：出場原因的名稱跟 /summary 一樣：SL→設定SL、SL(移動)→移動SL、TP→設定TP（沒移動過）／移動TP；
+#     強平、手動平倉不變。出場通知「原因」、策略結束「出場原因」都是（rn_why_nm）；逐單紀錄裡的 why 不動（VPS 統計指令照樣用）。
 #   v13.6（1111 2026-10-15）：TP 每秒移動 2 次（RN_TP_STEP＝0.5 秒），SL 照舊每秒 4 次。1111：插針很多但很少碰到 TP——
 #     TP＝最高 +0.15% 每 0.25 秒跟著最高價往上推，急漲時 TP 一直被推走；TP 慢半拍，插針比較碰得到。距離 +0.15% 不動。
 #     7 天紀錄（6 個帳戶、獲利出場 3660 單）：TP 162 單（4.4%）。模擬、實盤一樣（實盤送 OKX 的 TP 也是每秒最多改 2 次）。
@@ -1347,7 +1349,8 @@ def rn_done(T, p, m):
     rn_log_add(T, p, m)
     T["rnd"].append({"side": p["side"], "lvl": p["lvl"], "ent": p["ent"], "t_in": p["t_in"],
                      "t_out": p["out"][0], "net": m["net"], "netu": m["netu"], "gu": m["gu"], "fu": m["fu"], "why": p["out"][2],
-                     "g": m["g"], "fund": m["fund"], "fn": m["fn"], "mfe": rn_q2(p["mfe"]), "lev": rn_plev(T, p)})   # v10.1：統計用
+                     "g": m["g"], "fund": m["fund"], "fn": m["fn"], "mfe": rn_q2(p["mfe"]), "lev": rn_plev(T, p),
+                     "n_tp": int(p.get("n_tp", 0))})       # v10.1：統計用；v13.7：TP 有沒有移動過（設定TP／移動TP）
 
 def rn_pl(title, a, fee=True, mark=False, inv=None):
     """損益一段：標題＋毛損益、淨損益（% 與 U 各自對齊）。a＝rn_acc 格式的合計。
@@ -2258,7 +2261,7 @@ def rn_exit_lines(T, p, m, tail=None):
     if T.get("real") and p.get("trig"):                    # v11.0 實盤：觸發價、滑價（＋比觸發價好、−比觸發價差）
         L.append(f"觸發 {rt_q(p['trig'], tick)}|滑價 {rn_sp(rn_q2(rn_g(side, p['trig'], px)))}")
     L += [f"持倉 {rn_hold(t - p['t_in'])}",
-          f"原因 {why}",
+          f"原因 {rn_why_nm(why, p.get('n_tp', 0))}",   # v13.7：名稱跟 /summary 一樣
           f"移動 SL {p['n_mv']}次 | TP {p.get('n_tp', 0)}次",
           f"最高毛利率 {hi}",
           f"最低毛利率 {lo}"]
@@ -2274,6 +2277,13 @@ def rn_exit_lines(T, p, m, tail=None):
 
 
 RN_WHY = ("SL", "SL(移動)", "TP", "強平")     # v10.1：出場原因的排列順序
+RN_WHY_ORD = ("設定SL", "移動SL", "設定TP", "移動TP", "強平")   # v13.7：畫面上的排列順序
+
+def rn_why_nm(why, n_tp=0):
+    """v13.7（1111 2026-10-15）：出場原因畫面上的名稱，跟 /summary 一樣（紀錄裡照舊存 SL／SL(移動)／TP）。"""
+    if why == "TP":
+        return "移動TP" if int(n_tp or 0) else "設定TP"
+    return {"SL": "設定SL", "SL(移動)": "移動SL"}.get(why, why)
 
 def rn_span(sec):
     """v10.1：時間長度。一天以內跟持倉一樣（50:38、1:50:11），超過一天加「天」（1天1:50:11），跑一星期也好讀。"""
@@ -2293,14 +2303,15 @@ def rn_rec_round(T, r):
             "g": r["g"] if r.get("g") is not None else rn_q2(Decimal(r["gu"]) / amt * 100),
             "net": Decimal(r["net"]), "fund": r["fund"] if r.get("fund") is not None else rn_q2(fu / amt * 100),
             "gu": Decimal(r["gu"]), "netu": Decimal(r["netu"]), "fu": fu, "fn": int(r.get("fn", 1 if fu else 0)),
-            "t_in": float(r["t_in"]), "t_out": float(r["t_out"]), "mfe": r.get("mfe")}
+            "t_in": float(r["t_in"]), "t_out": float(r["t_out"]), "mfe": r.get("mfe"), "n_tp": int(r.get("n_tp") or 0)}
 
 def rn_rec_log(r):
     """v10.1：逐單出場紀錄（runtlog 一行）→ 統計用的一單。"""
     D = lambda k: Decimal(str(r.get(k) or "0"))
     return {"side": r["side"], "lvl": int(r["lvl"]), "lev": Decimal(r["lev"]) if r.get("lev") else None, "why": r.get("why", ""),
             "g": D("gp"), "net": D("np"), "fund": D("fp"), "gu": D("gu"), "netu": D("u"), "fu": D("fu"), "fn": int(r.get("fn") or 0),
-            "t_in": float(r["t_in"]), "t_out": float(r["t_out"]), "mfe": Decimal(r["mfe"]) if r.get("mfe") is not None else None}
+            "t_in": float(r["t_in"]), "t_out": float(r["t_out"]), "mfe": Decimal(r["mfe"]) if r.get("mfe") is not None else None,
+            "n_tp": int(r.get("n_tp") or 0)}
 
 def rn_run_recs(T):
     """v10.1 策略結束：整個策略（從 /runt 開始、所有輪）出場的每一單，從逐單紀錄（runtlog）取。
@@ -2332,9 +2343,10 @@ def rn_stat_lines(T, recs, full):
     """v10.1（1111：一大串各單淨損益沒有意義，跑一星期也要看得懂）：統計取代一單一行。
     full＝策略結束才有的「出場統計」（平均／最長持倉、最高毛利率、最好、最差）。回傳 (出場原因一行, 出場統計段, 各層出場段)。"""
     why = {}
-    for r in recs:
-        why[r["why"]] = why.get(r["why"], 0) + 1
-    ws = [w for w in RN_WHY if why.get(w)] + [w for w in why if w not in RN_WHY]
+    for r in recs:                                         # v13.7：設定SL／移動SL／設定TP／移動TP（同 /summary）
+        w = rn_why_nm(r["why"], r.get("n_tp", 0))
+        why[w] = why.get(w, 0) + 1
+    ws = [w for w in RN_WHY_ORD if why.get(w)] + [w for w in why if w not in RN_WHY_ORD]
     why_line = "出場原因 " + "|".join(f"{w} {why[w]}" for w in ws)
     nm = lambda r: rn_nm(T, r["side"], r["lvl"]) + rn_lvx(T, r["lvl"], r.get("lev"))   # v11.3：L01 起
     stat = []
