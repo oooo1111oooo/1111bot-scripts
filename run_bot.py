@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v14.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v14.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -1039,6 +1039,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v14.2（1111 2026-10-16）：出場通知本輪合計最後一行 損益合計 後面「這一輪的淨利率%」（跟上面淨損益重複）改成 持倉中N單🎯
+#     （N＝L、S 兩邊還抱著的單數）：損益合計 -2.30%|持倉中3單🎯。/status、進場成交、/stoprunt 的損益合計不動。
 #   v14.1（1111 2026-10-16 看過模擬畫面 OK）：出場通知「本日合計」改成「本輪合計 N單」（rn_rnd_lines）：這一輪 L、S 兩邊加起來
 #     （單數、每一層的單數＋淨利率%、毛損益／手續費／資金費／淨損益），淨損益下面加 /status 的損益合計（持倉中每一單 % 相加|這一輪的淨利率%；
 #     沒有持倉＝+0.00%，照樣列）。強平通知的本日已實現不動。
@@ -2492,7 +2494,7 @@ def rn_exit_lines(T, p, m, tail=None):
           f"最低毛利率 {lo}"]
     one = ["本單"] + [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
     one[-1] += E.pnl_emoji(rn_q4(m["netu"]))
-    rnd = rn_rnd_lines(T, px)                              # v14.1（1111 2026-10-16）：本日合計 → 本輪合計＋損益合計
+    rnd = rn_rnd_lines(T, px)                              # v14.1（1111 2026-10-16）：本日合計 → 本輪合計＋損益合計（v14.2：|持倉中N單🎯）
     # v11.4（1111）：這一輪結束 → 本輪結束兩行寫在這裡（tail＝rn_end_note），不另外發
     # v12.0（1111 2026-10-11）：🎯持倉中那一段拿掉（每一單看 /status）
     return L + [""] + rn_join([one, rnd, tail or []]) + ["", f"時間:{hhmmss()}"]
@@ -2500,8 +2502,10 @@ def rn_exit_lines(T, p, m, tail=None):
 def rn_rnd_lines(T, px):
     """v14.1（1111 2026-10-16 看過模擬畫面 OK）出場通知：本輪合計 N單＝這一輪 L、S 兩邊加起來（同 rn_lay_pc：這一組＋另一邊）
     → 每一層 這一輪的單數＋淨利率%（S01 0單+0.00%|L01 1單+0.24%）→ 毛損益／手續費／資金費／淨損益（% ＝各邊 U ÷ 各邊設定的 U，相加；
-      淨損益%＝每一層相加，跟損益合計後面一樣）
-    → 損益合計 持倉中每一單 % 相加（px＝出場價）|這一輪的淨利率%（同 /status；沒有持倉＝+0.00%，照樣列）。"""
+      淨損益%＝每一層相加）
+    → 損益合計 持倉中每一單 % 相加（px＝出場價）|這一輪的淨利率%（同 /status；沒有持倉＝+0.00%，照樣列）。
+    v14.2（1111 2026-10-16）：損益合計後面改成 持倉中N單🎯（N＝L、S 兩邊還抱著的單數，同前面 % 算的那幾單；這一輪的淨利率%＝上面淨損益，不重複）：
+      損益合計 -2.30%|持倉中3單🎯；沒有持倉＝損益合計 +0.00%|持倉中0單🎯。"""
     P = rn_partner(T)
     gs = [T] + ([P] if P is not None else [])
     a = rn_acc()
@@ -2517,13 +2521,13 @@ def rn_rnd_lines(T, px):
     if not a["n"]:
         return []
     rt = sum((rn_rnd_tot(G) for G in gs), Decimal(0))
-    a["np"] = rt                                           # 淨損益%＝每一層的淨利率%相加＝損益合計後面（同 /status，不會差 0.01%）
+    a["np"] = rt                                           # 淨損益%＝每一層的淨利率%相加（同 /status 損益合計後面，不會差 0.01%）
     recs = [{"sym": T["sym"], "side": r["side"], "lvl": r["lvl"], "t_out": r["t_out"], "blk": G.get("blk") or 0}
             for G in gs for r in G.get("rnd") or []]
     L = rn_pl(f"本輪合計 {a['n']}單", a, mark=True)
     L = L[:1] + rn_lay_rows(recs, T["sym"], MD(T), pc=rn_lay_pc(T)) + L[1:]
     ones = [rn_one(G, q, px) for G in gs for q in G["pos"] if not q["out"]]
-    return L + [f"損益合計 {rn_sp(sum(ones, Decimal(0)))}|{rn_sp(rt)}"]
+    return L + [f"損益合計 {rn_sp(sum(ones, Decimal(0)))}|持倉中{len(ones)}單🎯"]   # v14.2：後面＝持倉中N單🎯
 
 
 RN_WHY = ("SL", "SL(移動)", "TP", "強平")     # v10.1：出場原因的排列順序
