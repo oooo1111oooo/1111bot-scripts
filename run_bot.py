@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v13.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v14.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -1039,6 +1039,9 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v14.0（1111 2026-10-15 看過模擬畫面 OK）：/amp 每一頁：橫線改成空白列；拿掉平均振幅、中位振幅；最高振幅下面加
+#     歷史高點（OKX 這個永續合約上市以來最高價|yyyy/mm/dd）→ ⬆️ 現價到歷史高點% → 現價 → ⬇️ → 歷史低點。amp_ath：月 K 找哪個月、日 K 找哪一天，
+#     一天查一次（data/amp_ath.json，6 個帳戶共用），這次的 K 線或現價創新高／新低就馬上更新。
 #   v13.9（1111 2026-10-15 看過模擬畫面 OK）：① TP＝最高 +0.10%（RN_TP_GAP 0.15→0.10）、每秒移動 1 次（RN_TP_STEP 0.5→1.0）；SL 不動；
 #     /menu 說明改成跟著常數。② 新指令 /vps：整台 VPS（機型、開機、CPU、限速 st、記憶體、swap、硬碟）＋每個帳戶（CPU 最近 1 分鐘、記憶體、
 #     WS 斷線 最近1小時/今天、價格延遲＝OKX 成交到收到的最近 1 分鐘最大值）＋警告（限速 >10%、斷線 ≥3 次/小時、延遲 >2 秒、價格連線中斷、
@@ -5603,6 +5606,94 @@ async def cmd_timeframe(u, c):
 AMP_DAYS = {"1m": 2, "3m": 7, "5m": 14, "10m": 14, "15m": 30, "30m": 30}
 AMP_NATIVE = (30, 15, 5, 3, 1)   # OKX 原生分鐘週期（大→小）
 AMP_RUN = {"on": False, "i": 0, "n": 0, "task": None}
+AMP_ATH_FILE = "/srv/1111bot/data/amp_ath.json"   # v14.0：歷史高低點（一天查一次，6 個帳戶共用）
+
+def amp_ath_load():
+    try:
+        with open(AMP_ATH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def amp_ath_save(sym, v):
+    try:
+        d = amp_ath_load()
+        d[sym] = v
+        tmp = f"{AMP_ATH_FILE}.{ACCT}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, AMP_ATH_FILE)
+    except Exception as e:
+        print("[amp] 歷史高低點存檔失敗", type(e).__name__, e)
+
+async def amp_hist(iid, bar, after="", lim=100, ep="history-candles"):
+    """v14.0：K 線一頁（新→舊，含還沒收線的那一根）：[(ts, 高, 低)]。ep＝candles（最近的）／history-candles（更早的）。查不到等一下重試，最多 3 次。"""
+    q = f"/api/v5/market/{ep}?instId={iid}&bar={bar}&limit={lim}" + (f"&after={after}" if after else "")
+    r = {}
+    for i in range(3):
+        r = await pub(q)
+        if r.get("code") == "0":
+            break
+        await asyncio.sleep(1.0 + i)
+    if r.get("code") != "0":
+        raise RuntimeError(f"OKX K線查詢失敗 {r.get('code')} {r.get('msg')}")
+    out = []
+    for c in r.get("data") or []:
+        try:
+            out.append((int(c[0]), Decimal(c[2]), Decimal(c[3])))
+        except Exception:
+            continue
+    return out
+
+async def amp_ath_query(iid):
+    """v14.0：OKX 上市以來的最高、最低價和那一天：月 K 找哪個月 → 日 K 找哪一天。回傳 {hi, hi_t, lo, lo_t}（t＝毫秒）。"""
+    got, after = {}, ""
+    for i in range(5):                                     # 一頁 100 個月（第一頁用 candles，含這個月）；最多翻 5 頁
+        page = await amp_hist(iid, "1M", after, ep="candles" if i == 0 else "history-candles")
+        if not page:
+            break
+        for x in page:
+            got[x[0]] = x
+        if len(page) < 100:
+            break
+        after = str(min(t for t, _, _ in page))
+        await asyncio.sleep(0.12)
+    months = list(got.values())
+    if not months:
+        raise RuntimeError("OKX 查不到月 K")
+    mh = max(months, key=lambda x: (x[1], -x[0]))
+    ml = min(months, key=lambda x: (x[2], x[0]))
+    def nxt(ms):                                           # 那個月的下一個月 1 號（台灣時間）
+        d = datetime.fromtimestamp(ms / 1000, TZ8)
+        y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+        return int(d.replace(year=y, month=m, day=1, hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    async def day(m, pick):
+        await asyncio.sleep(0.12)
+        days = [x for x in await amp_hist(iid, "1D", str(nxt(m[0])), 40) if m[0] <= x[0] < nxt(m[0])]
+        return pick(days) if days else (m[0], m[1], m[2])
+    dh = await day(mh, lambda xs: max(xs, key=lambda x: (x[1], -x[0])))
+    dl = await day(ml, lambda xs: min(xs, key=lambda x: (x[2], x[0])))
+    return {"hi": str(dh[1]), "hi_t": dh[0], "lo": str(dl[2]), "lo_t": dl[0]}
+
+async def amp_ath(sym, iid, S, last, t_now):
+    """v14.0：歷史高低點：今天查過就用存下來的；這次的 K 線（最高價、最低價）或現價創新高／新低 → 馬上換成新的。查不到回 None。"""
+    today = rn_today()
+    v = amp_ath_load().get(sym)
+    if not v or v.get("d") != today:
+        try:
+            v = {**await amp_ath_query(iid), "d": today}
+        except Exception as e:
+            print("[amp] 歷史高低點查詢失敗", sym, type(e).__name__, e)
+            return None
+    hi, lo = Decimal(v["hi"]), Decimal(v["lo"])
+    for p, t in ((S["hi"], S["tH"]), (last, int(t_now * 1000))):
+        if p > hi:
+            hi, v["hi"], v["hi_t"] = p, str(p), t
+    for p, t in ((S["lo"], S["tL"]), (last, int(t_now * 1000))):
+        if p < lo:
+            lo, v["lo"], v["lo_t"] = p, str(p), t
+    amp_ath_save(sym, v)
+    return v
 
 def amp_n(tf):
     return AMP_DAYS.get(tf, 7) * 86400 // TF_SEC[tf]
@@ -5708,34 +5799,41 @@ async def amp_page(sym, tf, head):
         return f"{head}\n💥 {sym} 查無K線資料,跳下一個"
     S = amp_stats(kl, n)
     q = lambda v: str(Decimal(str(v)).quantize(tick))
-    sA, sV, sM = f"{S['amax']:.3f}", f"{S['aavg']:.3f}", f"{S['amed']:.3f}"
-    a1, a2, a3 = _amp_right([sA, sV, sM])
+    sA = f"{S['amax']:.3f}"                                 # v14.0（1111）：平均振幅、中位振幅拿掉
     p1, p2, p3 = _amp_right([q(S["hi"]), q(last), q(S["lo"])])
     def rx(a, b):                                          # 倍數＝畫面上的 a ÷ 畫面上的 b，四捨五入到小數兩位
         a, b = Decimal(a), Decimal(b)
         return str((a / b).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if b else "-"
-    r2, r3 = rx(sA, sV), rx(sA, sM)
+    ath = await amp_ath(sym, iid, S, last, t_now)          # v14.0：歷史高點、歷史低點
+    if ath:
+        hu = Decimal(f"{(Decimal(ath['hi']) - last) / last * 100:.3f}") or Decimal("0.000")
+        ld = Decimal(f"{(last - Decimal(ath['lo'])) / last * 100:.3f}") or Decimal("0.000")
+        h1, h2 = _amp_right([f"{hu:.3f}", f"{ld:.3f}"])
+        ymd = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%Y/%m/%d")
+        hist = [f"歷史高點 {q(Decimal(ath['hi']))}|{ymd(ath['hi_t'])}", f"⬆️ {h1}%",
+                f"現　價 {q(last)}|{_amp_t(t_now * 1000)}", f"⬇️ {h2}%", f"歷史低點 {q(Decimal(ath['lo']))}|{ymd(ath['lo_t'])}"]
+    else:
+        hist = ["歷史高點 查詢失敗", f"現　價 {q(last)}|{_amp_t(t_now * 1000)}", "歷史低點 查詢失敗"]
     up = Decimal(f"{(S['hi'] - last) / last * 100:.3f}")  # 現價要漲多少才到最高價（負＝已經衝過最高價）
     dn = Decimal(f"{(last - S['lo']) / last * 100:.3f}")  # 現價要跌多少才到最低價（負＝已經跌破最低價）
     up = up if up else Decimal("0.000"); dn = dn if dn else Decimal("0.000")
     rg = up + dn
     d1, d2 = _amp_right([f"{up:.3f}", f"{dn:.3f}"])
     cnt = f"{S['n']}根" + ("" if S["n"] >= n else "(OKX只有這些)")
-    L = [head,
+    L = [head,                                             # v14.0（1111 2026-10-15）：橫線改成空白列
          f"{sym}|{tf}|{cnt}",
          f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
-         RT_SEP,
-         f"最高振幅 {a1}%|{_amp_t(S['tA'])}",
-         f"平均振幅 {a2}%|{r2}倍",
-         f"中位振幅 {a3}%|{r3}倍",
-         RT_SEP,
+         "",
+         f"最高振幅 {sA}%|{_amp_t(S['tA'])}",
+         *hist,
+         "",
          f"最高價 {p1}|{_amp_t(S['tH'])}",
          f"⬆️ {d1}%",
          f"現　價 {p2}|{_amp_t(t_now * 1000)}",
          f"⬇️ {d2}%",
          f"最低價 {p3}|{_amp_t(S['tL'])}",
          f"區　間 {rg:.3f}%|{rx(f'{rg:.3f}', sA)}倍",
-         RT_SEP,
+         "",
          f"時間:{hhmmss()}"]
     return "\n".join(L)
 
@@ -5795,7 +5893,7 @@ async def cmd_menu(u, c):
         f"/gap 7.5% 12.5% 17.5% 22.5% 27.5%　帳戶與帳戶的距離：第 {'、'.join(f'{(RN_NLV + 1) * k}→{(RN_NLV + 1) * k + 1}' for k in range(1, LAD_NBLK))} 層"
         f"（前一個帳戶 {RN_NLV + 1} 的倍數層的損失點，價格%）；"
         "6 個帳戶共用，設了馬上生效；預設 7.5% 12.5% 17.5% 22.5% 27.5%；不帶參數＝顯示目前的設定\n"
-        "/tf 查看/設定週期\n/amp 振幅分析：用目前的週期，照 /coins 的幣種一個一頁（1m 看 2 天、3m 7 天、5m/10m 14 天、15m/30m 30 天）\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
+        "/tf 查看/設定週期\n/amp 振幅分析：用目前的週期，照 /coins 的幣種一個一頁（1m 看 2 天、3m 7 天、5m/10m 14 天、15m/30m 30 天）；最高振幅、歷史高低點（OKX 上市以來）、這段期間的最高最低價\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
         f"/run 幣種 方向 槓桿 保證金 埋伏點%　實盤（OKX 真的下單）：規則跟 /runt 一樣（共用原點、{RN_NLV + 1} 單、{pct(RN_LV_STEP)}%、接續帳戶）；成交、出場、手續費、資金費、強平價都以 OKX 為準，"
         "每一單 SL/TP 是 OKX 條件單；開始前檢查 OKX 雙向持倉、那個方向沒有別的單、每一單夠最小張數\n"
         "/stop 幣種 方向｜all　停止實盤：沒有持倉＝撤掉 OKX 掛單、確認後停止；有持倉＝🚦最後一輪（BOT 不平倉）\n"
