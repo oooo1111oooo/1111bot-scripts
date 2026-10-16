@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v14.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v14.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -1039,6 +1039,8 @@ async def cmd_price(u, c):
 
 # ---------- /runt 佈局策略（模擬，v8.2） ----------
 # v7.6 → v7.7 → v7.8 → v7.9 → v8.0（1111 2026-10-04 核可）：/runt＝新「佈局模式」。
+#   v14.6（1111 2026-10-16 看過模擬畫面 OK）：加空白列——① /summary 分幣種：總成交單下面、每一層那幾行下面各空一行（rn_sum_sim）；
+#     ② 出場通知本輪合計：每一層那幾行下面空一行再接毛損益（rn_rnd_lines）。強平通知本日已實現、實盤 /summary 舊版面不動。
 #   v14.5（1111 2026-10-16 看過模擬畫面 OK）：① S 倒過來（rn_rows：S04…S01，價格高的在上）——/status（S → 現價 → L＝價格由高到低）、
 #     進場成交、/stoprunt 一起；L 不變。② 進場成交：🌐原點下面空一行、損益合計上面空一行、後面加 |持倉N單🎯（這一邊抱著的單數，含剛成交這張）：
 #     損益合計 -7.56%|+2.39%|持倉3單🎯。
@@ -1926,7 +1928,7 @@ def rn_sum_sim(d, full=False):
         M += [RT_SEP, title, f"最大金額 {pct(peak(sym))}U💰", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯",
               f"總成交單 {ct['n']}單 | 共{rn_rounds(recs, sym, MM)}輪"]   # v13.4（1111）：共幾輪
         if ct["n"]:
-            M += lay_lines(sym) + rows("總", ct, None, sp) + [""] + blk   # v13.0：每一層的單數
+            M += [""] + lay_lines(sym) + [""] + rows("總", ct, None, sp) + [""] + blk   # v13.0：每一層的單數；v14.6：上下各空一行
     M += [RT_SEP] + foot
     return [L, M]
 
@@ -2540,7 +2542,7 @@ def rn_rnd_lines(T, px):
     recs = [{"sym": T["sym"], "side": r["side"], "lvl": r["lvl"], "t_out": r["t_out"], "blk": G.get("blk") or 0}
             for G in gs for r in G.get("rnd") or []]
     L = rn_pl(f"本輪合計 {a['n']}單", a, mark=True)
-    L = L[:1] + rn_lay_rows(recs, T["sym"], MD(T), pc=rn_lay_pc(T)) + L[1:]
+    L = L[:1] + rn_lay_rows(recs, T["sym"], MD(T), pc=rn_lay_pc(T)) + [""] + L[1:]   # v14.6：每一層下面空一行再接毛損益
     ones = [rn_one(G, q, px) for G in gs for q in G["pos"] if not q["out"]]
     return L + [f"損益合計 {rn_sp(sum(ones, Decimal(0)))}|持倉{len(ones)}單🎯"]   # v14.2：後面＝持倉N單🎯（v14.4 持倉中 → 持倉）
 
