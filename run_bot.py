@@ -18,7 +18,7 @@
 【部署】GitHub 網頁上傳 run_bot.py → VPS：bash /srv/1111bot/deploy5.sh <行數> <版本>（還原：rollback）。
   五個帳戶（o2222o～o6666o）共用這一份檔案，ACCT 由 systemd 的 EnvironmentFile 注入。
 """
-import sys, hmac, base64, hashlib, json, time, asyncio, os, re, builtins, uuid
+import sys, hmac, base64, hashlib, json, time, asyncio, os, re, builtins, uuid, socket
 from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
@@ -104,8 +104,12 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v15.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v15.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
+# v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
+#   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
+OKX_V4 = "0.0.0.0"      # httpx 綁 IPv4（local_address）
+OKX_FAM = socket.AF_INET  # WebSocket 只用 IPv4
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
 ACCOUNT_TF = "5m"
@@ -313,7 +317,7 @@ async def ws_public_task():
         return
     while not SHUTTING_DOWN:
         try:
-            async with wsl.connect(WS_PUB_URL, ping_interval=20, ping_timeout=10) as ws:
+            async with wsl.connect(WS_PUB_URL, ping_interval=20, ping_timeout=10, family=OKX_FAM) as ws:   # v15.2：IPv4
                 WS_LIVE["pub"] = True
                 WS_CONN["t"] = WS_CONN["rx"] = time.time()   # v12.5：連線前收到的價格，要等這一次連線有新成交才算數
                 subbed = set()
@@ -5793,7 +5797,7 @@ async def ws_private_task():
             await asyncio.sleep(2)
             continue
         try:
-            async with wsl.connect(WS_PRI_URL, ping_interval=20, ping_timeout=10) as ws:
+            async with wsl.connect(WS_PRI_URL, ping_interval=20, ping_timeout=10, family=OKX_FAM) as ws:   # v15.2：IPv4
                 ts = str(int(time.time()))
                 sgn = base64.b64encode(hmac.new(ACC[f"OKX_{ACCT}_SECRET"].encode(), (ts + "GET" + "/users/self/verify").encode(),
                                                 hashlib.sha256).digest()).decode()
@@ -7022,7 +7026,8 @@ async def job_summary(ctx):
 # ---------- 啟動 ----------
 async def _post_init(app):
     global HTTP
-    HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), limits=httpx.Limits(max_connections=40))
+    HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0),
+                             transport=httpx.AsyncHTTPTransport(local_address=OKX_V4, limits=httpx.Limits(max_connections=40)))   # v15.2：連 OKX 一律走 IPv4
     load_state()              # v10.8：聊天室、/tf 週期（原本在舊 /run 的 startup_recover）
     # v15.0：/runt 換成網格 → v13.1 的模擬平倉旗標（runt_flat_帳戶）不再用（/stoprunt 就是馬上停止）
     # v10.3（1111 2026-10-07）：左下 Menu 順序 status、summary、coins、price、run、stop、runt、stoprunt、timeframe、check、menu
