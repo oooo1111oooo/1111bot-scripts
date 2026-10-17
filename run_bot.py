@@ -104,7 +104,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v15.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v15.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -3694,6 +3694,7 @@ async def rn_recover(app):
 # 金額：現貨每層買「每層U」、空單每層保證金「每層U」（槓桿只用在空單）。損益 %＝U ÷ 每層U（現貨＝1X）。
 # 手續費（固定常數）：現貨 maker 0.08%、taker 0.10%；合約 maker 0.02%、taker 0.05%。
 #   空單資金費照 OKX 費率模擬，算進每一單（出場通知多一行資金費），不另外發通知（💰 現在是現貨的符號）。
+# 幣種數量（v15.3，1111 2026-10-18）：一個帳戶不限幾個幣種（原本最多 3 個＝1111 的預算，不寫進程式，要能測極限）；同一個幣種一組。
 # 強平：空單同一個幣種合起來算（rn_gliq，逐倉公式），碰到＝全部空單強平（💥 一則）。現貨沒有強平。
 # 兩套帳本：BOT 分倉（每一層自己的進場價、損益）＋官方均價（OKX：現貨平均成本、空單倉位均價）。
 # 存檔：runtgrid_{帳戶}.json（v14 的 runtlayer 不再用；重開時看到舊的組 → 改名 .v14 收起來、不恢復、發通知）。
@@ -3702,7 +3703,6 @@ GD_STEP    = Decimal("3")      # 每一格離原點 3%
 GD_N       = 33                # L01～L33、U01～U33、S01～S33
 SP_FEE_IN  = Decimal("0.08")   # 現貨 maker（限價買進）0.08%
 SP_FEE_OUT = Decimal("0.10")   # 現貨 taker（市價賣出）0.10%
-GD_MAX_SYM = 3                 # 一個帳戶最多 3 個幣種
 GD_DIRS    = "LSU"
 GD_FILE    = f"/srv/1111bot/data/runtgrid_{ACCT}.json"
 GD_MK      = {"sp": "💰", "sw": "🈴"}   # 1111：現貨 💰、合約 🈴
@@ -4625,7 +4625,7 @@ GD_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"
           f" L＝💰現貨 L00～L{GD_N:02d}(原點和原點下面)\n"
           f" U＝💰現貨 U01～U{GD_N:02d}(原點上面)\n"
           f" S＝🈴空單 S01～S{GD_N:02d}(原點上面)\n"
-          f"每一格離原點 {pct(GD_STEP)}%;一個帳戶最多 {GD_MAX_SYM} 個幣種\n"
+          f"每一格離原點 {pct(GD_STEP)}%;同一個幣種一組(幣種數量不限)\n"
           "槓桿要加 X(空單用),每層U 要加 U,埋伏點要加 %")
 GD_RETRY = "請重新輸入 /runt 參數:\n幣種 方向 槓桿 每層U 埋伏點%\n例:SUIUSDT LSU 2X 5U 0.1%"
 GD_HINT = "SUIUSDT LSU 2X 5U 0.1%"
@@ -4684,8 +4684,6 @@ async def cmd_runt(u, c):
     sym = p["sym"]
     if sym in GD:
         await retry(f"{E.WARN} {sym} 已經在跑 runt\n要換請先 /stoprunt {sym}"); return
-    if len(GD) >= GD_MAX_SYM:
-        await retry(f"{E.WARN} 一個帳戶最多 {GD_MAX_SYM} 個幣種(現在 {'、'.join(sorted(GD))})"); return
     has = {x: x in p["dir"] for x in GD_DIRS}
     try:
         sp, sw = await gd_specs(sym, has)
@@ -4701,7 +4699,7 @@ async def cmd_runt(u, c):
             except Exception:
                 await retry(f"{E.LOSS} 查不到 {x['iid']} 現價,請稍後再試"); return
     mmr = await rn_mmr({"iid": sw["iid"]}) if sw else None
-    if sym in GD or len(GD) >= GD_MAX_SYM:                 # 查價途中又打了一次
+    if sym in GD:                                          # 查價途中又打了一次
         return
     now = time.time()
     G = gd_new(p, sp, sw, u.effective_chat.id, now, mmr)
@@ -6919,7 +6917,7 @@ async def cmd_menu(u, c):
         "　掛單：現價下面最近一格（沒有持倉的）掛 1 張現貨買、現價上面最近一格 S（沒有持倉的）掛 1 張空，跟著價格換格；一律限價，掛單價已經被現價穿過＝先不掛\n"
         f"　出場：每一層各自：{arm}SL＝最高−{RN_SL_GAP:.2f}%、TP＝最高+{RN_TP_GAP:.2f}%，之後一起往獲利移動（SL 每秒 {round(1 / RN_STEP)} 次、TP 每秒 {round(1 / RN_TP_STEP)} 次）；"
         "現貨只賣那一層；出場後那一格空出來，價格回來再掛\n"
-        f"　每層U：現貨每層買 U、空單每層保證金 U（槓桿只用在空單）；一個帳戶最多 {GD_MAX_SYM} 個幣種、同一個幣種一組\n"
+        f"　每層U：現貨每層買 U、空單每層保證金 U（槓桿只用在空單）；同一個幣種一組（幣種數量不限）\n"
         f"　手續費：現貨 {SP_FEE_IN}%／{SP_FEE_OUT}%、合約 {RN_FEE_IN}%／{RN_FEE_OUT}%（掛單／市價）；空單資金費照 OKX 費率算進每一單；空單合起來算強平（逐倉公式）\n"
         "　/status：📣 一個幣種一段：▶️開始、🩵原點、價格由高到低（S、U、L 混在一起，同價 S 在上；現價在它的價格位置）；"
         "持倉列 時間|這一單%|這一格的淨利率%、掛單列 時間|掛單價|掛單中🔹；持倉損益＝每一單%相加|出場單的淨利率%|N單🎯；官方均價 💰現貨／🈴空單（OKX 的算法）\n"
