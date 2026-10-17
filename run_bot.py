@@ -8,7 +8,7 @@
   /run、/stop：實盤（v11.0，1111 2026-10-07 授權）：v14 的佈局規則（下面「/runt 佈局策略」那一區，rn_ 函式），OKX 真的下單；
   成交、出場、損益以 OKX 為準。
   說明在「/run 實盤」那一區的註解。
-  /status、/summary、/coins、/price、/timeframe、/check、/menu。
+  /status、/summary、/coins、/amp、/check、/vps、/menu。（v15.1：/price、/gap、/timeframe 拿掉）
 
 【鐵則】
   1. OKX 為唯一真相來源：損益、手續費、持倉，實盤一律查 OKX；OKX 沒有的才由 BOT 算。
@@ -104,7 +104,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v15.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v15.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 ACCT = os.environ.get("ACCT", "o3333o")  # 由 systemd 注入
 TZ8 = timezone(timedelta(hours=8))
@@ -792,7 +792,7 @@ def _check_health_lines():
         tally = "　".join(f"{k}×{v}" for k, v in sorted(API_SCODE.items(), key=lambda kv: -kv[1])[:4])
         out.append(f"{'🔴' if '50011' in API_SCODE else '🟡'} API錯誤　{tally}")
     live = sum(len(gd_held(G)) for G in GD.values())     # v15.0：/runt 網格
-    out.append(f"🟢 runt　　{len(GD)} 個幣種｜持倉 {live} 單｜週期 {ACCOUNT_TF}")
+    out.append(f"🟢 runt　　{len(GD)} 個幣種｜持倉 {live} 單")
     if REAL.G or RR_SYNC["ok"] is not None:                # v11.0：實盤 /run 的對帳狀態
         rl = sum(1 for T in REAL.G.values() for p in T["pos"] if not p["out"])
         ago = time.time() - RR_SYNC["t"] if RR_SYNC["t"] else None
@@ -992,56 +992,12 @@ async def rec_hold_task(app):
                                                     + ([] if REC_HOLD[kind] else ["全部恢復了"]) + [f"時間:{hhmmss()}"]))
 
 
-# ---------- /price 價格階梯（v8.3 /test2；v9.7 改名 /price） ----------
-# 指令：/price 幣種　例：/price WLDUSDT（只查現價、列出價格，不掛單、不下單、不跑迴圈）。
-# 畫面（1111 定案：跟 /runt 同方向，價格由高到低）：S9～S0／現價／L0～L9。
-#   S0、L0 離現價 0.5%，之後每一層離上一層 0.5%（S 往上取 tick、L 往下取 tick，往離現價遠的方向）。
-T2_STEP = Decimal("0.5")
-T2_N    = 10                       # S0～S9、L0～L9
-T2_HINT = "WLDUSDT"
-T2_ASK  = "📝 請輸入 /price 幣種(直接打幣種,不用打 /price)\n例:WLDUSDT"
-
-def t2_ladder(px, tick):
-    """S0～S9、L0～L9 的價格：從現價開始，每一層＝上一層 ±0.5%。"""
-    S, L = [], []
-    s = l = px
-    for _ in range(T2_N):
-        s = rt_amb(s, "S", T2_STEP, tick); l = rt_amb(l, "L", T2_STEP, tick)
-        S.append(s); L.append(l)
-    return S, L
-
-def t2_lines(sym, px, tick):
-    S, L = t2_ladder(px, tick)
-    out = [f"📣 price｜{ACCT}", sym, RT_SEP]
-    out += [f"S{i} {rt_q(S[i], tick)}" for i in range(T2_N - 1, -1, -1)]
-    out += [f"現價 {rt_q(px, tick)}"]
-    out += [f"L{i} {rt_q(L[i], tick)}" for i in range(T2_N)]
-    return out + [RT_SEP, f"時間:{hhmmss()}"]
-
-async def cmd_price(u, c):
-    """/price（v9.7 由 /test2 改名）：沒帶參數 → 先問幣種；打錯 → 回錯誤原因，繼續等你重打。"""
-    a = c.args or []
-    if not a:
-        await ask(u, "price", cmd_price, f"{T2_ASK}\n{ASK_CANCEL}", T2_HINT); return
-    retry = lambda msg: ask(u, "price", cmd_price, f"{msg}\n請重新輸入 /price 幣種(例 WLDUSDT)", T2_HINT)
-    if len(a) != 1:
-        await retry(f"{E.WARN} 參數數量錯誤(需1個,收到{len(a)}個)"); return
-    sym = a[0].strip().upper()
-    if not sym.endswith("USDT") or len(sym) <= 4:
-        await retry(f"{E.WARN} 幣種格式錯誤:{a[0]}(例 WLDUSDT)"); return
-    try:
-        spec = await get_spec(sym)
-    except Exception:
-        await retry(f"{E.LOSS} 找不到幣種 {sym}"); return
-    tick = spec["tick"]
-    try:
-        px = rt_q(await get_last(spec["iid"]), tick)
-    except Exception:
-        await retry(f"{E.LOSS} 查不到 {sym} 現價,請稍後再試"); return
-    await reply(u, "\n".join(t2_lines(sym, px, tick)))
+# ---------- /price 價格階梯：v15.1（1111 2026-10-18）拿掉 ----------
 
 
 # ---------- /runt 佈局策略（模擬，v8.2）——v15.0 起 /runt 換成網格（gd_ 那一區），這一區的 rn_ 函式留給實盤 /run 用 ----------
+#   v15.1（1111 2026-10-18）：拿掉 /price、/gap、/timeframe；/amp 加週期參數（1m/5m/15m/1h/2h/4h），一次 2000 根。
+#     /gap 拿掉後 /run 接續帳戶的距離照 gap.json 存過的（沒有＝預設）；/run 的提示、/menu 裡「超過 /gap」改成「超過設定的距離」。
 #   v15.0（1111 2026-10-17 給的畫面＝定案；方向參數 LSU 2026-10-17 恢復）：/runt、/stoprunt 換成固定原點隱形網格（見 gd_ 那一區的註解）。
 #     /status、/summary、每天 00:00 的 /summary、/check 的 runt 部分跟著換；實盤 /run、/stop 不動。舊的 cmd_runt／cmd_stoprunt 改名 _v14 留著對照（不註冊）。
 #     存檔換成 runtgrid_{帳戶}.json；v14 的 runtlayer 有組 → 重開時改名 .v14、不恢復、發通知。/stoprunt all 平倉（v13.1 模擬平倉）拿掉。
@@ -3221,7 +3177,7 @@ RN_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"
           "方向:LS 兩邊(共用原點)、L 只做多、S 只做空\n"
           f"槓桿:固定,{RN_NLV + 1} 單都一樣(例 1X～5X)\n"
           f"每一邊最多 {RN_NLV + 1} 單(L01～L{RN_NLV + 1:02d}),每單間隔 {pct(RN_LV_STEP)}%\n"
-          f"第 2 個帳戶起接著算(L{RN_NLV + 2:02d}～L{2 * RN_NLV + 2:02d}…),等前一個帳戶的 L{RN_NLV + 1:02d} 損失點超過 /gap 才掛\n"
+          f"第 2 個帳戶起接著算(L{RN_NLV + 2:02d}～L{2 * RN_NLV + 2:02d}…),等前一個帳戶的 L{RN_NLV + 1:02d} 損失點超過設定的距離才掛\n"
           "槓桿要加 X,保證金要加 U,埋伏點要加 %")
 RN_RETRY = "請重新輸入 /runt 參數:\n幣種 方向 槓桿 保證金 埋伏點%\n例:WLDUSDT LS 2X 1U 0.5%"
 RN_HINT = "WLDUSDT LS 2X 1U 0.5%"
@@ -5017,56 +4973,7 @@ def lad_lines(T, px):
     return [f"{head}|{rn_sp(lad_loss(T, st['five'], px))}{tail}"]
 
 
-# ---------- /gap：帳戶與帳戶的距離（v12.8，6 個帳戶共用） ----------
-GAP_HINT = "7.5% 12.5% 17.5% 22.5% 27.5%"
-
-def gap_lines(head=None):
-    """/gap 畫面：05→06層 7.00%（% 欄對齊）。"""
-    v = lad_gaps()
-    nm = [f"{(RN_NLV + 1) * k:02d}→{(RN_NLV + 1) * k + 1:02d}層" for k in range(1, LAD_NBLK)]
-    ps = rn_pad([f"{rt_p2(x)}%" for x in v])
-    return ["⚙️ gap｜帳戶與帳戶的距離(6 個帳戶共用)"] + ([head] if head else []) + [f"{n} {x}" for n, x in zip(nm, ps)]
-
-def gap_parse(a):
-    """5 個距離（例 7.5% 12.5% 17.5% 22.5% 27.5%）：每個都要加 %、大於 0、小於 100。成功回 (list, None)，失敗回 (None, 說明)。"""
-    if len(a) != LAD_NBLK - 1:
-        return None, f"要 {LAD_NBLK - 1} 個距離,你打了 {len(a)} 個"
-    v = []
-    for x in a:
-        x = x.strip().replace("％", "%")
-        if not x.endswith("%"):
-            return None, f"{x} 要加 %(例 7%)"
-        try:
-            d = Decimal(x[:-1])
-        except Exception:
-            return None, f"{x} 不是數字"
-        if not d.is_finite() or not (0 < d < 100):
-            return None, f"{x} 要大於 0%、小於 100%"
-        v.append(d)
-    return v, None
-
-async def cmd_gap(u, c):
-    """/gap 第4→5層 第8→9層 第12→13層 第16→17層 第20→21層（例 /gap 7.5% 12.5% 17.5% 22.5% 27.5%）：
-    前一個帳戶的 5 的倍數層損失點（價格%，不含槓桿）超過這個距離，下一個帳戶才掛第一單。6 個帳戶共用，設了馬上生效。
-    不帶參數＝顯示目前的設定、等你直接輸入。"""
-    global CHAT_ID; CHAT_ID = u.effective_chat.id
-    a = c.args or []
-    if not a:
-        await ask(u, "gap", cmd_gap, "\n".join(gap_lines() + [f"要改請直接輸入 5 個(例 {GAP_HINT})"]), GAP_HINT, force=False); return
-    v, err = gap_parse(a)
-    if err:
-        await ask(u, "gap", cmd_gap, f"{E.WARN} {err}\n請重新輸入 5 個距離(例 {GAP_HINT})", GAP_HINT); return
-    try:
-        os.makedirs(LAD_DIR, exist_ok=True)
-        tmp = f"{LAD_GAP_FILE}.{ACCT}.tmp"
-        with open(tmp, "w") as f:
-            json.dump({"gap": [str(x) for x in v], "t": time.time(), "by": ACCT}, f)
-        os.replace(tmp, LAD_GAP_FILE)
-    except Exception as e:
-        await reply(u, f"{E.LOSS} /gap 存檔失敗 {type(e).__name__}: {e}"); return
-    LAD_GAP.update(t=time.time(), v=v)
-    print(f"[lad] /gap 改成 {' '.join(str(x) for x in v)}")
-    await reply(u, "\n".join(gap_lines("已更新,6 個帳戶馬上生效") + [f"時間:{hhmmss()}"]))
+# ---------- /gap 指令：v15.1（1111 2026-10-18）拿掉；距離照 lad_gaps（gap.json 存過的、沒有＝預設 7.5% 12.5% 17.5% 22.5% 27.5%），/run 接續帳戶照用 ----------
 
 
 # ==================== /run 實盤（v11.0，1111 2026-10-07 授權） ====================
@@ -6374,7 +6281,7 @@ RR_ASK = ("📝 請輸入 /run 參數(實盤,OKX 真的下單;直接打參數,�
           "例:WLDUSDT L 1X 5U 0.5%\n"
           "方向:LS 兩邊(共用原點)、L 只做多、S 只做空\n"
           f"槓桿:固定,{RN_NLV + 1} 單都一樣;每一邊最多 {RN_NLV + 1} 單(L01～L{RN_NLV + 1:02d}),每單間隔 {pct(RN_LV_STEP)}%\n"
-          f"第 2 個帳戶起接著算(L{RN_NLV + 2:02d}～L{2 * RN_NLV + 2:02d}…),等前一個帳戶的 L{RN_NLV + 1:02d} 損失點超過 /gap 才掛\n"
+          f"第 2 個帳戶起接著算(L{RN_NLV + 2:02d}～L{2 * RN_NLV + 2:02d}…),等前一個帳戶的 L{RN_NLV + 1:02d} 損失點超過設定的距離才掛\n"
           "規則跟 /runt 一樣;成交、出場、手續費、資金費都以 OKX 為準,BOT 不平倉")
 RR_RETRY = "請重新輸入 /run 參數:\n幣種 方向 槓桿 保證金 埋伏點%\n例:WLDUSDT L 1X 5U 0.5%"
 RR_HINT = "WLDUSDT L 1X 5U 0.5%"
@@ -6719,21 +6626,12 @@ async def cmd_coins(u, c):
     L += ["━━━━━━━━━━"] + await fng + ["━━━━━━━━━━", f"時間：{hhmmss()}"]
     await reply(u, "\n".join(L))
 
-async def cmd_timeframe(u, c):
-    global ACCOUNT_TF
-    if not c.args:                                  # v7.5：先顯示目前週期，等你直接輸入新週期
-        await ask(u, "tf", cmd_timeframe, f"{E.BOT} 目前週期:{ACCOUNT_TF}\n可選:" + "/".join(TF_SEC.keys())
-                  + "\n要改請在60秒內直接輸入週期(例 3m),不改就不用理", "3m", force=False); return   # v8.2：不跳回覆列
-    tf = c.args[0].lower()                          # v5.1：/tf 3M 也認得
-    if tf not in TF_SEC:
-        await ask(u, "tf", cmd_timeframe, f"{E.WARN} 週期須為:" + "/".join(TF_SEC.keys()) + "\n請重新輸入週期(例 3m)", "3m"); return
-    ACCOUNT_TF = tf; save_state()
-    # v5.1：更正說明 —— /run 的策略沒有各自記週期，一律跟著帳戶週期走，所以是「立即」改用；
-    #       v9.7：/test1 刪除，回覆拿掉 /test1 那一行。
-    await reply(u, f"{E.BOT} {E.OK} 帳戶週期已設為 {tf}\n/run 立即改用 {tf}")
+# v15.1（1111 2026-10-18）：/timeframe（/tf）拿掉；/amp 自己帶週期。ACCOUNT_TF 留著固定 5m（舊 /runt、/run 埋伏通知的對齊用）。
 
 # ---------- /amp 振幅分析（v6.3～v9.6；v9.7 刪除；v11.1 1111 2026-10-07 加回） ----------
-# 指令：/amp（不帶參數）—— 用目前的 /tf 週期，照 /coins 的幣種清單和順序（v11.1：跟 /coins 同一份，coins_list），一個幣種一頁，
+# v15.1（1111 2026-10-18）：/amp 週期（1m/5m/15m/1h/2h/4h，都是 OKX 原生週期），一次 2000 根（約 1.4/6.9/20.8/83/167/333 天）；
+#   沒帶週期＝先問。原本跟著 /tf、10m 用 5m 合成、看幾天（AMP_DAYS）都拿掉。
+# 指令（v11.1～v15.0）：/amp（不帶參數）—— 用目前的 /tf 週期，照 /coins 的幣種清單和順序（v11.1：跟 /coins 同一份，coins_list），一個幣種一頁，
 #   算好一頁就先送；在背景跑，不卡住其他指令；進行中再按 /amp 回「進行中 第幾個/共幾個」。只查 OKX 公開 K 線，不下單。
 # 每一頁：最高振幅（哪一根）、平均振幅、中位振幅（後面是「最高振幅÷它」的倍數）、最高價（哪一根）、⬆️ 現價到最高價%、
 #   現價（查詢當下）、⬇️ 現價到最低價%、最低價（哪一根）、區間＝⬆️%＋⬇️%（後面是「區間÷最高振幅」的倍數）。
@@ -6743,8 +6641,9 @@ async def cmd_timeframe(u, c):
 # 看幾天（v11.1，1111）：1m 看 2 天（原本 7 天：10080 根、23 個幣種要 10 分鐘，還會擠到查價額度）、3m 7 天、5m／10m 14 天、
 #   15m／30m 30 天。根數＝天數÷週期：1m 2880、3m 3360、5m 4032、10m 2016、15m 2880、30m 1440。
 # v11.1：分隔符號改半形 |（跟其他畫面一致）。
-AMP_DAYS = {"1m": 2, "3m": 7, "5m": 14, "10m": 14, "15m": 30, "30m": 30}
-AMP_NATIVE = (30, 15, 5, 3, 1)   # OKX 原生分鐘週期（大→小）
+AMP_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "2h": "2H", "4h": "4H"}   # v15.1：/amp 的週期 → OKX 的 bar
+AMP_N = 2000                     # v15.1（1111）：一次 2000 根
+AMP_HINT = "1h"
 AMP_RUN = {"on": False, "i": 0, "n": 0, "task": None}
 AMP_ATH_FILE = "/srv/1111bot/data/amp_ath.json"   # v14.0：歷史高低點（一天查一次，6 個帳戶共用）
 
@@ -6836,7 +6735,7 @@ async def amp_ath(sym, iid, S, last, t_now):
     return v
 
 def amp_n(tf):
-    return AMP_DAYS.get(tf, 7) * 86400 // TF_SEC[tf]
+    return AMP_N
 
 async def amp_fetch_page(iid, after, ep, bar):
     """抓一頁 K 線（新→舊，只含已收線）。candles 只有最近約 1440 根，抓完改 history-candles 續抓。
@@ -6869,11 +6768,9 @@ async def amp_fetch_page(iid, after, ep, bar):
     return out, ep, False, oldest
 
 async def amp_klines(iid, tf, n):
-    """最近 n+1 根（多一根當第一根的前收）已收線的 tf K 線（舊→新）；OKX 不夠就回有的。"""
-    tfm = TF_SEC[tf] // 60
-    bm = next(m for m in AMP_NATIVE if tfm % m == 0)
-    bar, k, tfms = f"{bm}m", tfm // bm, TF_SEC[tf] * 1000
-    need = (n + 2) * k
+    """最近 n+1 根（多一根當第一根的前收）已收線的 tf K 線（舊→新）；OKX 不夠就回有的。v15.1：週期都是 OKX 原生（AMP_TF）。"""
+    bar = AMP_TF[tf]
+    need = n + 2
     base = {}; after, ep = "", "candles"
     for _ in range(need // 100 + 30):
         page, ep, done, after = await amp_fetch_page(iid, after, ep, bar)
@@ -6883,20 +6780,8 @@ async def amp_klines(iid, tf, n):
             base[x["ts"]] = x
         if len(base) >= need:
             break
-        await asyncio.sleep(0.12 if ep == "history-candles" else 0.06)   # 不要打太快（OKX 公開額度 5 個帳戶共用）
-    if k == 1:
-        return sorted(base.values(), key=lambda x: x["ts"])[-(n + 1):]
-    grp = {}
-    for x in base.values():
-        grp.setdefault(x["ts"] // tfms, []).append(x)
-    out = []
-    for g, L in grp.items():
-        if len(L) != k:
-            continue
-        L.sort(key=lambda x: x["ts"])
-        out.append({"ts": g * tfms, "o": L[0]["o"], "h": max(x["h"] for x in L), "l": min(x["l"] for x in L), "c": L[-1]["c"]})
-    out.sort(key=lambda x: x["ts"])
-    return out[-(n + 1):]
+        await asyncio.sleep(0.12 if ep == "history-candles" else 0.06)   # 不要打太快（OKX 公開額度 6 個帳戶共用）
+    return sorted(base.values(), key=lambda x: x["ts"])[-(n + 1):]
 
 def amp_stats(kl, n):
     """kl＝舊→新。回傳分析用的根數與各項數字（同數值取第一次出現的那一根）。"""
@@ -6993,12 +6878,23 @@ async def _amp_all(u, tf, syms):
     finally:
         AMP_RUN["on"] = False
 
+def amp_tf(x):
+    """v15.1：/amp 的週期（1m/5m/15m/1h/2h/4h，大小寫都認得：1H、15M）；不對回 None。"""
+    x = (x or "").strip().lower()
+    return x if x in AMP_TF else None
+
 async def cmd_amp(u, c):
-    """/amp（不帶參數；打了參數也一樣跑全部）—— 用目前的 /tf，照 /coins 的幣種清單和順序，一個幣種一頁。"""
+    """v15.1（1111 2026-10-18）/amp 週期：照 /coins 的幣種清單和順序，一個幣種一頁，每一頁 2000 根。沒帶週期 → 先問；打錯 → 繼續等你重打。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
-    tf = ACCOUNT_TF if ACCOUNT_TF in TF_SEC else "5m"
+    a = c.args or []
+    opts = "/".join(AMP_TF)
     if AMP_RUN["on"]:
         await reply(u, f"{E.BOT} 振幅分析進行中({AMP_RUN['i']}/{AMP_RUN['n']}),請等跑完"); return
+    if not a:
+        await ask(u, "amp", cmd_amp, f"📝 請輸入 /amp 週期(直接打週期,不用打 /amp)\n可選:{opts}\n一次 {AMP_N} 根K線\n例:{AMP_HINT}\n{ASK_CANCEL}", AMP_HINT); return
+    tf = amp_tf(a[0]) if len(a) == 1 else None
+    if tf is None:
+        await ask(u, "amp", cmd_amp, f"{E.WARN} 週期只能 {opts}(收到 {' '.join(a)})\n請重新輸入週期(例 {AMP_HINT})", AMP_HINT); return
     syms = coins_list()
     if not syms:
         await reply(u, f"{E.BOT} /coins 沒有幣種"); return
@@ -7012,7 +6908,6 @@ async def cmd_menu(u, c):
            else f"每一單最高毛利率 >{RN_BOX:.2f}% 框架形成（第一次設 SL，最低 +{RN_SL_MIN:.2f}%）：")   # v14.3：RN_ARM＝RN_BOX＝沒有保本點那一段
     await reply(u,f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
         "/status 所有 /run（實盤）、/runt（模擬網格）現況\n/summary 本日戰報（實盤、模擬各一份：總表＋分幣種）；每天 00:00 自動發前一天的\n"
-        "/price 幣種　價格階梯（只查價，不掛單，舊的 0.5% 階梯，跟 /runt 無關）：S9～S0／現價／L0～L9，每一層離上一層 0.5%\n"
         "/runt 幣種 方向 槓桿 每層U 埋伏點%（模擬，不下單；v15.0）：固定原點隱形網格＝💰現貨做多＋🈴合約做空\n"
         f"　方向：L、S、U 任意組合（LSU 全部、S 只開空單、US…）。L＝💰現貨 L00～L{GD_N:02d}（原點和原點下面）、U＝💰現貨 U01～U{GD_N:02d}（原點上面）、"
         f"S＝🈴空單 S01～S{GD_N:02d}（原點上面，跟 U 同價）；每一格離原點 {pct(GD_STEP)}%，超過 ±{pct(GD_N * GD_STEP)}% 不掛；沒開的那一邊不掛\n"
@@ -7026,10 +6921,7 @@ async def cmd_menu(u, c):
         "持倉列 時間|這一單%|這一格的淨利率%、掛單列 時間|掛單價|掛單中🔹；持倉損益＝每一單%相加|出場單的淨利率%|N單🎯；官方均價 💰現貨／🈴空單（OKX 的算法）\n"
         "　例：/runt SUIUSDT LSU 2X 5U 0.1%、/runt SUIUSDT S 2X 5U 0.1%\n"
         "/stoprunt 幣種｜all　停止 /runt：撤掉掛單、策略馬上結束；持倉不平倉（列出來，1111 自己處理）\n"
-        f"/gap 7.5% 12.5% 17.5% 22.5% 27.5%　/run 帳戶與帳戶的距離：第 {'、'.join(f'{(RN_NLV + 1) * k}→{(RN_NLV + 1) * k + 1}' for k in range(1, LAD_NBLK))} 層"
-        f"（前一個帳戶 {RN_NLV + 1} 的倍數層的損失點，價格%）；"
-        "6 個帳戶共用，設了馬上生效；預設 7.5% 12.5% 17.5% 22.5% 27.5%；不帶參數＝顯示目前的設定\n"
-        "/tf 查看/設定週期\n/amp 振幅分析：用目前的週期，照 /coins 的幣種一個一頁（1m 看 2 天、3m 7 天、5m/10m 14 天、15m/30m 30 天）；最高振幅、歷史高低點（OKX 上市以來）、這段期間的最高最低價\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
+        f"/amp 週期　振幅分析：週期 {'/'.join(AMP_TF)}，一次 {AMP_N} 根K線（約 1.4/6.9/20.8/83/167/333 天），照 /coins 的幣種一個一頁；最高振幅、歷史高低點（OKX 上市以來）、這段期間的最高最低價\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
         f"/run 幣種 方向 槓桿 保證金 埋伏點%　實盤（OKX 真的下單；v14 的佈局規則，跟新的 /runt 不一樣）：成交、出場、手續費、資金費、強平價都以 OKX 為準，"
         "每一單 SL/TP 是 OKX 條件單；開始前檢查 OKX 雙向持倉、那個方向沒有別的單、每一單夠最小張數\n"
         f"　方向：LS 兩邊｜L 只做多｜S 只做空。槓桿：固定槓桿 1X～100X，{RN_NLV + 1} 單都一樣\n"
@@ -7041,11 +6933,11 @@ async def cmd_menu(u, c):
         "一邊全部出場、另一邊還有單 → 這一邊在自己的第一單位置重新掛（原點不變）；兩邊都沒有單 → 這一輪結束，等 111 秒用現價重新來過。"
         "強平：同一邊合起來算（跟 OKX 一樣），碰到＝這一邊全部強平。"
         f"接續（v12.8）：同一個幣種同一個方向，層數跨帳戶接著算：第 1 個帳戶 L01～L{RN_NLV + 1:02d}、第 2 個 L{RN_NLV + 2:02d}～L{2 * RN_NLV + 2:02d} …；"
-        f"第 2 個以後的帳戶等前一個帳戶的 {RN_NLV + 1} 的倍數層損失點超過 /gap 才掛第一單。/run 只接 /run\n"
+        f"第 2 個以後的帳戶等前一個帳戶的 {RN_NLV + 1} 的倍數層損失點超過設定的距離（{' '.join(f'{rt_p2(x)}%' for x in lad_gaps())}）才掛第一單。/run 只接 /run\n"
         "/stop 幣種 方向｜all　停止實盤：沒有持倉＝撤掉 OKX 掛單、確認後停止；有持倉＝🚦最後一輪（BOT 不平倉）\n"
         "/vps VPS 狀況：CPU、限速、記憶體、硬碟；每個帳戶的 CPU、記憶體、WS 斷線(最近1小時/今天)、價格延遲；有問題列 ⚠️\n"
         "/check 健檢｜/check api｜/check log\n"
-        f"━━━━━━━━━━\n週期 {ACCOUNT_TF}｜行情 WS {ws_status()}")
+        f"━━━━━━━━━━\n行情 WS {ws_status()}")
 
 async def cmd_unknown(u, c):
     await reply(u, f"{E.BOT} 指令無法辨識：{u.message.text}\n請用 /menu")
@@ -7139,14 +7031,11 @@ async def _post_init(app):
     CMDS = [BotCommand("status", "現況"),
             BotCommand("summary", "本日戰報（實盤＋runt）"),
             BotCommand("coins", "帳戶＋幣種＋恐懼貪婪指數"),
-            BotCommand("price", "價格階梯（只查價）"),
             BotCommand("run", "實盤（OKX 真的下單）"),
             BotCommand("stop", "停止實盤｜幣種 方向或all"),
             BotCommand("runt", "網格（模擬，不下單）"),           # v15.0
             BotCommand("stoprunt", "停止runt｜幣種或all"),
-            BotCommand("gap", "帳戶與帳戶的距離"),        # v12.8
-            BotCommand("timeframe", "週期"),
-            BotCommand("amp", "振幅分析（依週期）"),
+            BotCommand("amp", "振幅分析｜週期"),                 # v15.1：/price、/gap、/timeframe 拿掉
             BotCommand("check", "健檢｜api｜log"),
             BotCommand("menu", "說明"),
             BotCommand("vps", "VPS 狀況")]                      # v13.9
@@ -7209,10 +7098,9 @@ def main():
     for cmd, fn in [(["menu", "start"], cmd_menu),
                     ("run", cmd_run), ("stop", cmd_stop),                    # v11.0：實盤（/runt 同一套規則，OKX 真的下單）
                     ("status", cmd_status), ("summary", cmd_summary),
-                    ("check", cmd_check), ("price", cmd_price),             # v10.8：/log /selftest /test2 舊別名拿掉
+                    ("check", cmd_check),                                     # v15.1：/price 拿掉
                     ("runt", cmd_runt), ("stoprunt", cmd_stoprunt),          # v7.6／v7.7：/runt＝佈局（模擬）
-                    ("gap", cmd_gap),                                         # v12.8：帳戶與帳戶的距離
-                    (["tf", "timeframe"], cmd_timeframe), ("amp", cmd_amp),   # v11.1：/amp 加回
+                    ("amp", cmd_amp),                                         # v11.1：/amp 加回；v15.1：/gap、/timeframe 拿掉
                     ("coins", cmd_coins), ("vps", cmd_vps)]:            # v13.9：/vps
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
