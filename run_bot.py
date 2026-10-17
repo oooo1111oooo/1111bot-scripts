@@ -104,7 +104,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v15.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v15.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -4021,9 +4021,19 @@ def gd_hold_line(G, ps, pxs, cum=None):
     mid = f"|{rn_sp(cum)}" if cum is not None else ""
     return f"持倉損益 {rn_sp(sum(ones, Decimal(0)))}{mid}|{len(ps)}單🎯"
 
-def gd_avg_line(G, kd, ps, px, full=True):
+def gd_upl(p, px):
+    """這一單的未實現損益 U（不含手續費，OKX 的算法）：現貨＝數量×(現價−進場價)；空單＝數量×(進場價−現價)。"""
+    return p["qty"] * ((px - p["ent"]) if p["kind"] == "sp" else (p["ent"] - px))
+
+def gd_hold_u_line(ps, pxs):
+    """v15.4（1111 2026-10-18）/status：持倉損益 -0.0002U|1單🎯＝還抱著的單未實現損益 U 合計（不含手續費）。"""
+    u = sum((gd_upl(p, pxs[p["kind"]]) for p in ps if pxs.get(p["kind"]) is not None), Decimal(0))
+    return f"持倉損益 {rn_su(rn_q4(u))}|{len(ps)}單🎯"
+
+def gd_avg_line(G, kd, ps, px, full=True, pc=True):
     """官方均價（OKX 的算法）：現貨＝平均成本（總成本÷總數量）、未實現＝數量×現價−成本、% ＝÷成本；
-    空單＝倉位均價（數量加權）、未實現＝數量×(均價−現價)、% ＝÷保證金合計。full＝/status（多 N單、後面 💰／🈴）。"""
+    空單＝倉位均價（數量加權）、未實現＝數量×(均價−現價)、% ＝÷保證金合計。full＝/status（多 N單、後面 💰／🈴）。
+    pc＝False（v15.4 /status）：不寫 %。"""
     ps = [p for p in ps if p["kind"] == kd]
     if not ps or px is None:
         return []
@@ -4034,7 +4044,8 @@ def gd_avg_line(G, kd, ps, px, full=True):
         upl, base = Q * px - cost, cost
     else:
         upl, base = cost - Q * px, G["amt"] * len(ps)
-    s = f"官方均價 {gd_q(G, kd, avg)}|" + (f"{len(ps)}單|" if full else "") + f"{rn_sp(rn_q2(upl / base * 100))}|{rn_su(rn_q4(upl))}"
+    s = (f"官方均價 {gd_q(G, kd, avg)}|" + (f"{len(ps)}單|" if full else "") + (f"{rn_sp(rn_q2(upl / base * 100))}|" if pc else "")
+         + rn_su(rn_q4(upl)))
     return [s + (GD_MK[kd] if full else "")]
 
 def gd_rows(G, ps, pxs, cum=True):
@@ -4173,10 +4184,12 @@ def gd_liq_lines(G, items):
 
 def gd_status_lines(G, now):
     """④ /status 一個幣種一段（1111 2026-10-17 畫面）：▶️開始 → 🩵原點 → 價格由高到低（S、U、L 混在一起，同價 S 在上；
-    掛單列 時:分:秒|掛單價|掛單中🔹；現價插在它的價格位置）→ 持倉損益 每一單%相加|出場單的淨利率%|N單🎯 → 官方均價 💰／🈴。"""
+    掛單列 時:分:秒|掛單價|掛單中🔹；現價插在它的價格位置）→ 持倉損益 → 官方均價 💰／🈴。
+    v15.4（1111 2026-10-18 畫面）：標題 📣持倉／📣埋伏（拿掉「通知」）；持倉損益 改成 U：還抱著的單未實現損益合計（不含手續費，
+    跟官方均價的 U 同一種算法）|N單🎯（出場單的淨利率% 拿掉）；官方均價 拿掉 %：均價|N單|未實現U💰。"""
     ps = gd_held(G)
     pxs = gd_pxs(G)
-    L = [f"📣{'持倉通知' if ps else '埋伏通知'} {gd_head(G)}", f"▶️{gd_md(G['t_run'])} 開始|{rn_hold(now - G['t_run'])}",
+    L = [f"📣{'持倉' if ps else '埋伏'} {gd_head(G)}", f"▶️{gd_md(G['t_run'])} 開始|{rn_hold(now - G['t_run'])}",
          gd_org_txt(G), ""]
     rows = [(p["ent"], 0 if p["kind"] == "sw" else 1, "pos", p) for p in ps]
     for kd, o in G["ord"].items():
@@ -4200,13 +4213,14 @@ def gd_status_lines(G, now):
     if not done or mpx is None:
         L.append(cur)
     if G.get("org"):
-        L += ["", gd_hold_line(G, ps, pxs, gd_all_net(G))]
+        L += ["", gd_hold_u_line(ps, pxs)]
         for kd in gd_kinds(G):
-            L += gd_avg_line(G, kd, ps, pxs.get(kd))
+            L += gd_avg_line(G, kd, ps, pxs.get(kd), pc=False)
     return L
 
 def gd_stop_lines(G, now):
-    """⑥ /stoprunt（1111 2026-10-17 畫面）：撤掉的掛單 → 還抱著的單（手動平倉）→ 累計出場、持倉損益、淨損益。"""
+    """⑥ /stoprunt（1111 2026-10-17 畫面）：撤掉的掛單 → 還抱著的單（手動平倉）→ 累計出場、持倉損益、淨損益。
+    v15.5（1111 2026-10-18：各層 % 相加沒有意義，跟 /status 一樣）：持倉損益 -6.4770U|11單🎯（未實現 U，不含手續費）、淨損益 +0.3906U（只寫 U）；每一層的 % 不變。"""
     L = [f"🛑 /stoprunt {gd_head(G)} 已停止", f"▶️{gd_md(G['t_run'])} 開始|歷時{rn_hold(now - G['t_run'])}"]
     cx = [(o["px"], 0 if kd == "sw" else 1, gd_nm(kd, o["k"]), kd) for kd, o in G["ord"].items() if o]
     if G.get("o00"):
@@ -4222,7 +4236,7 @@ def gd_stop_lines(G, now):
     A = G["agg"]
     n = sum(a["n"] for a in A.values())
     u = sum((a["u"] for a in A.values()), Decimal(0))
-    L += ["", f"累計出場 {n}單", gd_hold_line(G, ps, pxs), f"淨損益 {rn_sp(gd_all_net(G))}|{rn_su(u)}"]
+    L += ["", f"累計出場 {n}單", gd_hold_u_line(ps, pxs), f"淨損益 {rn_su(u)}"]
     return L + ["", f"時間:{hhmmss()}"]
 
 def gd_status_line(G):
@@ -6920,7 +6934,7 @@ async def cmd_menu(u, c):
         f"　每層U：現貨每層買 U、空單每層保證金 U（槓桿只用在空單）；同一個幣種一組（幣種數量不限）\n"
         f"　手續費：現貨 {SP_FEE_IN}%／{SP_FEE_OUT}%、合約 {RN_FEE_IN}%／{RN_FEE_OUT}%（掛單／市價）；空單資金費照 OKX 費率算進每一單；空單合起來算強平（逐倉公式）\n"
         "　/status：📣 一個幣種一段：▶️開始、🩵原點、價格由高到低（S、U、L 混在一起，同價 S 在上；現價在它的價格位置）；"
-        "持倉列 時間|這一單%|這一格的淨利率%、掛單列 時間|掛單價|掛單中🔹；持倉損益＝每一單%相加|出場單的淨利率%|N單🎯；官方均價 💰現貨／🈴空單（OKX 的算法）\n"
+        "持倉列 時間|這一單%|這一格的淨利率%、掛單列 時間|掛單價|掛單中🔹；持倉損益＝還抱著的單未實現損益 U（不含手續費）|N單🎯；官方均價 均價|N單|未實現U（💰現貨／🈴空單，OKX 的算法）\n"
         "　例：/runt SUIUSDT LSU 2X 5U 0.1%、/runt SUIUSDT S 2X 5U 0.1%\n"
         "/stoprunt 幣種｜all　停止 /runt：撤掉掛單、策略馬上結束；持倉不平倉（列出來，1111 自己處理）\n"
         f"/amp 週期　振幅分析：週期 {'/'.join(AMP_TF)}，一次 {AMP_N} 根K線（約 1.4/6.9/20.8/83/167/333 天），照 /coins 的幣種一個一頁；最高振幅、歷史高低點（OKX 上市以來）、這段期間的最高最低價\n/coins 交易帳戶(餘額｜權益｜可用｜佔用)＋幣種｜最小保證金(1X)｜最大槓桿＋恐懼貪婪指數(近7天)\n"
