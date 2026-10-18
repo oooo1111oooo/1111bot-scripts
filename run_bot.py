@@ -104,7 +104,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v15.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v15.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -3689,7 +3689,8 @@ async def rn_recover(app):
 # 掛單（像洋蔥夾著現價）：隨時「現價下面最近一格、沒有持倉的」掛 1 張現貨買；「現價上面最近一格 S、沒有持倉的」掛 1 張空；
 #   價格動 → 掛單跟著換到最近的那一格。一律限價（maker）；掛單價已經被現價穿過＝不掛。過了送單時間（RT_LAT）才生效。
 # 出場：每一層各自照現在的規則（rn_rule，跟 /run 同一個函式：>0.40% 設 SL、SL＝最高−0.20%、TP＝最高+0.10%…），碰到＝市價出場（taker），
-#   v15.7（1111 2026-10-18）：現貨（L、U）的 TP 改成最高 +0.15%、2 秒移動 1 次（gd_rule，只換這兩個參數）；空單不變。
+#   v15.7（1111 2026-10-18）：現貨（L、U）的 TP 改成最高 +0.15%、2 秒移動 1 次（gd_rule，只換現貨的參數）；空單不變。
+#   v15.8（1111 2026-10-18）：現貨 >0.50% 才設 SL（移動 SL 不變）、TP 1.5 秒移動 1 次。
 #   現貨只賣那一層的數量（BOT 自己的分倉帳本）。出場後那一格空出來，照掛單規則等價格回來再掛。
 # 價格：現貨層看現貨（SUI-USDT）逐筆成交價、空單看永續（SUI-USDT-SWAP）逐筆成交價；WS 斷線改成一次查全部（現貨 2 秒一次）。
 # 金額：現貨每層買「每層U」、空單每層保證金「每層U」（槓桿只用在空單）。損益 %＝U ÷ 每層U（現貨＝1X）。
@@ -3712,7 +3713,9 @@ GD_DIRS    = "LSU"
 GD_TGT     = Decimal("2.33")   # v15.6：空單每一層自己撐到原點×2.33（+133%）才強平
 GD_LCAP    = Decimal("20")     # v15.6：空單每一層槓桿最高 20X（1111 統一）
 GD_SP_TP_GAP  = Decimal("0.15")  # v15.7（1111 2026-10-18）：現貨（L、U）TP＝最高 +0.15%（空單照 RN_TP_GAP +0.10%）
-GD_SP_TP_STEP = 2.0              # v15.7：現貨 TP 最多 2 秒移動 1 次（空單照 RN_TP_STEP 1 秒 1 次）；SL、設 SL 的條件都不變
+GD_SP_TP_STEP = 1.5              # v15.8（1111 2026-10-18）：現貨 TP 最多 1.5 秒移動 1 次（v15.7 2 秒；空單照 RN_TP_STEP 1 秒 1 次）
+GD_SP_ARM     = Decimal("0.50")  # v15.8（1111 2026-10-18）：現貨 最高毛利率 >0.50% 才第一次設 SL（空單照 RN_ARM 0.40%）；
+                                 #   移動 SL 不變（SL＝最高 −0.20%）→ 第一次設的 SL 約 +0.30%
 GD_FILE    = f"/srv/1111bot/data/runtgrid_{ACCT}.json"
 GD_MK      = {"sp": "💰", "sw": "🈴"}   # 1111：現貨 💰、合約 🈴
 GD_ORG     = "🩵"                       # 原點
@@ -4367,9 +4370,8 @@ def gd_sum_msgs(d, full=False):
             title = f"{sym} {dr} {pct(gd_rD(r0, 'amt'))}U"                       # v15.6 拿掉槓桿
         grp = lambda r: (r.get("nm") or "?")[0]
         lets = [x for x in "LUS" if x in dr]
-        cnt = {x: sum(1 for r in rs if grp(r) == x) for x in lets}
         M += [RT_SEP, title, f"最{GD_FULL}金額 {pct(peak(sym))}U", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯",
-              f"總成交單 {len(rs)}單" + "".join(f"|{x}{GD_MK['sw' if x == 'S' else 'sp']}{cnt[x]}單" for x in lets)]
+              f"總成交單 {len(rs)}單"]                          # v15.8（1111 2026-10-18 畫面）：後面的 |L💰…單 拿掉
         if not rs:
             continue
         lay_n, lay_p = {}, {}
@@ -4385,7 +4387,7 @@ def gd_sum_msgs(d, full=False):
             gu, fe, fu, u = sm(xs, "gu"), fees(xs), sm(xs, "fu"), sm(xs, "u")
             fd = rn_q4(fu) != 0
             us = rn_pad([rn_su(gu), rn_su(-fe)] + ([rn_su(fu)] if fd else []) + [rn_su(u)])
-            M += ["", f"{x}{'合約' if x == 'S' else '現貨'} {len(xs)}單{GD_MK['sw' if x == 'S' else 'sp']}",
+            M += ["", f"{GD_MK['sw' if x == 'S' else 'sp']}{x} {len(xs)}單",          # v15.8：💰L 7單／💰U 0單／🈴S 0單
                   f"毛損益 {us[0]}", f"手續費 {us[1]}"] + ([f"資金費 {us[2]}"] if fd else []) + [f"淨損益 {us[-1]}"]
     M += [RT_SEP] + foot
     return [L, M]
@@ -4430,17 +4432,21 @@ def gd_tick(G, send, now):
 
 def gd_rule(T, p, px, now):
     """v15.7（1111 2026-10-18）：SL/TP 照 rn_rule（跟 /run 同一個函式，rn_rule 本身不改）；
-    現貨（L、U）那幾單的 TP 換成 GD_SP_TP_GAP +0.15%、GD_SP_TP_STEP 2 秒 1 次——只在這一次判斷裡換，判斷完馬上換回來
-    （rn_rule 中間不會 await，別的單、/run 不受影響）。空單照原本 +0.10%、1 秒 1 次。"""
+    現貨（L、U）那幾單換成現貨的參數——只在這一次判斷裡換，判斷完馬上換回來（rn_rule 中間不會 await，別的單、/run 不受影響）：
+    v15.8：>0.50% 才第一次設 SL（RN_ARM、RN_BOX→GD_SP_ARM；移動 SL 一樣是最高 −0.20%）、TP＝最高 +0.15%、1.5 秒移動 1 次。
+    空單照原本：>0.40% 設 SL、TP +0.10%、1 秒 1 次。"""
     if p["kind"] != "sp":
         return rn_rule(T, p, px, now)
     g = globals()
-    keep = g["RN_TP_GAP"], g["RN_TP_STEP"]
+    names = ("RN_ARM", "RN_BOX", "RN_TP_GAP", "RN_TP_STEP")
+    keep = [g[n] for n in names]
+    g["RN_ARM"] = g["RN_BOX"] = GD_SP_ARM
     g["RN_TP_GAP"], g["RN_TP_STEP"] = GD_SP_TP_GAP, GD_SP_TP_STEP
     try:
         return rn_rule(T, p, px, now)
     finally:
-        g["RN_TP_GAP"], g["RN_TP_STEP"] = keep
+        for n, v in zip(names, keep):
+            g[n] = v
 
 def gd_ws_drop(G):
     """停掉的組：別的組（網格、實盤）沒在用的幣種不再訂閱。"""
@@ -6982,7 +6988,7 @@ async def cmd_menu(u, c):
         "　原點：有 L＝現價下方埋伏點% 掛 💰L00 現貨買，成交價＝🩵原點；沒有 L＝/runt 那一刻的現價直接當原點。原點到 /stoprunt 都不動，沒有「輪」\n"
         "　掛單：現價下面最近一格（沒有持倉的）掛 1 張現貨買、現價上面最近一格 S（沒有持倉的）掛 1 張空，跟著價格換格；一律限價，掛單價已經被現價穿過＝先不掛\n"
         f"　出場：每一層各自：{arm}SL＝最高−{RN_SL_GAP:.2f}%、TP＝最高+{RN_TP_GAP:.2f}%，之後一起往獲利移動（SL 每秒 {round(1 / RN_STEP)} 次、TP 每秒 {round(1 / RN_TP_STEP)} 次）；"
-        f"💰現貨（L、U）的 TP＝最高+{GD_SP_TP_GAP:.2f}%、{pct(GD_SP_TP_STEP)} 秒移動 1 次（v15.7）；"
+        f"💰現貨（L、U）：最高毛利率 >{GD_SP_ARM:.2f}% 才設 SL（移動 SL 一樣）、TP＝最高+{GD_SP_TP_GAP:.2f}%、{pct(GD_SP_TP_STEP)} 秒移動 1 次（v15.8）；"
         "現貨只賣那一層；出場後那一格空出來，價格回來再掛\n"
         f"　每層U：現貨每層買 U、空單每層保證金 U；同一個幣種一組（幣種數量不限）\n"
         f"　空單槓桿（v15.6，不用打）：每一層自己的強平價剛好在原點+{pct((GD_TGT - 1) * 100)}%（S01 約 0.77X 越上面越高，最高 {pct(GD_LCAP)}X）"
