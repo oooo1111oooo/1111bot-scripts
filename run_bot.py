@@ -104,7 +104,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v16.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v16.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -699,8 +699,11 @@ async def cmd_status(u, c):
         by.setdefault(T["sym"], []).append(T)
     for sym in sorted(by):                                 # v11.7（1111）：一個幣種一段（L、S 合在一起）
         blocks.append([RT_SEP] + rn_coin_lines(by[sym], now))
+    sumb = gd_sum_msgs(rn_today(), coins=True) if GD else {}   # v16.1（1111 2026-10-19）：每個幣種後面接本日成績（跟 /summary 分幣種一樣）
     for G in sorted(GD.values(), key=lambda G: G["sym"]):  # v15.0：/runt 網格，一個幣種一段（gd_status_lines）
         blocks.append([RT_SEP] + gd_status_lines(G, now))
+        if sumb.get(G["sym"]):
+            blocks.append([""] + sumb[G["sym"]])
     blocks = blocks or [[RT_SEP, "目前沒有進行中的幣種"]]
     for part in tg_pack(f"❇️ status｜{ACCT}", blocks, [RT_SEP, f"時間:{hhmmss()}|{VERSION}"], emo=TG_EMO):   # v12.7：每一則最多 95 個 emoji
         await reply(u, part)
@@ -4249,7 +4252,7 @@ def gd_status_lines(G, now):
     跟官方均價的 U 同一種算法）|N單🎯（出場單的淨利率% 拿掉）；官方均價 拿掉 %：均價|N單|未實現U💰。"""
     ps = gd_held(G)
     pxs = gd_pxs(G)
-    L = [f"📣{'持倉' if ps else '埋伏'} {gd_head(G)}", f"▶️{gd_md(G['t_run'])} 開始|{rn_hold(now - G['t_run'])}",
+    L = [f"📣{'持倉' if ps else '埋伏'} {gd_head(G)}", f"▶️{gd_md(G['t_run'])}起|{rn_hold(now - G['t_run'])}",   # v16.1（1111）：開始→起
          gd_org_txt(G)] + gd_dnote(G) + [""]
     rows = [(p["ent"], 0 if p["kind"] == "sw" else 1, "pos", p) for p in ps]
     for kd, o in G["ord"].items():
@@ -4341,9 +4344,10 @@ def gd_tot_lines(pre, n, gu, fe, fu, u, mark=False):
     L.append(f"{pre}淨損益 {us[-1]}|均單{av[1]}" + (E.pnl_emoji(rn_q4(u)) if mark else ""))
     return L
 
-def gd_sum_msgs(d, full=False):
+def gd_sum_msgs(d, full=False, coins=False):
     """⑤ /summary（模擬 /runt 網格；1111 2026-10-17 畫面）：第一則總表、第二則分幣種（太長照分隔線分頁）。
-    最🈵金額＝今天同一時間最多佔用的錢（現貨每層U、空單每層保證金U）；持倉金額＝現在還抱著的單×每層U。"""
+    最🈵金額＝今天同一時間最多佔用的錢（現貨每層U、空單每層保證金U）；持倉金額＝現在還抱著的單×每層U。
+    v16.1：coins＝True → 回傳 {幣種: 分幣種那一段}（/status 每個幣種後面接本日成績用）。"""
     recs = gd_recs(d)
     t_day = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=TZ8).timestamp()
     t_end = min(time.time(), t_day + 86400)
@@ -4373,6 +4377,8 @@ def gd_sum_msgs(d, full=False):
     syms = {r.get("sym") for r in recs} | set(GD)
     head = [f"📊 summary｜{ACCT} | 總表", span]
     if not syms:
+        if coins:
+            return {}
         return [] if full else [head + ["", "本日沒有出場的單,也沒有持倉", ""] + foot]
     n = len(recs)
     L = head + ["", f"本日總計 {n}單⭐️"]
@@ -4396,6 +4402,7 @@ def gd_sum_msgs(d, full=False):
     L += gd_tot_lines("總", n, sm(recs, "gu"), fees(recs), sm(recs, "fu"), sm(recs, "u"), mark=True)
     L += [""] + foot
     M = [f"📊 summary｜{ACCT} 分幣種", span]
+    blk = {}
     for sym in sorted(syms):
         rs = [r for r in recs if r.get("sym") == sym]
         G = GD.get(sym)
@@ -4406,9 +4413,10 @@ def gd_sum_msgs(d, full=False):
             dr = r0.get("dir") or ""
             title = f"{sym} {dr} {pct(gd_rD(r0, 'amt'))}U"                       # v15.6 拿掉槓桿
         grp = lambda r: (r.get("nm") or "?")[0]
-        lets = [x for x in "LUSD" if x in dr]
-        M += [RT_SEP, title, f"最{GD_FULL}金額 {pct(peak(sym))}U", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯",
-              f"總成交單 {len(rs)}單"]                          # v15.8（1111 2026-10-18 畫面）：後面的 |L💰…單 拿掉
+        lets = "LUSD"                                      # v16.1（1111 2026-10-19）：四段都列（沒開的方向也列 0 單）
+        X = blk[sym] = [title, f"最{GD_FULL}金額 {pct(peak(sym))}U", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯",
+                        f"總成交單 {len(rs)}單"]                # v15.8（1111 2026-10-18 畫面）：後面的 |L💰…單 拿掉
+        M += [RT_SEP] + X
         if not rs:
             continue
         lay_n, lay_p = {}, {}
@@ -4417,15 +4425,19 @@ def gd_sum_msgs(d, full=False):
             lay_n[k] = lay_n.get(k, 0) + 1
             lay_p[k] = lay_p.get(k, Decimal(0)) + gd_rD(r, "np")
         ks = sorted(lay_n, key=lambda k: gd_nm_key(k) if k[:1] in "SULD" and k[1:].isdigit() else (9, 0))
-        M += [""] + gd_cells(ks, lay_n, lay_p)
-        M += [""] + gd_tot_lines("總", len(rs), sm(rs, "gu"), fees(rs), sm(rs, "fu"), sm(rs, "u"))
+        n0 = len(X)
+        X += [""] + gd_cells(ks, lay_n, lay_p)
+        X += [""] + gd_tot_lines("總", len(rs), sm(rs, "gu"), fees(rs), sm(rs, "fu"), sm(rs, "u"))
         for x in lets:
             xs = [r for r in rs if grp(r) == x]
             gu, fe, fu, u = sm(xs, "gu"), fees(xs), sm(xs, "fu"), sm(xs, "u")
             fd = rn_q4(fu) != 0
             us = rn_pad([rn_su(gu), rn_su(-fe)] + ([rn_su(fu)] if fd else []) + [rn_su(u)])
-            M += ["", f"{GD_MK['sw' if x in 'SD' else 'sp']}{x} {len(xs)}單{gd_dtag(x)}",   # v15.8：💰L 7單／💰U 0單／🈴S 0單；v16.0 🈴D 3單(o2222o)
+            X += ["", f"{GD_MK['sw' if x in 'SD' else 'sp']}{x} {len(xs)}單{gd_dtag(x) if 'D' in dr else ''}",   # v15.8：💰L 7單／💰U 0單／🈴S 0單；v16.0 🈴D 3單(o2222o)
                   f"毛損益 {us[0]}", f"手續費 {us[1]}"] + ([f"資金費 {us[2]}"] if fd else []) + [f"淨損益 {us[-1]}"]
+        M += X[n0:]
+    if coins:
+        return blk
     M += [RT_SEP] + foot
     return [L, M]
 
