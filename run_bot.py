@@ -104,7 +104,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v16.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v16.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -4360,20 +4360,26 @@ def gd_sum_msgs(d, full=False, coins=False):
             spans.append((r.get("sym"), max(float(r.get("t_in") or t1), t_day), t1, gd_rD(r, "amt")))
         except Exception:
             continue
+    held_n = {}
     for G in list(GD.values()):
         for p in gd_held(G):
             held[G["sym"]] = held.get(G["sym"], Decimal(0)) + G["amt"]
+            held_n[G["sym"]] = held_n.get(G["sym"], 0) + 1
             spans.append((G["sym"], max(p["t_in"], t_day), t_end, G["amt"]))
-    def peak(sym=None):
+    def peak_n(sym=None):
+        """今天同一時間最多佔用的錢，和那時候抱著幾單（v16.2：分幣種 最🈵金額 xx單|4U）。"""
         ev = []
         for sy, a, b, m in spans:
             if sym is None or sy == sym:
-                ev += [(a, 1, m), (b, 0, -m)]              # 同一時間：先出場、再進場
+                ev += [(a, 1, m, 1), (b, 0, -m, -1)]       # 同一時間：先出場、再進場
         cur = top = Decimal(0)
-        for _, _, m in sorted(ev):
-            cur += m
-            top = max(top, cur)
-        return top
+        n = top_n = 0
+        for _, _, m, d in sorted(ev, key=lambda e: (e[0], e[1])):
+            cur += m; n += d
+            if cur > top:
+                top, top_n = cur, n
+        return top, top_n
+    peak = lambda sym=None: peak_n(sym)[0]
     syms = {r.get("sym") for r in recs} | set(GD)
     head = [f"📊 summary｜{ACCT} | 總表", span]
     if not syms:
@@ -4414,7 +4420,8 @@ def gd_sum_msgs(d, full=False, coins=False):
             title = f"{sym} {dr} {pct(gd_rD(r0, 'amt'))}U"                       # v15.6 拿掉槓桿
         grp = lambda r: (r.get("nm") or "?")[0]
         lets = "LUSD"                                      # v16.1（1111 2026-10-19）：四段都列（沒開的方向也列 0 單）
-        X = blk[sym] = [title, f"最{GD_FULL}金額 {pct(peak(sym))}U", f"持倉金額 {pct(held.get(sym, Decimal(0)))}U🎯",
+        pk, pn = peak_n(sym)
+        X = blk[sym] = [title, f"最{GD_FULL}金額 {pn}單|{pct(pk)}U", f"持倉金額 {held_n.get(sym, 0)}單|{pct(held.get(sym, Decimal(0)))}U🎯",   # v16.2（1111 2026-10-19）
                         f"總成交單 {len(rs)}單"]                # v15.8（1111 2026-10-18 畫面）：後面的 |L💰…單 拿掉
         M += [RT_SEP] + X
         if not rs:
