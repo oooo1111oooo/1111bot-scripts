@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v17.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v17.0.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -3136,7 +3136,8 @@ async def coins_acct_lines(acct, tag=""):
     fee = f.get("fee") or {}
     fs = lambda kd: "/".join(f"{rt_p2(v)}%" for v in fee[kd]) if fee.get(kd) else "讀不到"
     return ([f"{acct}{tag} {fd_mode(acct)}" + (f"🚨{f['bad']}" if f.get("bad") else "")]
-            + [f"{k} {v}" for (k, _), v in zip(rows, vs)] + [f"費率 現貨{fs('sp')}|合約{fs('sw')}"])
+            + [f"{k} {v}" for (k, _), v in zip(rows, vs)]
+            + [f"費率 現貨{fs('sp')}", f"{GD_CXL_IND}合約{fs('sw')}"])   # v17.0.1（1111 2026-10-20 排版）：合約另一行，對齊在 現貨 下面
 
 def coins_list():
     """/coins、/amp 共用的幣種清單：symbols.json 有啟用的＋COINS_ADD，拿掉 COINS_HIDE，照字母排序（v11.1 抽出來共用）。"""
@@ -3164,14 +3165,15 @@ async def coins_mmr(syms):
 
 async def cmd_coins(u, c):
     """/coins。v17.0（1111 2026-10-19 畫面）：這個帳戶＋配對帳戶各一段（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率）；
-    每個幣種兩行：現價|最大槓桿|合約最小（OKX 最小下單量的價值）、每層最少 L|U|S|D（現價當原點、33 層全部下得了，0.5U 一級）。"""
+    每個幣種兩行：現價|最大槓桿|合約最小（OKX 最小下單量的價值）、每層最少 L|U|S|D（現價當原點、33 層全部下得了，0.5U 一級）。
+    v17.0.1（1111 2026-10-20 排版）：分 3 則：① 兩個帳戶 ② 每個幣種（幣種之間空一行） ③ 恐懼貪婪指數＋時間。"""
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
     pair = GD_PAIR.get(ACCT)
     accts = [(ACCT, "")] + ([(pair, "(D帳戶)")] if pair else ([(GD_DACCT[ACCT], "(主帳戶)")] if ACCT in GD_DACCT else []))
-    first = ["事件：幣種清單（即時）", "━━━━━━━━━━"]
-    for a, tag in accts:
-        first += await coins_acct_lines(a, tag) + ["━━━━━━━━━━"]
-    blocks = [first]
+    P1 = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
+    for i, (a, tag) in enumerate(accts):
+        P1 += (["━━━━━━━━━━"] if i else []) + await coins_acct_lines(a, tag)
+    await reply(u, "\n".join(P1))                         # ① 兩個帳戶（先送，幣種算好再送 ②）
     on = coins_list()                                       # v10.5：加 COINS_ADD，不重複；v11.1：跟 /amp 共用
     if not await okx_specs_all():
         await asyncio.sleep(1)
@@ -3213,14 +3215,12 @@ async def cmd_coins(u, c):
             print("[coins] fail", sym, type(e).__name__, e)
             rows.append((f"{sym}|查詢失敗", None))
     cols = {x: iter(rn_pad([m[x] for _, m in rows if m])) for x in "LUSD"}
-    L = ["幣種 現價|最大槓桿|合約最小", "每層最少 L|U|S|D(現價當原點)", ""]
+    blocks = [["每層最少 L|U|S|D(現價當原點)"]]          # ② 每個幣種：兩行一組，幣種之間空一行（太長才分頁，一組不切開）
     for head, m in rows:
-        L.append(head)
-        if m:
-            L.append(" " + "|".join(f"{x}{next(cols[x])}" for x in "LUSD"))
-    blocks += [L, ["━━━━━━━━━━"] + await fng]
-    for part in tg_pack(f"{E.BOT} OKX原K｜{ACCT}", blocks, ["━━━━━━━━━━", f"時間：{hhmmss()}"]):
+        blocks.append(["", head] + (["|".join(f"{x}{next(cols[x])}" for x in "LUSD")] if m else []))
+    for part in tg_pack("幣種 現價|最大槓桿|合約最小", blocks):
         await reply(u, part)
+    await reply(u, "\n".join(await fng + ["━━━━━━━━━━", f"時間：{hhmmss()}"]))   # ③ 恐懼貪婪指數
 
 # v15.1（1111 2026-10-18）：/timeframe（/tf）拿掉；/amp 自己帶週期。ACCOUNT_TF 留著固定 5m（舊 /runt、/run 埋伏通知的對齊用）。
 
@@ -3520,7 +3520,7 @@ async def cmd_menu(u, c):
         f"SL/TP 改單照 OKX 額度（每 {pct(GD_AMEND_WIN)} 秒 {GD_AMEND_N} 次，現貨、S、D 各一份），超過時離現價最近的先改\n"
         "　例：/runt SUIUSDT LSUD 5U 0.1%、/runt SUIUSDT LSU 5U 0.1%、/runt SUIUSDT S 5U 0.1%\n"
         "/stoprunt 幣種｜all　停止 /runt：撤掉掛單、策略馬上結束；持倉不平倉（列出來，1111 自己處理）\n"
-        "/coins 這個帳戶＋配對帳戶（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率）＋每個幣種（現價、最大槓桿、合約最小、每層最少 L|U|S|D）＋恐懼貪婪指數\n"
+        "/coins 分 3 則：①這個帳戶＋配對帳戶（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率） ②每個幣種（現價、最大槓桿、合約最小、每層最少 L|U|S|D） ③恐懼貪婪指數\n"
         f"/amp 週期　振幅分析：週期 {'/'.join(AMP_TF)}，一次 {AMP_N} 根K線，照 /coins 的幣種一個一頁\n"
         "/vps VPS 狀況：CPU、限速、記憶體、硬碟；每個帳戶的 CPU、記憶體、WS 斷線、價格延遲\n"
         "/check 健檢｜/check api｜/check log\n"
