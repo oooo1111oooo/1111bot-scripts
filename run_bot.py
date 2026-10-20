@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v17.0.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v17.0.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -3204,6 +3204,7 @@ async def cmd_coins(u, c):
     """/coins。v17.0（1111 2026-10-19 畫面）：這個帳戶＋配對帳戶各一段（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率）；
     每個幣種兩行：現價|最大槓桿|合約最小（OKX 最小下單量的價值）、每層最少 L|U|S|D（現價當原點、33 層全部下得了，0.5U 一級）。
     v17.0.1（1111 2026-10-20 排版）：分 3 則：① 兩個帳戶 ② 每個幣種（幣種之間空一行） ③ 恐懼貪婪指數＋時間。
+    v17.0.5（1111 2026-10-20）：第一行 現價|現貨最少幾顆|最大槓桿|合約最小。
     v17.0.2（1111 2026-10-20 排版）：② 拿掉上面兩行說明；每個幣種三行：現價|最大槓桿|合約最小、L33層 | U33層、D33層 | S33層
       ＝那一邊每一層都下得了的最少每層U（0.1U 一級）× 層數＝那一邊全部持倉要準備的錢（L 含 L00＝34 單；D 的錢在配對帳戶）。"""
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
@@ -3248,7 +3249,8 @@ async def cmd_coins(u, c):
                     v = gd_side_min(H, x, o)
                     mins[x] = f"{v * len(gd_side_layers(x)):.2f}U" if v is not None else "不行"   # 33 層的預算（L 含 L00）
             tk = (sp or sw)["tick"]
-            head = f"{sym} {rt_q(o, tk)}|" + (f"{pct(sw['maxlev'])}X|{sw['minsz'] * sw['ctval'] * (last or o):.2f}U" if sw else "沒有合約")
+            spn = f"{Decimal(sp['minsz']).normalize():f}顆" if sp else "沒有現貨"   # v17.0.5（1111 2026-10-20）：現貨最少幾顆（OKX 最小數量）
+            head = f"{sym} {rt_q(o, tk)}|{spn}|" + (f"{pct(sw['maxlev'])}X|{sw['minsz'] * sw['ctval'] * (last or o):.2f}U" if sw else "沒有合約")
             rows.append((head, mins))
         except Exception as e:
             print("[coins] fail", sym, type(e).__name__, e)
@@ -3569,7 +3571,7 @@ async def cmd_menu(u, c):
         f"SL/TP 改單照 OKX 額度（每 {pct(GD_AMEND_WIN)} 秒 {GD_AMEND_N} 次，現貨、S、D 各一份），超過時離現價最近的先改\n"
         "　例：/runt SUIUSDT LSUD 5U 0.1%、/runt SUIUSDT LSU 5U 0.1%、/runt SUIUSDT S 5U 0.1%\n"
         "/stoprunt 幣種｜all　停止 /runt：撤掉掛單、策略馬上結束；持倉不平倉（列出來，1111 自己處理）\n"
-        "/coins 分 3 則：①這個帳戶＋配對帳戶（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率） ②每個幣種（現價、最大槓桿、合約最小、33層預算 L|U|D|S＝每一層都下得了的最少每層U×層數，L 含 L00） ③恐懼貪婪指數\n"
+        "/coins 分 3 則：①這個帳戶＋配對帳戶（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率） ②每個幣種（現價、現貨最少幾顆、最大槓桿、合約最小、33層預算 L|U|D|S＝每一層都下得了的最少每層U×層數，L 含 L00） ③恐懼貪婪指數\n"
         f"/amp 週期　振幅分析：週期 {'/'.join(AMP_TF)}，一次 {AMP_N} 根K線，照 /coins 的幣種一個一頁\n"
         "/vps VPS 狀況：CPU、限速、記憶體、硬碟；每個帳戶的 CPU、記憶體、WS 斷線、價格延遲\n"
         "/check 健檢｜/check api｜/check log\n"
