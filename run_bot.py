@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1265,8 +1265,11 @@ GD_DIRS    = "LSUD"           # v16.0（1111 2026-10-19）：L、S、U、D；v18
 #   出場（v18.1，1111 2026-10-20）：現貨、合約都有 SL/TP（rn_rule）：最高毛利率 > 現貨 1.40%／合約 0.80% 第一次設，
 #     SL＝距離現價 −0.20%、TP＝距離現價 +0.20%，只往獲利方向、各自每秒 1 次；碰到＝taker。（v18.0 現貨沒有 SL/TP、>1.20% 就賣，拿掉）
 #   /runt：只有 o1111o 可以下 S、D（合約延伸到 o2222o、o3333o）；其他帳戶只能 L、U（現貨在自己的帳戶）。
-GD_MAIN    = "o1111o"                              # v18.0：只有這個帳戶可以下合約（S、D）
-GD_XACCT   = ("o1111o", "o2222o", "o3333o")        # v18.0：合約第 1～11 層、12～22 層、23～33 層放的帳戶
+# v18.2（1111 2026-10-21）：兩套一模一樣：o1111o＋o2222o、o3333o；o4444o＋o5555o、o6666o（將來幣安 6 個帳戶照樣兩套）
+GD_SETS    = {"o1111o": ("o1111o", "o2222o", "o3333o"), "o4444o": ("o4444o", "o5555o", "o6666o")}
+GD_MAIN    = next((m for m, xs in GD_SETS.items() if ACCT in xs), "o1111o")   # 這個帳戶那一套的主帳戶（只有主帳戶可以下合約 S、D）
+GD_XACCT   = GD_SETS[GD_MAIN]                      # 這一套：合約第 1～11 層、12～22 層、23～33 層放的帳戶
+GD_LIQ_IND = " " * 9                               # v18.2 開始通知 強平 第 2、3 行前面的空白（對齊 🈴S 後面的帳戶）
 GD_BLK     = 11                                    # v18.0：一個帳戶 11 層
 GD_ALEV    = Decimal("1.5")                        # v18.0：每個帳戶第一層的槓桿
 GD_SP_OFF  = Decimal("1.5")                        # v18.0：現貨 L/U 第 k 層＝原點 ±(3k−1.5)%（L01、U01 離原點 1.5%）
@@ -2007,7 +2010,8 @@ def gd_start_lines(G, mpx, now, info=None):
         L += ["", f"強平(每個帳戶{GD_BLK}單一起)"]
         for x in "SD":
             if G["has"][x]:
-                L.append(f"{GD_MK['sw']}{x} " + "|".join(f"{gd_ab(a)} {gd_liq_pc(G, gd_blk_ks(x, b)[0], o)}" for b, a in enumerate(GD_XACCT)))
+                L += [(f"{GD_MK['sw']}{x} " if b == 0 else GD_LIQ_IND) + f"{a} {gd_liq_pc(G, gd_blk_ks(x, b)[0], o)}"   # v18.2（1111 畫面）：一個帳戶一行
+                      for b, a in enumerate(GD_XACCT)]
     return L + list(info or []) + ["", f"時間:{hhmmss()}"]
 
 
@@ -3132,7 +3136,7 @@ async def gd_spec_fresh(has):
 
 
 # ---------- /runt、/stoprunt ----------
-_GM = ACCT == GD_MAIN                                    # v18.0：只有 o1111o 可以下 S、D
+_GM = ACCT == GD_MAIN                                    # v18.0：只有主帳戶（v18.2：o1111o、o4444o）可以下 S、D
 GD_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"
           "幣種 方向 每層U 埋伏點%\n"
           + ("例:SUIUSDT LSUD 5U 0.1%\n方向:L、S、U、D 任意組合(LSUD 全部、LSU、S、D…)\n" if _GM else
@@ -3717,7 +3721,8 @@ async def cmd_menu(u, c):
         f"　v18.0 合約每 {GD_BLK} 層一個帳戶：{GD_XACCT[0]} S01～S11、D01～D11｜{GD_XACCT[1]} S12～S22、D12～D22｜{GD_XACCT[2]} S23～S33、D23～D33"
         "（雙向持倉＋逐倉：空單、多單各自一個倉位，每個帳戶的 S、D 各自 11 單一起強平）；"
         f"每個帳戶第一層 {pct(GD_ALEV)}X，後面拉到跟第一層同一個強平價的最大倍數（最高 {pct(GD_LCAP)}X；算不出來＝跟前一層一樣，例 D30～D33＝D29）\n"
-        f"　S、D 只能在 {GD_MAIN} 下；其他帳戶只能 L、U（現貨在自己的帳戶）\n"
+        f"　v18.2 兩套一模一樣：{'｜'.join(f'{m}（＋{xs[1]}、{xs[2]}）' for m, xs in GD_SETS.items())}；"
+        f"S、D 只能在 {'、'.join(GD_SETS)} 下；其他帳戶只能 L、U（現貨在自己的帳戶）\n"
         "　原點：有 L＝現價下方埋伏點% 掛 💰L00 現貨買，成交價＝🩵原點；沒有 L＝/runt 那一刻的現價直接當原點。原點到 /stoprunt 都不動\n"
         "　掛單：一組最多 3 張：現價下面最近一格（沒有持倉的）💰現貨買、🈴做多；現價上面最近一格 🈴做空；跟著價格換格；一律限價（post-only）\n"
         f"　出場：每一層各自：{arm}SL＝距離現價−{RN_SL_DIST:.2f}%、TP＝距離現價+{RN_TP_DIST:.2f}%（做空相反），"
