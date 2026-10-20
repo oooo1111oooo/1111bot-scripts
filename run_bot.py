@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.0.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1937,6 +1937,13 @@ def gd_hold_u_line(ps, pxs):
     u = sum((gd_upl(p, pxs[p["kind"]]) for p in ps if pxs.get(p["kind"]) is not None), Decimal(0))
     return f"持倉損益 {rn_su(rn_q4(u))}|{len(ps)}單🎯"
 
+def gd_hold_pu_line(ps, pxs):
+    """v18.0.1（1111 2026-10-20 畫面）/status：持倉損益 -1.87%|-0.0560U|1單🎯＝還抱著的每一單 % 相加（跟出場通知的持倉損益一樣）|未實現 U 合計（不含手續費）。"""
+    ok = [p for p in ps if pxs.get(p["kind"]) is not None]
+    pc = sum((gd_own(p, pxs[p["kind"]]) for p in ok), Decimal(0))
+    u = sum((gd_upl(p, pxs[p["kind"]]) for p in ok), Decimal(0))
+    return f"持倉損益 {rn_sp(pc)}|{rn_su(rn_q4(u))}|{len(ps)}單🎯"
+
 def gd_avg_line(G, kd, ps, px, full=True, pc=True, grp=None, b=None):
     """官方均價（OKX 的算法）：現貨＝平均成本（總成本÷總數量）、未實現＝數量×現價−成本、% ＝÷成本；
     合約＝倉位均價（數量加權）、未實現＝S 數量×(均價−現價)、D 數量×(現價−均價)，% ＝÷保證金合計。full＝/status（多 N單、後面 💰／🈴空單／🈴多單）。
@@ -2147,6 +2154,8 @@ def gd_liq_lines(G, items):
 
 def gd_status_lines(G, now):
     """④ /status 一個幣種一段（1111 2026-10-17 畫面）：▶️開始 → 🩵原點 → 價格由高到低（S、U、L 混在一起，同價 S 在上；
+    v18.0.1（1111 2026-10-20 畫面）：持倉列下面多 累計 那一段（跟出場通知一樣：從 /runt 開始一直累計，有出場單才有）；
+    持倉損益 改成 每一單 % 相加|未實現U|N單🎯。
     掛單列 時:分:秒|掛單價|掛單中🔹；現價插在它的價格位置）→ 持倉損益 → 官方均價 💰／🈴。
     v15.4（1111 2026-10-18 畫面）：標題 📣持倉／📣埋伏（拿掉「通知」）；持倉損益 改成 U：還抱著的單未實現損益合計（不含手續費，
     跟官方均價的 U 同一種算法）|N單🎯（出場單的淨利率% 拿掉）；官方均價 拿掉 %：均價|N單|未實現U💰。"""
@@ -2177,7 +2186,8 @@ def gd_status_lines(G, now):
     if not done or mpx is None:
         L.append(cur)
     if G.get("org"):
-        L += ["", gd_hold_u_line(ps, pxs)]
+        acc = gd_acc_lines(G, pxs)[:-1] + [""] if G["agg"] else []   # v18.0.1（1111 2026-10-20 畫面）：累計（跟出場通知一樣，這一輪一直累計）
+        L += [""] + acc + [gd_hold_pu_line(ps, pxs)]
         secs = [(ACCT, gd_avg_line(G, "sp", ps, pxs.get("sp"), pc=False) if G.get("sp") else [])]
         if G.get("sw"):                                    # v18.0（1111 畫面）：每個帳戶 🈴空單、🈴多單各一行；別的帳戶空一行、(o2222o) 下面
             for b, a in enumerate(GD_XACCT):
