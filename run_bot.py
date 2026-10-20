@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v17.0.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v17.0.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1485,6 +1485,11 @@ def gd_prm(G, p=None):
         return f"{pct(p['lev'])}X {pct(G['amt'])}U"
     return f"{pct(G['amt'])}U"
 
+def gd_bprm(G, p):
+    """v17.0.7 出場通知「本單」那一行：空單＝槓桿X 金額U、現貨＝金額U；自動用最低金額的層寫那一層實際的金額（損益 % 的分母）。"""
+    a = pct(G["amt"]) if not p.get("up") else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
+    return (f"{pct(p['lev'])}X " if p["kind"] == "sw" else "") + f"{a}U"
+
 def gd_slev_r(G, r):
     """v15.6 空單一層的槓桿（r＝進場價÷原點）：這一層自己的強平價剛好＝原點×2.33。
     OKX 逐倉、模擬手續費（進 0.02%、出 0.05%）：(L×(1−0.02%)+1)×進場價 ÷ (L×(1+維持保證金率+0.05%))＝原點×2.33
@@ -1990,7 +1995,7 @@ def gd_exit_lines(G, p, m):
         if Decimal(ds) > 0:
             L.append(f"零頭 {ds}顆📌")                     # v17.0.6（1111 2026-10-20 畫面）：零頭另一行
     L += [f"持倉 {rn_hold(t - p['t_in'])}", f"原因 {rn_why_nm(why, p.get('n_tp', 0))}",
-          f"移動 SL {p['n_mv']}次 | TP {p.get('n_tp', 0)}次", f"最高毛利率 {hi}", f"最低毛利率 {lo}", "", "本單"]
+          f"移動 SL {p['n_mv']}次 | TP {p.get('n_tp', 0)}次", f"最高毛利率 {hi}", f"最低毛利率 {lo}", "", f"本單{GD_MK[kd]}   {gd_nm(kd, p['k'])} {gd_bprm(G, p)}"]   # v17.0.7（1111 2026-10-20）
     L += [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
     L[-1] += E.pnl_emoji(rn_q4(m["netu"]))
     return L + [""] + gd_acc_lines(G, {kd: px}) + ["", f"時間:{hhmmss()}"]
