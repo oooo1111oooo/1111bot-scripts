@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v17.0.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v17.0.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1963,7 +1963,9 @@ def gd_acc_lines(G, pxs):
             + ([("資金費", rn_q2(fu / amt * 100), fu)] if rn_q4(fu) != 0 else []) + [("淨損益", gd_all_net(G), u)])
     x = rn_pad([rn_sp(r[1]) for r in rows])
     y = rn_pad([rn_su(r[2]) for r in rows])
-    L = [f"累計 {n}單({gd_md(G['t_run'])} 開始)"] + gd_cells(ks, {k: A[k]["n"] for k in ks}, {k: A[k]["net"] for k in ks})
+    cs = rn_pad([f"{A[k]['n']}單{rn_sp(A[k]['net'])}" for k in ks])
+    L = ([f"累計 {n}單({gd_md(G['t_run'])} 開始)", f"損益 {rn_sp(gd_all_net(G))}"]   # v17.0.6（1111 2026-10-20 畫面）：損益＝每一格的 % 加起來
+         + [f"{k}🟰{c}" for k, c in zip(ks, cs)])                                      #   每一格 U01🟰1單+0.38%
     L += [""] + [f"{r[0]} {a}|{b}" for r, a, b in zip(rows, x, y)]
     L[-1] += E.pnl_emoji(rn_q4(u))
     return L + [gd_hold_line(G, gd_held(G), gd_pxs(G, pxs))]
@@ -1984,7 +1986,9 @@ def gd_exit_lines(G, p, m):
     if kd == "sp" and m.get("sell") is not None:          # v17.0：現貨賣出的顆數（實得往下取到數量單位），零頭留在帳戶
         lot = (G.get("sp") or {}).get("lot") or GD_LOT0
         ds = gd_qs(m["dust"], lot, 2)
-        L.append(f"賣出 {gd_qs(m['sell'], lot)}顆" + (f"(零頭{ds}顆留在帳戶)" if Decimal(ds) > 0 else ""))
+        L.append(f"賣出 {gd_qs(m['sell'], lot)}顆")
+        if Decimal(ds) > 0:
+            L.append(f"零頭 {ds}顆📌")                     # v17.0.6（1111 2026-10-20 畫面）：零頭另一行
     L += [f"持倉 {rn_hold(t - p['t_in'])}", f"原因 {rn_why_nm(why, p.get('n_tp', 0))}",
           f"移動 SL {p['n_mv']}次 | TP {p.get('n_tp', 0)}次", f"最高毛利率 {hi}", f"最低毛利率 {lo}", "", "本單"]
     L += [f"{n} {x}|{y}" + (f"|結算{m['fn']}次" if n == "資金費" else "") for n, x, y in zip(names, pc, us)]
