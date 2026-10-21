@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -933,12 +933,14 @@ async def rec_okx_ready(syms, need_px=False):
 # ---------- 出場規則（rn_rule：每一單的 SL/TP；/runt 網格用，v17.1 的 /run 也用同一個）----------
 # v17.0（1111 2026-10-19）：舊 /run（v11 佈局實盤）、v14 舊 /runt、接續帳戶拿掉；這一區只留網格還在用的常數、函式。
 RN_STEP    = 0.25              # 每秒查價 4 次（固定）
-RN_TP_STEP = 1.0               # v18.1（1111 2026-10-20）：TP 每秒最多移動 1 次（v13.9 起就是 1 次）
+RN_TP_STEP = 0.5               # v18.3（1111 2026-10-21）：TP 每秒最多移動 2 次（v13.9～v18.2 每秒 1 次）
 RN_SL_STEP = 1.0               # v18.1（1111 2026-10-20）：SL 每秒最多移動 1 次（v17.0～v18.0.1 每秒 2 次），現貨、合約都一樣
-RN_ARM     = Decimal("0.80")   # v18.1（1111 2026-10-20）：合約（S 做空、D 做多）最高毛利率 > 0.80% 才第一次設 SL/TP（v17.0～v18.0.1 0.50%）
-GD_SP_ARM  = Decimal("1.40")   # v18.1（1111 2026-10-20）：現貨（L、U）最高毛利率 > 1.40% 才第一次設 SL/TP（v18.0 沒有 SL/TP、>1.20% 就賣）
+RN_ARM     = Decimal("0.80")   # v18.1（1111 2026-10-20）：做空（S）最高毛利率 > 0.80% 才第一次設 SL/TP（v17.0～v18.0.1 0.50%）
+GD_LONG_ARM = Decimal("1.50")  # v18.3（1111 2026-10-21）：做多（L、U 現貨、D 合約）最高毛利率 > 1.50% 才第一次設 SL/TP
+                               #   （v18.1～v18.2 現貨 1.40%、D 0.80%）
 RN_SL_DIST = Decimal("0.20")   # v18.1（1111 2026-10-20）：SL＝距離現價 −0.20%（做空＝現價 +0.20%）；v9.5～v18.0.1 是 最高毛利率 −0.20%
-RN_TP_DIST = Decimal("0.20")   # v18.1（1111 2026-10-20）：TP＝距離現價 +0.20%（做空＝現價 −0.20%）；v13.9～v18.0.1 是 最高毛利率 +0.10%
+RN_TP_DIST = Decimal("0.20")   # v18.1（1111 2026-10-20）：移動 TP＝距離現價 +0.20%（做空＝現價 −0.20%）；v13.9～v18.0.1 是 最高毛利率 +0.10%
+RN_TP_FIRST = Decimal("0.30")  # v18.3（1111 2026-10-21）：第一次設的 TP＝距離現價 +0.30%（做空＝現價 −0.30%），L、S、U、D 都一樣
 RN_SL_MIN  = Decimal("0.20")   # SL 最低 +0.20%（保本；v11.3 起，v18.1 沿用）
 RN_MMR_DEF = Decimal("0.01")   # v9.3 強平：查不到 OKX 維持保證金率時先用 1%（OKX 多數幣種第 1 檔）
 RN_FEE_IN  = Decimal("0.02")   # 手續費 0.07%＝限價進場 0.02%
@@ -1139,8 +1141,9 @@ async def rn_fund_query(T):
 
 def rn_rule(T, p, px, now, arm=None):
     """v18.1（1111 2026-10-20）：每次查價（0.25 秒）判斷一次，現貨、合約同一套（只有第一次設的門檻不一樣）：
-    第一次設：最高毛利率（逐筆）> arm（合約 RN_ARM 0.80%、現貨 GD_SP_ARM 1.40%）→ 同時設 SL＝距離現價 −0.20%、TP＝距離現價 +0.20%。
-    之後：SL＝距離現價 −0.20%、TP＝距離現價 +0.20%，都只往獲利方向移動，各自每秒最多 1 次（RN_SL_STEP、RN_TP_STEP）。
+    第一次設：最高毛利率（逐筆）> arm（v18.3：做多 L、U、D GD_LONG_ARM 1.50%、做空 S RN_ARM 0.80%）→ 同時設 SL＝距離現價 −0.20%、
+      TP＝距離現價 +0.30%（v18.3 RN_TP_FIRST）。
+    之後：SL＝距離現價 −0.20%（每秒最多 1 次）、TP＝距離現價 +0.20%（v18.3：每秒最多 2 次），都只往獲利方向移動。
     做空方向相反（SL＝現價 +0.20%、TP＝現價 −0.20%）。SL 至少離現價 0.20%（往外取 tick）；SL 最低 +0.20%（保本，RN_SL_MIN）；
     SL 至少離現價 1 跳（保本價離現價不到 1 跳＝這次不設／不動）。
     以前（v9.0～v18.0.1）：SL＝最高毛利率 −0.20%、TP＝最高毛利率 +0.10%（照最高，不是照現價）。"""
@@ -1153,7 +1156,7 @@ def rn_rule(T, p, px, now, arm=None):
     if cur_sl is None and hi <= arm:
         return
     better = lambda a, b: (a > b) if isL else (a < b)      # a 比 b 更往獲利方向
-    ds, dt = RN_SL_DIST / 100, RN_TP_DIST / 100
+    ds, dt = RN_SL_DIST / 100, (RN_TP_FIRST if cur_tp is None else RN_TP_DIST) / 100   # v18.3：第一次設 TP +0.30%、移動 +0.20%
     if isL:
         sl_px, tp_px = align(px * (1 - ds), tick, "L"), align(px * (1 + dt), tick, "S")
     else:
@@ -1257,7 +1260,7 @@ SP_FEE_IN  = Decimal("0.08")   # 現貨 maker（限價買進）0.08%
 SP_FEE_OUT = Decimal("0.10")   # 現貨 taker（市價賣出）0.10%
 GD_DIRS    = "LSUD"           # v16.0（1111 2026-10-19）：L、S、U、D；v18.0：D＝原點下面的合約做多 D01～D33
 # v18.0（1111 2026-10-20 Excel＋畫面）：新策略
-#   現貨 L01～L33、U01～U33＝原點 ±1.5% 起每 3%（GD_SP_OFF）；L00＝原點；全部在下 /runt 的帳戶。
+#   現貨 L01～L33＝原點 −1.5% 起每 3%（GD_SP_OFF）、U01～U33＝原點 +3% 起每 3%（v18.3，跟 S 同價）；L00＝原點；全部在下 /runt 的帳戶。
 #   合約 S01～S33（做空，原點 +3%…+99%）、D01～D33（做多，原點 −3%…−99%）：每 11 層一個帳戶（GD_XACCT）：
 #     o1111o S01～S11＋D01～D11、o2222o S12～S22＋D12～D22、o3333o S23～S33＋D23～D33（雙向持倉＋逐倉：空單、多單各自一個倉位）。
 #   槓桿：每個帳戶第一層（S01、S12、S23、D01、D12、D23）1.5X（GD_ALEV），後面每一層拉到「跟第一層同一個強平價」的最大倍數
@@ -1272,7 +1275,7 @@ GD_XACCT   = GD_SETS[GD_MAIN]                      # 這一套：合約第 1～1
 GD_LIQ_IND = " " * 9                               # v18.2 開始通知 強平 第 2、3 行前面的空白（對齊 🈴S 後面的帳戶）
 GD_BLK     = 11                                    # v18.0：一個帳戶 11 層
 GD_ALEV    = Decimal("1.5")                        # v18.0：每個帳戶第一層的槓桿
-GD_SP_OFF  = Decimal("1.5")                        # v18.0：現貨 L/U 第 k 層＝原點 ±(3k−1.5)%（L01、U01 離原點 1.5%）
+GD_SP_OFF  = Decimal("1.5")                        # v18.0：現貨 L 第 k 層＝原點 −(3k−1.5)%（L01 −1.5%）；v18.3 U 改成 +3k%（U01 +3%，跟 S 同價）
 GD_LCAP    = Decimal("20")     # v15.6：合約每一層槓桿最高 20X（1111 統一）
 # v17.0（1111 2026-10-19）：/runt 照 OKX 實盤規則模擬（/run 將來用同一套，差別只在成交、出場、損益查 OKX）：
 #   數量照 OKX 單位往下取（現貨數量單位、合約張數；空單保證金照樣每層U，取整只少倉位）；下的時候檢查擋下來＋建議；
@@ -1411,9 +1414,9 @@ def gd_skd(s):
     return "sp" if s == "sp" else "sw"
 
 def gd_off(kd, k):
-    """v18.0：第 k 格離原點幾 %：現貨 L/U＝±(3k−1.5)%（L00＝0）；合約 S/D＝±3k%。"""
-    if kd == "sp" and k:
-        return (GD_STEP * abs(k) - GD_SP_OFF) * (1 if k > 0 else -1)
+    """第 k 格離原點幾 %：現貨 L＝−(3k−1.5)%（v18.0，L00＝0）、v18.3 現貨 U＝+3k%（跟 S 同價）；合約 S/D＝±3k%。"""
+    if kd == "sp" and k < 0:
+        return -(GD_STEP * abs(k) - GD_SP_OFF)
     return GD_STEP * k
 
 
@@ -1998,7 +2001,7 @@ def gd_start_lines(G, mpx, now, info=None):
     L += ["", "以原點為軸心計算級距"]
     for x in "LU":
         if G["has"][x]:
-            L.append(f"{GD_MK['sp']}{x}01～{x}{GD_N:02d}({pct(GD_SP_OFF)}%起每{pct(GD_STEP)}%)")
+            L.append(f"{GD_MK['sp']}{x}01～{x}{GD_N:02d}(" + (f"{pct(GD_SP_OFF)}%起" if x == "L" else "") + f"每{pct(GD_STEP)}%)")   # v18.3：U 每3%
     o = (G.get("org") or G.get("o00"))["px"]               # 槓桿照原點算（有 L＝L00 的價格，成交＝原點）
     for x, nm in (("S", "做空"), ("D", "做多")):
         if G["has"][x]:
@@ -2247,6 +2250,21 @@ def gd_tot_lines(pre, n, gu, fe, fu, u, mark=False):
     L.append(f"{pre}淨損益 {us[-1]}|均單{av[1]}" + (E.pnl_emoji(rn_q4(u)) if mark else ""))
     return L
 
+def gd_why_lines(recs):
+    """v18.3（1111 2026-10-21 畫面）/summary 總表 出場原因：設定SL 27|L層 12|S層 2|U層 1|D層 10（設定TP、移動SL、移動TP 各一行；
+    強平、強制平倉…有才多一行，同樣格式）；同一欄的數字對齊。"""
+    tp = lambda r: r.get("why") == "TP"
+    kinds = [("設定SL", lambda r: r.get("why") == "SL"), ("設定TP", lambda r: tp(r) and not int(r.get("n_tp") or 0)),
+             ("移動SL", lambda r: r.get("why") == "SL(移動)"), ("移動TP", lambda r: tp(r) and int(r.get("n_tp") or 0) > 0)]
+    other = sorted({r.get("why") for r in recs if r.get("why") and r.get("why") not in ("SL", "SL(移動)", "TP")}, key=lambda w: (w != "強平", w))
+    kinds += [(w, (lambda w: lambda r: r.get("why") == w)(w)) for w in other]
+    rows = []
+    for nm, f in kinds:
+        rs = [r for r in recs if f(r)]
+        rows.append((nm, [len(rs)] + [sum(1 for r in rs if (r.get("nm") or "?")[0] == x) for x in "LSUD"]))
+    cols = [rn_pad([str(v[i]) for _, v in rows]) for i in range(5)]
+    return [f"{nm} {cols[0][j]}|" + "|".join(f"{x}層 {cols[i + 1][j]}" for i, x in enumerate("LSUD")) for j, (nm, _) in enumerate(rows)]
+
 def gd_sum_msgs(d, full=False):
     """⑤ /summary（模擬 /runt 網格；1111 2026-10-17 畫面）：第一則總表、第二則分幣種（太長照分隔線分頁）。
     最🈵金額＝今天同一時間最多佔用的錢（現貨每層U、空單每層保證金U）；持倉金額＝現在還抱著的單×每層U。
@@ -2290,18 +2308,7 @@ def gd_sum_msgs(d, full=False):
     n = len(recs)
     L = head + ["", f"本日總計 {n}單⭐️"]
     if recs:
-        c = lambda f: sum(1 for r in recs if f(r))
-        tp = lambda r: r.get("why") == "TP"
-        L += ["出場原因",
-              f"設定SL {c(lambda r: r.get('why') == 'SL')} | 設定TP {c(lambda r: tp(r) and not int(r.get('n_tp') or 0))}",
-              f"移動SL {c(lambda r: r.get('why') == 'SL(移動)')} | 移動TP {c(lambda r: tp(r) and int(r.get('n_tp') or 0) > 0)}"]
-        other = {}
-        for r in recs:
-            w = r.get("why")
-            if w and w not in ("SL", "SL(移動)", "TP"):
-                other[w] = other.get(w, 0) + 1
-        if other:
-            L.append(" | ".join(f"{w} {other[w]}" for w in sorted(other, key=lambda w: (w != "強平", w))))
+        L += ["出場原因"] + gd_why_lines(recs)                 # v18.3（1111 2026-10-21 畫面）：每一種原因一行，後面分 L、S、U、D 層
     sm = lambda rs, k: sum((gd_rD(r, k) for r in rs), Decimal(0))
     fees = lambda rs: sum((gd_rfee(r) for r in rs), Decimal(0))
     L += ["", f"最{GD_FULL}金額 {pct(peak())}U|{len(syms)}幣種",
@@ -2388,7 +2395,7 @@ GD_SNAP = ("sl", "tp", "sl_g", "tp_g", "pend", "t_arm", "arm_px", "n_mv", "n_tp"
 def gd_rules(G, now):
     """v17.0：每一單的 SL/TP（rn_rule），照 OKX 條件單額度：每 2 秒 20 次（GD_AMEND_N），一份額度＝同一個帳戶＋同一個商品：
     v18.1：sp＝這個帳戶的現貨（L、U）一份；合約＝那個帳戶這個幣的永續一份（S、D 一起）；第一次設、移動都算一次。
-    第一次設的門檻：現貨 GD_SP_ARM 1.40%、合約 RN_ARM 0.80%。
+    第一次設的門檻（v18.3）：做多（L、U、D）GD_LONG_ARM 1.50%、做空（S）RN_ARM 0.80%。
     同一份額度這一拍要改的超過了 → 離現價最近的（SL 離現價最近；還沒設 SL 的看進場價）先改，其他這一拍不動、下一拍再算。"""
     by = {}
     for p in G["pos"]:
@@ -2403,7 +2410,7 @@ def gd_rules(G, now):
         for p, px in ps:
             snap = {k: p.get(k) for k in GD_SNAP}
             pend0 = p["pend"]
-            rn_rule(G[p["kind"]], p, px, now, GD_SP_ARM if p["kind"] == "sp" else RN_ARM)
+            rn_rule(G[p["kind"]], p, px, now, GD_LONG_ARM if p["side"] == "L" else RN_ARM)
             if p["pend"] is not None and p["pend"] is not pend0:   # 這一拍要送一次（設 SL/TP 或移動）
                 if len(q) >= GD_AMEND_N:
                     p.update(snap)                         # 額度用完：這一拍不改
@@ -3145,7 +3152,7 @@ GD_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"
           f" U＝💰現貨 U01～U{GD_N:02d}(原點上面)\n"
           + (f" S＝🈴做空 S01～S{GD_N:02d}(原點上面)\n"
              f" D＝🈴做多 D01～D{GD_N:02d}(原點下面)\n" if _GM else "")
-          + f"現貨離原點 {pct(GD_SP_OFF)}% 起每 {pct(GD_STEP)}%\n"
+          + f"現貨 L 離原點 {pct(GD_SP_OFF)}% 起每 {pct(GD_STEP)}%、U 每 {pct(GD_STEP)}%(跟 S 同價)\n"
           + (f"合約每 {pct(GD_STEP)}%,每 {GD_BLK} 層一個帳戶({'、'.join(GD_XACCT)}),每個帳戶第一層 {pct(GD_ALEV)}X、後面同一個強平價(槓桿不用打)\n"
              if _GM else f"做空、做多合約只能在 {GD_MAIN}下\n")
           + "同一個幣種一組(幣種數量不限)\n"
@@ -3711,12 +3718,12 @@ async def cmd_amp(u, c):
 
 async def cmd_menu(u, c):
     """/menu 說明。v17.0（1111 2026-10-19）：舊 /run、/stop、接續帳戶拿掉；/runt 照實盤規則。v18.0：新策略。"""
-    arm = f"最高毛利率 >💰現貨{GD_SP_ARM:.2f}%／🈴合約{RN_ARM:.2f}% 第一次設 SL/TP："
+    arm = f"最高毛利率 >做多(L、U、D){GD_LONG_ARM:.2f}%／做空(S){RN_ARM:.2f}% 第一次設 SL/TP："
     await reply(u, f"{E.BOT} OKX原K｜{ACCT} {VERSION}\n使用說明\n━━━━━━━━━━\n"
         "/status 所有 /runt（模擬網格）現況；最上面 資金(模擬)＝每個帳戶 可用|佔用\n"
         "/summary 本日戰報（總表＋分幣種）；每天 00:00 自動發前一天的\n"
         "/runt 幣種 方向 每層U 埋伏點%（模擬，不下單）：固定原點隱形網格＝💰現貨做多＋🈴合約做空、做多\n"
-        f"　方向：L、S、U、D 任意組合。L＝💰現貨 L00～L{GD_N:02d}（原點和原點下面）、U＝💰現貨 U01～U{GD_N:02d}（原點上面），離原點 {pct(GD_SP_OFF)}% 起每 {pct(GD_STEP)}%；"
+        f"　方向：L、S、U、D 任意組合。L＝💰現貨 L00～L{GD_N:02d}（原點和原點下面）、U＝💰現貨 U01～U{GD_N:02d}（原點上面）；L 離原點 {pct(GD_SP_OFF)}% 起每 {pct(GD_STEP)}%、U 每 {pct(GD_STEP)}%（跟 S 同價）；"
         f"S＝🈴做空 S01～S{GD_N:02d}（原點上面）、D＝🈴做多 D01～D{GD_N:02d}（原點下面），每 {pct(GD_STEP)}%；超過 ±{pct(GD_N * GD_STEP)}% 不掛\n"
         f"　v18.0 合約每 {GD_BLK} 層一個帳戶：{GD_XACCT[0]} S01～S11、D01～D11｜{GD_XACCT[1]} S12～S22、D12～D22｜{GD_XACCT[2]} S23～S33、D23～D33"
         "（雙向持倉＋逐倉：空單、多單各自一個倉位，每個帳戶的 S、D 各自 11 單一起強平）；"
@@ -3725,8 +3732,9 @@ async def cmd_menu(u, c):
         f"S、D 只能在 {'、'.join(GD_SETS)} 下；其他帳戶只能 L、U（現貨在自己的帳戶）\n"
         "　原點：有 L＝現價下方埋伏點% 掛 💰L00 現貨買，成交價＝🩵原點；沒有 L＝/runt 那一刻的現價直接當原點。原點到 /stoprunt 都不動\n"
         "　掛單：一組最多 3 張：現價下面最近一格（沒有持倉的）💰現貨買、🈴做多；現價上面最近一格 🈴做空；跟著價格換格；一律限價（post-only）\n"
-        f"　出場：每一層各自：{arm}SL＝距離現價−{RN_SL_DIST:.2f}%、TP＝距離現價+{RN_TP_DIST:.2f}%（做空相反），"
-        f"之後都只往獲利方向移動（SL 每秒 {round(1 / RN_SL_STEP)} 次、TP 每秒 {round(1 / RN_TP_STEP)} 次；SL 最低 +{RN_SL_MIN:.2f}%），碰到＝市價出場；現貨只賣那一層\n"
+        f"　出場：每一層各自：{arm}SL＝距離現價−{RN_SL_DIST:.2f}%、TP＝距離現價+{RN_TP_FIRST:.2f}%（做空相反）；"
+        f"之後 SL＝現價−{RN_SL_DIST:.2f}%（每秒 {round(1 / RN_SL_STEP)} 次）、TP＝現價+{RN_TP_DIST:.2f}%（每秒 {round(1 / RN_TP_STEP)} 次），都只往獲利方向移動；"
+        f"SL 最低 +{RN_SL_MIN:.2f}%；碰到＝市價出場；現貨只賣那一層\n"
         "　每層U：現貨每層買 U、合約每層保證金 U\n"
         "　照實盤規則：數量照 OKX 單位往下取（合約保證金照樣每層U）；下的時候檢查 帳戶模式、雙向持倉、那個幣三個帳戶都沒有合約持倉／掛單、這個帳戶沒有現貨、"
         "每一邊的第一層下不下得了、可用夠不夠，不過就擋並告訴你怎麼改（後面每層U 不夠的層＝自動用那一層的最低金額，不擋）；"
