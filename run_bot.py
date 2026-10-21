@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.4.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1960,10 +1960,17 @@ def gd_avg_line(G, kd, ps, px, full=True, pc=True, grp=None, b=None):
 
 def gd_rows(G, ps, pxs, cum=True, liq=False):
     """持倉列：L11 時:分:秒|這一單的%|這一格的淨利率%（cum＝False：只到這一單的%）；兩欄各自對齊。
-    v18.4（1111 2026-10-21 畫面）liq＝/status：合約那幾行後面多 |🔴62.61%＝距離強平（S 現價再漲幾 %、D 再跌幾 %；同一個帳戶同一邊數字一樣）。"""
+    v18.4（1111 2026-10-21 畫面）liq＝/status：S 做空後面多 |🔴61.07%＝距離強平（現價再漲幾 %）。
+    v18.4.1（1111 2026-10-21）：每個帳戶 11 單在第一層的強平價一起強平 → 只寫在那個帳戶抱著的第一層（S01、S12、S23；
+      第一層出場了＝那個帳戶抱著的最低一層）；D 做多不寫（1111：不太可能被強平）。"""
     a = rn_pad([rn_sp(gd_own(p, pxs[p["kind"]])) if pxs.get(p["kind"]) is not None else "查價中" for p in ps])
     b = rn_pad([rn_sp(gd_cum(G, gd_nm(p["kind"], p["k"]))) for p in ps])
-    d = [gd_liq_dist(G, p, pxs.get("sw")) if liq and p["kind"] == "sw" else None for p in ps]
+    first = {}
+    for p in ps:
+        if p["kind"] == "sw" and p["side"] == "S":
+            first[gd_blk(p["k"])] = min(first.get(gd_blk(p["k"]), p["k"]), p["k"])
+    d = [gd_liq_dist(G, p, pxs.get("sw")) if liq and p["kind"] == "sw" and p["side"] == "S" and first.get(gd_blk(p["k"])) == p["k"] else None
+         for p in ps]
     c = iter(rn_pad([x for x in d if x is not None]))
     d = [next(c) if x is not None else None for x in d]
     return [f"{gd_nm(p['kind'], p['k'])} {gd_hms(p['t_in'])}|{x}" + (f"|{y}" if cum else "") + (f"|🔴{z}" if z else "")
