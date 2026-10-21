@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1499,8 +1499,14 @@ def gd_need(G, kd, k, lp):
     return z["q"] * lp if kd == "sp" else z["amt"]
 
 def gd_pamt(G, p):
-    """v17.0.3：這一單的金額（損益 %、強平、佔用用）：自動調高的層＝那一層的最低金額，其他＝每層U。"""
-    return p.get("amt") or G["amt"]
+    """v17.0.3：這一單的金額（損益 %、強平、佔用用）：自動調高的層＝那一層的最低金額，其他＝每層U。
+    v18.4：每層U 可以中途改 → 用這一單進場時的每層U（p["lu"]），舊的單照原本的金額。"""
+    return p.get("amt") or gd_lu(G, p)
+
+
+def gd_lu(G, p):
+    """v18.4：這一單進場時的每層U（中途改每層U 之前進場的單照原本的；沒記的＝現在的每層U）。"""
+    return p.get("lu") or G["amt"]
 
 def gd_qs(v, lot, extra=0):
     """數量的寫法：照數量單位的小數位數（extra＝多幾位，零頭、手續費用），往下取。"""
@@ -1525,14 +1531,14 @@ def gd_head(G):
     return f"{G['sym']} {G['dir']} {gd_prm(G)}"
 
 def gd_prm(G, p=None):
-    """每層U；p＝合約那一層 → 前面加那一層自己的槓桿（進場、出場通知的標題，例 S07 2.38X 5U、D12 1.5X 5U）。"""
+    """每層U；p＝那一單 → 用那一單自己的每層U（v18.4），合約前面加那一層自己的槓桿（例 S07 2.38X 5U、D12 1.5X 5U）。"""
     if p is not None and p["kind"] == "sw":
-        return f"{pct(p['lev'])}X {pct(G['amt'])}U"
-    return f"{pct(G['amt'])}U"
+        return f"{pct(p['lev'])}X {pct(gd_lu(G, p))}U"
+    return f"{pct(gd_lu(G, p) if p is not None else G['amt'])}U"
 
 def gd_bprm(G, p):
     """v17.0.7 出場通知「本單」那一行：合約＝槓桿X 金額U、現貨＝金額U；自動用最低金額的層寫那一層實際的金額（損益 % 的分母）。"""
-    a = pct(G["amt"]) if not p.get("up") else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
+    a = pct(gd_lu(G, p)) if not p.get("up") else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
     return (f"{pct(p['lev'])}X " if p["kind"] == "sw" else "") + f"{a}U"
 
 def gd_cap(G):
@@ -1618,6 +1624,7 @@ def gd_pos(G, kd, k, ent, t, px_hit, t_ord):
          "sl": None, "tp": None, "sl_g": None, "tp_g": None, "pend": None,
          "t_arm": None, "arm_px": None, "n_mv": 0, "n_tp": 0, "hi": None, "tp_t": 0.0, "sl_t": 0.0, "fu": Decimal(0), "fn": 0,
          "mfe": max(g0, Decimal(0)), "mae": min(g0, Decimal(0)), "told": False, "out": None}
+    p["lu"] = G["amt"]                                     # v18.4：這一單進場時的每層U（之後改每層U 不影響這一單）
     if z["up"]:
         p["amt"], p["up"] = z["amt"], True                 # v17.0.3：這一單的金額＝最低金額
     if kd == "sp":
@@ -1640,7 +1647,7 @@ def gd_liq(G, grp, b):
     c = G["glc"].get((grp, b))
     if not c or c[0] != sig:
         T = {"amt": G["amt"], "xx": 0, "mmr": G.get("mmr"), "tick": G["sw"]["tick"]}   # 槓桿用每一單自己的（p["lev"]）
-        c = G["glc"][(grp, b)] = (sig, rn_gliq(T, "S" if grp == "S" else "L", ps))
+        c = G["glc"][(grp, b)] = (sig, rn_gliq(T, "S" if grp == "S" else "L", [dict(p, amt=gd_pamt(G, p)) for p in ps]))   # v18.4：每一單自己的保證金
     return c[1]
 
 def gd_xpx(px, lvl):
@@ -1951,17 +1958,40 @@ def gd_avg_line(G, kd, ps, px, full=True, pc=True, grp=None, b=None):
     mk = GD_MK[kd] + ("" if kd == "sp" else ("空單" if ps[0]["side"] == "S" else "多單"))   # v18.0（1111 畫面）
     return [s + (mk if full else "")]
 
-def gd_rows(G, ps, pxs, cum=True):
-    """持倉列：L11 時:分:秒|這一單的%|這一格的淨利率%（cum＝False：只到這一單的%）；兩欄各自對齊。"""
+def gd_rows(G, ps, pxs, cum=True, liq=False):
+    """持倉列：L11 時:分:秒|這一單的%|這一格的淨利率%（cum＝False：只到這一單的%）；兩欄各自對齊。
+    v18.4（1111 2026-10-21 畫面）liq＝/status：合約那幾行後面多 |🔴62.61%＝距離強平（S 現價再漲幾 %、D 再跌幾 %；同一個帳戶同一邊數字一樣）。"""
     a = rn_pad([rn_sp(gd_own(p, pxs[p["kind"]])) if pxs.get(p["kind"]) is not None else "查價中" for p in ps])
     b = rn_pad([rn_sp(gd_cum(G, gd_nm(p["kind"], p["k"]))) for p in ps])
-    return [f"{gd_nm(p['kind'], p['k'])} {gd_hms(p['t_in'])}|{x}" + (f"|{y}" if cum else "") for p, x, y in zip(ps, a, b)]
+    d = [gd_liq_dist(G, p, pxs.get("sw")) if liq and p["kind"] == "sw" else None for p in ps]
+    c = iter(rn_pad([x for x in d if x is not None]))
+    d = [next(c) if x is not None else None for x in d]
+    return [f"{gd_nm(p['kind'], p['k'])} {gd_hms(p['t_in'])}|{x}" + (f"|{y}" if cum else "") + (f"|🔴{z}" if z else "")
+            for p, x, y, z in zip(ps, a, b, d)]
+
+
+def gd_liq_dist(G, p, px):
+    """v18.4：這一單那個倉位（帳戶×S/D）的預估強平價離現價幾 %（S＝要再漲、D＝要再跌），62.61%。"""
+    lq = gd_liq(G, gd_grp(p), gd_blk(p["k"]))
+    if lq is None or not px:
+        return None
+    v = (lq / px - 1) * 100 if p["side"] == "S" else (1 - lq / px) * 100
+    return f"{max(v, Decimal(0)):.2f}%"
 
 def gd_agg_add(G, nm, m):
     a = G["agg"].setdefault(nm, {"n": 0, "net": Decimal(0), "gu": Decimal(0), "feeu": Decimal(0), "fu": Decimal(0),
-                                 "u": Decimal(0), "fn": 0})
+                                 "u": Decimal(0), "fn": 0, "gp": Decimal(0), "fp": Decimal(0), "fdp": Decimal(0)})
     a["n"] += 1
     a["net"] += m["net"]; a["gu"] += m["gu"]; a["feeu"] += m["feeu"]; a["fu"] += m["fu"]; a["u"] += m["netu"]; a["fn"] += m["fn"]
+    a["gp"] = a.get("gp", Decimal(0)) + m["g"]; a["fp"] = a.get("fp", Decimal(0)) + m["fee"]   # v18.4：每一單的 毛損益%、手續費%、資金費% 相加
+    a["fdp"] = a.get("fdp", Decimal(0)) + m["fund"]
+
+
+def gd_agg_pc(G, amt):
+    """v18.4：沒有記 毛損益%、手續費%、資金費% 的格子（v18.4 以前的）＝用那時候的每層U 補上。"""
+    for a in G["agg"].values():
+        if "gp" not in a:
+            a["gp"], a["fp"], a["fdp"] = rn_q2(a["gu"] / amt * 100), rn_q2(a["feeu"] / amt * 100), rn_q2(a["fu"] / amt * 100)
 
 def gd_cells(names, cnt, pc):
     """每一格一行：S11 3單+2.70%（單數＋淨利率%，不空格；整格對齊）。"""
@@ -2062,14 +2092,14 @@ def gd_fill_qty(G, p):
     if p["kind"] == "sp":
         got = p.get("got")
         got = p["qty"] if got is None else got
-        up = [f"{GD_IND}(每層{pct(G['amt'])}U 不夠,自動用最低金額)"] if p.get("up") else []   # v17.0.3
+        up = [f"{GD_IND}(每層{pct(gd_lu(G, p))}U 不夠,自動用最低金額)"] if p.get("up") else []   # v17.0.3
         return [f"{GD_IND}買{gd_qs(p['qty'], lot)}顆|{rn_q4(p['qty'] * p['ent'])}U",
                 f"{GD_IND}手續費{gd_qs(p['qty'] - got, lot, 2)}顆|實得{gd_qs(got, lot, 2)}顆"] + up
     ct = p.get("ct")
     ct = p["qty"] / (x.get("ctval") or 1) if ct is None else ct
-    mg = pct(G["amt"]) if not p.get("up") else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
+    mg = pct(gd_lu(G, p)) if not p.get("up") else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
     return ([f"{GD_IND}{pct(ct)}張({pct(p['qty'])}{G['sym'][:-4]})|倉位{(p['qty'] * p['ent']).quantize(Decimal('0.01'))}U|保證金{mg}U"]
-            + ([f"{GD_IND}(每層{pct(G['amt'])}U 不夠,自動用最低金額)"] if p.get("up") else []))
+            + ([f"{GD_IND}(每層{pct(gd_lu(G, p))}U 不夠,自動用最低金額)"] if p.get("up") else []))
 
 def gd_acc_lines(G, pxs):
     """出場通知的累計（從 /runt 開始）：每一格（S → U → L，各自價格由高到低）→ 毛損益／手續費／(資金費)／淨損益 → 持倉損益。
@@ -2082,8 +2112,13 @@ def gd_acc_lines(G, pxs):
     fu = sum((A[k]["fu"] for k in ks), Decimal(0))
     u = sum((A[k]["u"] for k in ks), Decimal(0))
     amt = G["amt"]
-    rows = ([("毛損益", rn_q2(gu / amt * 100), gu), ("手續費", -rn_q2(fe / amt * 100), -fe)]
-            + ([("資金費", rn_q2(fu / amt * 100), fu)] if rn_q4(fu) != 0 else []) + [("淨損益", gd_all_net(G), u)])
+    if G.get("mix"):                                       # v18.4：中途改過每層U → % ＝每一單的 % 相加（每一單照自己的金額）
+        P = lambda k: sum((A[x].get(k, Decimal(0)) for x in ks), Decimal(0))
+        pg, pf, pd = P("gp"), P("fp"), P("fdp")
+    else:
+        pg, pf, pd = rn_q2(gu / amt * 100), rn_q2(fe / amt * 100), rn_q2(fu / amt * 100)
+    rows = ([("毛損益", pg, gu), ("手續費", -pf, -fe)]
+            + ([("資金費", pd, fu)] if rn_q4(fu) != 0 else []) + [("淨損益", gd_all_net(G), u)])
     x = rn_pad([rn_sp(r[1]) for r in rows])
     y = rn_pad([rn_su(r[2]) for r in rows])
     cs = rn_pad([f"{A[k]['n']}單{rn_sp(A[k]['net'])}" for k in ks])
@@ -2130,7 +2165,7 @@ def gd_liq_lines(G, items):
     x = "S" if k0 > 0 else "D"
     ns = sorted(abs(p["k"]) for p, _ in items)
     rng = f"{x}{ns[0]:02d}" + (f"～{x}{ns[-1]:02d}" if len(ns) > 1 else "")
-    L = [f"💥強平 {G['sym']} {rng} {gd_prm(G)}{GD_MK['sw']}{gd_atag('sw', k0)}", "",
+    L = [f"💥強平 {G['sym']} {rng} {pct(gd_lu(G, items[0][0]))}U{GD_MK['sw']}{gd_atag('sw', k0)}", "",
          f"強平 {rn_mdt(t)}|{gd_q(G, 'sw', px)}", ""]
     a = rn_pad([rn_sp(m["net"]) for _, m in items])
     b = rn_pad([rn_su(m["netu"]) for _, m in items])
@@ -2161,7 +2196,7 @@ def gd_status_lines(G, now):
     if G.get("o00"):
         rows.append((G["o00"]["px"], 1, "ord", ("sp", 0, G["o00"])))
     rows.sort(key=lambda r: (-r[0], r[1]))
-    prow = iter(gd_rows(G, [r[3] for r in rows if r[2] == "pos"], pxs))
+    prow = iter(gd_rows(G, [r[3] for r in rows if r[2] == "pos"], pxs, liq=True))   # v18.4：合約後面寫距離強平
     mpx = pxs.get(gd_okd(G))
     cur = f"現價 {gd_hms(now)}|{gd_q(G, gd_okd(G), mpx)}🛜" if mpx is not None else "現價 查價中"
     done = mpx is None
@@ -2499,7 +2534,7 @@ def gd_dump(G):
                 "arm_px": s(p["arm_px"]), "n_mv": p["n_mv"], "n_tp": p.get("n_tp", 0), "hi": s(p["hi"]), "tp_t": p.get("tp_t", 0.0), "sl_t": p.get("sl_t", 0.0),
                 "mfe": str(p["mfe"]), "mae": str(p["mae"]), "fu": str(p.get("fu", 0)), "fn": p.get("fn", 0),
                 "ct": s(p.get("ct")), "got": s(p.get("got")),                            # v17.0：張數、現貨實得顆數
-                "amt": s(p.get("amt")), "up": bool(p.get("up"))}                         # v17.0.3：自動調高的層
+                "amt": s(p.get("amt")), "up": bool(p.get("up")), "lu": s(p.get("lu"))}   # v17.0.3：自動調高的層；v18.4：進場時的每層U
     O = lambda o: None if not o else {"k": o.get("k", 0), "px": str(o["px"]), "t": o["t"]}
     return {"v": 180, "sym": G["sym"], "dir": G["dir"], "amt": str(G["amt"]), "off": str(G["off"]),   # v18.0
             "fee": {g: [str(a), str(b)] for g, (a, b) in (G.get("fee") or {}).items()},   # v17.0：帳戶費率
@@ -2507,7 +2542,7 @@ def gd_dump(G):
             "org": {"px": str(G["org"]["px"]), "t": G["org"]["t"]} if G.get("org") else None, "o00": O(G.get("o00")),
             "ord": {kd: O(o) for kd, o in G["ord"].items()}, "pos": [P(p) for p in G["pos"] if not p["out"]],
             "agg": {nm: {k: (v if isinstance(v, int) else str(v)) for k, v in a.items()} for nm, a in G["agg"].items()},
-            "fund_last": G["sw"]["fund"]["last"] if G.get("sw") else None}
+            "fund_last": G["sw"]["fund"]["last"] if G.get("sw") else None, "mix": bool(G.get("mix"))}   # v18.4：改過每層U
 
 def gd_save():
     GD_SAVE["dirty"], GD_SAVE["t"] = False, time.time()
@@ -2573,11 +2608,14 @@ async def gd_rec_one(app, d, names):
                          "t_arm": y.get("t_arm"), "arm_px": D(y.get("arm_px")), "n_mv": int(y.get("n_mv", 0)), "n_tp": int(y.get("n_tp", 0)),
                          "hi": D(y.get("hi")), "tp_t": float(y.get("tp_t") or 0.0), "sl_t": float(y.get("sl_t") or 0.0), "mfe": Decimal(y.get("mfe", "0")),
                          "mae": Decimal(y.get("mae", "0")), "fu": Decimal(y.get("fu", "0")), "fn": int(y.get("fn", 0)),
-                         "ct": D(y.get("ct")), "got": D(y.get("got")), "amt": D(y.get("amt")), "up": bool(y.get("up")),
+                         "ct": D(y.get("ct")), "got": D(y.get("got")), "amt": D(y.get("amt")), "up": bool(y.get("up")), "lu": D(y.get("lu")),
                          "told": True, "out": None})
     G["fee"] = {g: (Decimal(a), Decimal(b)) for g, (a, b) in (d.get("fee") or {}).items()} or None   # v17.0
     for nm, a in (d.get("agg") or {}).items():
         G["agg"][nm] = {k: (v if isinstance(v, int) else Decimal(v)) for k, v in a.items()}
+    G["mix"] = bool(d.get("mix"))
+    if not G["mix"]:
+        gd_agg_pc(G, G["amt"])                             # v18.4：以前的格子補上 %（那時候每層U 都一樣）
     gd_start(app, G)
     n = len(gd_held(G))
     m = sum(1 for o in G["ord"].values() if o) + (1 if G.get("o00") else 0)
@@ -3156,6 +3194,7 @@ GD_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"
           + (f"合約每 {pct(GD_STEP)}%,每 {GD_BLK} 層一個帳戶({'、'.join(GD_XACCT)}),每個帳戶第一層 {pct(GD_ALEV)}X、後面同一個強平價(槓桿不用打)\n"
              if _GM else f"做空、做多合約只能在 {GD_MAIN}下\n")
           + "同一個幣種一組(幣種數量不限)\n"
+          "進行中的幣改每層U:幣種 每層U(例 SUIUSDT 3U)\n"
           "每層U 要加 U,埋伏點要加 %")
 GD_HINT = "SUIUSDT LSUD 5U 0.1%" if _GM else "SUIUSDT LU 5U 0.1%"
 GD_RETRY = f"請重新輸入 /runt 參數:\n幣種 方向 每層U 埋伏點%\n例:{GD_HINT}"
@@ -3204,14 +3243,24 @@ async def cmd_runt(u, c):
     if not a:
         await ask(u, "runt", cmd_runt, "\n".join([GD_ASK, RT_SEP] + gd_running() + [ASK_CANCEL]), GD_HINT); return
     retry = lambda msg: ask(u, "runt", cmd_runt, f"{msg}\n{GD_RETRY}", GD_HINT)
+    if len(a) == 2:                                        # v18.4（1111 2026-10-21）：/runt 幣種 每層U＝進行中的幣改每層U
+        sym = a[0].strip().upper()
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)[uU]", a[1].strip())
+        if not m:
+            await retry(f"{E.WARN} 改每層U 要打:幣種 每層U(例 {sym} 3U)"); return
+        if sym not in GD:
+            await retry(f"{E.WARN} {sym} 沒有在跑 runt,不能改每層U\n要開始請打 4 個參數:幣種 方向 每層U 埋伏點%"); return
+        await gd_amt_change(u, GD[sym], Decimal(m.group(1)), retry); return
     p, err = gd_parse(a)
     if err:
         await retry(f"{E.WARN} {err}"); return
     if ACCT != GD_MAIN and set(p["dir"]) & {"S", "D"}:    # v18.0（1111 2026-10-20）：其他帳戶只能下現貨
         await retry("\n".join(gd_xonly_lines(p))); return
     sym = p["sym"]
-    if sym in GD:
-        await retry(f"{E.WARN} {sym} 已經在跑 runt\n要換請先 /stoprunt {sym}"); return
+    if sym in GD:                                          # v18.4（1111 2026-10-21 畫面）
+        H = GD[sym]
+        await retry("\n".join([f"{E.WARN} {sym} 進行中 runt({H['dir']} {pct(H['amt'])}U)", f"要改每層U:/runt {sym} {pct(p['amt'])}U",
+                                "要換方向/埋伏點", f"請先/stoprunt {sym}", "再重新 /runt"])); return
     has = {x: x in p["dir"] for x in GD_DIRS}
     await gd_spec_fresh(has)                               # v17.0：開始時重查 OKX 規格
     try:
@@ -3264,6 +3313,67 @@ def gd_stop_one(G, now):
     gd_ws_drop(G)
     print(f"[grid] 停止 {gd_head(G)}")
     return L
+
+async def gd_amt_change(u, G, amt, retry):
+    """v18.4（1111 2026-10-21 畫面）：/runt 幣種 每層U（進行中的幣）＝改每層U：原點、格子、槓桿、強平價都不動；
+    抱著的單照原本的金額（p["lu"]，SL/TP、損益照舊）；掛單撤掉換成新的金額（照實盤：先撤再掛，gd_hang 下一拍掛新的）；之後新掛的單都用新的。
+    新的金額連第一層都下不了＝擋（跟開始時一樣）。累計的 % 之後改成每一單的 % 相加（G["mix"]）。"""
+    sym, old = G["sym"], G["amt"]
+    if amt <= 0:
+        await retry(f"{E.WARN} 每層U 須大於 0"); return
+    if amt == old:
+        await retry(f"{E.WARN} {sym} 每層U 已經是 {pct(old)}U"); return
+    o = (G.get("org") or G.get("o00") or {}).get("px")
+    if o is None:
+        await retry(f"{E.WARN} {sym} 還沒有原點,稍後再改"); return
+    first = [x for x in G["dir"] if not gd_size(G, *gd_first(x), gd_lpx(o, *gd_first(x), G[gd_side_kd(x)]["tick"]), o, amt)["ok"]]
+    if first:
+        L = [f"{E.WARN} /runt {sym} 每層U {pct(old)}U→{pct(amt)}U 沒有改", "", "每層U 不夠,第一層下不了"]
+        for x in first:
+            kd, k = gd_first(x)
+            L.append(f" {GD_MK[kd]}{gd_nm(kd, k)} {'買' if kd == 'sp' else '開'}不了(最少{pct(G[kd].get('minsz') or 0)}{'顆' if kd == 'sp' else '張'})")
+        mins = [gd_layer_min(G, *gd_first(x), o) for x in G["dir"]]
+        if all(v is not None for v in mins):
+            L.append(f" 👉每層最少 {max(mins)}U")
+        await retry("\n".join(L)); return
+    accts = [ACCT] + ([a for a in GD_XACCT if a != ACCT] if G["has"]["S"] or G["has"]["D"] else [])
+    for a in accts:
+        try:
+            await fd_refresh(a)
+        except Exception as e:
+            print("[grid] 改每層U 讀帳戶失敗", a, type(e).__name__, e)
+    fd_sim_read()
+    now = time.time()
+    held = [p for p in G["pos"] if not p["out"]]
+    for p in held:
+        if p.get("lu") is None:
+            p["lu"] = old                                  # 抱著的單照原本的金額
+    if not G.get("mix"):
+        gd_agg_pc(G, old)
+    n_ord = 0
+    for cur in G["ord"].values():
+        if cur and cur.get("cxl") is None:
+            cur["cxl"], cur["nxt"] = now + RT_LAT, None    # 撤掉，下一拍照新的金額再掛
+            n_ord += 1
+    o0 = G.get("o00")
+    if o0:
+        n_ord += 1
+        if o0.get("live") is not None:
+            o0.update(live=now + 2 * RT_LAT, chk=False); o0.pop("x", None)   # L00 撤掉換成新的金額（再一次 post-only）
+    G["amt"], G["mix"] = amt, True
+    gd_save_soon()
+    lus = sorted({gd_lu(G, p) for p in held}) or [old]
+    L = [f"✅ /runt {sym} 每層U {pct(old)}U→{pct(amt)}U", "",
+         f"持倉 {len(held)}單 照原本 {'、'.join(pct(v) + 'U' for v in lus)}(SL/TP損益不變)",
+         f"掛單 {n_ord}張 撤掉換成 {pct(amt)}U",
+         f"之後新掛的單都用 {pct(amt)}U"]
+    if G["has"]["S"] or G["has"]["D"]:
+        L.append("槓桿/強平價不變(照原點)")
+    rows = [(a, fd_avail(a)) for a in accts]
+    vs = rn_pad([f"{v:.2f}U" if v is not None else "查不到" for _, v in rows])
+    L += ["", "資金(模擬從真的可用扣)"] + [f"{a} 可用 {x}" + (f"|約夠{int(v // amt)}層" if v is not None else "") for (a, v), x in zip(rows, vs)]
+    print(f"[grid] 改每層U {sym} {old}→{amt}")
+    await reply(u, "\n".join(L + ["", f"時間:{hhmmss()}"]))
 
 async def cmd_stoprunt(u, c):
     """v15.0 /stoprunt 幣種｜all：馬上停止（撤掉掛單、策略結束）；持倉不平倉，列出來（1111 自己處理）。"""
@@ -3742,6 +3852,7 @@ async def cmd_menu(u, c):
         "手續費照帳戶費率、現貨買進從幣扣（零頭留在帳戶）；post-only 一掛就會成交＝被取消、下一拍重算；換格先撤單、確認撤掉再掛；"
         f"SL/TP 改單照 OKX 額度（每 {pct(GD_AMEND_WIN)} 秒 {GD_AMEND_N} 次，這個帳戶的現貨一份、每個帳戶的永續一份），超過時離現價最近的先改\n"
         "　例：/runt SUIUSDT LSUD 5U 0.1%、/runt SUIUSDT LSU 5U 0.1%、/runt SUIUSDT LU 5U 0.1%（其他帳戶）\n"
+        "　v18.4 改每層U（進行中的幣）：/runt 幣種 每層U（例 /runt WLDUSDT 3U）：原點、槓桿、強平價不動；抱著的單照原本的金額；掛單撤掉換成新的金額；之後新掛的都用新的\n"
         "/stoprunt 幣種｜all　停止 /runt：撤掉掛單、策略馬上結束；持倉不平倉（列出來，1111 自己處理）\n"
         f"/coins 分 3 則：①帳戶（{GD_MAIN}＝{'、'.join(GD_XACCT)}；其他帳戶＝自己）（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率） ②每個幣種（現價、現貨最少幾顆、最大槓桿、合約最小、33層預算 L|U|D|S＝每一層都下得了的最少每層U×層數，L 含 L00） ③恐懼貪婪指數\n"
         f"/amp 週期　振幅分析：週期 {'/'.join(AMP_TF)}，一次 {AMP_N} 根K線，照 /coins 的幣種一個一頁\n"
