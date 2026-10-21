@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.5.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.5.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -996,7 +996,7 @@ def rn_gliq(T, side, ps):
             fee = p.get("fee_in") or Decimal(0)
         else:
             mg = p.get("amt") or T["amt"]                  # v17.0.3：網格自動調高的層＝那一層自己的保證金
-            fee = mg * rn_plev(T, p) * RN_FEE_IN / 100
+            fee = q * p["ent"] * RN_FEE_IN / 100             # v18.5.2（1111 2026-10-22）：開倉手續費照實際倉位（數量×進場價），不是 保證金×設計槓桿
         MB += mg - fee + (p.get("fu") or Decimal(0))
     if Q <= 0:
         return None
@@ -1530,16 +1530,25 @@ def gd_head(G):
     """幣種 方向 每層U（1111：埋伏通知、/status、/summary、/stoprunt 的標題；v15.6 拿掉槓桿）。"""
     return f"{G['sym']} {G['dir']} {gd_prm(G)}"
 
+def gd_alev(G, p):
+    """v18.5.2（1111 2026-10-22）：合約這一單的實際槓桿＝倉位（數量×進場價）÷保證金（每層U；自動用最低金額的層＝那一層的金額）。
+    數量照 OKX 單位往下取 → 實際槓桿 ≤ 設計槓桿（p["lev"]，例 WLD 1U S01：2張 1.10U ÷ 1U＝1.1X，設計 1.5X）。"""
+    return p["qty"] * p["ent"] / gd_pamt(G, p)
+
+def gd_alev_s(G, p):
+    """v18.5.2：實際槓桿的寫法（四捨五入到 0.01X，去尾零：1.1X、2.37X）。"""
+    return pct(gd_alev(G, p).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
 def gd_prm(G, p=None):
-    """每層U；p＝那一單 → 用那一單自己的每層U（v18.4），合約前面加那一層自己的槓桿（例 S07 2.38X 5U、D12 1.5X 5U）。"""
+    """每層U；p＝那一單 → 用那一單自己的每層U（v18.4），合約前面加那一單的實際槓桿（v18.5.2，例 S01 1.1X 1U、S07 2.37X 5U）。"""
     if p is not None and p["kind"] == "sw":
-        return f"{pct(p['lev'])}X {pct(gd_lu(G, p))}U"
+        return f"{gd_alev_s(G, p)}X {pct(gd_lu(G, p))}U"
     return f"{pct(gd_lu(G, p) if p is not None else G['amt'])}U"
 
 def gd_bprm(G, p):
     """v17.0.7 出場通知「本單」那一行：合約＝槓桿X 金額U、現貨＝金額U；自動用最低金額的層寫那一層實際的金額（損益 % 的分母）。"""
     a = pct(gd_lu(G, p)) if not p.get("up") else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
-    return (f"{pct(p['lev'])}X " if p["kind"] == "sw" else "") + f"{a}U"
+    return (f"{gd_alev_s(G, p)}X " if p["kind"] == "sw" else "") + f"{a}U"   # v18.5.2：實際槓桿
 
 def gd_cap(G):
     """合約槓桿上限：20X；那個幣 OKX 最高更低照 OKX。"""
@@ -1902,9 +1911,11 @@ def gd_money(G, p, px):
     return {"g": g, "fee": fp, "net": g - fp + fd, "gu": gu, "feeu": feeu, "netu": gu - feeu + fuq, "fu": fuq, "fund": fd,
             "fn": p.get("fn", 0), **extra}
 
-def gd_own(p, px):
-    """這一單自己的損益 %（現貨＝價格漲跌%；空單＝槓桿×價格漲跌%），照畫面取到 0.01%。"""
-    return rn_q2(p["lev"] * rn_g(p["side"], p["ent"], px))
+def gd_own(G, p, px):
+    """這一單自己的損益 %（現貨＝價格漲跌%；合約＝槓桿×價格漲跌%），照畫面取到 0.01%。
+    v18.5.2（1111 2026-10-22）：合約用實際槓桿（gd_alev）＝跟出場的毛損益 % 同一種算法（數量×價差÷保證金）。"""
+    lev = gd_alev(G, p) if p["kind"] == "sw" else p["lev"]
+    return rn_q2(lev * rn_g(p["side"], p["ent"], px))
 
 def gd_cum(G, nm):
     """這一格從 /runt 開始到現在出場單的淨利率%（每一單 % 相加）。"""
@@ -1929,7 +1940,7 @@ def gd_pxs(G, pxs=None):
 
 def gd_hold_line(G, ps, pxs, cum=None):
     """持倉損益 每一單 % 相加|(出場單的淨利率%)|N單🎯。"""
-    ones = [gd_own(p, pxs[p["kind"]]) for p in ps if pxs.get(p["kind"]) is not None]
+    ones = [gd_own(G, p, pxs[p["kind"]]) for p in ps if pxs.get(p["kind"]) is not None]
     mid = f"|{rn_sp(cum)}" if cum is not None else ""
     return f"持倉損益 {rn_sp(sum(ones, Decimal(0)))}{mid}|{len(ps)}單🎯"
 
@@ -1942,10 +1953,10 @@ def gd_hold_u_line(ps, pxs):
     u = sum((gd_upl(p, pxs[p["kind"]]) for p in ps if pxs.get(p["kind"]) is not None), Decimal(0))
     return f"持倉損益 {rn_su(rn_q4(u))}|{len(ps)}單🎯"
 
-def gd_hold_pu_line(ps, pxs):
+def gd_hold_pu_line(G, ps, pxs):
     """v18.0.1（1111 2026-10-20 畫面）/status：持倉損益 -1.87%|-0.0560U|1單🎯＝還抱著的每一單 % 相加（跟出場通知的持倉損益一樣）|未實現 U 合計（不含手續費）。"""
     ok = [p for p in ps if pxs.get(p["kind"]) is not None]
-    pc = sum((gd_own(p, pxs[p["kind"]]) for p in ok), Decimal(0))
+    pc = sum((gd_own(G, p, pxs[p["kind"]]) for p in ok), Decimal(0))
     u = sum((gd_upl(p, pxs[p["kind"]]) for p in ok), Decimal(0))
     return f"持倉損益 {rn_sp(pc)}|{rn_su(rn_q4(u))}|{len(ps)}單🎯"
 
@@ -1971,7 +1982,7 @@ def gd_rows(G, ps, pxs, cum=True, liq=False):
     v18.4（1111 2026-10-21 畫面）liq＝/status：S 做空後面多 |🔴61.07%＝距離強平（現價再漲幾 %）。
     v18.4.1（1111 2026-10-21）：每個帳戶 11 單在第一層的強平價一起強平 → 只寫在那個帳戶抱著的第一層（S01、S12、S23；
       第一層出場了＝那個帳戶抱著的最低一層）；D 做多不寫（1111：不太可能被強平）。"""
-    a = rn_pad([rn_sp(gd_own(p, pxs[p["kind"]])) if pxs.get(p["kind"]) is not None else "查價中" for p in ps])
+    a = rn_pad([rn_sp(gd_own(G, p, pxs[p["kind"]])) if pxs.get(p["kind"]) is not None else "查價中" for p in ps])
     b = rn_pad([rn_sp(gd_cum(G, gd_nm(p["kind"], p["k"]))) for p in ps])
     first = {}
     for p in ps:
@@ -2018,7 +2029,7 @@ def gd_log_add(G, p, m):
     try:
         t_in, (t_out, px, why) = p["t_in"], p["out"]
         r = {"d": rn_today(t_out), "g": 1, "sym": G["sym"], "dir": G["dir"], "kind": p["kind"], "side": p["side"], "k": p["k"],
-             "lvl": p["k"], "nm": gd_nm(p["kind"], p["k"]), "lev": str(p["lev"]), "acct": gd_kacct(p["kind"], p["k"]), "amt": str(gd_pamt(G, p)), "up": 1 if p.get("up") else 0,
+             "lvl": p["k"], "nm": gd_nm(p["kind"], p["k"]), "lev": str(rn_q2(gd_alev(G, p))) if p["kind"] == "sw" else str(p["lev"]), "acct": gd_kacct(p["kind"], p["k"]), "amt": str(gd_pamt(G, p)), "up": 1 if p.get("up") else 0,
              "org": round(float(G["org"]["t"]), 3) if G.get("org") else None, "t_run": round(G["t_run"], 3),
              "ent": str(p["ent"]), "px": str(px), "t_in": round(t_in, 3), "t_out": round(t_out, 3), "hold": round(t_out - t_in, 1),
              "why": why, "n_mv": p["n_mv"], "n_tp": p.get("n_tp", 0), "mfe": str(rn_q2(p["mfe"])), "mae": str(rn_q2(p["mae"])),
@@ -2246,7 +2257,7 @@ def gd_status_lines(G, now):
         L.append(cur)
     if G.get("org"):
         acc = gd_acc_lines(G, pxs)[:-1] + [""] if G["agg"] else []   # v18.0.1（1111 2026-10-20 畫面）：累計（跟出場通知一樣，這一輪一直累計）
-        L += [""] + acc + [gd_hold_pu_line(ps, pxs)]
+        L += [""] + acc + [gd_hold_pu_line(G, ps, pxs)]
         secs = [(ACCT, gd_avg_line(G, "sp", ps, pxs.get("sp"), pc=False) if G.get("sp") else [])]
         if G.get("sw"):                                    # v18.0（1111 畫面）：每個帳戶 🈴空單、🈴多單各一行；別的帳戶空一行、(o2222o) 下面
             for b, a in enumerate(GD_XACCT):
