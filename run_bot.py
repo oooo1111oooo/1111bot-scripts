@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.5.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.5.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -2223,7 +2223,17 @@ def gd_liq_lines(G, items):
     L += ["", f"這次強平 {len(items)}單", f"毛損益 {us[0]}", f"手續費 {us[1]}", f"淨損益 {us[2]}{E.pnl_emoji(rn_q4(u))}"]
     return L + [""] + gd_acc_lines(G, {"sw": px}) + ["", f"時間:{hhmmss()}"]
 
+GD_S01_MK = "🔴"                                           # v18.5.5（1111 2026-10-22）：/status 掛單中的 S01（S12、S23）後面
 GD_L00_MK = "⏺️"                                           # v18.5.4（1111 2026-10-22）：/status L00（原點）那一行後面
+
+
+def gd_ord_mk(kd, k):
+    """/status 掛單列後面的 emoji：L00＝⏺️（v18.5.4）；每個帳戶空單的第一層（S01、S12、S23：強平的關鍵點）＝🔴（v18.5.5，1111 2026-10-22）；其他＝🔹。"""
+    if kd == "sp" and k == 0:
+        return GD_L00_MK
+    if kd == "sw" and k > 0 and k == gd_k0(k):
+        return GD_S01_MK
+    return RN_ORD_MK
 
 
 def gd_status_lines(G, now):
@@ -2262,7 +2272,7 @@ def gd_status_lines(G, now):
             L.append(f"L00 {gd_hms(org['t'])}|{gd_q(G, 'sp', org['px'])}{GD_L00_MK}")
         else:
             kd, k, o = r[3]
-            L.append(f"{gd_nm(kd, k)} {gd_hms(o['t'])}|{gd_q(G, kd, o['px'])}|掛單中{GD_L00_MK if kd == 'sp' and k == 0 else RN_ORD_MK}")
+            L.append(f"{gd_nm(kd, k)} {gd_hms(o['t'])}|{gd_q(G, kd, o['px'])}|掛單中{gd_ord_mk(kd, k)}")
     if not done or mpx is None:
         L.append(cur)
     if G.get("org"):
