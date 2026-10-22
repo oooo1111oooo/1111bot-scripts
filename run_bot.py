@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.5.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.5.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -2223,6 +2223,9 @@ def gd_liq_lines(G, items):
     L += ["", f"這次強平 {len(items)}單", f"毛損益 {us[0]}", f"手續費 {us[1]}", f"淨損益 {us[2]}{E.pnl_emoji(rn_q4(u))}"]
     return L + [""] + gd_acc_lines(G, {"sw": px}) + ["", f"時間:{hhmmss()}"]
 
+GD_L00_MK = "⏺️"                                           # v18.5.4（1111 2026-10-22）：/status L00（原點）那一行後面
+
+
 def gd_status_lines(G, now):
     """④ /status 一個幣種一段（1111 2026-10-17 畫面）：▶️開始 → 🩵原點 → 價格由高到低（S、U、L 混在一起，同價 S 在上；
     v18.0.1（1111 2026-10-20 畫面）：持倉列下面多 累計 那一段（跟出場通知一樣：從 /runt 開始一直累計，有出場單才有）；
@@ -2241,6 +2244,10 @@ def gd_status_lines(G, now):
             rows.append((o["px"], 0 if kd == "sw" else 1, "ord", (kd, o["k"], o)))
     if G.get("o00"):
         rows.append((G["o00"]["px"], 1, "ord", ("sp", 0, G["o00"])))
+    org = G.get("org")
+    if org and G["has"]["L"] and not any(r[3]["kind"] == "sp" and r[3]["k"] == 0 for r in rows if r[2] == "pos") \
+            and not any(r[3][0] == "sp" and r[3][1] == 0 for r in rows if r[2] == "ord"):
+        rows.append((org["px"], 1, "org", None))           # v18.5.4（1111 2026-10-22）：L00 沒持倉、沒掛單 → 照原點的價格位置也列出來
     rows.sort(key=lambda r: (-r[0], r[1]))
     prow = iter(gd_rows(G, [r[3] for r in rows if r[2] == "pos"], pxs, liq=True))   # v18.4：合約後面寫距離強平
     mpx = pxs.get(gd_okd(G))
@@ -2249,11 +2256,13 @@ def gd_status_lines(G, now):
     for r in rows:
         if not done and r[0] < mpx:
             L.append(cur); done = True
-        if r[2] == "pos":
-            L.append(next(prow))
+        if r[2] == "pos":                                  # v18.5.4（1111 2026-10-22）：L00＝原點那一格，後面 ⏺️（持倉、掛單中、沒持倉沒掛單都是）
+            L.append(next(prow) + (GD_L00_MK if r[3]["kind"] == "sp" and r[3]["k"] == 0 else ""))
+        elif r[2] == "org":
+            L.append(f"L00 {gd_hms(org['t'])}|{gd_q(G, 'sp', org['px'])}{GD_L00_MK}")
         else:
             kd, k, o = r[3]
-            L.append(f"{gd_nm(kd, k)} {gd_hms(o['t'])}|{gd_q(G, kd, o['px'])}|掛單中{RN_ORD_MK}")
+            L.append(f"{gd_nm(kd, k)} {gd_hms(o['t'])}|{gd_q(G, kd, o['px'])}|掛單中{GD_L00_MK if kd == 'sp' and k == 0 else RN_ORD_MK}")
     if not done or mpx is None:
         L.append(cur)
     if G.get("org"):
