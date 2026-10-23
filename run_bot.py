@@ -103,7 +103,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v18.5.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v18.5.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -2269,7 +2269,7 @@ def gd_status_lines(G, now):
         if r[2] == "pos":                                  # v18.5.4（1111 2026-10-22）：L00＝原點那一格，後面 ⏺️（持倉、掛單中、沒持倉沒掛單都是）
             L.append(next(prow) + (GD_L00_MK if r[3]["kind"] == "sp" and r[3]["k"] == 0 else ""))
         elif r[2] == "org":
-            L.append(f"L00 {gd_hms(org['t'])}|{gd_q(G, 'sp', org['px'])}{GD_L00_MK}")
+            L.append(f"L00 {gd_hms(org['t'])}|{gd_q(G, 'sp', org['px'])}|未掛單{GD_L00_MK}")   # v18.5.6（1111 2026-10-23）：沒持倉的列一定寫狀態（掛單中／未掛單）
         else:
             kd, k, o = r[3]
             L.append(f"{gd_nm(kd, k)} {gd_hms(o['t'])}|{gd_q(G, kd, o['px'])}|掛單中{gd_ord_mk(kd, k)}")
