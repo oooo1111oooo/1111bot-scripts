@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.0.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -631,20 +631,25 @@ def tg_pack(title, blocks, tail=(), lim=TG_LIM, emo=None):
         return ["\n".join([title] + pages[0])]
     return ["\n".join([f"{title}({i}/{len(pages)})"] + p) for i, p in enumerate(pages, 1)]
 
+def tg_sep(ln):
+    """v20.0.1：這一行是不是分隔線（━ 連起來至少 10 個；/summary 分幣種用 14 個）。"""
+    return len(ln) >= 10 and set(ln) == {"━"}
+
 def tg_split(t, lim=TG_LIM):
-    """v10.0：一則太長 → 第一行當標題，在分隔線（━━━）處切成好幾頁；不長就原樣一則。"""
-    if len(t) <= lim:
+    """v10.0：一則太長 → 第一行當標題，在分隔線（━━━）處切成好幾頁；不長就原樣一則。
+    v20.0.1：emoji 超過 TG_EMO（95）個也分頁（/summary 幣種多時，每個幣種前面多了 💛）。"""
+    if len(t) <= lim and tg_emo(t) <= TG_EMO:
         return [t]
     lines = t.split("\n")
     segs, cur = [], []
     for ln in lines[1:]:
-        if ln == TG_SEP and cur:
+        if tg_sep(ln) and cur:
             segs.append(cur); cur = [ln]
         else:
             cur.append(ln)
     if cur:
         segs.append(cur)
-    return tg_pack(lines[0], segs, (), lim)
+    return tg_pack(lines[0], segs, (), lim, emo=TG_EMO)
 
 
 async def reply(u, t):
@@ -2448,6 +2453,9 @@ def gd_running(M=None):
     return ["進行中:"] + ([gd_status_line(G) for G in sorted(M.D.values(), key=lambda G: G["sym"])] or [f"目前沒有進行中的 {M.cmd}"])
 
 # ---------- /summary ----------
+GD_SUM_SEP = "━" * 14                                      # v20.0.1（1111 2026-10-26 畫面）：/summary 分幣種的分隔線拉長
+GD_SUM_MK  = "💛"                                          # v20.0.1（1111 2026-10-26 畫面）：/summary 分幣種 每個幣種名稱前面
+
 def gd_recs(d, M=None):
     """某一天（台灣時間）網格的逐單出場紀錄（v14 以前的紀錄沒有 g，不算）。v19.0：M＝GSIM（/runt）、GREAL（/run 實盤）。"""
     return [r for r in rn_log_read(d, M or GSIM) if r.get("g")]
@@ -2550,7 +2558,7 @@ def gd_sum_msgs(d, full=False, M=None, quiet=False):
         grp = lambda r: (r.get("nm") or "?")[0]
         lets = "LUSD"                                      # v16.1（1111 2026-10-19）：四段都列（沒開的方向也列 0 單）
         pk, pn = peak_n(sym)
-        X = [title, f"最{GD_FULL}金額 {pn}單|{pct(pk)}U", f"持倉金額 {held_n.get(sym, 0)}單|{pct(held.get(sym, Decimal(0)))}U🎯",   # v16.2（1111 2026-10-19）
+        X = [f"{GD_SUM_MK}{title}", f"最{GD_FULL}金額 {pn}單|{pct(pk)}U", f"持倉金額 {held_n.get(sym, 0)}單|{pct(held.get(sym, Decimal(0)))}U🎯",   # v16.2（1111 2026-10-19）
                         f"總成交單 {len(rs)}單"]                # v15.8（1111 2026-10-18 畫面）：後面的 |L💰…單 拿掉
         lay_n, lay_p = {}, {}
         for r in rs:
@@ -2558,7 +2566,7 @@ def gd_sum_msgs(d, full=False, M=None, quiet=False):
             lay_n[k] = lay_n.get(k, 0) + 1
             lay_p[k] = lay_p.get(k, Decimal(0)) + gd_rD(r, "np")
         X.append(f"目前損益 {rn_sp(sum(lay_p.values(), Decimal(0)))}")   # v17.0.4（1111 2026-10-20）：下面每一格的 % 加起來
-        X0 += [RT_SEP] + X
+        X0 += [GD_SUM_SEP] + X
         if not rs:
             continue
         ks = sorted(lay_n, key=lambda k: gd_nm_key(k) if k[:1] in "SULD" and k[1:].isdigit() else (9, 0))
@@ -2573,7 +2581,7 @@ def gd_sum_msgs(d, full=False, M=None, quiet=False):
             X += ["", f"{GD_MK['sw' if x in 'SD' else 'sp']}{x} {len(xs)}單",   # v15.8：💰L 7單／💰U 0單／🈴S 0單；v18.0 🈴D 不寫帳戶
                   f"毛損益 {us[0]}", f"手續費 {us[1]}"] + ([f"資金費 {us[2]}"] if fd else []) + [f"淨損益 {us[-1]}"]
         X0 += X[n0:]
-    X0 += [RT_SEP] + foot
+    X0 += [GD_SUM_SEP] + foot
     return [L, X0]
 
 # ---------- 迴圈 ----------
