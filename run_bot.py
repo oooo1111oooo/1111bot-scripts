@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.0.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -2046,7 +2046,7 @@ def gd_avg_line(G, kd, ps, px, full=True, pc=True, grp=None, b=None):
     if G.get("real"):                                      # v19.0：實盤＝OKX 的數字（合約：OKX 倉位均價、未實現；現貨：OKX 平均成本、未實現）
         x = rg_avg_okx(G, kd, grp, b)
         if x:
-            mk = GD_MK[kd] + ("多單" if kd == "sw" and ps[0]["side"] == "L" else "")
+            mk = GD_MK[kd] + (("D" if ps[0]["side"] == "L" else "S") if kd == "sw" else "")   # v20.0.2
             return [f"官方均價 {gd_q(G, kd, x[0])}|" + (f"{len(ps)}單|" if full else "") + rn_su(rn_q4(x[1])) + (mk if full else "")]
     Q = sum((p["qty"] for p in ps), Decimal(0))
     cost = sum((p["qty"] * p["ent"] for p in ps), Decimal(0))
@@ -2055,7 +2055,7 @@ def gd_avg_line(G, kd, ps, px, full=True, pc=True, grp=None, b=None):
     base = cost if kd == "sp" else sum((gd_pamt(G, p) for p in ps), Decimal(0))
     s = (f"官方均價 {gd_q(G, kd, avg)}|" + (f"{len(ps)}單|" if full else "") + (f"{rn_sp(rn_q2(upl / base * 100))}|" if pc else "")
          + rn_su(rn_q4(upl)))
-    mk = GD_MK[kd] + ("多單" if kd == "sw" and ps[0]["side"] == "L" else "")   # v18.0（1111 畫面）；v18.5.3（1111 2026-10-22）：空單拿掉「空單」，多單照舊
+    mk = GD_MK[kd] + (("D" if ps[0]["side"] == "L" else "S") if kd == "sw" else "")   # v20.0.2（1111 2026-10-26 畫面）：合約 多單＝🈴D、空單＝🈴S（v18.5.3：🈴、🈴多單）
     return [s + (mk if full else "")]
 
 def gd_rows(G, ps, pxs, cum=True, liq=False):
