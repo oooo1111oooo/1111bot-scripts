@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.0.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -699,7 +699,7 @@ async def cmd_status(u, c):
     v12.7（1111 2026-10-13）：每一則最多 95 個 emoji（超過換下一則），每個幣種都用 Telegram 自己的圖案（🛜 藍色、📣 黃色）。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     now = time.time()
-    blocks = [[RT_SEP] + fd_status_lines()] if (RD or GD) else []   # v20.0.4（1111 2026-10-30）：最上面一段資金（/runt、/run 同一套數字＝/coins）
+    blocks = [[RT_SEP] + b for b in fd_status_blocks()] if (RD or GD) else []   # v20.0.5（1111 2026-10-30）：最上面 資金＝跟 /coins 一樣的畫面（每個帳戶一段）
     for G in sorted(RD.values(), key=lambda G: G["sym"]):  # v19.0：/run 實盤在前
         blocks.append([RT_SEP] + gd_status_lines(G, now))
     for G in sorted(GD.values(), key=lambda G: G["sym"]):  # v15.0：/runt 網格，一個幣種一段（gd_status_lines）
@@ -3296,13 +3296,22 @@ async def fd_fee_for(acct, sym):
         a = {**(await fd_fee(acct)), **a}
     return a
 
-def fd_status_lines():
-    """v17.0 /status 最上面：資金 每個帳戶 可用|佔用（v20.0.4：/runt、/run 同一套＝fd_money＝/coins；有 /runt＝資金(模擬)、只有 /run＝資金(OKX)）。"""
-    rows = [(a, fd_money(a)) for a in fd_accts()]
-    av = rn_pad([f"{m['avail']:.2f}U" if m else "查詢中" for _, m in rows])
-    us = rn_pad([f"{m['used']:.2f}U" if m else "查詢中" for _, m in rows])
+def fd_money_lines(acct):
+    """v20.0.5（1111 2026-10-30 畫面）：一個帳戶的資金（/coins、/status 同一個畫面）：帳戶 帳戶模式|持倉模式 → 餘額、權益、可用、佔用（fd_money，2 位小數）。"""
+    f = FD.get(acct) or {}
+    m = fd_money(acct)
+    if not m:
+        return [f"{acct} 資金查詢中"]                     # 開機還沒讀到 OKX（每分鐘讀一次）
+    head = f"{acct} {fd_mode(acct)}" + (f"🚨{f['bad']}" if f.get("bad") else "")
+    rows = [("餘額", m["cash"]), ("權益", m["eq"]), ("可用", m["avail"]), ("佔用", m["used"])]
+    return [head] + [f"{k} {v}" for (k, _), v in zip(rows, rn_pad([f"{v:.2f}U" for _, v in rows]))]
+
+
+def fd_status_blocks():
+    """/status 最上面的資金（v20.0.5：跟 /coins 一樣每個帳戶一段；有 /runt＝資金(模擬)、只有 /run＝資金(OKX)；數字＝fd_money＝/coins）。"""
     title = "資金(模擬)" if any(not G.get("done") for G in GD.values()) else "資金(OKX)"
-    return [title] + [f"{a} 可用 {x}|佔用 {y}" + ("🚨" + FD[a]["bad"] if fd_halt(a) else "") for (a, _), x, y in zip(rows, av, us)]
+    bs = [fd_money_lines(a) for a in fd_accts()]
+    return [[title] + bs[0]] + bs[1:] if bs else [[title]]
 
 async def gd_spec_check(app):
     """每小時查一次 OKX 規格；每層U 不夠的層變了 → 通知（v17.0.3：不夠的層之後自動用最低金額，不再不掛；已經持倉的照常）。"""
@@ -5367,13 +5376,9 @@ async def coins_acct_lines(acct, tag=""):
     if not FD[acct].get("fee"):
         await fd_fee(acct)
     f = FD[acct]
-    m = fd_money(acct)                                     # v20.0.4（1111 2026-10-30）：跟 /status 同一套（/runt、/run 一樣，以 OKX 資金現況為準）
-    rows = [("餘額", m["cash"]), ("權益", m["eq"]), ("可用", m["avail"]), ("佔用", m["used"])]
-    vs = rn_pad([f"{v:.2f}U" for _, v in rows])
     fee = f.get("fee") or {}
     fs = lambda kd: "/".join(f"{rt_p2(v)}%" for v in fee[kd]) if fee.get(kd) else "讀不到"
-    return ([f"{acct}{tag} {fd_mode(acct)}" + (f"🚨{f['bad']}" if f.get("bad") else "")]
-            + [f"{k} {v}" for (k, _), v in zip(rows, vs)]
+    return (fd_money_lines(acct)                           # v20.0.4／v20.0.5：資金跟 /status 同一個畫面、同一套數字（fd_money）
             + [f"費率 現貨{fs('sp')}", f"{GD_CXL_IND}合約{fs('sw')}"])   # v17.0.1（1111 2026-10-20 排版）：合約另一行，對齊在 現貨 下面
 
 def coins_list():
