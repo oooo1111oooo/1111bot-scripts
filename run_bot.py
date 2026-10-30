@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.0.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -2259,7 +2259,7 @@ def gd_acc_lines(G, pxs, liq=False, status=False):
     rd = gd_acc_liq(G, ks, pxs) if liq else {}
     cs = [c + (f"🔴{rd[k]}" if k in rd else "") for k, c in zip(ks, cs)]
     if status:                                             # v20.0.3（1111 2026-10-27 畫面）/status：每一格 → 最後一行 累計🟰19單(… 開始)；拿掉 損益 那一行
-        L = [f"{k}🟰{c}" for k, c in zip(ks, cs)] + [f"累計🟰{n}單({gd_md(G['t_run'])} 開始)"]
+        L = [f"{k}🟰{c}" for k, c in zip(ks, cs)] + [f"累計💚{n}單({gd_md(G['t_run'])} 開始)"]   # v20.0.7（1111 2026-10-30）：🟰 改 💚
     else:
         L = ([f"累計 {n}單({gd_md(G['t_run'])} 開始)", f"損益 {rn_sp(gd_all_net(G))}"]   # v17.0.6（1111 2026-10-20 畫面）：損益＝每一格的 % 加起來
              + [f"{k}🟰{c}" for k, c in zip(ks, cs)])                                      #   每一格 U01🟰1單+0.38%
