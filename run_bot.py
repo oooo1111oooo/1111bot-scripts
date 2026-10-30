@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.0.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -699,10 +699,9 @@ async def cmd_status(u, c):
     v12.7（1111 2026-10-13）：每一則最多 95 個 emoji（超過換下一則），每個幣種都用 Telegram 自己的圖案（🛜 藍色、📣 黃色）。"""
     global CHAT_ID; CHAT_ID = u.effective_chat.id
     now = time.time()
-    blocks = [[RT_SEP] + rg_fd_lines()] if RD else []      # v19.0：/run 實盤在前：資金(OKX)＋每個幣種
-    for G in sorted(RD.values(), key=lambda G: G["sym"]):
+    blocks = [[RT_SEP] + fd_status_lines()] if (RD or GD) else []   # v20.0.4（1111 2026-10-30）：最上面一段資金（/runt、/run 同一套數字＝/coins）
+    for G in sorted(RD.values(), key=lambda G: G["sym"]):  # v19.0：/run 實盤在前
         blocks.append([RT_SEP] + gd_status_lines(G, now))
-    blocks += [[RT_SEP] + fd_status_lines()] if GD else []  # v17.0（1111 2026-10-19）：最上面 資金(模擬)
     for G in sorted(GD.values(), key=lambda G: G["sym"]):  # v15.0：/runt 網格，一個幣種一段（gd_status_lines）
         blocks.append([RT_SEP] + gd_status_lines(G, now))
     blocks = blocks or [[RT_SEP, "目前沒有進行中的幣種"]]
@@ -3133,6 +3132,7 @@ def fd_sim_write():
     try:
         d = {"t": time.time(), "acct": ACCT, "used": {a: str(fd_used(a)) for a in fd_accts()},
              "real": {a: str(fd_real(a)) for a in fd_accts()},
+             "upl": {a: str(fd_upl(a)) for a in fd_accts()},                       # v20.0.4：模擬未實現（/coins、/status 權益）
              "runt": sorted(s for s, G in GD.items() if not G.get("done")),       # v20.0：同一個幣只能在一個 bot 下（gd_other_bot）
              "run": sorted(s for s, G in RD.items() if not G.get("done"))}
         f = f"{FD_SIM_DIR}/fd_sim_{ACCT}.json"
@@ -3145,7 +3145,7 @@ def fd_sim_write():
 
 
 def fd_sim_read():
-    """v18.0：讀另外 5 個 bot 的模擬佔用、已實現（超過 60 秒沒更新＝那個 bot 沒在跑，不算）→ FD_SIM["ext"]：帳戶 → [佔用, 已實現]。"""
+    """v18.0：讀另外 5 個 bot 的模擬佔用、已實現（超過 60 秒沒更新＝那個 bot 沒在跑，不算）→ FD_SIM["ext"]：帳戶 → [佔用, 已實現, 未實現(v20.0.4)]。"""
     ext, now = {}, time.time()
     try:
         names = [x for x in os.listdir(FD_SIM_DIR) if x.startswith("fd_sim_") and x.endswith(".json") and x != f"fd_sim_{ACCT}.json"]
@@ -3157,9 +3157,9 @@ def fd_sim_read():
                 d = json.load(fh)
             if now - float(d.get("t") or 0) > FD_SIM_OLD:
                 continue
-            for i, k in enumerate(("used", "real")):
+            for i, k in enumerate(("used", "real", "upl")):
                 for a, v in (d.get(k) or {}).items():
-                    ext.setdefault(a, [Decimal(0), Decimal(0)])[i] += Decimal(v)
+                    ext.setdefault(a, [Decimal(0), Decimal(0), Decimal(0)])[i] += Decimal(v)
         except Exception as e:
             print("[fd] 共用紀錄讀不了", x, type(e).__name__, e)
     FD_SIM["ext"], FD_SIM["t"] = ext, now
@@ -3186,12 +3186,43 @@ def gd_other_bot(sym, M):
 
 def fd_used_all(acct):
     """v18.0：這個帳戶 6 個 bot 合起來的模擬佔用（這個 bot 即時＋別的 bot 共用紀錄）。"""
-    return fd_used(acct) + (FD_SIM["ext"].get(acct) or [Decimal(0), Decimal(0)])[0]
+    return fd_used(acct) + (FD_SIM["ext"].get(acct) or [Decimal(0)] * 3)[0]
 
 
 def fd_real_all(acct):
     """v18.0：這個帳戶 6 個 bot 合起來的模擬已實現。"""
-    return fd_real(acct) + (FD_SIM["ext"].get(acct) or [Decimal(0), Decimal(0)])[1]
+    return fd_real(acct) + (FD_SIM["ext"].get(acct) or [Decimal(0)] * 3)[1]
+
+
+def fd_upl(acct):
+    """v20.0.4：這個 bot 在這個帳戶 /runt 還抱著的單的未實現損益 U（現價；跟 /status 持倉損益的 U 同一個算法 gd_upl）。"""
+    u = Decimal(0)
+    for G in list(GD.values()):
+        if G.get("done"):
+            continue
+        for p in G["pos"]:
+            if not p["out"] and gd_kacct(p["kind"], p["k"]) == acct:
+                px = (G.get("px") or {}).get(p["kind"])
+                if px is not None:
+                    u += gd_upl(p, px)
+    return u
+
+
+def fd_money(acct):
+    """v20.0.4（1111 2026-10-30）：/coins、/status 的資金（/runt、/run 同一套，以 OKX 的資金現況為準）：
+      可用＝OKX 可用 − /runt 模擬佔用 ＋ /runt 模擬已實現（只有 /run＝OKX 可用）；
+      佔用＝OKX 佔用（掛單＋合約保證金）＋ OKX 現貨持倉成本（OKX 把現貨算成幣，不在 USDT 佔用裡）＋ /runt 模擬佔用；
+      餘額＝可用＋佔用；權益＝餘額＋OKX 未實現（合約 upl＋現貨 spotUpl）＋ /runt 模擬未實現。
+    /runt 的佔用、已實現、未實現＝6 個 bot 合起來（共用紀錄 fd_sim）。還沒讀到 OKX＝None。"""
+    f = FD.get(acct)
+    if not f or f.get("avail") is None:
+        return None
+    used, real = fd_used_all(acct), fd_real_all(acct)
+    upl = fd_upl(acct) + (FD_SIM["ext"].get(acct) or [Decimal(0)] * 3)[2]
+    avail = f["avail"] - used + real
+    occ = (f.get("frozen") or Decimal(0)) + (f.get("rcost") or Decimal(0)) + used
+    cash = avail + occ
+    return {"avail": avail, "used": occ, "cash": cash, "eq": cash + (f.get("rupl") or Decimal(0)) + upl}
 
 def fd_avail(acct, back=Decimal(0)):
     """模擬可用＝真的可用（每分鐘讀 OKX）− 6 個 bot 的模擬佔用 ＋ 模擬已實現（＋back：換格撤掉那一張還回來的）。沒讀過＝None（不限）。
@@ -3204,17 +3235,24 @@ def fd_avail(acct, back=Decimal(0)):
 async def fd_refresh(acct, app=None):
     """讀這個帳戶的 USDT 可用、餘額、權益、佔用＋帳戶模式、持倉模式（/runt 開始、每分鐘巡邏、/coins）。成功回 None，失敗回原因。
     巡邏時（app）帳戶模式、持倉模式變成不能做 → 那個帳戶先不掛新單、通知一次；改回來 → 通知、接著掛。"""
-    b, c = await asyncio.gather(api("GET", "/api/v5/account/balance?ccy=USDT", acct=acct),
+    b, c = await asyncio.gather(api("GET", "/api/v5/account/balance", acct=acct),   # v20.0.4：全部幣（現貨持倉成本、未實現）
                                 api("GET", "/api/v5/account/config", acct=acct))
     for r in (b, c):
         if str(r.get("code")) != "0":
             return f"{r.get('code')} {r.get('msg') or ''}".strip()
-    x = next((d for d in ((b.get("data") or [{}])[0].get("details") or []) if d.get("ccy") == "USDT"), {})
-    D_ = lambda k: Decimal(x.get(k) or "0")
+    dets = (b.get("data") or [{}])[0].get("details") or []
+    x = next((d for d in dets if d.get("ccy") == "USDT"), {})
+    D_ = lambda k, y=None: Decimal((x if y is None else y).get(k) or "0")
+    rcost, rupl = Decimal(0), D_("upl")                    # v20.0.4：OKX 現貨持倉成本（均價×數量；沒有均價＝市值）、未實現（合約 upl＋現貨 spotUpl）
+    for y in dets:
+        if y.get("ccy") in ("USDT", None) or D_("cashBal", y) <= 0:
+            continue
+        rcost += D_("openAvgPx", y) * D_("cashBal", y) if y.get("openAvgPx") not in (None, "") else D_("eqUsd", y)
+        rupl += D_("spotUpl", y)
     cfg = (c.get("data") or [{}])[0]
     f = FD.setdefault(acct, {})
     old = f.get("bad")
-    f.update(avail=D_("availBal"), cash=D_("cashBal"), eq=D_("eq"), frozen=D_("frozenBal"),
+    f.update(avail=D_("availBal"), cash=D_("cashBal"), eq=D_("eq"), frozen=D_("frozenBal"), rcost=rcost, rupl=rupl,
              lv=str(cfg.get("acctLv") or ""), pm=cfg.get("posMode") or "", iso=cfg.get("ctIsoMode") or "", perm=cfg.get("perm"), t=time.time())
     f["bad"] = fd_bad(f["lv"], f["pm"])
     if app is not None and f["bad"] != old and (f["bad"] or old):
@@ -3259,11 +3297,12 @@ async def fd_fee_for(acct, sym):
     return a
 
 def fd_status_lines():
-    """v17.0 /status 最上面：資金(模擬) 每個帳戶 可用|佔用（可用＝真的可用 − 模擬佔用 ＋ 模擬已實現；v18.0：6 個 bot 合起來）。"""
-    rows = [(a, fd_avail(a), fd_used_all(a)) for a in fd_accts()]
-    av = rn_pad([f"{v:.2f}U" if v is not None else "查詢中" for _, v, _ in rows])
-    us = rn_pad([f"{u:.2f}U" for _, _, u in rows])
-    return ["資金(模擬)"] + [f"{a} 可用 {x}|佔用 {y}" + ("🚨" + FD[a]["bad"] if fd_halt(a) else "") for (a, _, _), x, y in zip(rows, av, us)]
+    """v17.0 /status 最上面：資金 每個帳戶 可用|佔用（v20.0.4：/runt、/run 同一套＝fd_money＝/coins；有 /runt＝資金(模擬)、只有 /run＝資金(OKX)）。"""
+    rows = [(a, fd_money(a)) for a in fd_accts()]
+    av = rn_pad([f"{m['avail']:.2f}U" if m else "查詢中" for _, m in rows])
+    us = rn_pad([f"{m['used']:.2f}U" if m else "查詢中" for _, m in rows])
+    title = "資金(模擬)" if any(not G.get("done") for G in GD.values()) else "資金(OKX)"
+    return [title] + [f"{a} 可用 {x}|佔用 {y}" + ("🚨" + FD[a]["bad"] if fd_halt(a) else "") for (a, _), x, y in zip(rows, av, us)]
 
 async def gd_spec_check(app):
     """每小時查一次 OKX 規格；每層U 不夠的層變了 → 通知（v17.0.3：不夠的層之後自動用最低金額，不再不掛；已經持倉的照常）。"""
@@ -5328,8 +5367,9 @@ async def coins_acct_lines(acct, tag=""):
     if not FD[acct].get("fee"):
         await fd_fee(acct)
     f = FD[acct]
-    rows = [("餘額", f["cash"]), ("權益", f["eq"]), ("可用", f["avail"]), ("佔用", f["frozen"])]
-    vs = rn_pad([f"{rn_q4(v):.4f}U" for _, v in rows])
+    m = fd_money(acct)                                     # v20.0.4（1111 2026-10-30）：跟 /status 同一套（/runt、/run 一樣，以 OKX 資金現況為準）
+    rows = [("餘額", m["cash"]), ("權益", m["eq"]), ("可用", m["avail"]), ("佔用", m["used"])]
+    vs = rn_pad([f"{v:.2f}U" for _, v in rows])
     fee = f.get("fee") or {}
     fs = lambda kd: "/".join(f"{rt_p2(v)}%" for v in fee[kd]) if fee.get(kd) else "讀不到"
     return ([f"{acct}{tag} {fd_mode(acct)}" + (f"🚨{f['bad']}" if f.get("bad") else "")]
@@ -5370,6 +5410,7 @@ async def cmd_coins(u, c):
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
     accts = [(a, "") for a in list(GD_XACCT) + ([ACCT] if ACCT not in GD_XACCT else [])]   # v20.0：每個 bot 都列 5 個帳戶（o6666o 多列自己）
     P1 = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
+    fd_sim_read()                                          # v20.0.4：別的 bot 的模擬佔用、已實現、未實現（跟 /status 一樣）
     for i, (a, tag) in enumerate(accts):
         P1 += (["━━━━━━━━━━"] if i else []) + await coins_acct_lines(a, tag)
     await reply(u, "\n".join(P1))                         # ① 兩個帳戶（先送，幣種算好再送 ②）
