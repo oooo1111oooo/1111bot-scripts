@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0.7"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.0.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -951,7 +951,7 @@ async def rec_okx_ready(syms, need_px=False):
 # ---------- 出場規則（rn_rule：每一單的 SL/TP；/runt 網格用，v17.1 的 /run 也用同一個）----------
 # v17.0（1111 2026-10-19）：舊 /run（v11 佈局實盤）、v14 舊 /runt、接續帳戶拿掉；這一區只留網格還在用的常數、函式。
 RN_STEP    = 0.25              # 每秒查價 4 次（固定）
-RN_TP_STEP = 0.5               # v18.3（1111 2026-10-21）：TP 每秒最多移動 2 次（v13.9～v18.2 每秒 1 次）
+RN_TP_STEP = 2.0               # v20.0.8（1111 2026-10-31）：TP 2 秒最多移動 1 次（v18.3～v20.0.7 每秒 2 次；v13.9～v18.2 每秒 1 次）
 RN_SL_STEP = 1.0               # v18.1（1111 2026-10-20）：SL 每秒最多移動 1 次（v17.0～v18.0.1 每秒 2 次），現貨、合約都一樣
 RN_ARM     = Decimal("0.80")   # v18.1（1111 2026-10-20）：做空（S）最高毛利率 > 0.80% 才第一次設 SL/TP（v17.0～v18.0.1 0.50%）
 GD_LONG_ARM = Decimal("1.50")  # v18.3（1111 2026-10-21）：做多（L、U 現貨、D 合約）最高毛利率 > 1.50% 才第一次設 SL/TP
@@ -1192,7 +1192,7 @@ def rn_rule(T, p, px, now, arm=None):
     if cur_tp is not None and not better(tp_px, cur_tp):
         tp_px = cur_tp                                     # 只往獲利方向
     if cur_tp is not None and tp_px != cur_tp and now - p.get("tp_t", 0.0) < RN_TP_STEP - 0.05:
-        tp_px = cur_tp                                     # TP 離上次移動不到 1 秒 → 這次不動
+        tp_px = cur_tp                                     # TP 離上次移動不到 RN_TP_STEP（v20.0.8：2 秒）→ 這次不動
     if sl_px is None:
         if T.get("real"):
             p["want"] = None                               # 這次不設 → 舊的待送也作廢
@@ -5779,7 +5779,7 @@ async def cmd_menu(u, c):
         "　原點：有 L＝現價下方埋伏點% 掛 💰L00 現貨買，成交價＝🩵原點；沒有 L＝/runt 那一刻的現價直接當原點。原點到 /stoprunt 都不動\n"
         "　掛單：一組最多 3 張：現價下面最近一格（沒有持倉的）💰現貨買、🈴做多；現價上面最近一格 🈴做空；跟著價格換格；一律限價（post-only）\n"
         f"　出場：每一層各自：{arm}SL＝距離現價−{RN_SL_DIST:.2f}%、TP＝距離現價+{RN_TP_FIRST:.2f}%（做空相反）；"
-        f"之後 SL＝現價−{RN_SL_DIST:.2f}%（每秒 {round(1 / RN_SL_STEP)} 次）、TP＝現價+{RN_TP_DIST:.2f}%（每秒 {round(1 / RN_TP_STEP)} 次），都只往獲利方向移動；"
+        f"之後 SL＝現價−{RN_SL_DIST:.2f}%（每秒 {round(1 / RN_SL_STEP)} 次）、TP＝現價+{RN_TP_DIST:.2f}%（{pct(RN_TP_STEP)} 秒 1 次），都只往獲利方向移動；"
         f"SL 最低 +{RN_SL_MIN:.2f}%；碰到＝市價出場；現貨只賣那一層\n"
         "　每層U：現貨每層買 U、合約每層保證金 U\n"
         "　照實盤規則：數量照 OKX 單位往下取（合約保證金照樣每層U）；下的時候檢查 帳戶模式、雙向持倉、那個幣五個帳戶都沒有現貨、合約持倉、掛單、"
