@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.0.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -225,7 +225,8 @@ USDT_SWAP = "-USDT-SWAP"
 def _spec_row(d):
     return {"iid": d["instId"], "tick": Decimal(d["tickSz"]), "lot": Decimal(d["lotSz"]),
             "minsz": Decimal(d["minSz"]), "ctval": Decimal(d["ctVal"]),
-            "maxlev": Decimal(d["lever"]), "ctvalccy": d["ctValCcy"]}
+            "maxlev": Decimal(d["lever"]), "ctvalccy": d["ctValCcy"],
+            "list": int(d.get("listTime") or 0)}                # v20.0.6：OKX 上架時間（/amp 開幣時間）
 
 async def okx_specs_all():
     """v12.5：一次查回全部 USDT 永續的規格，放進 SPEC_CACHE（1 次查詢，不管幾個幣種）。成功回 True。"""
@@ -3303,8 +3304,8 @@ def fd_money_lines(acct):
     if not m:
         return [f"{acct} 資金查詢中"]                     # 開機還沒讀到 OKX（每分鐘讀一次）
     head = f"{acct} {fd_mode(acct)}" + (f"🚨{f['bad']}" if f.get("bad") else "")
-    rows = [("餘額", m["cash"]), ("權益", m["eq"]), ("可用", m["avail"]), ("佔用", m["used"])]
-    return [head] + [f"{k} {v}" for (k, _), v in zip(rows, rn_pad([f"{v:.2f}U" for _, v in rows]))]
+    rows = [("餘額", m["cash"], "🟢"), ("權益", m["eq"], ""), ("可用", m["avail"], "✅"), ("佔用", m["used"], "🔴")]   # v20.0.6（1111 2026-10-30 畫面）：emoji
+    return [head] + [f"{k} {v}{e}" for (k, _, e), v in zip(rows, rn_pad([f"{v:.2f}U" for _, v, _ in rows]))]
 
 
 def fd_status_blocks():
@@ -5375,11 +5376,20 @@ async def coins_acct_lines(acct, tag=""):
         return [f"{acct}{tag} 查詢失敗({e}),稍後再試"]
     if not FD[acct].get("fee"):
         await fd_fee(acct)
-    f = FD[acct]
-    fee = f.get("fee") or {}
-    fs = lambda kd: "/".join(f"{rt_p2(v)}%" for v in fee[kd]) if fee.get(kd) else "讀不到"
-    return (fd_money_lines(acct)                           # v20.0.4／v20.0.5：資金跟 /status 同一個畫面、同一套數字（fd_money）
-            + [f"費率 現貨{fs('sp')}", f"{GD_CXL_IND}合約{fs('sw')}"])   # v17.0.1（1111 2026-10-20 排版）：合約另一行，對齊在 現貨 下面
+    return fd_money_lines(acct)                            # v20.0.4／v20.0.5：資金跟 /status 同一個畫面、同一套數字（fd_money）；v20.0.6：費率移到最下面（cmd_coins）
+
+
+def coins_fee_lines(accts):
+    """v20.0.6（1111 2026-10-30 畫面）：費率只寫一次，放在最下面（每個帳戶都一樣）；有帳戶不一樣＝每個帳戶各寫一行。"""
+    fs = lambda fee, kd: "/".join(f"{rt_p2(v)}%" for v in fee[kd]) if fee.get(kd) else "讀不到"
+    rows = [(a, (FD.get(a) or {}).get("fee") or {}) for a in accts]
+    txt = [(a, fs(fee, "sp"), fs(fee, "sw")) for a, fee in rows if fee]   # 查詢失敗的帳戶不算
+    if not txt:
+        return ["費率 讀不到"]
+    if len({(x, y) for _, x, y in txt}) <= 1:
+        _, x, y = txt[0]
+        return [f"費率 現貨{x}", f"{GD_CXL_IND}合約{y}"]          # v17.0.1（1111 2026-10-20 排版）：合約另一行，對齊在 現貨 下面
+    return [f"{a} 費率 現貨{x}|合約{y}" for a, x, y in txt]
 
 def coins_list():
     """/coins、/amp 共用的幣種清單：symbols.json 有啟用的＋COINS_ADD，拿掉 COINS_HIDE，照字母排序（v11.1 抽出來共用）。"""
@@ -5414,10 +5424,11 @@ async def cmd_coins(u, c):
       ＝那一邊每一層都下得了的最少每層U（0.1U 一級）× 層數＝那一邊全部持倉要準備的錢（L 含 L00＝34 單；v18.0 S、D 照新的槓桿算，錢分在三個帳戶）。"""
     fng = asyncio.ensure_future(fng_lines())                 # v9.7：恐懼貪婪指數跟幣種一起查
     accts = [(a, "") for a in list(GD_XACCT) + ([ACCT] if ACCT not in GD_XACCT else [])]   # v20.0：每個 bot 都列 5 個帳戶（o6666o 多列自己）
-    P1 = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "━━━━━━━━━━"]
+    P1 = [f"{E.BOT} OKX原K｜{ACCT}", "事件：幣種清單（即時）", "", "━━━━━━━━━━"]   # v20.0.6（1111 畫面）：分隔線上面空一行
     fd_sim_read()                                          # v20.0.4：別的 bot 的模擬佔用、已實現、未實現（跟 /status 一樣）
     for i, (a, tag) in enumerate(accts):
         P1 += (["━━━━━━━━━━"] if i else []) + await coins_acct_lines(a, tag)
+    P1 += ["━━━━━━━━━━"] + coins_fee_lines([a for a, _ in accts])   # v20.0.6：費率只寫一次，放最下面
     await reply(u, "\n".join(P1))                         # ① 兩個帳戶（先送，幣種算好再送 ②）
     on = coins_list()                                       # v10.5：加 COINS_ADD，不重複；v11.1：跟 /amp 共用
     if not await okx_specs_all():
@@ -5674,40 +5685,40 @@ async def amp_page(sym, tf, head):
         return f"{head}\n💥 {sym} 查無K線資料,跳下一個"
     S = amp_stats(kl, n)
     q = lambda v: str(Decimal(str(v)).quantize(tick))
-    sA = f"{S['amax']:.3f}"                                 # v14.0（1111）：平均振幅、中位振幅拿掉
-    p1, p2, p3 = _amp_right([q(S["hi"]), q(last), q(S["lo"])])
-    def rx(a, b):                                          # 倍數＝畫面上的 a ÷ 畫面上的 b，四捨五入到小數兩位
-        a, b = Decimal(a), Decimal(b)
-        return str((a / b).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if b else "-"
+    # v20.0.6（1111 2026-10-30 畫面）：區間加年份、平均振幅加回來、開幣時間；價格五行 歷史高點 🟩 → 區間高點 💚 → 現價 🛜 → 區間低點 ❤️ → 歷史低點 🟥，
+    #   價格同一欄右對齊、「 | 」分開、% 不要小數（四捨五入）；查詢區間範圍＝⬆️%＋⬇️%（照舊 3 位小數）
     ath = await amp_ath(sym, iid, S, last, t_now)          # v14.0：歷史高點、歷史低點
-    if ath:
-        hu = Decimal(f"{(Decimal(ath['hi']) - last) / last * 100:.3f}") or Decimal("0.000")
-        ld = Decimal(f"{(last - Decimal(ath['lo'])) / last * 100:.3f}") or Decimal("0.000")
-        h1, h2 = _amp_right([f"{hu:.3f}", f"{ld:.3f}"])
-        ymd = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%Y/%m/%d")
-        hist = [f"歷史高點 {q(Decimal(ath['hi']))}|{ymd(ath['hi_t'])}", f"⬆️ {h1}%",
-                f"現　價 {q(last)}|{_amp_t(t_now * 1000)}", f"⬇️ {h2}%", f"歷史低點 {q(Decimal(ath['lo']))}|{ymd(ath['lo_t'])}"]
-    else:
-        hist = ["歷史高點 查詢失敗", f"現　價 {q(last)}|{_amp_t(t_now * 1000)}", "歷史低點 查詢失敗"]
-    up = Decimal(f"{(S['hi'] - last) / last * 100:.3f}")  # 現價要漲多少才到最高價（負＝已經衝過最高價）
-    dn = Decimal(f"{(last - S['lo']) / last * 100:.3f}")  # 現價要跌多少才到最低價（負＝已經跌破最低價）
+    ymd = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%Y/%m/%d")
+    md = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%m/%d")
+    ymdhm = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
+    pc = lambda a, b: (a - b) / last * 100                 # 現價要漲（a 高點）／跌（b 低點）多少 %
+    p0 = lambda v: f"{Decimal(v).quantize(Decimal(1), rounding=ROUND_HALF_UP)}%"
+    up = Decimal(f"{pc(S['hi'], last):.3f}")              # 現價要漲多少才到區間最高價（負＝已經衝過）
+    dn = Decimal(f"{pc(last, S['lo']):.3f}")              # 現價要跌多少才到區間最低價（負＝已經跌破）
     up = up if up else Decimal("0.000"); dn = dn if dn else Decimal("0.000")
-    rg = up + dn
-    d1, d2 = _amp_right([f"{up:.3f}", f"{dn:.3f}"])
+    rows = []                                              # (emoji, 價格, 日期, %)
+    if ath:
+        rows.append(("🟩", Decimal(ath["hi"]), ymd(ath["hi_t"]), p0(pc(Decimal(ath["hi"]), last))))
+    rows += [("💚", S["hi"], md(S["tH"]), p0(up)), ("🛜", last, _amp_t(t_now * 1000), None), ("❤️", S["lo"], md(S["tL"]), p0(dn))]
+    if ath:
+        rows.append(("🟥", Decimal(ath["lo"]), ymd(ath["lo_t"]), p0(pc(last, Decimal(ath["lo"])))))
+    ps = _amp_right([q(r[1]) for r in rows])
+    px_lines = [f"{e} {p} | {d}" + (f" | {x}" if x is not None else "") for (e, _, d, x), p in zip(rows, ps)]
+    if not ath:
+        px_lines = ["🟩 歷史高點 查詢失敗"] + px_lines + ["🟥 歷史低點 查詢失敗"]
+    lt = (spec or {}).get("list") or 0
     cnt = f"{S['n']}根" + ("" if S["n"] >= n else "(OKX只有這些)")
     L = [head,                                             # v14.0（1111 2026-10-15）：橫線改成空白列
          f"{sym}|{tf}|{cnt}",
-         f"{_amp_t(S['rows'][0]['ts'])} ~ {_amp_t(S['rows'][-1]['ts'])}",
+         f"{ymdhm(S['rows'][0]['ts'])} ~ {ymdhm(S['rows'][-1]['ts'])}",
          "",
-         f"最高振幅 {sA}%|{_amp_t(S['tA'])}",
-         *hist,
+         f"最高振幅 {S['amax']:.3f}%|{_amp_t(S['tA'])}",
+         f"平均振幅 {S['aavg']:.3f}%",
          "",
-         f"最高價 {p1}|{_amp_t(S['tH'])}",
-         f"⬆️ {d1}%",
-         f"現　價 {p2}|{_amp_t(t_now * 1000)}",
-         f"⬇️ {d2}%",
-         f"最低價 {p3}|{_amp_t(S['tL'])}",
-         f"區　間 {rg:.3f}%|{rx(f'{rg:.3f}', sA)}倍",
+         f"開幣時間 {ymd(lt) if lt else '查不到'}",
+         "",
+         *px_lines,
+         f"查詢區間範圍 {up + dn:.3f}%",
          "",
          f"時間:{hhmmss()}"]
     return "\n".join(L)
