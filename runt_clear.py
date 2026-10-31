@@ -1,8 +1,9 @@
-# runt_clear.py（v19.0 前，2026-10-23）：一次清空 6 個帳戶的 /runt（模擬）。
+# runt_clear.py（2026-10-23；v20.0 2026-10-24 也能用）：一次清空 6 個帳戶的 /runt（模擬）。
 # 1. 停掉 6 個 bot（bot 停的時候會把 /runt 最後存一次檔）
 # 2. 每個帳戶 /runt 還抱著的單，用「現在 OKX 的現價」模擬強制平倉（市價出場），寫進今天的逐單紀錄 runtlog（/summary 看得到，出場原因＝強制平倉）
-#    算法＝v18.5.6／v19.0 gd_money（模擬）：那一單的金額、帳戶費率（存檔裡的）、現貨買進手續費從幣扣、賣出照現貨數量單位往下取；
-#    合約 S 做空、D 做多；實際槓桿＝數量×進場價÷金額
+#    算法＝v18.5.6～v20.0 gd_money（模擬）：那一單的金額、帳戶費率（存檔裡的）、現貨買進手續費從幣扣、賣出照現貨數量單位往下取；
+#    合約 S 做空、D 做多；實際槓桿＝數量×進場價÷金額。帳戶：存檔 v＜200（v18～v19）＝現貨在這個帳戶、合約每 11 層一個帳戶（兩套）；
+#    v≥200（v20.0）＝現貨、合約都是每 10 層一個帳戶 o1111o～o5555o，費率 現貨 "sp:帳戶"、合約 帳戶
 # 3. /runt 存檔清空（掛單一起清掉；原本的存檔備份成 runtgrid_帳戶.json.bak-日期-時間）、6 個 bot 共用的模擬佔用紀錄 fd_sim 刪掉（bot 開起來會重寫）
 # 4. 6 個 bot 開回來
 # 只查 OKX 公開的現價、數量單位，不下單、不碰 OKX 帳戶；不碰實盤 /run 的檔案（rungrid、rungridlog）。
@@ -13,7 +14,8 @@ from datetime import datetime, timezone, timedelta
 
 DATA = os.environ.get("RUNT_DATA", "/srv/1111bot/data")
 ACCTS = ["o1111o", "o2222o", "o3333o", "o4444o", "o5555o", "o6666o"]
-SETS = {"o1111o": ("o1111o", "o2222o", "o3333o"), "o4444o": ("o4444o", "o5555o", "o6666o")}
+SETS = {"o1111o": ("o1111o", "o2222o", "o3333o"), "o4444o": ("o4444o", "o5555o", "o6666o")}   # v18～v19
+X20 = ("o1111o", "o2222o", "o3333o", "o4444o", "o5555o")                                         # v20.0
 TZ8 = timezone(timedelta(hours=8))
 FEE_DEF = {"sp": ("0.08", "0.10"), "sw": ("0.02", "0.05")}
 LOT0 = D("0.00000001")
@@ -35,8 +37,11 @@ def pct(v):
     return str(d.quantize(D(1)) if d == d.to_integral_value() else d)
 
 
-def kacct(acct, kind, k):
-    """跟 gd_kacct 一樣：現貨＝這個帳戶；合約＝那一套的第 1～11 層、12～22、23～33 層的帳戶。"""
+def kacct(acct, kind, k, v=180):
+    """跟 gd_kacct 一樣：v20.0（v≥200）＝現貨、合約都是每 10 層一個帳戶 o1111o～o5555o（L00 在 o1111o）；
+    v18～v19＝現貨在這個帳戶、合約＝那一套的第 1～11 層、12～22、23～33 層的帳戶。"""
+    if v >= 200:
+        return X20[max(abs(k) - 1, 0) // 10]
     if kind != "sw":
         return acct
     main = next((m for m, xs in SETS.items() if acct in xs), "o1111o")
@@ -64,10 +69,14 @@ async def okx():
 
 
 def money(g, p, px, lot, acct):
-    """跟 v18.5.6／v19.0 gd_money（模擬）同一個算法。"""
+    """跟 v18.5.6～v20.0 gd_money（模擬）同一個算法。"""
     kind, k = p["kind"], int(p["k"])
+    v = int(g.get("v") or 0)
     amt = D(p.get("amt") or p.get("lu") or g["amt"])
-    key = "sp" if kind == "sp" else kacct(acct, kind, k)
+    if v >= 200:
+        key = f"sp:{kacct(acct, kind, k, v)}" if kind == "sp" else kacct(acct, kind, k, v)
+    else:
+        key = "sp" if kind == "sp" else kacct(acct, kind, k)
     fe = (g.get("fee") or {}).get(key) or FEE_DEF["sp" if kind == "sp" else "sw"]
     fi, fo = D(fe[0]), D(fe[1])
     ent, qty = D(p["ent"]), D(p["qty"])
@@ -110,7 +119,7 @@ def flat(acct, data, px_of, lot_of, t_out):
             org = g.get("org") or {}
             t_in = float(p["t_in"])
             recs.append({"d": day, "g": 1, "sym": sym, "dir": g["dir"], "kind": kind, "side": side, "k": k, "lvl": k, "nm": nm(kind, k),
-                         "lev": str(q2(qty * ent / m["amt"])) if kind == "sw" else str(D(p["lev"])), "acct": kacct(acct, kind, k),
+                         "lev": str(q2(qty * ent / m["amt"])) if kind == "sw" else str(D(p["lev"])), "acct": kacct(acct, kind, k, int(g.get("v") or 0)),
                          "amt": str(m["amt"]), "up": 1 if p.get("up") else 0,
                          "org": round(float(org["t"]), 3) if org.get("t") is not None else None, "t_run": round(float(g["t_run"]), 3),
                          "ent": str(ent), "px": str(px), "t_in": round(t_in, 3), "t_out": round(t_out, 3), "hold": round(t_out - t_in, 1),
