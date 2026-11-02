@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.1.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.1.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -280,7 +280,7 @@ async def get_last(iid):
 # 只有幾個樣本，WS trades 逐筆推送才不會漏。
 # 【旁路原則】WS 掛掉自動降級回 REST 查價（1 秒一次，rt_px）。
 # v12.5：WS 連著時，冷門幣種幾秒沒成交也不另外查（沒成交＝價格沒變）；WS 斷線才一次查回全部幣種（rt_bulk_px）。
-WS_PUB_URL = "wss://ws.okx.com:8443/ws/v5/public"
+WS_PUB_URL = "wss://ws.okx.com/ws/v5/public"     # v20.1.2：OKX 2026-10-31 起停用 8443 埠 → 改 443（預設埠，網址拿掉 :8443）
 
 WS_PX   = {}        # iid -> (Decimal 價格, epoch 時間戳)
 WS_LIVE = {"pub": False, "pri": False}
@@ -302,6 +302,16 @@ def _ws_lib():
         return None
     import websockets as _w
     return _w
+
+
+WS_NOTE = {}        # v20.1.2：OKX WS 的 notice（code → 最後一次印的時間）
+
+def ws_notice(m):
+    """v20.1.2：OKX WS 送來的通知（event=notice，例：64010 換埠）：不是錯誤，每一種 1 小時只印一次（不算異常）。"""
+    k = str(m.get("code"))
+    if time.time() - WS_NOTE.get(k, 0) >= 3600:
+        WS_NOTE[k] = time.time()
+        print(f"[WS] OKX 通知 {k} {m.get('msg')}")
 
 
 def _ws_push_px(iid, px):
@@ -344,6 +354,8 @@ async def ws_public_task():
                     except asyncio.TimeoutError:
                         continue
                     m = json.loads(raw)
+                    if m.get("event") == "notice":
+                        ws_notice(m)
                     if m.get("arg", {}).get("channel") == "trades":
                         iid = m["arg"].get("instId")
                         if m.get("data"):
@@ -3583,7 +3595,7 @@ RG_WS   = {}                       # 帳戶 → 私有 WS 連著沒
 RG_WST  = {}                       # 帳戶 → 私有 WS 的背景工作
 RG_FDQ  = {}                       # 帳戶 → 要馬上讀 OKX 可用（時間）
 RG_WAKE = None
-WS_PRI_URL = "wss://ws.okx.com:8443/ws/v5/private"
+WS_PRI_URL = "wss://ws.okx.com/ws/v5/private"    # v20.1.2：8443 → 443（OKX 公告；8443 登入前會先送 notice 64010）
 RG_PKEEP = ("real", "acct", "oid", "sz", "fee_in", "fee_b", "ssz", "aid", "aid_x", "n_acx", "manual", "part", "xoid", "acl_wait", "t_aw")
 RG_OKEEP = ("kd", "acct", "sz", "amt", "up", "lev", "lu", "clid", "oid", "cxl", "t_s", "drop", "keep")
 
@@ -4909,8 +4921,15 @@ async def rg_ws_one(a):
                                                 hashlib.sha256).digest()).decode()
                 await ws.send(json.dumps({"op": "login", "args": [{"apiKey": ACC[f"OKX_{a}_API_KEY"], "passphrase": ACC[f"OKX_{a}_PASSPHRASE"],
                                                                   "timestamp": ts, "sign": sgn}]}))
-                raw = await asyncio.wait_for(ws.recv(), timeout=10)
-                if json.loads(raw).get("event") != "login":
+                t_end = time.monotonic() + 10
+                while True:                                # v20.1.2：OKX 先送 notice（例：64010 換埠通知）不算登入失敗，等登入的回覆
+                    raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, t_end - time.monotonic()))
+                    m = json.loads(raw)
+                    if m.get("event") == "login":
+                        break
+                    if m.get("event") == "notice":
+                        ws_notice(m)
+                        continue
                     raise RuntimeError(f"login fail {raw[:200]}")
                 await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "orders", "instType": "ANY"}]}))
                 RG_WS[a] = True
@@ -4923,6 +4942,8 @@ async def rg_ws_one(a):
                     m = json.loads(raw)
                     if m.get("arg", {}).get("channel") == "orders" and m.get("data"):
                         rg_wake().set()
+                    elif m.get("event") == "notice":
+                        ws_notice(m)
         except asyncio.CancelledError:
             raise
         except Exception as e:
