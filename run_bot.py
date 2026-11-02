@@ -20,7 +20,7 @@
 【部署】GitHub 網頁上傳 run_bot.py → VPS：bash /srv/1111bot/deploy.sh test <行數> <版本>（只更新 o1111o）→ deploy.sh all。
   六個帳戶（o1111o～o6666o）共用這一份檔案，ACCT 由 systemd 的 EnvironmentFile 注入。
 """
-import sys, hmac, base64, hashlib, json, time, asyncio, os, re, builtins, socket, uuid
+import sys, hmac, base64, hashlib, json, time, asyncio, os, re, builtins, socket, uuid, shutil
 from collections import deque
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, ROUND_HALF_UP, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.1.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.1.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -803,6 +803,10 @@ def _check_health_lines():
         ico = "🟢" if ago is not None and ago < 5 else "🔴"
         out.append(f"{ico} run實盤　{len(RD)} 個幣種｜持倉 {live} 單｜OKX對帳 " + (f"{ago:.1f}秒前" if ago is not None else "還沒有")
                    + f"｜私有WS {'✅' if any(RG_WS.values()) else '❌'}")
+    else:                                                  # v20.1.1（1111）：沒有 /run 也顯示一行
+        out.append("🟢 run實盤　0 個幣種｜持倉 0 單")
+    if RD_HOLD:
+        out.append(f"🔴 run實盤　{len(RD_HOLD)} 個幣種重開後還沒恢復（BOT 每 10 秒再試）")
     live = sum(len(gd_held(G)) for G in GD.values())     # v15.0：/runt 網格
     out.append(f"🟢 runt　　{len(GD)} 個幣種｜持倉 {live} 單")
     out.append(f"{'🟢' if not DIAG_ERR else '🟡'} 異常　　{len(DIAG_ERR)} 筆（緩衝共 {len(DIAG)} 行）")
@@ -1331,6 +1335,7 @@ GD_SAVE = {"dirty": False, "t": 0.0}
 GD_HOLD = []                            # 重開時沒恢復成功的（原樣留在存檔，背景每 10 秒再試）
 RD = {}                                 # v19.0：/run 實盤網格：幣種 → 一組（跟 GD 同一種格式，多實盤欄位）
 RD_HOLD = []                            # v19.0：/run 重開時沒恢復成功的
+RG_BOOT = {"wait": False}               # v20.1.1：bot 啟動中、/run 存檔還沒讀進來 → gd_save 不可以寫 rungrid（v19.0～v20.1.0 會被 /runt 恢復時寫成空的）
 RG_FILE     = f"/srv/1111bot/data/rungrid_{ACCT}.json"       # v19.0：/run 存檔
 RG_LOG_FILE = f"/srv/1111bot/data/rungridlog_{ACCT}.jsonl"   # v19.0：/run 每一張出場一行（/summary 實盤）
 
@@ -2774,6 +2779,8 @@ def gd_dump(G):
 def gd_save():
     GD_SAVE["dirty"], GD_SAVE["t"] = False, time.time()
     for M in (GSIM, GREAL):                                # v19.0：模擬 runtgrid、實盤 rungrid 各自一個檔
+        if M.real and RG_BOOT["wait"]:                     # v20.1.1：/run 存檔還沒讀進來（rg_recover）→ 不寫（不然會蓋成空的）
+            continue
         if M.real and not M.D and not M.hold and not os.path.exists(M.file):
             continue
         try:
@@ -5040,6 +5047,12 @@ async def rg_recover(app):
                 data = json.load(f) or []
     except Exception as e:
         print("[run] recover read fail", e)
+    if data:
+        try:
+            shutil.copyfile(RG_FILE, RG_FILE + ".boot")    # v20.1.1：開機時讀到的存檔留一份（萬一之後出事還找得回來）
+        except Exception as e:
+            print("[run] 存檔備份失敗", e)
+    RG_BOOT["wait"] = False                                # v20.1.1：讀進來了 → 之後可以存檔
     if not data:
         return
     RG_APP["app"] = app
@@ -5950,6 +5963,7 @@ async def job_summary(ctx):
 # ---------- 啟動 ----------
 async def _post_init(app):
     global HTTP
+    RG_BOOT["wait"] = True    # v20.1.1：/run 存檔讀進來（rg_recover）之前，任何存檔都不寫 rungrid
     HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0),
                              transport=httpx.AsyncHTTPTransport(local_address=OKX_V4, limits=httpx.Limits(max_connections=40)))   # v15.2：連 OKX 一律走 IPv4
     load_state()              # v10.8：聊天室、/tf 週期（原本在舊 /run 的 startup_recover）
@@ -6005,6 +6019,7 @@ async def _post_init(app):
         await rg_recover(app)       # v19.0：/run 實盤的組接著跑，以 OKX 為準對帳
     except Exception as e:
         print("[run] recover fail", type(e).__name__, e)
+    RG_BOOT["wait"] = False
     rt_bg(gd_save_task())           # v15.0：網格存檔（最快 1 秒一次、平常 10 秒一次）
     rt_bg(fd_task(app))             # v17.0：每分鐘讀帳戶可用、帳戶模式；每小時查 OKX 規格
 
