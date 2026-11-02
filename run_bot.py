@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.0.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.1.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -3233,11 +3233,17 @@ def fd_avail(acct, back=Decimal(0)):
         return None
     return f["avail"] - fd_used_all(acct) + fd_real_all(acct) + back
 
-async def fd_refresh(acct, app=None):
+async def fd_refresh(acct, app=None, cfg=True):
     """讀這個帳戶的 USDT 可用、餘額、權益、佔用＋帳戶模式、持倉模式（/runt 開始、每分鐘巡邏、/coins）。成功回 None，失敗回原因。
-    巡邏時（app）帳戶模式、持倉模式變成不能做 → 那個帳戶先不掛新單、通知一次；改回來 → 通知、接著掛。"""
-    b, c = await asyncio.gather(api("GET", "/api/v5/account/balance", acct=acct),   # v20.0.4：全部幣（現貨持倉成本、未實現）
-                                api("GET", "/api/v5/account/config", acct=acct))
+    巡邏時（app）帳戶模式、持倉模式變成不能做 → 那個帳戶先不掛新單、通知一次；改回來 → 通知、接著掛。
+    v20.1.0：cfg=False＝只讀餘額（帳戶模式用上一次的；從來沒讀過照樣讀）。"""
+    if not cfg and not (FD.get(acct) or {}).get("cfg_t"):
+        cfg = True
+    if cfg:
+        b, c = await asyncio.gather(api("GET", "/api/v5/account/balance", acct=acct),   # v20.0.4：全部幣（現貨持倉成本、未實現）
+                                    api("GET", "/api/v5/account/config", acct=acct))
+    else:
+        b, c = await api("GET", "/api/v5/account/balance", acct=acct), {"code": "0", "data": []}
     for r in (b, c):
         if str(r.get("code")) != "0":
             return f"{r.get('code')} {r.get('msg') or ''}".strip()
@@ -3250,12 +3256,13 @@ async def fd_refresh(acct, app=None):
             continue
         rcost += D_("openAvgPx", y) * D_("cashBal", y) if y.get("openAvgPx") not in (None, "") else D_("eqUsd", y)
         rupl += D_("spotUpl", y)
-    cfg = (c.get("data") or [{}])[0]
     f = FD.setdefault(acct, {})
     old = f.get("bad")
-    f.update(avail=D_("availBal"), cash=D_("cashBal"), eq=D_("eq"), frozen=D_("frozenBal"), rcost=rcost, rupl=rupl,
-             lv=str(cfg.get("acctLv") or ""), pm=cfg.get("posMode") or "", iso=cfg.get("ctIsoMode") or "", perm=cfg.get("perm"), t=time.time())
-    f["bad"] = fd_bad(f["lv"], f["pm"])
+    f.update(avail=D_("availBal"), cash=D_("cashBal"), eq=D_("eq"), frozen=D_("frozenBal"), rcost=rcost, rupl=rupl, t=time.time())
+    if cfg:
+        cf = (c.get("data") or [{}])[0]
+        f.update(lv=str(cf.get("acctLv") or ""), pm=cf.get("posMode") or "", iso=cf.get("ctIsoMode") or "", perm=cf.get("perm"), cfg_t=time.time())
+    f["bad"] = fd_bad(f.get("lv") or "", f.get("pm") or "")
     if app is not None and f["bad"] != old and (f["bad"] or old):
         if f["bad"]:
             txt = [f"🚨 {acct} 變成 {f['bad']}", "所有 runt 先不掛新單(持倉的 SL/TP 照常)", "改回 合約模式|雙向持倉 會自動接著掛"]
@@ -3537,8 +3544,10 @@ async def gd_spec_fresh(has):
 #   紀錄：rungrid_{帳戶}.json（存檔）、rungridlog_{帳戶}.jsonl（每一張出場，/summary）、rungridevent_{帳戶}.jsonl（每一次送單、撤單、成交、
 #         出場、改單、保證金、資金費），留 30 天。
 RG_EV_FILE   = f"/srv/1111bot/data/rungridevent_{ACCT}.jsonl"
-RG_SYNC_GAP  = 0.5      # 每 0.5 秒對帳 OKX 掛單、條件單（掛單 60 次/2 秒、條件單 20 次/2 秒）
-RG_POS_GAP   = 1.0      # 每 1 秒對帳 OKX 持倉（10 次/2 秒，同一個帳戶別的 bot 也會查）
+RG_SYNC_GAP  = 1.0      # v20.1.0：每 1 秒對帳 OKX 掛單、條件單（v19.0～v20.0.9 0.5 秒）；私有 WS 有動靜照樣馬上對
+RG_POS_GAP   = 2.0      # v20.1.0：每 2 秒對帳 OKX 持倉（v19.0～v20.0.9 1 秒）
+RG_FULL_GAP  = 60       # v20.1.0：平常只查「這個 bot 在那個帳戶有東西」的帳戶；每 60 秒 5 個帳戶全部查一次（孤兒單、漏掉的）
+RG_CFG_GAP   = 60       # v20.1.0：帳戶模式、持倉模式 60 秒讀一次（可用照樣 10 秒、有事情馬上讀）
 RG_SYNC_MIN  = 0.25     # 私有 WS 叫醒時，兩次對帳最少間隔
 RG_AMB_SEC   = 10       # 送單沒有回應：10 秒內用自訂單號找，找不到當作沒送出
 RG_CXL_AGAIN = 3        # 撤單 3 秒還在 → 再撤一次
@@ -3547,7 +3556,7 @@ RG_COOL      = 30       # 掛單被拒 → 那個位置 30 秒後再試
 RG_PO_COOL   = 1.0      # post-only 被 OKX 取消 → 1 秒後照現價重算
 RG_MIS_CONF  = 1.0      # OKX 倉位跟 BOT 對不上要持續 1 秒（兩次對帳）才去找手動平倉／強平
 RG_MIS_SEC   = 20       # 對不上超過 20 秒 → 通知
-RG_BAL_GAP   = 10       # 每 10 秒讀一次 OKX 可用（下單、成交、撤單後馬上再讀）
+RG_BAL_GAP   = 10       # 每 10 秒讀一次 OKX 可用（下單、成交、撤單後馬上再讀）；v20.1.0：只讀有用到的帳戶（其他的 fd_task 每 60 秒讀）
 RG_SPOT_GAP  = 3        # 每 3 秒對帳一次 OKX 現貨餘額（手動賣掉）
 RG_MG_TOL    = Decimal("0.02")    # 保證金差 0.02U 以內不調
 RG_MG_PCT    = Decimal("0.005")   #           或差 0.5% 以內不調
@@ -3560,7 +3569,7 @@ RG_WHY_OTHER = {"full_liquidation": "強平", "partial_liquidation": "強平", "
 RG_DIG  = (re.sub(r"\D", "", ACCT) or "0")[0]
 RG_PFX  = f"gr{RG_DIG}"            # /run 進場單的自訂單號開頭
 RG_APFX = f"ga{RG_DIG}"            # /run 條件單的自訂單號開頭
-RG_SYNC = {"t": 0.0, "ok": None, "err": 0, "warn_t": 0.0, "pos_t": {}}
+RG_SYNC = {"t": 0.0, "ok": None, "err": 0, "warn_t": 0.0, "pos_t": {}, "full_t": 0.0}
 RG_HOLD = {"until": 0.0}           # OKX 回速率超限 50011 → 條件單請求暫停 2 秒
 RG_APP  = {"app": None}
 RG_WS   = {}                       # 帳戶 → 私有 WS 連著沒
@@ -3664,6 +3673,43 @@ def rg_init(G):
 def rg_accts():
     """/run 用到的帳戶（OKX 可用、私有 WS）：有 /run 的組＝o1111o～o5555o（v20.0：現貨、合約都分 5 個帳戶）。"""
     return list(GD_XACCT) if any(not G.get("done") for G in RD.values()) else []
+
+def rg_used_accts(gs=None):
+    """v20.1.0：這個 bot 的 /run 在哪幾個帳戶有東西（OKX 上的掛單、送單／撤單中、持倉、條件單、OKX 合約倉位、現貨）→ 平常只對帳這幾個帳戶。"""
+    gs = [G for G in RD.values() if not G.get("done")] if gs is None else gs
+    out = set()
+    for G in gs:
+        for o in list(G["ord"].values()) + [G.get("o00")]:
+            if o and (rg_onokx(o) or o.get("cxl") or o.get("amb")):
+                out.add(o["acct"])
+        for p in G["pos"]:
+            if not p["out"] and p.get("real"):
+                out.add(p["acct"])
+        for k, x in (G.get("okpos") or {}).items():
+            if x and x.get("sz"):
+                out.add(k.split("|")[0])
+        out |= set((G.get("okspot") or {}).keys())
+        out |= set((G.get("spmis") or {}).keys()) if isinstance(G.get("spmis"), dict) else set()
+    return out & set(GD_XACCT)
+
+def rg_spot_accts(G):
+    """v20.1.0：這一組要對現貨餘額的帳戶（BOT 在那個帳戶抱著現貨、或上一次 OKX 有記錄）。"""
+    out = {p["acct"] for p in G["pos"] if not p["out"] and p["kind"] == "sp"}
+    return out | set((G.get("okspot") or {}).keys())
+
+async def rg_spot_bal(need):
+    """v20.1.0：現貨餘額一個帳戶查一次（全部要對的幣一起，一次最多 20 個幣）：need＝帳戶 → {幣}。回傳 帳戶 → OKX 回覆（details 合在一起）。"""
+    async def one(a, bs):
+        bs = sorted(bs)
+        rs = await asyncio.gather(*(api("GET", "/api/v5/account/balance?ccy=" + ",".join(bs[i:i + 20]), acct=a) for i in range(0, len(bs), 20)))
+        bad = next((r for r in rs if str(r.get("code")) != "0"), None)
+        if bad is not None:
+            return a, bad
+        dets = [d for r in rs for d in ((r.get("data") or [{}])[0].get("details") or [])]
+        return a, {"code": "0", "data": [{"details": dets}]}
+    if not need:
+        return {}
+    return dict(await asyncio.gather(*(one(a, bs) for a, bs in need.items())))
 
 def rg_avail(acct):
     v = (FD.get(acct) or {}).get("avail")
@@ -4512,9 +4558,10 @@ def rg_mg_check(G, acct, side, now):
             rg_fdq(acct)
     rt_bg(go())
 
-async def rg_spot_check(G, now, accts):
+async def rg_spot_check(G, now, accts, spb=None):
     """每 3 秒：每個帳戶的 OKX 現貨餘額（v20.0：現貨也分 5 個帳戶；/status 官方均價用 OKX 平均成本）；
-    比 BOT 在那個帳戶抱著的實得顆數少 → 1111 手動賣掉了 → 查那個帳戶的 OKX 賣單，從最深一層往回算。accts＝這次對帳查得到的帳戶。"""
+    比 BOT 在那個帳戶抱著的實得顆數少 → 1111 手動賣掉了 → 查那個帳戶的 OKX 賣單，從最深一層往回算。accts＝這次對帳查得到的帳戶。
+    v20.1.0：spb＝rg_sync 一個帳戶查一次（全部的幣一起）的結果；沒給＝自己查。"""
     if now - (G.get("sp_t") or 0) < RG_SPOT_GAP:
         return
     G["sp_t"] = now
@@ -4529,7 +4576,10 @@ async def rg_spot_check(G, now, accts):
     todo = [a for a in accts if a in held or a in oks]
     if not todo:
         return
-    rs = await asyncio.gather(*(api("GET", f"/api/v5/account/balance?ccy={base}", acct=a) for a in todo))
+    if spb is None:
+        rs = await asyncio.gather(*(api("GET", f"/api/v5/account/balance?ccy={base}", acct=a) for a in todo))
+    else:
+        rs = [spb.get(a) or {"code": "-1"} for a in todo]
     tol = ((G.get("sp") or {}).get("lot") or GD_LOT0) * 2
     for a, r in zip(todo, rs):
         if str(r.get("code")) != "0":
@@ -4566,7 +4616,7 @@ def rg_err(G, where, e):
     print(f"[run] sync {where} fail", G.get("sym"), type(e).__name__, e)
     rg_warn(G, f"err{where}", f"BOT 內部錯誤({where},已經接著跑,OKX 上的單照常):{type(e).__name__}: {e}")
 
-async def rg_sync_group(G, P, now):
+async def rg_sync_group(G, P, now, spb=None, full=True):
     # ① 進場單（L00、3 個位置）
     for slot, o in [("o00", G.get("o00"))] + list(G["ord"].items()):
         if not o or P.get(o["acct"]) is None:
@@ -4607,14 +4657,16 @@ async def rg_sync_group(G, P, now):
     # ④ 現貨餘額（v20.0：每個帳戶）
     if G.get("sp"):
         try:
-            await rg_spot_check(G, now, [a for a in GD_XACCT if P.get(a) is not None])
+            await rg_spot_check(G, now, [a for a in GD_XACCT if P.get(a) is not None], spb)
         except Exception as e:
             rg_err(G, "spot", e)
     # ⑤ 條件單被取消（不是 BOT 撤的、這一單還在）
     for p in list(G["pos"]):
         if not p["out"] and p.get("acx_pend") and now - p["acx_pend"] >= (RG_ACX_WAIT_SP if p["kind"] == "sp" else RG_ACX_WAIT):
             rg_acx_due(G, p)
-    # ⑥ 孤兒單（每 60 秒）
+    # ⑥ 孤兒單（每 60 秒：v20.1.0 5 個帳戶全部查的那一次）
+    if not full:
+        return
     try:
         await rg_orphans(G, {a: P.get(a) for a in GD_XACCT}, now)
     except Exception as e:
@@ -4681,7 +4733,7 @@ RG_ORPH_AGE = 30       # 送出去超過 30 秒還沒有人認領才算（剛送
 async def rg_orphans(G, P, now):
     """保險：OKX 上這個幣有 /run（這個 bot）的掛單、條件單，但 BOT 沒有任何一單認領（例：bot 在送單途中當掉）→ 撤掉、通知。
     不撤的話，一張沒人管的條件單觸發時會平掉別的單的倉位。"""
-    if now - (G.get("orph_t") or 0) < RG_ORPH_GAP:
+    if now - (G.get("orph_t") or 0) < RG_ORPH_GAP - 5:
         return
     G["orph_t"] = now
     old = lambda x: now - (int(x.get("cTime") or 0) / 1000) > RG_ORPH_AGE
@@ -4723,13 +4775,18 @@ async def rg_algo_pending(a):
     return {"code": "0", "data": rows}
 
 async def rg_sync():
-    """向 OKX 對帳一次（全部 /run 的組一起）：每個帳戶 掛單、條件單、持倉（每 1 秒）各查一次，再逐組比對。
-    一個帳戶有任何一個查不到 → 那個帳戶這一次不下任何結論。"""
+    """向 OKX 對帳一次（全部 /run 的組一起）：每個帳戶 掛單、條件單、持倉（每 2 秒）各查一次，再逐組比對。
+    一個帳戶有任何一個查不到 → 那個帳戶這一次不下任何結論。
+    v20.1.0：平常只查這個 bot 在那個帳戶有東西的帳戶（rg_used_accts）；每 60 秒 5 個帳戶全部查一次（孤兒單）；
+    現貨餘額一個帳戶查一次（全部的幣一起，rg_spot_bal）。"""
     gs = [G for G in list(RD.values()) if not G.get("done")]
     if not gs:
         return
     now = time.time()
-    accts = set(GD_XACCT)                                  # v20.0：現貨、合約都在 5 個帳戶
+    full = now - RG_SYNC.get("full_t", 0.0) >= RG_FULL_GAP
+    accts = set(GD_XACCT) if full else rg_used_accts(gs)   # v20.0：現貨、合約都在 5 個帳戶
+    if full:
+        RG_SYNC["full_t"] = now
     sw_accts = set(GD_XACCT) if any(G.get("sw") for G in gs) else set()
 
     async def one(a):
@@ -4755,6 +4812,15 @@ async def rg_sync():
         return a, A, None
     out = await asyncio.gather(*(one(a) for a in sorted(accts)))
     P = {a: A for a, A, _ in out}
+    spb = None
+    need = {}
+    for G in gs:
+        if G.get("sp") and now - (G.get("sp_t") or 0) >= RG_SPOT_GAP:
+            for a in rg_spot_accts(G):
+                if P.get(a) is not None:
+                    need.setdefault(a, set()).add(G["sym"][:-4])
+    if need:
+        spb = await rg_spot_bal(need)
     bad = [(a, c) for a, A, c in out if A is None]
     if bad:
         RG_SYNC["ok"] = False
@@ -4766,12 +4832,12 @@ async def rg_sync():
         RG_SYNC.update(t=now, ok=True)
     for G in gs:
         try:
-            await rg_sync_group(G, P, now)
+            await rg_sync_group(G, P, now, spb, full)
         except Exception as e:
             print("[run] sync fail", G.get("sym"), type(e).__name__, e)
 
 async def rg_sync_task():
-    """背景：有 /run 的組就每 0.5 秒對帳一次；私有 WS 有動靜（或 BOT 剛送單、撤單）就馬上對（最少隔 0.25 秒）。"""
+    """背景：有 /run 的組就每 1 秒對帳一次（v20.1.0；原本 0.5 秒）；私有 WS 有動靜（或 BOT 剛送單、撤單）就馬上對（最少隔 0.25 秒）。"""
     last = 0.0
     while not SHUTTING_DOWN:
         try:
@@ -4799,25 +4865,29 @@ async def rg_sync_task():
             await asyncio.sleep(1)
 
 async def rg_bal_task():
-    """背景：/run 用到的帳戶每 10 秒讀一次 OKX 可用（＋帳戶模式）；下單、成交、撤單之後 1 秒內再讀一次。"""
+    """背景：/run 用到的帳戶每 10 秒讀一次 OKX 可用（＋帳戶模式）；下單、成交、撤單之後 1 秒內再讀一次。
+    v20.1.0：每 10 秒只讀這個 bot 有東西的帳戶（其他帳戶 fd_task 每 60 秒讀）；帳戶模式、持倉模式 60 秒讀一次。"""
     last = {}
     while not SHUTTING_DOWN:
         await asyncio.sleep(1)
-        if not RD:
+        if RD:
+            await rg_bal_once(last, time.time())
+
+async def rg_bal_once(last, now):
+    """rg_bal_task 的一拍（last＝帳戶 → 上一次讀的時間）。"""
+    used = rg_used_accts()
+    for a in rg_accts():
+        q = RG_FDQ.get(a)
+        if not ((q is not None and now - q >= 0.5) or (a in used and now - last.get(a, 0) >= RG_BAL_GAP)):
             continue
-        now = time.time()
-        for a in rg_accts():
-            q = RG_FDQ.get(a)
-            if not ((q is not None and now - q >= 0.5) or now - last.get(a, 0) >= RG_BAL_GAP):
-                continue
-            RG_FDQ.pop(a, None)
-            last[a] = now
-            try:
-                e = await fd_refresh(a, RG_APP.get("app"))
-                if e:
-                    print("[run] 帳戶讀不到", a, e)
-            except Exception as ex:
-                print("[run] 帳戶讀取失敗", a, type(ex).__name__, ex)
+        RG_FDQ.pop(a, None)
+        last[a] = now
+        try:
+            e = await fd_refresh(a, RG_APP.get("app"), cfg=now - (FD.get(a) or {}).get("cfg_t", 0) >= RG_CFG_GAP)
+            if e:
+                print("[run] 帳戶讀不到", a, e)
+        except Exception as ex:
+            print("[run] 帳戶讀取失敗", a, type(ex).__name__, ex)
 
 async def rg_ws_one(a):
     """私有頻道（一個帳戶）：訂單有動靜就叫醒對帳；真相一律回查 OKX（WS 漏訊也不會誤判）。這個帳戶沒有 /run 就斷開。"""
