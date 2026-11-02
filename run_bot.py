@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.1.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.1.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -2216,22 +2216,14 @@ def gd_fill_lines(G, p):
     return L + ["", f"時間:{hhmmss()}"]
 
 def gd_fill_qty(G, p):
-    """v17.0（1111 2026-10-19 畫面）：進場通知多的那幾行（照 OKX 單位往下取之後的數量）：
-    現貨＝買幾顆|花多少U、手續費幾顆|實得幾顆（手續費從買到的幣扣）；合約＝幾張(幾顆)|倉位U|保證金U（保證金照樣每層U）。"""
-    x = G.get(p["kind"]) or {}
-    lot = x.get("lot") or GD_LOT0
+    """v17.0（1111 2026-10-19 畫面）：進場通知多的那幾行。v20.1.4（1111 2026-11-02）：顆數、張數拿掉 →
+    現貨＝買xU；合約＝倉位xU|保證金xU（保證金照樣每層U）。"""
     if p["kind"] == "sp":
-        got = p.get("got")
-        got = p["qty"] if got is None else got
         up = [f"{GD_IND}(每層{pct(gd_lu(G, p))}U 不夠,自動用最低金額)"] if p.get("up") else []   # v17.0.3
         up += [f"{GD_IND}(部分成交,金額照成交的比例)"] if p.get("part") else []                    # v19.0：實盤部分成交
-        return [f"{GD_IND}買{gd_qs(p['qty'], lot)}顆|{rn_q4(p['qty'] * p['ent'])}U",
-                f"{GD_IND}手續費{gd_qs(p['qty'] - got, lot, 2)}顆",
-                f"{GD_IND}實得{gd_qs(got, lot, 2)}顆"] + up        # v18.5.3（1111 2026-10-22）：實得換行
-    ct = p.get("ct")
-    ct = p["qty"] / (x.get("ctval") or 1) if ct is None else ct
+        return [f"{GD_IND}買{rn_q4(p['qty'] * p['ent'])}U"] + up   # v20.1.4（1111 2026-11-02）：顆數（買、手續費、實得）拿掉
     mg = pct(gd_lu(G, p)) if not (p.get("up") or p.get("part")) else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
-    return ([f"{GD_IND}{pct(ct)}張({pct(p['qty'])}{G['sym'][:-4]})|倉位{(p['qty'] * p['ent']).quantize(Decimal('0.01'))}U|保證金{mg}U"]
+    return ([f"{GD_IND}倉位{(p['qty'] * p['ent']).quantize(Decimal('0.01'))}U|保證金{mg}U"]   # v20.1.4（1111 2026-11-02）：張數、顆數拿掉
             + ([f"{GD_IND}(每層{pct(gd_lu(G, p))}U 不夠,自動用最低金額)"] if p.get("up") else [])
             + ([f"{GD_IND}(部分成交,保證金照成交的比例)"] if p.get("part") else []))
 
@@ -2297,12 +2289,7 @@ def gd_exit_lines(G, p, m):
     if p["t_arm"]:
         L.append(f"設SL {rn_mdt(p['t_arm'])}|{gd_q(G, kd, p['arm_px'])}")
     L.append(f"出場 {rn_mdt(t)}|{gd_q(G, kd, px)}")
-    if kd == "sp" and m.get("sell") is not None:          # v17.0：現貨賣出的顆數（實得往下取到數量單位），零頭留在帳戶
-        lot = (G.get("sp") or {}).get("lot") or GD_LOT0
-        ds = gd_qs(m["dust"], lot, 2)
-        L.append(f"賣出 {gd_qs(m['sell'], lot)}顆")
-        if Decimal(ds) > 0:
-            L.append(f"零頭 {ds}顆📌")                     # v17.0.6（1111 2026-10-20 畫面）：零頭另一行
+    # v20.1.4（1111 2026-11-02）：現貨 賣出幾顆、零頭幾顆 兩行拿掉（零頭照樣留在帳戶、價值照樣算在毛損益）
     L += [f"持倉 {rn_hold(t - p['t_in'])}", f"原因 {rn_why_nm(why, p.get('n_tp', 0))}"]
     L.append(f"移動 SL {p['n_mv']}次 | TP {p.get('n_tp', 0)}次")   # v18.1：現貨也有 SL/TP
     L += [f"最高毛利率 {hi}", f"最低毛利率 {lo}", "", f"本單{GD_MK[kd]}   {gd_nm(kd, p['k'])} {gd_bprm(G, p)}"]   # v17.0.7（1111 2026-10-20）
@@ -2514,14 +2501,6 @@ def gd_why_lines(recs):
     # v18.4.2（1111 2026-10-22 畫面）：拿掉空格、不補對齊空白（太長 TG 會換行）：設定SL33|L層4|S層20|U層9|D層0
     return [f"{nm}{v[0]}|" + "|".join(f"{x}層{v[i + 1]}" for i, x in enumerate("LSUD")) for nm, v in rows]
 
-def gd_qn(v):
-    """v20.1.3：顆數（/summary 跟 OKX 對）：1 顆以上 2 位小數、不到 1 顆 6 位小數，後面的 0 拿掉（69.00→69、68.7936→68.79）。"""
-    v = Decimal(v)
-    if v == 0:
-        return "0"
-    q = v.quantize(Decimal("0.01") if abs(v) >= 1 else Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    return format(q.normalize(), "f")
-
 def gd_book(G):
     """v20.1.3：這一組每個帳戶 → 合約持倉（S 空單、L＝D 多單）、現貨持倉、委託（掛單）張數。"""
     out = {}
@@ -2539,13 +2518,11 @@ def gd_book(G):
     return out
 
 def gd_book_acct(d):
-    """v20.1.3（1111 2026-11-02 畫面）：一個帳戶三行：🈴合倉 1單|分倉 2單|多 69顆、💰現貨 4單|68.79顆、✅委託 3單。"""
+    """v20.1.4（1111 2026-11-02）：一個帳戶三行：🈴合倉 1單(分倉 2單)、💰現貨 4單、✅委託 3單（顆數拿掉）。
+    合倉＝OKX 當前倉位「合倉」（同一個幣同一個方向一行）；分倉＝每一層合約單一行（＝BOT 的合約單數）。"""
     sw = d["sw"]
-    q = "".join(f"|{'多' if x == 'L' else '空'} {gd_qn(sum((p['qty'] for p in sw[x]), Decimal(0)))}顆" for x in ("L", "S") if sw.get(x))
-    sp = d["sp"]
-    return [f"{GD_MK['sw']}合倉 {sum(1 for x in sw if sw[x])}單|分倉 {sum(len(v) for v in sw.values())}單{q}",
-            f"{GD_MK['sp']}現貨 {len(sp)}單" + (f"|{gd_qn(sum((p.get('got') or p['qty'] for p in sp), Decimal(0)))}顆" if sp else ""),
-            f"✅委託 {d['ord']}單"]
+    return [f"{GD_MK['sw']}合倉 {sum(1 for x in sw if sw[x])}單(分倉 {sum(len(v) for v in sw.values())}單)",
+            f"{GD_MK['sp']}現貨 {len(d['sp'])}單", f"✅委託 {d['ord']}單"]
 
 def gd_book_lines(G):
     """v20.1.3：/summary 分幣種 🎯持倉 下面（OKX 每個帳戶分開看）：這個 bot 的帳戶照寫；別的帳戶空一行、(o2222o) 下面（跟 /status 一樣）。"""
@@ -2560,7 +2537,7 @@ def gd_book_lines(G):
     return L
 
 def gd_book_tot_lines(gs):
-    """v20.1.3：/summary 總表 🎯持倉 下面：🈴合倉 3單|分倉 5單、💰現貨 10單|3幣種、✅委託 9單（全部帳戶加起來）。"""
+    """v20.1.3：/summary 總表 🎯持倉 下面：🈴合倉 3單(分倉 5單)、💰現貨 10單|3幣種、✅委託 9單（全部帳戶加起來；v20.1.4 寫法）。"""
     m = n = sp = od = 0
     coins = set()
     for G in gs:
@@ -2571,7 +2548,7 @@ def gd_book_tot_lines(gs):
             od += d["ord"]
             if d["sp"]:
                 coins.add(G["sym"])
-    return [f"{GD_MK['sw']}合倉 {m}單|分倉 {n}單", f"{GD_MK['sp']}現貨 {sp}單|{len(coins)}幣種", f"✅委託 {od}單"]
+    return [f"{GD_MK['sw']}合倉 {m}單(分倉 {n}單)", f"{GD_MK['sp']}現貨 {sp}單|{len(coins)}幣種", f"✅委託 {od}單"]   # v20.1.4
 
 def gd_sum_msgs(d, full=False, M=None, quiet=False):
     """⑤ /summary（模擬 /runt 網格；1111 2026-10-17 畫面）：第一則總表、第二則分幣種（太長照分隔線分頁）。
