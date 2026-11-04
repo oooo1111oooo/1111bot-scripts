@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.1.4"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.1.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -2221,7 +2221,8 @@ def gd_fill_qty(G, p):
     if p["kind"] == "sp":
         up = [f"{GD_IND}(每層{pct(gd_lu(G, p))}U 不夠,自動用最低金額)"] if p.get("up") else []   # v17.0.3
         up += [f"{GD_IND}(部分成交,金額照成交的比例)"] if p.get("part") else []                    # v19.0：實盤部分成交
-        return [f"{GD_IND}買{rn_q4(p['qty'] * p['ent'])}U"] + up   # v20.1.4（1111 2026-11-02）：顆數（買、手續費、實得）拿掉
+        return ([f"{GD_IND}買{rn_q4(p['qty'] * p['ent'])}U"]   # v20.1.4（1111 2026-11-02）：顆數（買、手續費、實得）拿掉
+                + ([f"{GD_IND}(補滿:跟之前部分成交的合成一單)"] if p.get("merged") else []) + up)   # v20.1.5（1111 2026-11-04 畫面）
     mg = pct(gd_lu(G, p)) if not (p.get("up") or p.get("part")) else f"{gd_pamt(G, p).quantize(Decimal('0.01'), rounding=ROUND_CEILING)}"
     return ([f"{GD_IND}倉位{(p['qty'] * p['ent']).quantize(Decimal('0.01'))}U|保證金{mg}U"]   # v20.1.4（1111 2026-11-02）：張數、顆數拿掉
             + ([f"{GD_IND}(每層{pct(gd_lu(G, p))}U 不夠,自動用最低金額)"] if p.get("up") else [])
@@ -2903,6 +2904,10 @@ async def gd_rec_one(app, d, names, M=None):
                          "told": True, "out": None})
         if M.real:
             rg_pload(G["pos"][-1], y)                      # v19.0：OKX 單號、張數、手續費、條件單
+            q = G["pos"][-1]
+            if q["kind"] == "sp" and q.get("manual") and not q.get("aid") and rg_tiny_q(G, q):
+                q["manual"] = False                        # v20.1.5：v20.1.4 以前「低於 OKX 最小、請自己處理」的現貨 → 未滿（價格回來補滿）
+                rg_tiny_mark(G, q)
     G["fee"] = {g: (Decimal(a), Decimal(b)) for g, (a, b) in (d.get("fee") or {}).items()} or None   # v17.0
     for nm, a in (d.get("agg") or {}).items():
         G["agg"][nm] = {k: (v if isinstance(v, int) else Decimal(v)) for k, v in a.items()}
@@ -3634,8 +3639,9 @@ RG_WST  = {}                       # 帳戶 → 私有 WS 的背景工作
 RG_FDQ  = {}                       # 帳戶 → 要馬上讀 OKX 可用（時間）
 RG_WAKE = None
 WS_PRI_URL = "wss://ws.okx.com/ws/v5/private"    # v20.1.2：8443 → 443（OKX 公告；8443 登入前會先送 notice 64010）
-RG_PKEEP = ("real", "acct", "oid", "sz", "fee_in", "fee_b", "ssz", "aid", "aid_x", "n_acx", "manual", "part", "xoid", "acl_wait", "t_aw")
-RG_OKEEP = ("kd", "acct", "sz", "amt", "up", "lev", "lu", "clid", "oid", "cxl", "t_s", "drop", "keep")
+RG_PKEEP = ("real", "acct", "oid", "sz", "fee_in", "fee_b", "ssz", "aid", "aid_x", "n_acx", "manual", "part", "xoid", "acl_wait", "t_aw",
+            "tiny", "merged")                              # v20.1.5：未滿（現貨低於 OKX 最小）、補滿合併（之前那一單的 OKX 單號）
+RG_OKEEP = ("kd", "acct", "sz", "amt", "up", "lev", "lu", "clid", "oid", "cxl", "t_s", "drop", "keep", "fill")   # v20.1.5：fill＝補滿未滿的那一張
 
 
 def rg_wake():
@@ -3816,6 +3822,7 @@ def rg_pload(p, y):
     p.update(real=True, acct=y.get("acct") or gd_kacct(p["kind"], p["k"]), oid=y.get("oid"), sz=D_(y.get("sz")), fee_in=D_(y.get("fee_in")) or Decimal(0),
              fee_b=D_(y.get("fee_b")), ssz=D_(y.get("ssz")), aid=y.get("aid"), aid_x=y.get("aid_x"), t_aid=0.0,
              n_acx=int(y.get("n_acx") or 0), manual=bool(y.get("manual")), part=bool(y.get("part")), xoid=y.get("xoid"),
+             tiny=bool(y.get("tiny")), merged=y.get("merged"),
              acl_wait=y.get("acl_wait"), t_aw=float(y.get("t_aw") or 0) or time.time(), want=None, abusy=False, x_pend=False)
     if y.get("sent"):
         p["sent"] = tuple(D_(x) for x in y["sent"])
@@ -3833,7 +3840,7 @@ def rg_oload(o, slot=True):
          "sz": D_(o.get("sz")), "amt": D_(o.get("amt")), "up": bool(o.get("up")), "lev": D_(o.get("lev")) or Decimal(1), "lu": D_(o.get("lu")),
          "clid": o.get("clid"), "oid": o.get("oid"), "busy": False, "cxl": bool(o.get("cxl")), "cxl_t": 0.0,
          "t_s": float(o.get("t_s") or 0) or time.time(), "amb": bool(o.get("clid") and not o.get("oid")), "acc": Decimal(0),
-         "drop": bool(o.get("drop")), "keep": bool(o.get("keep"))}
+         "drop": bool(o.get("drop")), "keep": bool(o.get("keep")), "fill": bool(o.get("fill"))}
     return x
 
 
@@ -4015,7 +4022,7 @@ def rg_hang(G, now):
         if cur is not None and (cur.get("acc") or 0) > 0 and ((px > cur["px"]) if s != "S" else (px < cur["px"])):
             rg_cancel(G, cur)                              # 部分成交、價格又離開掛單價 → 剩下的撤掉，成交的部分＝一單（照比例），照常管理
             continue
-        held = {p["k"] for p in G["pos"] if p["kind"] == kd and not p["out"]}
+        held = {p["k"] for p in G["pos"] if p["kind"] == kd and not p["out"] and not p.get("tiny")}   # v20.1.5：未滿的層照樣再掛（補滿）
         buy = s != "S"
         best = None
         for k in gd_rng(G, s):
@@ -4046,6 +4053,7 @@ def rg_hang(G, now):
             continue
         gd_short_ok(G, s, kd, best[0], best[1], acct, None if av is None else av - need)
         o = rg_onew(G, kd, best[0], best[1], now)
+        rg_tiny_fill(G, o)                                 # v20.1.5：這一層有未滿的 → 只掛剩下的
         G["ord"][s] = o
         rg_go_place(G, s, o)
         gd_save_soon()
@@ -4055,7 +4063,7 @@ def rg_rules(G, now):
     還沒有條件單＝下一張 OCO、有＝改觸發價。送出去還沒回來不再送；額度用完 → 離現價最近的先送，其他下一拍。"""
     by = {}
     for p in G["pos"]:
-        if p["out"] or p.get("manual"):
+        if p["out"] or p.get("manual") or p.get("tiny"):    # v20.1.5：未滿＝等補滿才設 SL/TP
             continue
         px = G["px"].get(p["kind"])
         if px is not None:
@@ -4112,6 +4120,10 @@ async def rg_algo_place(G, p, want):
             body = {"instId": x["iid"], "tdMode": "cash", "side": "sell", "ordType": "oco", "sz": rg_s(sz), "algoClOrdId": acl}
         else:
             sz = p["sz"]
+        if kd == "sp" and (sz <= 0 or sz < (x.get("minsz") or 0)):   # v20.1.5：現貨低於 OKX 最小 → 未滿（價格回到這一層補滿）
+            p["want"] = None
+            rg_tiny_mark(G, p)
+            return
         if sz <= 0 or sz < (x.get("minsz") or 0):                    # 數量低於 OKX 最小單位（部分成交、手動平掉一部分剩下的）→ 條件單下不了
             p["manual"], p["want"] = True, None
             rg_warn(G, f"tiny{gd_nm(kd, p['k'])}", f"{gd_nm(kd, p['k'])}{gd_atag(kd, p['k'])} 數量 {pct(sz)} 低於 OKX 最小 {pct(x.get('minsz') or 0)},"
@@ -4196,6 +4208,75 @@ async def rg_algo_amend(G, p, want):
 
 
 # ---------- 對帳（OKX 為準） ----------
+def rg_tiny_q(G, p):
+    """v20.1.5：這一單現貨扣完手續費、往下取到數量單位後，低於 OKX 最小（條件單下不了、賣不掉）。"""
+    x = G.get("sp") or {}
+    got = p.get("got") if p.get("got") is not None else p["qty"]
+    return p["kind"] == "sp" and gd_fl(got, x.get("lot") or GD_LOT0) < (x.get("minsz") or 0)
+
+def rg_tiny_mark(G, p):
+    """v20.1.5（1111 2026-11-04 畫面）：未滿＝先不設 SL/TP；網格照樣在這一層再掛剩下的，成交了合成一單（rg_tiny_join）。"""
+    x = G.get("sp") or {}
+    p["tiny"], p["want"] = True, None
+    got = p.get("got") if p.get("got") is not None else p["qty"]
+    nm = gd_nm("sp", p["k"])
+    rg_ev("tiny", G, nm=nm, acct=p["acct"], got=got, minsz=x.get("minsz"))
+    rg_warn(G, f"tiny{nm}{p['acct']}", f"{nm}{gd_atag('sp', p['k'])} {'部分成交' if p.get('part') else '數量'} {pct(gd_fl(got, x.get('lot') or GD_LOT0))} "
+            f"低於 OKX 最小 {pct(x.get('minsz') or 0)},條件單下不了\n價格回到 {nm} 會補滿這一層,補滿後照常設 SL/TP", every=1)
+    gd_save_soon()
+
+def rg_tiny_of(G, k, acct, but=None):
+    return next((q for q in G["pos"] if q is not but and not q["out"] and q.get("tiny") and q["kind"] == "sp" and q["k"] == k
+                 and q["acct"] == acct), None)
+
+def rg_tiny_fill(G, o):
+    """v20.1.5：要掛的這一層（現貨）有未滿的單 → 只掛剩下的（1 層 − 已經買到的；不到 OKX 最小＝掛最小），金額照比例。"""
+    if o["kd"] != "sp":
+        return
+    t = rg_tiny_of(G, o["k"], o["acct"])
+    if t is None:
+        return
+    x = G.get("sp") or {}
+    lot, mn = x.get("lot") or GD_LOT0, x.get("minsz") or Decimal(0)
+    rem = gd_fl(o["sz"] - t["qty"], lot)
+    if rem < mn:
+        rem = (mn / lot).to_integral_value(rounding=ROUND_CEILING) * lot
+    if o.get("amt") is not None and o["sz"]:
+        o["amt"] = (o["amt"] * rem / o["sz"]).quantize(Decimal("0.00000001"))
+    o["sz"], o["fill"] = rem, True
+
+def rg_tiny_join(G, p, o):
+    """v20.1.5：同一層（同一個帳戶）有未滿的現貨 → 跟這一單合成一單（數量相加、進場價＝平均、手續費、金額相加），
+    未滿那一單拿掉（不算出場）；合完還是低於 OKX 最小 → 照樣未滿。這一單本身就低於最小 → 未滿。"""
+    if p["kind"] != "sp":
+        return
+    t = rg_tiny_of(G, p["k"], p["acct"], but=p)
+    if t is None and o.get("fill") and o.get("amt") is not None and o.get("sz"):
+        p["amt"], p["part"] = (o["amt"] * p["qty"] / o["sz"]).quantize(Decimal("0.00000001")), True   # 未滿那一單已經不在了（例：手動賣掉）→ 金額照這一張的比例
+    if t is not None:
+        new_amt = (o["amt"] * (p["qty"] / o["sz"]) if o.get("fill") and o.get("amt") is not None and o.get("sz") else gd_pamt(G, p))
+        lu = p.get("lu") or G["amt"]
+        amt = (new_amt + gd_pamt(G, t)).quantize(Decimal("0.00000001"))
+        if abs(amt - lu) < Decimal("0.0001"):
+            amt = lu                                       # 補滿＝剛好 1 層
+        q = p["qty"] + t["qty"]
+        ent = (p["qty"] * p["ent"] + t["qty"] * t["ent"]) / q
+        p.update(ent=ent, qty=q, sz=q, got=(p.get("got") or p["qty"]) + (t.get("got") or t["qty"]),
+                 fee_in=(p.get("fee_in") or Decimal(0)) + (t.get("fee_in") or Decimal(0)),
+                 fee_b=(p.get("fee_b") or Decimal(0)) + (t.get("fee_b") or Decimal(0)),
+                 fu=p.get("fu", Decimal(0)) + t.get("fu", Decimal(0)), t_in=min(p["t_in"], t["t_in"]), t_ord=t.get("t_ord") or p.get("t_ord"),
+                 amt=amt, part=amt < lu * Decimal("0.999"), up=bool(p.get("up") or t.get("up")), merged=t.get("oid") or "1")
+        px = G["px"].get("sp")
+        if px is not None:
+            g = rn_g("L", ent, px)
+            p["mfe"], p["mae"] = max(g, Decimal(0)), min(g, Decimal(0))
+        G["pos"].remove(t)
+        rg_ev("tiny_join", G, nm=gd_nm("sp", p["k"]), acct=p["acct"], oid=p.get("oid"), oid_t=t.get("oid"), qty=q, ent=ent, got=p["got"])
+        print(f"[run] 補滿 {G['sym']} {gd_nm('sp', p['k'])} 合成一單 {pct(q)}@{ent}")
+    p["tiny"] = False
+    if rg_tiny_q(G, p):
+        rg_tiny_mark(G, p)
+
 def rg_pos_new(G, o, od):
     """OKX 進場單成交（全部，或撤單時已部分成交）→ 一單持倉：進場價＝OKX 成交均價、數量＝OKX 成交數量、手續費＝OKX 實際。"""
     kd, k = o["kd"], o["k"]
@@ -4757,6 +4838,7 @@ async def rg_sync_entry(G, slot, o, P, now):
             return
         p = rg_pos_new(G, o, res[1])
         G["pos"].append(p)
+        rg_tiny_join(G, p, o)                              # v20.1.5：同一層有未滿的 → 合成一單；合完（或這一單本身）還是低於 OKX 最小 → 未滿
         if slot == "o00":
             if G.get("o00") is o:
                 G["o00"] = None
