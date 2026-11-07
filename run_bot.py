@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.1.5"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.1.6"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1688,6 +1688,16 @@ def gd_hms(t):
 def gd_q(G, kd, px):
     return rt_q(px, G[kd]["tick"])
 
+def gd_q6(G, kd, px):
+    """v20.1.6（1111 2026-11-07）：/status 每一層的價格（成交價／掛單價）、現價：照 tick 的小數位數，最多 6 位。"""
+    q = gd_q(G, kd, px)
+    try:
+        if isinstance(q, Decimal) and -q.as_tuple().exponent > 6:
+            q = q.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    except Exception:
+        pass
+    return q
+
 # ---------- 一組網格 ----------
 def gd_new(p, sp, sw, chat, now, mmr=None):
     G = {"sym": p["sym"], "dir": p["dir"], "has": {x: x in p["dir"] for x in GD_DIRS}, "amt": p["amt"],
@@ -2075,7 +2085,7 @@ def gd_avg_line(G, kd, ps, px, full=True, pc=True, grp=None, b=None):
     mk = GD_MK[kd] + (("D" if ps[0]["side"] == "L" else "S") if kd == "sw" else "")   # v20.0.2（1111 2026-10-26 畫面）：合約 多單＝🈴D、空單＝🈴S（v18.5.3：🈴、🈴多單）
     return [s + (mk if full else "")]
 
-def gd_rows(G, ps, pxs, cum=True, liq=False):
+def gd_rows(G, ps, pxs, cum=True, liq=False, col=None):
     """持倉列：L11 時:分:秒|這一單的%|這一格的淨利率%（cum＝False：只到這一單的%）；兩欄各自對齊。
     v18.4（1111 2026-10-21 畫面）liq＝/status：S 做空後面多 |🔴61.07%＝距離強平（現價再漲幾 %）。
     v18.4.1（1111 2026-10-21）：每個帳戶 11 單在第一層的強平價一起強平 → 只寫在那個帳戶抱著的第一層（S01、S12、S23；
@@ -2090,8 +2100,9 @@ def gd_rows(G, ps, pxs, cum=True, liq=False):
          for p in ps]
     c = iter(rn_pad([x for x in d if x is not None]))
     d = [next(c) if x is not None else None for x in d]
-    return [f"{gd_nm(p['kind'], p['k'])} {gd_hms(p['t_in'])}|{x}" + (f"|{y}" if cum else "") + (f"|🔴{z}" if z else "")
-            for p, x, y, z in zip(ps, a, b, d)]
+    col = col or [gd_hms(p["t_in"]) for p in ps]           # v20.1.6（1111 2026-11-07）：/status 時:分:秒 → 成交價（col）
+    return [f"{gd_nm(p['kind'], p['k'])} {t}|{x}" + (f"|{y}" if cum else "") + (f"|🔴{z}" if z else "")
+            for p, t, x, y, z in zip(ps, col, a, b, d)]
 
 
 def gd_liq_dist(G, p, px):
@@ -2271,8 +2282,8 @@ def gd_acc_lines(G, pxs, liq=False, status=False):
     if status:                                             # v20.0.3（1111 2026-10-27 畫面）/status：每一格 → 最後一行 累計🟰19單(… 開始)；拿掉 損益 那一行
         L = [f"{k}🟰{c}" for k, c in zip(ks, cs)] + [f"累計💚{n}單({gd_md(G['t_run'])} 開始)"]   # v20.0.7（1111 2026-10-30）：🟰 改 💚
     else:
-        L = ([f"累計 {n}單({gd_md(G['t_run'])} 開始)", f"損益 {rn_sp(gd_all_net(G))}"]   # v17.0.6（1111 2026-10-20 畫面）：損益＝每一格的 % 加起來
-             + [f"{k}🟰{c}" for k, c in zip(ks, cs)])                                      #   每一格 U01🟰1單+0.38%
+        L = ([f"{k}🟰{c}" for k, c in zip(ks, cs)]                                        # 每一格 U01🟰1單+0.38%
+             + [f"累計 {n}單({gd_md(G['t_run'])} 開始)"])   # v20.1.6（1111 2026-11-07 畫面）：累計 放到每一格下面；損益 拿掉（下面有淨損益）
     L += [""] + [f"{r[0]} {a}|{b}" for r, a, b in zip(rows, x, y)]
     L[-1] += E.pnl_emoji(rn_q4(u))
     return L + [gd_hold_line(G, gd_held(G), gd_pxs(G, pxs))]
@@ -2358,9 +2369,15 @@ def gd_status_lines(G, now):
             and not any(r[3][0] == "sp" and r[3][1] == 0 for r in rows if r[2] == "ord"):
         rows.append((org["px"], 1, "org", None))           # v18.5.4（1111 2026-10-22）：L00 沒持倉、沒掛單 → 照原點的價格位置也列出來
     rows.sort(key=lambda r: (-r[0], r[1]))
-    prow = iter(gd_rows(G, [r[3] for r in rows if r[2] == "pos"], pxs, liq=True))   # v18.4：合約後面寫距離強平
+    # v20.1.6（1111 2026-11-07 畫面）：每一層的 時:分:秒 → 那一層的價格（持倉＝成交價、掛單＝掛單價、L00 未掛單＝原點價），最多 6 位小數，一起對齊；
+    #   掛單列 L03 0.4385|掛單中🔹、現價 0.4436🛜（時間拿掉）
+    pc = rn_pad([str(gd_q6(G, r[3]["kind"], r[0]) if r[2] == "pos" else gd_q6(G, "sp", r[0]) if r[2] == "org" else gd_q6(G, r[3][0], r[0]))
+                 for r in rows])
+    pcol = dict(zip(map(id, rows), pc))
+    prow = iter(gd_rows(G, [r[3] for r in rows if r[2] == "pos"], pxs, liq=True,
+                        col=[pcol[id(r)] for r in rows if r[2] == "pos"]))   # v18.4：合約後面寫距離強平
     mpx = pxs.get(gd_okd(G))
-    cur = f"現價 {gd_hms(now)}|{gd_q(G, gd_okd(G), mpx)}🛜" if mpx is not None else "現價 查價中"
+    cur = f"現價 {gd_q6(G, gd_okd(G), mpx)}🛜" if mpx is not None else "現價 查價中"
     done = mpx is None
     for r in rows:
         if not done and r[0] < mpx:
@@ -2368,10 +2385,10 @@ def gd_status_lines(G, now):
         if r[2] == "pos":                                  # v18.5.4（1111 2026-10-22）：L00＝原點那一格，後面 ⏺️（持倉、掛單中、沒持倉沒掛單都是）
             L.append(next(prow) + (GD_L00_MK if r[3]["kind"] == "sp" and r[3]["k"] == 0 else ""))
         elif r[2] == "org":
-            L.append(f"L00 {gd_hms(org['t'])}|{gd_q(G, 'sp', org['px'])}|未掛單{GD_L00_MK}")   # v18.5.6（1111 2026-10-23）：沒持倉的列一定寫狀態（掛單中／未掛單）
+            L.append(f"L00 {pcol[id(r)]}|未掛單{GD_L00_MK}")   # v18.5.6（1111 2026-10-23）：沒持倉的列一定寫狀態（掛單中／未掛單）；v20.1.6 時間拿掉
         else:
             kd, k, o = r[3]
-            L.append(f"{gd_nm(kd, k)} {gd_hms(o['t'])}|{gd_q(G, kd, o['px'])}|掛單中{gd_ord_mk(kd, k)}")
+            L.append(f"{gd_nm(kd, k)} {pcol[id(r)]}|掛單中{gd_ord_mk(kd, k)}")   # v20.1.6：時間拿掉
     if not done or mpx is None:
         L.append(cur)
     if G.get("org"):
@@ -2599,8 +2616,9 @@ def gd_sum_msgs(d, full=False, M=None, quiet=False):
         L += ["出場原因"] + gd_why_lines(recs)                 # v18.3（1111 2026-10-21 畫面）：每一種原因一行，後面分 L、S、U、D 層
     sm = lambda rs, k: sum((gd_rD(r, k) for r in rs), Decimal(0))
     fees = lambda rs: sum((gd_rfee(r) for r in rs), Decimal(0))
-    L += ["", f"最{GD_FULL}金額 {pct(peak())}U|{len(syms)}幣種", "",
-          f"🎯持倉 {sum(held_n.values())}單|{pct(sum(held.values(), Decimal(0)))}U|{len([s for s in held if held[s]])}幣種"]   # v20.1.3（1111 2026-11-02）
+    u4 = lambda v: pct(rn_q4(v))                           # v20.1.6（1111 2026-11-07）：最🈵金額、🎯持倉 的 U 最多 4 位小數（總表、分幣種）
+    L += ["", f"最{GD_FULL}金額 {u4(peak())}U|{len(syms)}幣種", "",
+          f"🎯持倉 {sum(held_n.values())}單|{u4(sum(held.values(), Decimal(0)))}U|{len([s for s in held if held[s]])}幣種"]   # v20.1.3（1111 2026-11-02）
     L += gd_book_tot_lines(list(GS.values()))
     L += gd_tot_lines("總", n, sm(recs, "gu"), fees(recs), sm(recs, "fu"), sm(recs, "u"), mark=True)
     L += [""] + foot
@@ -2617,8 +2635,8 @@ def gd_sum_msgs(d, full=False, M=None, quiet=False):
         grp = lambda r: (r.get("nm") or "?")[0]
         lets = "LUSD"                                      # v16.1（1111 2026-10-19）：四段都列（沒開的方向也列 0 單）
         pk, pn = peak_n(sym)
-        X = [f"{GD_SUM_MK}{title}", f"最{GD_FULL}金額 {pn}單|{pct(pk)}U", "",          # v16.2（1111 2026-10-19）
-             f"🎯持倉 {held_n.get(sym, 0)}單|{pct(held.get(sym, Decimal(0)))}U"]       # v20.1.3（1111 2026-11-02 畫面）：持倉金額 → 🎯持倉
+        X = [f"{GD_SUM_MK}{title}", f"最{GD_FULL}金額 {pn}單|{u4(pk)}U", "",          # v16.2（1111 2026-10-19）
+             f"🎯持倉 {held_n.get(sym, 0)}單|{u4(held.get(sym, Decimal(0)))}U"]       # v20.1.3（1111 2026-11-02 畫面）：持倉金額 → 🎯持倉
         X += gd_book_lines(G) + ["", f"總成交單 {len(rs)}單"]   # v20.1.3：跟 OKX 對（🈴合倉／分倉、💰現貨＝資產、✅委託）；v15.8：|L💰…單 拿掉
         lay_n, lay_p = {}, {}
         for r in rs:
