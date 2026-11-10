@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.1.8"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.1.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1327,7 +1327,9 @@ GD_LOT0      = Decimal("0.00000001")   # 規格沒有數量單位時（測試用
 GD_SHORT_GAP = 1800             # v17.0：可用不夠的通知，同一組同一種掛單 30 分鐘內最多一次（錢在邊緣時一直進出，免得洗版；/status 隨時看得到資金）
 GD_FEE_DEF   = {"sp": (SP_FEE_IN, SP_FEE_OUT), "sw": (RN_FEE_IN, RN_FEE_OUT)}   # 讀不到帳戶費率時（% 掛單、吃單）
 FD = {}                         # v17.0：帳戶 → OKX 讀到的 {avail 可用、cash 餘額、eq 權益、frozen 佔用、lv 帳戶模式、pm 持倉模式、fee 費率、bad、t}
+                                # v20.1.9：＋spv 現貨市值、supl 現貨未實現（都換成 USDT）、oth 資金帳戶＋金融帳戶（總資產估值，每分鐘）
 FD_GAP      = 60                # 每 60 秒讀一次帳戶可用、帳戶模式、持倉模式（巡邏）
+FD_VAL_GAP  = 30                # v20.1.9：總資產估值（資金帳戶＋金融帳戶）同一個帳戶 30 秒內不重查（OKX 這一支查詢次數很少）
 FD_SPEC_GAP = 3600              # 每小時查一次 OKX 規格
 FD_LV = {"1": "現貨模式", "2": "合約模式", "3": "跨幣種保證金", "4": "組合保證金"}
 FD_PM = {"long_short_mode": "雙向持倉", "net_mode": "單向持倉"}
@@ -2495,14 +2497,29 @@ def gd_rD(r, k):
 def gd_rfee(r):
     return gd_rD(r, "feeu") if r.get("feeu") is not None else gd_rD(r, "gu") - gd_rD(r, "u") + gd_rD(r, "fu")
 
-def gd_tot_lines(pre, n, gu, fe, fu, u, mark=False):
-    """總毛損益 U|均單U、總手續費 U、(總資金費 U)、總淨損益 U|均單U（1111 2026-10-17：% 改成均單＝合計 U ÷ 總成交單）。"""
+def gd_tot_lines(pre, n, gu, fe, fu, u, mark=False, hold=None):
+    """總毛損益 U|均單U、總手續費 U、(總資金費 U)、總淨損益 U|均單U（1111 2026-10-17：% 改成均單＝合計 U ÷ 總成交單）。
+    v20.1.9：hold＝(還抱著的單的未實現 U, 單數) → 下面多一行 持倉損益 -6.7900U|22單🎯（U 跟上面對齊；寫法同 /stop 的 gd_hold_u_line）。"""
     fd = rn_q4(fu) != 0
-    us = rn_pad([rn_su(gu), rn_su(-fe)] + ([rn_su(fu)] if fd else []) + [rn_su(u)])
+    us = rn_pad([rn_su(gu), rn_su(-fe)] + ([rn_su(fu)] if fd else []) + [rn_su(u)] + ([rn_su(rn_q4(hold[0]))] if hold else []))
     av = rn_pad([rn_su(rn_q4(gu / n) if n else 0), rn_su(rn_q4(u / n) if n else 0)])
     L = [f"{pre}毛損益 {us[0]}|均單{av[0]}", f"{pre}手續費 {us[1]}"] + ([f"{pre}資金費 {us[2]}"] if fd else [])
-    L.append(f"{pre}淨損益 {us[-1]}|均單{av[1]}" + (E.pnl_emoji(rn_q4(u)) if mark else ""))
+    L.append(f"{pre}淨損益 {us[-2 if hold else -1]}|均單{av[1]}" + (E.pnl_emoji(rn_q4(u)) if mark else ""))
+    if hold:
+        L.append(f"持倉損益 {us[-1]}|{hold[1]}單🎯")
     return L
+
+
+def gd_hold_all(gs):
+    """v20.1.9：這幾組還抱著的單 → (未實現 U 合計（現價、不含手續費，gd_upl＝/status 持倉損益的 U）, 單數)；沒有持倉＝None。"""
+    u, n = Decimal(0), 0
+    for G in gs:
+        pxs = gd_pxs(G)
+        for p in gd_held(G):
+            n += 1
+            if pxs.get(p["kind"]) is not None:
+                u += gd_upl(p, pxs[p["kind"]])
+    return (u, n) if n else None
 
 def gd_why_lines(recs):
     """v18.3（1111 2026-10-21 畫面）/summary 總表 出場原因：每一種原因一行，後面分 L、S、U、D 層（設定TP、移動SL、移動TP 各一行；
@@ -2620,7 +2637,8 @@ def gd_sum_msgs(d, full=False, M=None, quiet=False):
     L += ["", f"最{GD_FULL}金額 {u4(peak())}U|{len(syms)}幣種", "",
           f"🎯持倉 {sum(held_n.values())}單|{u4(sum(held.values(), Decimal(0)))}U|{len([s for s in held if held[s]])}幣種"]   # v20.1.3（1111 2026-11-02）
     L += gd_book_tot_lines(list(GS.values()))
-    L += gd_tot_lines("總", n, sm(recs, "gu"), fees(recs), sm(recs, "fu"), sm(recs, "u"), mark=True)
+    L += gd_tot_lines("總", n, sm(recs, "gu"), fees(recs), sm(recs, "fu"), sm(recs, "u"), mark=True,
+                      hold=gd_hold_all(list(GS.values())))   # v20.1.9（1111 2026-11-10）：還抱著的單的未實現（OKX 資產有算、本日淨損益只算出場的）
     L += [""] + foot
     X0 = [f"📊 summary｜{ACCT} {M.tag}分幣種", span]
     for sym in sorted(syms):
@@ -2644,6 +2662,8 @@ def gd_sum_msgs(d, full=False, M=None, quiet=False):
             lay_n[k] = lay_n.get(k, 0) + 1
             lay_p[k] = lay_p.get(k, Decimal(0)) + gd_rD(r, "np")
         X.append(f"目前損益 {rn_sp(sum(lay_p.values(), Decimal(0)))}")   # v17.0.4（1111 2026-10-20）：下面每一格的 % 加起來
+        if G is not None and gd_held(G):                   # v20.1.9（1111 2026-11-10）：還抱著的單（跟 /status 那個幣的持倉損益同一行）
+            X.append(gd_hold_pu_line(G, gd_held(G), gd_pxs(G)))
         X0 += [GD_SUM_SEP] + X
         if not rs:
             continue
@@ -3290,20 +3310,26 @@ def fd_upl(acct):
 
 
 def fd_money(acct):
-    """v20.0.4（1111 2026-10-30）：/coins、/status 的資金（/runt、/run 同一套，以 OKX 的資金現況為準）：
-      可用＝OKX 可用 − /runt 模擬佔用 ＋ /runt 模擬已實現（只有 /run＝OKX 可用）；
-      佔用＝OKX 佔用（掛單＋合約保證金）＋ OKX 現貨持倉成本（OKX 把現貨算成幣，不在 USDT 佔用裡）＋ /runt 模擬佔用；
-      餘額＝可用＋佔用；權益＝餘額＋OKX 未實現（合約 upl＋現貨 spotUpl）＋ /runt 模擬未實現。
+    """/coins、/status 的資金（/runt、/run 同一套，以 OKX 的資金現況為準；畫面、名稱跟 v20.0.6 一樣）。
+    v20.1.9（1111 2026-11-10：o1111o OKX 資產總覽 692.74，BOT 權益 689.68、餘額 696.48 → 找到原因就直接改）：
+      權益＝OKX USDT 權益（＝OKX 可用＋佔用，已經含合約未實現）＋ 現貨市值 ＋ 資金帳戶＋金融帳戶 ＋ /runt 模擬已實現、未實現
+          ＝OKX 資產總覽的「總資產估值」（同一次讀的餘額算；1111 的數字 692.73 對 OKX 692.74）；
+      未實現＝OKX 合約 upl ＋ 現貨 spotUpl ＋ /runt 模擬未實現；餘額＝權益 − 未實現（手上的單都照進場價算）；
+      可用＝OKX 可用 − /runt 模擬佔用 ＋ /runt 模擬已實現；佔用＝餘額 − 可用（掛單、合約保證金、現貨成本、資金帳戶）。
+      → 跟 v20.0.4 同一個關係：餘額＝可用＋佔用、權益＝餘額＋未實現。
+    v20.0.4～v20.1.8 錯在：OKX 的 USDT 佔用已經含合約未實現（逐倉保證金＋未實現）→ 餘額混進合約未實現、權益又加一次＝合約未實現算兩次；
+      資金帳戶沒算；現貨 OKX 給的是美元（eqUsd、openAvgPx、spotUpl），沒換成 USDT。
     /runt 的佔用、已實現、未實現＝6 個 bot 合起來（共用紀錄 fd_sim）。還沒讀到 OKX＝None。"""
     f = FD.get(acct)
     if not f or f.get("avail") is None:
         return None
     used, real = fd_used_all(acct), fd_real_all(acct)
     upl = fd_upl(acct) + (FD_SIM["ext"].get(acct) or [Decimal(0)] * 3)[2]
+    z = Decimal(0)
     avail = f["avail"] - used + real
-    occ = (f.get("frozen") or Decimal(0)) + (f.get("rcost") or Decimal(0)) + used
-    cash = avail + occ
-    return {"avail": avail, "used": occ, "cash": cash, "eq": cash + (f.get("rupl") or Decimal(0)) + upl}
+    eq = (f.get("avail") or z) + (f.get("frozen") or z) + (f.get("spv") or z) + (f.get("oth") or z) + real + upl
+    cash = eq - ((f.get("upl") or z) + (f.get("supl") or z) + upl)
+    return {"avail": avail, "used": cash - avail, "cash": cash, "eq": eq}
 
 def fd_avail(acct, back=Decimal(0)):
     """模擬可用＝真的可用（每分鐘讀 OKX）− 6 個 bot 的模擬佔用 ＋ 模擬已實現（＋back：換格撤掉那一張還回來的）。沒讀過＝None（不限）。
@@ -3319,8 +3345,13 @@ async def fd_refresh(acct, app=None, cfg=True):
     v20.1.0：cfg=False＝只讀餘額（帳戶模式用上一次的；從來沒讀過照樣讀）。"""
     if not cfg and not (FD.get(acct) or {}).get("cfg_t"):
         cfg = True
-    if cfg:
-        b, c = await asyncio.gather(api("GET", "/api/v5/account/balance", acct=acct),   # v20.0.4：全部幣（現貨持倉成本、未實現）
+    v = None
+    if cfg and time.time() - (FD.get(acct) or {}).get("val_t", 0) >= FD_VAL_GAP:
+        b, c, v = await asyncio.gather(api("GET", "/api/v5/account/balance", acct=acct),   # v20.0.4：全部幣（現貨持倉成本、未實現）
+                                       api("GET", "/api/v5/account/config", acct=acct),
+                                       api("GET", "/api/v5/asset/asset-valuation?ccy=USDT", acct=acct))   # v20.1.9：資金帳戶＋金融帳戶（每分鐘、/coins）
+    elif cfg:
+        b, c = await asyncio.gather(api("GET", "/api/v5/account/balance", acct=acct),
                                     api("GET", "/api/v5/account/config", acct=acct))
     else:
         b, c = await api("GET", "/api/v5/account/balance", acct=acct), {"code": "0", "data": []}
@@ -3331,14 +3362,26 @@ async def fd_refresh(acct, app=None, cfg=True):
     x = next((d for d in dets if d.get("ccy") == "USDT"), {})
     D_ = lambda k, y=None: Decimal((x if y is None else y).get(k) or "0")
     rcost, rupl = Decimal(0), D_("upl")                    # v20.0.4：OKX 現貨持倉成本（均價×數量；沒有均價＝市值）、未實現（合約 upl＋現貨 spotUpl）
+    upx = D_("eqUsd") / D_("eq") if D_("eq") > 0 and D_("eqUsd") > 0 else Decimal(1)   # v20.1.9：OKX USDT 的美元價（現貨的 eqUsd、spotUpl 是美元）
+    spv = supl = Decimal(0)                                # v20.1.9：現貨市值、現貨未實現（換成 USDT）
     for y in dets:
         if y.get("ccy") in ("USDT", None) or D_("cashBal", y) <= 0:
             continue
         rcost += D_("openAvgPx", y) * D_("cashBal", y) if y.get("openAvgPx") not in (None, "") else D_("eqUsd", y)
         rupl += D_("spotUpl", y)
+        spv += D_("eqUsd", y) / upx
+        supl += D_("spotUpl", y) / upx
     f = FD.setdefault(acct, {})
     old = f.get("bad")
-    f.update(avail=D_("availBal"), cash=D_("cashBal"), eq=D_("eq"), frozen=D_("frozenBal"), rcost=rcost, rupl=rupl, t=time.time())
+    f.update(avail=D_("availBal"), cash=D_("cashBal"), eq=D_("eq"), frozen=D_("frozenBal"), rcost=rcost, rupl=rupl,
+             upl=D_("upl"), spv=spv, supl=supl, t=time.time())
+    if v is not None and str(v.get("code")) == "0" and v.get("data"):   # v20.1.9：總資產估值讀不到（例：速率）＝用上一次的
+        dt = (v["data"][0] or {}).get("details") or {}
+        try:
+            f["oth"] = sum((Decimal(str(dt.get(k) or "0")) for k in ("funding", "earn", "classic")), Decimal(0))
+            f["val_t"] = time.time()
+        except Exception:
+            pass
     if cfg:
         cf = (c.get("data") or [{}])[0]
         f.update(lv=str(cf.get("acctLv") or ""), pm=cf.get("posMode") or "", iso=cf.get("ctIsoMode") or "", perm=cf.get("perm"), cfg_t=time.time())
@@ -3385,7 +3428,8 @@ async def fd_fee_for(acct, sym):
     return a
 
 def fd_money_lines(acct):
-    """v20.0.5（1111 2026-10-30 畫面）：一個帳戶的資金（/coins、/status 同一個畫面）：帳戶 帳戶模式|持倉模式 → 餘額、權益、可用、佔用（fd_money，2 位小數）。"""
+    """v20.0.5（1111 2026-10-30 畫面）：一個帳戶的資金（/coins、/status 同一個畫面）：帳戶 帳戶模式|持倉模式 → 餘額、權益、可用、佔用（fd_money，2 位小數）。
+    v20.1.9：畫面不變；權益＝OKX 資產總覽的總資產估值（fd_money）。"""
     f = FD.get(acct) or {}
     m = fd_money(acct)
     if not m:
@@ -5610,7 +5654,7 @@ COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSD
              "NEARUSDT", "STRKUSDT", "WUSDT", "ZROUSDT", "TIAUSDT", "FILUSDT")
 
 async def coins_acct_lines(acct, tag=""):
-    """v10.1：交易帳戶 USDT 四行（當下向 OKX 查），名稱照 OKX：餘額＝cashBal、權益＝eq、可用＝availBal、佔用＝frozenBal。
+    """v10.1：交易帳戶 USDT 四行（當下向 OKX 查）；v20.1.9：權益＝OKX 資產總覽的總資產估值（算法看 fd_money）。
     v17.0（1111 2026-10-19 畫面）：一個帳戶一段：帳戶 帳戶模式|持倉模式 → 四行 → 費率 現貨 掛單/吃單|合約 掛單/吃單。"""
     e = await fd_refresh(acct)
     if e:
@@ -6034,7 +6078,7 @@ async def cmd_menu(u, c):
         "/stoprunt 幣種｜all　停止 /runt：撤掉掛單、不再掛新單；持倉照規則（SL/TP 照常移動）跑到出場為止，全部出場後策略結束、通知；沒有持倉＝馬上結束（BOT 不平倉）\n"
         "/run 幣種 方向 每層U 埋伏點%（v19.0 實盤，OKX 真的下單）：規則跟 /runt 一模一樣；掛單＝OKX post-only、SL/TP＝每一單一張 OKX OCO（移動＝改單）；"
         "成交、出場、手續費、資金費、強平價都查 OKX；合約 OKX 槓桿設成每個帳戶最高那一層、成交後保證金補到每層U（強平價＝設計）；/stop 同 /stoprunt（BOT 不平倉）\n"
-        f"/coins 分 3 則：①帳戶（{'、'.join(GD_XACCT)}；o6666o 多列自己）（帳戶模式、持倉模式、餘額、權益、可用、佔用、費率） ②每個幣種（現價、現貨最少幾顆、最大槓桿、合約最小、{GD_N}層預算 L|U|D|S＝每一層都下得了的最少每層U×層數，L 含 L00） ③恐懼貪婪指數\n"
+        f"/coins 分 3 則：①帳戶（{'、'.join(GD_XACCT)}；o6666o 多列自己）（帳戶模式、持倉模式、餘額、權益＝OKX 總資產估值、可用、佔用、費率） ②每個幣種（現價、現貨最少幾顆、最大槓桿、合約最小、{GD_N}層預算 L|U|D|S＝每一層都下得了的最少每層U×層數，L 含 L00） ③恐懼貪婪指數\n"
         f"/amp 週期　振幅分析：週期 {'/'.join(AMP_TF)}，一次 {AMP_N} 根K線，照 /coins 的幣種一個一頁\n"
         "/vps VPS 狀況：CPU、限速、記憶體、硬碟；每個帳戶的 CPU、記憶體、WS 斷線、價格延遲\n"
         "/check 健檢｜/check api｜/check log\n"
