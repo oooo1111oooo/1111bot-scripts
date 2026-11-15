@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.2.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.2.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -5841,17 +5841,10 @@ async def fng_lines():
         L.append(f"{t:%m/%d}({WEEK_ZH[t.weekday()]}) {emo} {v} {zh}".replace("  ", " "))
     return L + ["(每天 08:00 更新)"]
 
-COINS_HIDE = ("HYPEUSDT", "XAUUSDT")   # v10.1（1111）：/coins 不列（只是不列，/runt 照樣可以用）；v11.8（1111）：ZECUSDT、PEPEUSDT 加回 /coins
-# v10.5（1111）：/coins 多列這 10 個（2026-10-07 查過 OKX 都有 USDT 永續、都在交易中）。跟 symbols.json 合起來、拿掉 COINS_HIDE，照字母排序。
-# v11.3（1111 2026-10-10）：加 STXUSDT（查過 OKX：STX-USDT-SWAP 交易中，每張 10 STX、最小 0.1 張、最高 20X）。
-# v11.8（1111 2026-10-11）：加 PEPEUSDT、ZECUSDT（查過 OKX 都在交易中、最高 50X；原本在 COINS_HIDE 裡，拿出來）。
-# v12.3（1111 2026-10-12）：加 SKYUSDT（查過 OKX：SKY-USDT-SWAP 交易中，每張 100 SKY、最小 1 張、最高 20X）。
-# v12.6（1111 2026-10-13）：加 NEARUSDT、STRKUSDT、WUSDT、ZROUSDT、TIAUSDT、FILUSDT（2026-10-13 查過 OKX 都是 USDT 永續、交易中）：
-#   NEAR 每張 10 NEAR、最小 0.1 張、最高 50X；STRK 每張 1 STRK、最小 1 張、50X；W 每張 1 W、最小 1 張、20X；
-#   ZRO 每張 1 ZRO、最小 1 張、20X；TIA 每張 1 TIA、最小 1 張、50X；FIL 每張 0.1 FIL、最小 1 張、50X。
-COINS_ADD = ("PUMPUSDT", "NIGHTUSDT", "ETHFIUSDT", "ENAUSDT", "APTUSDT", "JUPUSDT", "ARBUSDT", "ONDOUSDT", "AEROUSDT", "ASTERUSDT",
-             "STXUSDT", "PEPEUSDT", "ZECUSDT", "SKYUSDT",
-             "NEARUSDT", "STRKUSDT", "WUSDT", "ZROUSDT", "TIAUSDT", "FILUSDT")
+# v20.2.1（1111 2026-11-15）：/coins（和 /amp）的幣種清單＝1111 給的 18 個，固定（不再看 symbols.json、COINS_ADD、COINS_HIDE）。
+#   1111 寫 AREOUSDT＝AEROUSDT（OKX 沒有 AREO；AERO-USDT-SWAP 交易中）。新加的 FET（每張 10、最高 20X）、WIF（每張 1、50X）2026-11-15 查過 OKX 交易中。
+COINS_LIST = ("AEROUSDT", "APTUSDT", "ARBUSDT", "BTCUSDT", "ENAUSDT", "ETHFIUSDT", "ETHUSDT", "FETUSDT", "FILUSDT",
+              "NEARUSDT", "NIGHTUSDT", "PUMPUSDT", "STRKUSDT", "STXUSDT", "TIAUSDT", "WIFUSDT", "WLDUSDT", "ZROUSDT")
 
 async def coins_acct_lines(acct, tag=""):
     """v10.1：交易帳戶 USDT 四行（當下向 OKX 查）；v20.1.9：權益＝OKX 資產總覽的總資產估值（算法看 fd_money）。
@@ -5878,8 +5871,8 @@ def coins_fee_lines(accts):
     return [f"{a} 費率 現貨{x}|合約{y}" for a, x, y in txt]
 
 def coins_list():
-    """/coins、/amp 共用的幣種清單：symbols.json 有啟用的＋COINS_ADD，拿掉 COINS_HIDE，照字母排序（v11.1 抽出來共用）。"""
-    return sorted(({s["symbol"] for s in SYMS if s["enabled"]} | set(COINS_ADD)) - set(COINS_HIDE))
+    """/coins、/amp 共用的幣種清單（v11.1 抽出來共用）。v20.2.1：固定 COINS_LIST，照字母排序。"""
+    return sorted(set(COINS_LIST))
 
 async def coins_spot_last():
     """v17.0：一次查回全部現貨的現價 {instId: 現價}；查不到回 {}。"""
@@ -5916,7 +5909,7 @@ async def cmd_coins(u, c):
         P1 += (["━━━━━━━━━━"] if i else []) + await coins_acct_lines(a, tag)
     P1 += ["━━━━━━━━━━"] + coins_fee_lines([a for a, _ in accts])   # v20.0.6：費率只寫一次，放最下面
     await reply(u, "\n".join(P1))                         # ① 兩個帳戶（先送，幣種算好再送 ②）
-    on = coins_list()                                       # v10.5：加 COINS_ADD，不重複；v11.1：跟 /amp 共用
+    on = coins_list()                                       # v11.1：跟 /amp 共用；v20.2.1：固定 18 個（COINS_LIST）
     if not await okx_specs_all():
         await asyncio.sleep(1)
         await okx_specs_all()
