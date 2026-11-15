@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.1.9"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.2.0"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -1591,13 +1591,26 @@ def gd_qs(v, lot, extra=0):
     e = max(min(e, 0), -8)
     return str(Decimal(v).quantize(Decimal(1).scaleb(e), rounding=ROUND_DOWN))
 
+def gd_ldir(kd, k):
+    """v20.2.0：這一層是哪個方向（L00＝L）。"""
+    return gd_nm(kd, k)[0]
+
+def gd_on(G, x):
+    """v20.2.0（1111 2026-11-15）：這個方向還在跑（有下、沒有被 /stop 幣種 方向 停掉）。"""
+    return bool(G["has"].get(x)) and x not in (G.get("xdir") or "")
+
+def gd_ondirs(G):
+    """v20.2.0：還在跑的方向（照 /run 打的順序）。"""
+    return "".join(x for x in G["dir"] if gd_on(G, x))
+
 def gd_rng(G, s):
-    """可以掛的格子（v18.0 照掛單位置）：sp＝有 L＝L33～L00、有 U＝U01～U33；S＝S01～S33；D＝D33～D01。"""
+    """可以掛的格子（v18.0 照掛單位置）：sp＝有 L＝L33～L00、有 U＝U01～U33；S＝S01～S33；D＝D33～D01。
+    v20.2.0：被 /stop 停掉的方向不算（gd_hang、rg_hang 就會撤掉那個方向的掛單、不再掛）。"""
     if s == "S":
-        return range(1, GD_N + 1) if G["has"]["S"] else []
+        return range(1, GD_N + 1) if gd_on(G, "S") else []
     if s == "D":
-        return range(-GD_N, 0) if G["has"]["D"] else []
-    return range(-GD_N if G["has"]["L"] else 1, (GD_N if G["has"]["U"] else 0) + 1)
+        return range(-GD_N, 0) if gd_on(G, "D") else []
+    return range(-GD_N if gd_on(G, "L") else 1, (GD_N if gd_on(G, "U") else 0) + 1)
 
 def gd_okd(G):
     """原點用哪一種價格：有現貨（L、U）＝現貨，只有 S＝永續。"""
@@ -1854,6 +1867,9 @@ def gd_hang(G, now):
     可用不夠（fd_avail）＝那一張不掛（跟實盤被拒一樣），通知一次、有錢了自動接著掛再通知；帳戶模式被改（fd_halt）＝不掛新單。
     L00 被 post-only 取消 → 價格回到 L00 上面再重掛。"""
     o = G.get("o00")
+    if o and not gd_on(G, "L") and G["has"].get("L"):       # v20.2.0：L 停了 → L00 不再掛
+        G["o00"] = o = None
+        gd_save_soon()
     if o and o.get("live") is None:
         px = G["px"].get("sp")
         if px is not None and px > o["px"] and not fd_halt(gd_kacct("sp", 0)):
@@ -2357,7 +2373,8 @@ def gd_status_lines(G, now):
     ps = gd_held(G)
     pxs = gd_pxs(G)
     L = [f"📣{'持倉' if ps else '埋伏'} {gd_M(G).tag}{gd_head(G)}", f"▶️{gd_md(G['t_run'])}起|{rn_hold(now - G['t_run'])}",   # v16.1（1111）：開始→起
-         ] + (["🚦停止中(不再掛單,持倉跑到出場為止)"] if G.get("stop") else []) + ([] if G["has"]["L"] else [gd_org_txt(G)]) + [""]
+         ] + (["🚦停止中(不再掛單,持倉跑到出場為止)"] if G.get("stop") else gd_xtxt(G)) \
+        + ([] if G["has"]["L"] and (gd_on(G, "L") or gd_l00_row(G)) else [gd_org_txt(G)]) + [""]   # v20.2.0：L 停了、L00 也出場了 → 留原點那一行
     # v18.0：拿掉 🈴D層在 o2222o 執行；v18.5 停止中；v20.0.3（1111 2026-10-27 畫面）：有 L 拿掉 🩵原點 那一行（L00 那一列後面 🩵 就是原點）；沒有 L 沒有 L00 那一列，留著
     rows = [(p["ent"], 0 if p["kind"] == "sw" else 1, "pos", p) for p in ps]
     for sl, o in G["ord"].items():
@@ -2367,7 +2384,7 @@ def gd_status_lines(G, now):
     if G.get("o00"):
         rows.append((G["o00"]["px"], 1, "ord", ("sp", 0, G["o00"])))
     org = G.get("org")
-    if org and G["has"]["L"] and not any(r[3]["kind"] == "sp" and r[3]["k"] == 0 for r in rows if r[2] == "pos") \
+    if org and gd_on(G, "L") and not any(r[3]["kind"] == "sp" and r[3]["k"] == 0 for r in rows if r[2] == "pos") \
             and not any(r[3][0] == "sp" and r[3][1] == 0 for r in rows if r[2] == "ord"):
         rows.append((org["px"], 1, "org", None))           # v18.5.4（1111 2026-10-22）：L00 沒持倉、沒掛單 → 照原點的價格位置也列出來
     rows.sort(key=lambda r: (-r[0], r[1]))
@@ -2466,6 +2483,161 @@ def gd_stop_dup_lines(G):
     return [f"{E.WARN} {G['sym']} 已經停止策略中,請勿重複", f"持倉 {len(gd_held(G))}單 跑到出場為止,全部出場後會通知"]
 
 
+def gd_xrun(G):
+    """v20.2.0：停掉了、還在等持倉出場的方向。"""
+    done = G.get("xdone") or ""
+    return "".join(x for x in (G.get("xdir") or "") if x not in done)
+
+
+def gd_xtxt(G):
+    """v20.2.0（1111 2026-11-15 畫面）：/status 標題下面：🚦S 停止中(不再掛單,持倉跑到出場為止)／🛑S 已停止。"""
+    run, done = gd_xrun(G), G.get("xdone") or ""
+    return ([f"🚦{run} 停止中(不再掛單,持倉跑到出場為止)"] if run else []) + ([f"🛑{done} 已停止"] if done else [])
+
+
+def gd_l00_row(G):
+    """L00 還有持倉或掛單（/status 有 L00 那一列）。"""
+    return bool(G.get("o00")) or any(p["kind"] == "sp" and p["k"] == 0 for p in gd_held(G))
+
+
+def gd_xbusy(G, xs):
+    """v20.2.0：這幾個方向還有東西：持倉、剛出場還沒記帳的、掛單（含換格準備的那一張）、L00。"""
+    if any(gd_ldir(p["kind"], p["k"]) in xs for p in G["pos"]):
+        return True
+    for s, o in G["ord"].items():
+        for x in (o, (o or {}).get("nxt")):
+            if x and gd_ldir(gd_skd(s), x["k"]) in xs:
+                return True
+    return "L" in xs and bool(G.get("o00"))
+
+
+def gd_xagg(G, xs):
+    """v20.2.0：這幾個方向的累計出場（單數、淨損益U）。"""
+    A = [a for nm, a in G["agg"].items() if nm[:1] in xs]
+    return sum(a["n"] for a in A), sum((a["u"] for a in A), Decimal(0))
+
+
+def gd_xstop_lines(G, xs, now, cx):
+    """v20.2.0（1111 2026-11-15 畫面 ①）：/stop 幣種 方向（只停一部分方向，那個方向還有持倉）→ 🚦 停止中。"""
+    M = gd_M(G)
+    ps = [p for p in gd_held(G) if gd_ldir(p["kind"], p["k"]) in xs]
+    pxs = gd_pxs(G)
+    L = [f"🚦 /{M.stop} {M.tag}{G['sym']} {xs} 停止中", f"▶️{gd_md(G['t_run'])} 開始|歷時{rn_hold(now - G['t_run'])}"]
+    cx = [c for c in cx if c[2][0] in xs]
+    if cx:
+        L += [f"撤單 {cx[0][2]} {gd_q(G, cx[0][3], cx[0][0])}"] + [f"{GD_CXL_IND}{nm} {gd_q(G, kd, px)}" for px, _, nm, kd in cx[1:]]
+    else:
+        L.append("撤單 無")
+    L += [f"{xs} 不再掛新單", f"其他方向繼續:{gd_ondirs(G)}"]
+    L += ["", f"{xs} 持倉{len(ps)}單(照規則跑到出場為止):" if ps else f"{xs} 持倉0單"] + gd_rows(G, ps, pxs, cum=False)
+    n, u = gd_xagg(G, xs)
+    L += ["", f"{xs} 累計出場 {n}單", gd_hold_u_line(ps, pxs), f"{xs} 淨損益 {rn_su(u)}"]
+    return L + ["", f"{xs} 全部出場後會再通知", "", f"時間:{hhmmss()}"]
+
+
+def gd_xdone_lines(G, xs, now, first=False):
+    """v20.2.0（1111 2026-11-15 畫面 ②）：停掉的方向最後一單出場（first＝打 /stop 時本來就沒有持倉）→ 🛑 已停止，其他方向照跑。"""
+    M = gd_M(G)
+    n, u = gd_xagg(G, xs)
+    return [f"🛑 /{M.stop} {M.tag}{G['sym']} {xs} 已停止", f"▶️{gd_md(G['t_run'])} 開始|歷時{rn_hold(now - G['t_run'])}",
+            f"{xs} 持倉0單" if first else f"{xs} 持倉全部出場", f"其他方向繼續:{gd_ondirs(G)}",
+            "", f"{xs} 累計出場 {n}單", f"{xs} 淨損益 {rn_su(u)}", "", f"時間:{hhmmss()}"]
+
+
+def gd_xdup_lines(G, xs):
+    """v20.2.0：已經停掉的方向又打 /stop 幣種 方向 → 已經停止,請勿重複。"""
+    run = "".join(x for x in xs if x not in (G.get("xdone") or ""))
+    n = sum(1 for p in gd_held(G) if gd_ldir(p["kind"], p["k"]) in run)
+    return [f"{E.WARN} {G['sym']} {xs} 已經停止,請勿重複"] + ([f"{run} 持倉 {n}單 跑到出場為止,全部出場後會通知"] if run and n else [])
+
+
+def gd_xend(G, send, now):
+    """v20.2.0：停掉的方向（還沒通知過的）沒有持倉、沒有掛單了 → 通知 🛑 已停止（一次）。/stop 正在等 OKX 撤單（xwait）時先不判斷。"""
+    run = gd_xrun(G)
+    if not run or G.get("stop") or G.get("xwait"):
+        return
+    xs = "".join(x for x in run if not gd_xbusy(G, x))
+    if not xs:
+        return
+    G["xdone"] = (G.get("xdone") or "") + xs
+    send("\n".join(gd_xdone_lines(G, xs, now)))
+    print(f"[grid] {gd_M(G).tag}{G['sym']} {xs} 停止 → 全部出場（其他方向繼續 {gd_ondirs(G)}）")
+    gd_save_soon()
+
+
+def gd_xstop(G, xs, now):
+    """v20.2.0：/stoprunt 幣種 方向（模擬，只停一部分方向）：那個方向的掛單撤掉、不再掛；持倉照規則跑到出場；其他方向照跑。"""
+    cx = gd_cx_list(G)
+    G["xdir"] = (G.get("xdir") or "") + xs
+    if "L" in xs:
+        G["o00"] = None
+    first = not gd_xbusy(G, xs) or not any(gd_ldir(p["kind"], p["k"]) in xs for p in G["pos"])
+    for s, cur in G["ord"].items():
+        if not cur:
+            continue
+        if cur.get("nxt") and gd_ldir(gd_skd(s), cur["nxt"]["k"]) in xs:
+            cur["nxt"] = None
+        if gd_ldir(gd_skd(s), cur["k"]) in xs:
+            if first:
+                G["ord"][s] = cur.get("nxt") if cur.get("cxl") is not None else None   # 沒有持倉＝馬上拿掉（跟 /stoprunt 全停一樣）
+            elif cur.get("cxl") is None:
+                cur["cxl"], cur["nxt"] = now + RT_LAT, None   # 撤單（確認之前碰到照樣成交，那一單也跑到出場）
+    gd_save_soon()
+    print(f"[grid] 停止 {G['sym']} {xs}（其他方向繼續 {gd_ondirs(G)}）")
+    if first and not gd_xbusy(G, xs):
+        G["xdone"] = (G.get("xdone") or "") + xs
+        return gd_xdone_lines(G, xs, now, first=True)
+    return gd_xstop_lines(G, xs, now, cx)
+
+
+async def rg_xstop(G, xs):
+    """v20.2.0：/stop 幣種 方向（實盤，只停一部分方向）：那個方向的掛單送撤單（等 OKX 確認，最多 6 秒）、不再掛；持倉照規則跑到出場（BOT 不平倉）；
+    其他方向照跑。那個方向沒有持倉、掛單都撤掉了＝馬上 🛑 已停止；撤單時剛好成交＝那一單也跑到出場。"""
+    now = time.time()
+    cx = gd_cx_list(G)
+    G["xdir"] = (G.get("xdir") or "") + xs
+    G["xwait"] = True
+    try:
+        o = G.get("o00")
+        if "L" in xs and o:
+            o["drop"] = True
+            if rg_onokx(o):
+                if not o.get("cxl"):
+                    rg_cancel(G, o)
+            else:
+                G["o00"] = None
+        for s, cur in list(G["ord"].items()):
+            if cur and gd_ldir(gd_skd(s), cur["k"]) in xs:
+                if rg_onokx(cur):
+                    if not cur.get("cxl"):
+                        rg_cancel(G, cur)
+                else:
+                    G["ord"][s] = None
+        gd_save_soon()
+        rg_wake().set()
+        t_end = now + 6
+        while time.time() < t_end and gd_xbusy_ord(G, xs) and not G["done"]:
+            await asyncio.sleep(0.3)
+            rg_wake().set()
+    finally:
+        G["xwait"] = False
+    if G["done"]:
+        return None
+    print(f"[run] 停止 {G['sym']} {xs}（其他方向繼續 {gd_ondirs(G)}）")
+    if not gd_xbusy(G, xs):
+        G["xdone"] = (G.get("xdone") or "") + xs
+        gd_save_soon()
+        return gd_xdone_lines(G, xs, time.time(), first=True)
+    return gd_xstop_lines(G, xs, time.time(), cx)
+
+
+def gd_xbusy_ord(G, xs):
+    """v20.2.0：這幾個方向還有掛單（OKX 還沒確認撤掉）。"""
+    if "L" in xs and G.get("o00"):
+        return True
+    return any(o and gd_ldir(gd_skd(s), o["k"]) in xs for s, o in G["ord"].items())
+
+
 def gd_stop_busy_lines(G):
     """v18.5（1111 2026-10-22 畫面）：停止中的幣打 /runt（開新的、改每層U）→ 擋。"""
     return [f"{E.WARN} {G['sym']} 停止中(還有持倉 {len(gd_held(G))}單)", f"全部出場後才能重新 /{gd_M(G).cmd}"]
@@ -2474,7 +2646,10 @@ def gd_status_line(G):
     """進行中的一行（/runt、/stoprunt 沒帶參數時列出來）。"""
     n = len(gd_held(G))
     st = "等L00成交" if G.get("org") is None else (f"持倉 {n}單" if n else "埋伏中")
-    return f"💡{gd_head(G)} 埋伏{rt_p2(G['off'])}%|{st}" + ("|🚦停止中" if G.get("stop") else "")   # v18.5
+    if G.get("stop"):
+        return f"💡{gd_head(G)} 埋伏{rt_p2(G['off'])}%|{st}|🚦停止中"   # v18.5
+    run, done = gd_xrun(G), G.get("xdone") or ""           # v20.2.0：只停一部分方向
+    return f"💡{gd_head(G)} 埋伏{rt_p2(G['off'])}%|{st}" + (f"|🚦{run}停止中" if run else "") + (f"|🛑{done}已停止" if done else "")
 
 def gd_running(M=None):
     M = M or GSIM
@@ -2713,6 +2888,7 @@ def gd_tick(G, send, now):
     if G.get("stop") and not G.get("stop_wait") and not gd_held(G) and not any(G["ord"].values()) and not G.get("o00"):
         gd_stop_end(G, send, now)                          # v18.5：停止中，最後一單出場了
         return
+    gd_xend(G, send, now)                                  # v20.2.0：只停一部分方向 → 那個方向最後一單出場了
     if G.get("real"):                                      # v19.0：/run 實盤：資金費看 OKX（rg_sync）、SL/TP 送 OKX 條件單、掛單送 OKX
         if G["org"] is not None:
             rg_rules(G, now)
@@ -2862,6 +3038,7 @@ def gd_dump(G):
             "agg": {nm: {k: (v if isinstance(v, int) else str(v)) for k, v in a.items()} for nm, a in G["agg"].items()},
             "fund_last": G["sw"]["fund"]["last"] if G.get("sw") else None, "mix": bool(G.get("mix")),   # v18.4：改過每層U
             "stop": G.get("stop"),                                                                     # v18.5：停止中
+            "xdir": G.get("xdir") or "", "xdone": G.get("xdone") or "",                               # v20.2.0：停掉的方向、已經通知已停止的方向
             **({"real": True, "ff0": G.get("ff0") or {}, "lev_set": G.get("lev_set") or {}, "seen": (G.get("seen") or [])[-300:],
                 "acx": (G.get("acx") or [])[-200:]} if G.get("real") else {})}   # v19.0
 
@@ -2951,6 +3128,7 @@ async def gd_rec_one(app, d, names, M=None):
         G["agg"][nm] = {k: (v if isinstance(v, int) else Decimal(v)) for k, v in a.items()}
     G["mix"] = bool(d.get("mix"))
     G["stop"] = d.get("stop")                              # v18.5：停止中（持倉跑到出場為止）
+    G["xdir"], G["xdone"] = d.get("xdir") or "", d.get("xdone") or ""   # v20.2.0：/stop 幣種 方向
     if M.real:
         rg_init(G)
         G["ff0"] = d.get("ff0") or {}
@@ -4037,13 +4215,14 @@ def rg_hang(G, now):
     o = G.get("o00")
     if o is not None:
         a0 = o["acct"]                                     # v20.0：L00 在第一個帳戶（o1111o）
+        xl = not gd_on(G, "L")                             # v20.2.0：L 停了 → L00 跟停止中一樣撤掉
         if rg_onokx(o):
-            if (G.get("stop") or fd_halt(a0)) and not o.get("cxl"):
-                o["drop"] = bool(G.get("stop"))
+            if (G.get("stop") or xl or fd_halt(a0)) and not o.get("cxl"):
+                o["drop"] = bool(G.get("stop") or xl)
                 rg_cancel(G, o)
             elif (o.get("acc") or 0) > 0 and not o.get("cxl") and (G["px"].get("sp") or 0) > o["px"]:
                 rg_cancel(G, o)                            # 部分成交、價格又回到上面 → 剩下的撤掉，成交的部分＝L00（原點）
-        elif G.get("stop"):
+        elif G.get("stop") or xl:
             G["o00"] = None
             gd_save_soon()
         else:
@@ -5323,11 +5502,13 @@ GD_ASK = ("📝 請輸入 /runt 參數(直接打參數,不用打 /runt)\n"      
 GD_HINT = "SUIUSDT LSUD 5U 0.1%"
 GD_RETRY = f"請重新輸入 /runt 參數:\n幣種 方向 每層U 埋伏點%\n例:{GD_HINT}"
 
-GD_STOP_ASK = ["📝 請輸入要停止的幣種,或 all",
-               "例:SUIUSDT、all(全部幣種)",
-               "停止＝撤掉掛單、不再掛新單;持倉照規則跑到出場為止,全部出場後策略結束(BOT 不平倉)"]
-GD_STOP_RETRY = "請重新輸入要停止的幣種,或 all(例 SUIUSDT)"
-GD_STOP_HINT = "SUIUSDT 或 all"
+GD_STOP_ASK = ["📝 請輸入要停止的幣種和方向",              # v20.2.0（1111 2026-11-15 畫面）：方向一定要打
+               "例:SUIUSDT S(只停 S)",
+               "   SUIUSDT LSUD(四個方向全停)",
+               "   all LSUD(全部幣種全停)",
+               "停止＝撤掉那個方向的掛單、不再掛新單;持倉照規則跑到出場為止(BOT 不平倉)"]
+GD_STOP_RETRY = "請重新輸入要停止的幣種和方向(例 SUIUSDT S)"
+GD_STOP_HINT = "SUIUSDT S"
 
 def gd_parse(a):
     """/runt 4 個參數：幣種 方向 每層U 埋伏點%（v15.6 拿掉槓桿）。成功回 (dict, None)，失敗回 (None, 錯誤說明)。"""
@@ -5574,11 +5755,12 @@ async def gd_amt_change(u, G, amt, retry):
 
 async def cmd_stoprunt(u, c):
     """v15.0 /stoprunt 幣種｜all。v18.5（1111 2026-10-22）：撤掉掛單、不再掛新單；持倉照規則跑到出場為止（SL/TP 照常移動），
-    全部出場後策略結束、通知；沒有持倉＝馬上結束。停止中的幣再打＝已經停止策略中,請勿重複。BOT 不平倉。"""
+    全部出場後策略結束、通知；沒有持倉＝馬上結束。停止中的幣再打＝已經停止策略中,請勿重複。BOT 不平倉。
+    v20.2.0（1111 2026-11-15）：/stoprunt 幣種 方向｜all 方向，方向一定要打；只停一部分方向＝其他方向照跑；剩下的方向全停＝策略結束。"""
     await gd_stop_cmd(u, c, GSIM)
 
 async def cmd_stop(u, c):
-    """v19.0 /stop 幣種｜all（實盤）：跟 /stoprunt 一樣，撤單送 OKX、等 OKX 確認撤掉。BOT 永遠不平倉。"""
+    """v19.0 /stop 幣種｜all（實盤）：跟 /stoprunt 一樣，撤單送 OKX、等 OKX 確認撤掉。BOT 永遠不平倉。v20.2.0：/stop 幣種 方向｜all 方向。"""
     await gd_stop_cmd(u, c, GREAL)
 
 async def gd_stop_cmd(u, c, M):
@@ -5591,27 +5773,45 @@ async def gd_stop_cmd(u, c, M):
     retry = lambda msg: ask(u, M.stop, fn, "\n".join([msg, GD_STOP_RETRY] + run_lines), GD_STOP_HINT)
     if not a:
         await ask(u, M.stop, fn, "\n".join(GD_STOP_ASK + run_lines + [ASK_CANCEL]), GD_STOP_HINT); return
-    if len(a) != 1:
-        await retry(f"{E.WARN} 只要打幣種或 all(方向不用打;收到{len(a)}個參數)"); return
     w = a[0].strip().upper()
+    ex = "all" if w == "ALL" else w
+    if len(a) == 1:                                        # v20.2.0（1111 2026-11-15）：方向一定要打，沒打不停
+        await retry("\n".join([f"{E.WARN} 要打方向", f"例:/{M.stop} {ex} S(只停 S)", f"   /{M.stop} {ex} LSUD(四個方向全停)"])); return
+    if len(a) != 2:
+        await retry(f"{E.WARN} 只要打幣種和方向(例 /{M.stop} {ex} S;收到{len(a)}個參數)"); return
+    d = a[1].strip().upper()
+    if any(x not in GD_DIRS for x in d) or len(set(d)) != len(d):
+        await retry(f"{E.WARN} 方向只能 L、S、U、D 的組合,每個字母最多一次(例 S、LSUD;收到 {a[1]})"); return
     if w == "ALL":
-        gs = sorted(GS.values(), key=lambda G: G["sym"])
+        gs = [G for G in sorted(GS.values(), key=lambda G: G["sym"]) if any(x in G["dir"] for x in d)]
+        if not gs:
+            await retry(f"{E.WARN} 進行中的 {M.cmd} 都沒有 {d}"); return
     elif w in GS:
-        gs = [GS[w]]
+        G = GS[w]
+        miss = "".join(x for x in d if x not in G["dir"])
+        if miss:
+            await retry(f"{E.WARN} {w} 沒有 {miss}(這個幣跑的是 {G['dir']})"); return
+        gs = [G]
     else:
         await retry(f"{E.WARN} {w} 沒有在跑 {M.cmd}"); return
-    if M.real:                                             # v19.0：實盤一組一組撤單、等 OKX 確認
-        for G in gs:
-            L = gd_stop_dup_lines(G) if G.get("stop") else await rg_stop_one(G)
-            if L:
-                await reply(u, "\n".join(L))
-        gd_save()
-        return
     now = time.time()
-    outs = [gd_stop_dup_lines(G) if G.get("stop") else gd_stop_one(G, now) for G in gs]   # v18.5：停止中的不重複
+    outs = []
+    for G in gs:
+        xs = "".join(x for x in G["dir"] if x in d)        # 這個幣有的方向（照 /run 打的順序）
+        new = "".join(x for x in xs if gd_on(G, x))         # 還在跑的（之前停過的不重複停）
+        if G.get("stop"):
+            outs.append(gd_stop_dup_lines(G)); continue    # v18.5：整個幣停止中的不重複
+        if not new:
+            outs.append(gd_xdup_lines(G, xs)); continue
+        if new == gd_ondirs(G):                              # 剩下的方向全停＝跟以前的 /stop 一樣（策略結束）
+            outs.append(await rg_stop_one(G) if M.real else gd_stop_one(G, now)); continue
+        if "L" in new and G.get("org") is None:
+            outs.append([f"{E.WARN} {G['sym']} 原點 L00 還沒成交,現在不能只停 L(要全停請打 /{M.stop} {G['sym']} {G['dir']})"]); continue
+        outs.append(await rg_xstop(G, new) if M.real else gd_xstop(G, new, now))
     gd_save()
     for L in outs:
-        await reply(u, "\n".join(L))
+        if L:
+            await reply(u, "\n".join(L))
 
 FNG_URL = "https://api.alternative.me/fng/?limit=7"      # v9.7：Crypto Fear & Greed Index（alternative.me，免費、不用 key，每天 08:00 台灣時間更新）
 FNG_ZH = {"Extreme Fear": ("😱", "極度恐懼"), "Fear": ("😨", "恐懼"), "Neutral": ("😐", "中性"),
@@ -6075,7 +6275,8 @@ async def cmd_menu(u, c):
         f"SL/TP 改單照 OKX 額度（每 {pct(GD_AMEND_WIN)} 秒 {GD_AMEND_N} 次，每個帳戶的現貨一份、永續一份），超過時離現價最近的先改\n"
         "　例：/runt SUIUSDT LSUD 5U 0.1%、/runt SUIUSDT LSU 5U 0.1%、/runt SUIUSDT LU 5U 0.1%\n"
         "　v18.4 改每層U（進行中的幣）：/runt 幣種 每層U（例 /runt WLDUSDT 3U）：原點、槓桿、強平價不動；抱著的單照原本的金額；掛單撤掉換成新的金額；之後新掛的都用新的\n"
-        "/stoprunt 幣種｜all　停止 /runt：撤掉掛單、不再掛新單；持倉照規則（SL/TP 照常移動）跑到出場為止，全部出場後策略結束、通知；沒有持倉＝馬上結束（BOT 不平倉）\n"
+        "/stoprunt 幣種 方向｜all 方向　停止 /runt（方向一定要打，例 /stoprunt SUIUSDT S＝只停 S、其他方向照跑；SUIUSDT LSUD＝全停）："
+        "撤掉那個方向的掛單、不再掛新單；持倉照規則（SL/TP 照常移動）跑到出場為止，出場完通知；剩下的方向全停＝策略結束（BOT 不平倉）\n"
         "/run 幣種 方向 每層U 埋伏點%（v19.0 實盤，OKX 真的下單）：規則跟 /runt 一模一樣；掛單＝OKX post-only、SL/TP＝每一單一張 OKX OCO（移動＝改單）；"
         "成交、出場、手續費、資金費、強平價都查 OKX；合約 OKX 槓桿設成每個帳戶最高那一層、成交後保證金補到每層U（強平價＝設計）；/stop 同 /stoprunt（BOT 不平倉）\n"
         f"/coins 分 3 則：①帳戶（{'、'.join(GD_XACCT)}；o6666o 多列自己）（帳戶模式、持倉模式、餘額、權益＝OKX 總資產估值、可用、佔用、費率） ②每個幣種（現價、現貨最少幾顆、最大槓桿、合約最小、{GD_N}層預算 L|U|D|S＝每一層都下得了的最少每層U×層數，L 含 L00） ③恐懼貪婪指數\n"
@@ -6178,9 +6379,9 @@ async def _post_init(app):
             BotCommand("summary", "本日戰報（runt）"),
             BotCommand("coins", "帳戶＋幣種＋恐懼貪婪指數"),
             BotCommand("run", "實盤網格（OKX 真的下單）"),       # v19.0
-            BotCommand("stop", "停止run｜幣種或all"),
+            BotCommand("stop", "停止run｜幣種 方向"),
             BotCommand("runt", "網格（模擬，不下單）"),           # v15.0
-            BotCommand("stoprunt", "停止runt｜幣種或all"),
+            BotCommand("stoprunt", "停止runt｜幣種 方向"),
             BotCommand("amp", "振幅分析｜週期"),                 # v15.1：/price、/gap、/timeframe 拿掉
             BotCommand("check", "健檢｜api｜log"),
             BotCommand("menu", "說明"),
