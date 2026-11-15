@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.2.1"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.2.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -5981,9 +5981,13 @@ async def cmd_coins(u, c):
 # 看幾天（v11.1，1111）：1m 看 2 天（原本 7 天：10080 根、23 個幣種要 10 分鐘，還會擠到查價額度）、3m 7 天、5m／10m 14 天、
 #   15m／30m 30 天。根數＝天數÷週期：1m 2880、3m 3360、5m 4032、10m 2016、15m 2880、30m 1440。
 # v11.1：分隔符號改半形 |（跟其他畫面一致）。
-AMP_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "2h": "2H", "4h": "4H"}   # v15.1：/amp 的週期 → OKX 的 bar
+# v20.2.2（1111 2026-11-15）：週期改成 1m/5m/15m/4h/8h（1h、2h 拿掉）。2000 根約 1.4/6.9/20.8/333/667 天。
+#   OKX 沒有 8H K 線（bar=8H 回 51000 Parameter bar error）→ 8h＝兩根 4H 合成（AMP_MERGE）：OKX 4H 從 UTC 00/04/08… 開始，
+#   8h 對齊 UTC 00/08/16（＝台灣 08:00/16:00/00:00）；兩根都已收線才算一根（湊不滿的丟掉）。開＝第一根開、高＝最高、低＝最低、收＝第二根收。
+AMP_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "4h": "4H", "8h": "4H"}   # v15.1：/amp 的週期 → OKX 的 bar（8h 用 4H 合成）
+AMP_MERGE = {"8h": 2}            # v20.2.2：幾根 OKX K 線合成一根
 AMP_N = 2000                     # v15.1（1111）：一次 2000 根
-AMP_HINT = "1h"
+AMP_HINT = "4h"
 AMP_RUN = {"on": False, "i": 0, "n": 0, "task": None}
 AMP_ATH_FILE = "/srv/1111bot/data/amp_ath.json"   # v14.0：歷史高低點（一天查一次，6 個帳戶共用）
 
@@ -6108,9 +6112,11 @@ async def amp_fetch_page(iid, after, ep, bar):
     return out, ep, False, oldest
 
 async def amp_klines(iid, tf, n):
-    """最近 n+1 根（多一根當第一根的前收）已收線的 tf K 線（舊→新）；OKX 不夠就回有的。v15.1：週期都是 OKX 原生（AMP_TF）。"""
+    """最近 n+1 根（多一根當第一根的前收）已收線的 tf K 線（舊→新）；OKX 不夠就回有的。v15.1：週期都是 OKX 原生（AMP_TF）。
+    v20.2.2：8h＝兩根 4H 合成（amp_merge）。"""
     bar = AMP_TF[tf]
-    need = n + 2
+    k = AMP_MERGE.get(tf, 1)
+    need = (n + 2) * k
     base = {}; after, ep = "", "candles"
     for _ in range(need // 100 + 30):
         page, ep, done, after = await amp_fetch_page(iid, after, ep, bar)
@@ -6121,7 +6127,24 @@ async def amp_klines(iid, tf, n):
         if len(base) >= need:
             break
         await asyncio.sleep(0.12 if ep == "history-candles" else 0.06)   # 不要打太快（OKX 公開額度 6 個帳戶共用）
-    return sorted(base.values(), key=lambda x: x["ts"])[-(n + 1):]
+    kl = sorted(base.values(), key=lambda x: x["ts"])
+    if k > 1:
+        kl = amp_merge(kl, k)
+    return kl[-(n + 1):]
+
+def amp_merge(kl, k):
+    """v20.2.2：k 根 4H（舊→新、都已收線）合成一根（k×4 小時，對齊 UTC 00:00 起算）；湊不滿 k 根的丟掉。"""
+    span = 4 * 3600 * 1000 * k
+    grp = {}
+    for x in kl:
+        grp.setdefault(x["ts"] // span, []).append(x)
+    out = []
+    for g in sorted(grp):
+        xs = sorted(grp[g], key=lambda x: x["ts"])
+        if len(xs) != k:
+            continue
+        out.append({"ts": g * span, "o": xs[0]["o"], "h": max(x["h"] for x in xs), "l": min(x["l"] for x in xs), "c": xs[-1]["c"]})
+    return out
 
 def amp_stats(kl, n):
     """kl＝舊→新。回傳分析用的根數與各項數字（同數值取第一次出現的那一根）。"""
@@ -6219,7 +6242,7 @@ async def _amp_all(u, tf, syms):
         AMP_RUN["on"] = False
 
 def amp_tf(x):
-    """v15.1：/amp 的週期（1m/5m/15m/1h/2h/4h，大小寫都認得：1H、15M）；不對回 None。"""
+    """v15.1：/amp 的週期（v20.2.2：1m/5m/15m/4h/8h，大小寫都認得：4H、15M）；不對回 None。"""
     x = (x or "").strip().lower()
     return x if x in AMP_TF else None
 
