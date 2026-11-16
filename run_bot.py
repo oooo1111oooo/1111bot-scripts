@@ -106,7 +106,7 @@ def _peak_in_window(k, win=2.0):
 TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
 
 
-VERSION = "v20.2.2"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
+VERSION = "v20.2.3"     # 腳本版本號：回報問題時請附上（/status 最後一行顯示）
 BASE = "https://www.okx.com"
 # v15.2（2026-10-18）：連 OKX 一律走 IPv4（固定 IP 13.159.58.20，搬主機也不變）。10/15 換 Lightsail 主機後 IPv6 換了一個新的，
 #   OKX API Key 綁的是舊的 IPv4＋IPv6 → 走到 IPv6 的私有查詢（/coins 交易帳戶、實盤 /run）被 OKX 擋。公開資料不檢查 IP，所以價格、K 線照常。
@@ -6165,7 +6165,8 @@ def amp_stats(kl, n):
             "hi": rows[iH]["h"], "tH": rows[iH]["ts"], "lo": rows[iL]["l"], "tL": rows[iL]["ts"]}
 
 def _amp_t(ms):
-    return datetime.fromtimestamp(ms / 1000, TZ8).strftime("%m/%d %H:%M")
+    """v20.2.3（1111 2026-11-16）：/amp 的時間點都帶年份（yyyy/mm/dd hh:mm）。"""
+    return datetime.fromtimestamp(ms / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
 
 def _amp_right(ss):
     """同一欄右對齊：位數不夠的前面補數字寬的空白。"""
@@ -6191,7 +6192,6 @@ async def amp_page(sym, tf, head):
     #   價格同一欄右對齊、「 | 」分開、% 不要小數（四捨五入）；查詢區間範圍＝⬆️%＋⬇️%（照舊 3 位小數）
     ath = await amp_ath(sym, iid, S, last, t_now)          # v14.0：歷史高點、歷史低點
     ymd = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%Y/%m/%d")
-    md = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%m/%d")
     ymdhm = lambda ms: datetime.fromtimestamp(ms / 1000, TZ8).strftime("%Y/%m/%d %H:%M")
     pc = lambda a, b: (a - b) / last * 100                 # 現價要漲（a 高點）／跌（b 低點）多少 %
     p0 = lambda v: f"{Decimal(v).quantize(Decimal(1), rounding=ROUND_HALF_UP)}%"
@@ -6201,7 +6201,7 @@ async def amp_page(sym, tf, head):
     rows = []                                              # (emoji, 價格, 日期, %)
     if ath:
         rows.append(("🟩", Decimal(ath["hi"]), ymd(ath["hi_t"]), p0(pc(Decimal(ath["hi"]), last))))
-    rows += [("💚", S["hi"], md(S["tH"]), p0(up)), ("🛜", last, _amp_t(t_now * 1000), None), ("❤️", S["lo"], md(S["tL"]), p0(dn))]
+    rows += [("💚", S["hi"], ymd(S["tH"]), p0(up)), ("🛜", last, _amp_t(t_now * 1000), None), ("❤️", S["lo"], ymd(S["tL"]), p0(dn))]   # v20.2.3：區間高低點也帶年份
     if ath:
         rows.append(("🟥", Decimal(ath["lo"]), ymd(ath["lo_t"]), p0(pc(last, Decimal(ath["lo"])))))
     ps = _amp_right([q(r[1]) for r in rows])
